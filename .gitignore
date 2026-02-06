@@ -1,0 +1,7 @@
+/target
+*.db
+imports
+.env
+
+node_modules/
+

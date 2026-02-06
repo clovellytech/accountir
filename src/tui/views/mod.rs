@@ -1,0 +1,16 @@
+pub mod account_form;
+pub mod accounts;
+pub mod bank_import;
+pub mod csv_import;
+pub mod dashboard;
+pub mod entry_detail;
+pub mod entry_form;
+pub mod event_log;
+pub mod help;
+pub mod journal;
+pub mod plaid;
+pub mod plaid_config;
+pub mod plaid_link;
+pub mod reports;
+pub mod startup;
+pub mod welcome;

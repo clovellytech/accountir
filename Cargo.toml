@@ -1,0 +1,78 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "accountir"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first, event-sourced double-entry accounting"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/zakvdm/accountir"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# SQLite
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto (for Merkle tree)
+sha2 = "0.10"
+hex = "0.4"
+
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# HTTP server
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Money handling
+rust_decimal = { version = "1", features = ["serde"] }
+
+# Config directories
+dirs = "6"
+
+# Config file
+toml = { version = "1.0.7+spec-1.1.0", features = ["preserve_order"] }
+
+# HTTP client (for Plaid proxy communication)
+reqwest = { version = "0.13.2", features = [
+  "json",
+  "rustls",
+  "blocking",
+], default-features = false }
+
+# Open URLs in browser
+open = "5"
+
+# GnuCash import
+quick-xml = "0.39.2"
+flate2 = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
