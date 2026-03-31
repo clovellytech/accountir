@@ -179,8 +179,12 @@ impl MerkleTree {
         let mut pos = leaf_position;
 
         for level in 0..max_level as usize {
-            let sibling_pos = if pos % 2 == 0 { pos + 1 } else { pos - 1 };
-            let is_right_sibling = pos % 2 == 0;
+            let sibling_pos = if pos.is_multiple_of(2) {
+                pos + 1
+            } else {
+                pos - 1
+            };
+            let is_right_sibling = pos.is_multiple_of(2);
 
             // Try to get sibling hash (might not exist if odd number of nodes)
             if let Ok(sibling_hash) = self.get_hash(level, sibling_pos) {

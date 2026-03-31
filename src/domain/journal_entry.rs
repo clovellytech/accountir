@@ -24,17 +24,13 @@ pub enum JournalEntryError {
 /// Source of the journal entry
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum EntrySource {
+    #[default]
     Manual,
     Import,
     Recurring,
     System,
-}
-
-impl Default for EntrySource {
-    fn default() -> Self {
-        Self::Manual
-    }
 }
 
 /// A single line in a journal entry

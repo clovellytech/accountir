@@ -709,16 +709,14 @@ impl App {
         used_numbers.sort();
 
         // Determine the range based on first digit (e.g., 1xxx for assets, 2xxx for liabilities)
-        let range_start = (first_digit.to_digit(10).unwrap_or(1) * 1000) as u32;
+        let range_start = first_digit.to_digit(10).unwrap_or(1) * 1000;
         let range_end = range_start + 999;
 
         // Find the next unused number in this range
         let mut next = range_start;
         for num in used_numbers {
-            if num >= range_start && num <= range_end {
-                if num >= next {
-                    next = num + 1;
-                }
+            if num >= range_start && num <= range_end && num >= next {
+                next = num + 1;
             }
         }
 

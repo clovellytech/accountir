@@ -422,12 +422,10 @@ impl AccountForm {
             } else {
                 current_list_idx + 1
             }
+        } else if current_list_idx == 0 {
+            filtered.len() - 1
         } else {
-            if current_list_idx == 0 {
-                filtered.len() - 1
-            } else {
-                current_list_idx - 1
-            }
+            current_list_idx - 1
         };
 
         self.parent_list_state.select(Some(new_list_idx));

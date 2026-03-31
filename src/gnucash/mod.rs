@@ -498,10 +498,10 @@ fn parse_gnucash_xml<R: BufRead>(reader: R) -> Result<GncBook, GnuCashError> {
                     if get_attr_value(e, b"version").is_some() {
                         accounts.push(parse_account(&mut xml_reader, &mut buf)?);
                     }
-                } else if tag_matches_full(&tag, b"gnc:transaction") {
-                    if get_attr_value(e, b"version").is_some() {
-                        transactions.push(parse_transaction(&mut xml_reader, &mut buf)?);
-                    }
+                } else if tag_matches_full(&tag, b"gnc:transaction")
+                    && get_attr_value(e, b"version").is_some()
+                {
+                    transactions.push(parse_transaction(&mut xml_reader, &mut buf)?);
                 }
             }
             XmlEvent::Eof => break,

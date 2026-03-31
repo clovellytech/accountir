@@ -293,7 +293,7 @@ impl WelcomeView {
     ) -> Line<'static> {
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{}", key), Style::default().fg(Color::Cyan)),
+            Span::styled(key.to_string(), Style::default().fg(Color::Cyan)),
             Span::raw(" "),
             Span::styled(format!("{:<12}", name), Style::default().fg(Color::White)),
             Span::styled(description, Style::default().fg(Color::DarkGray)),

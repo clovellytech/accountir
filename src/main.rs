@@ -257,7 +257,7 @@ async fn main() -> Result<()> {
             let server_db = accountir::server::start_server_task().await;
 
             // If a specific database was provided (not the default), open it directly
-            if cli.database != PathBuf::from("accountir.db") {
+            if cli.database != std::path::Path::new("accountir.db") {
                 run_app_with_database(&cli.database, server_db)?;
             } else {
                 // Otherwise show the startup screen to select/create a database
@@ -800,7 +800,7 @@ fn show_status(store: &EventStore) -> Result<()> {
     Ok(())
 }
 
-fn handle_import_gnucash(file: &PathBuf, output: Option<PathBuf>) -> Result<()> {
+fn handle_import_gnucash(file: &std::path::Path, output: Option<PathBuf>) -> Result<()> {
     use accountir::gnucash;
     use accountir::store::migrations::init_schema;
 

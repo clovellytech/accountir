@@ -80,8 +80,8 @@ fn topological_sort_accounts(accounts: &[crate::gnucash::GncAccount]) -> Vec<usi
 
     // Start with accounts that have no parent (or parent not in our set)
     let mut queue: VecDeque<usize> = VecDeque::new();
-    for i in 0..n {
-        if in_degree[i] == 0 {
+    for (i, &deg) in in_degree.iter().enumerate().take(n) {
+        if deg == 0 {
             queue.push_back(i);
         }
     }

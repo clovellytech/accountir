@@ -100,6 +100,12 @@ pub enum BankImportResult {
     Skip(i64), // Skip/delete this import
 }
 
+impl Default for BankImportModal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BankImportModal {
     pub fn new() -> Self {
         Self {

@@ -38,6 +38,12 @@ pub enum PlaidAction {
     Disconnect(String),
 }
 
+impl Default for PlaidView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PlaidView {
     pub fn new() -> Self {
         Self {
