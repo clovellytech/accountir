@@ -26,17 +26,17 @@ jobs:
             archive: tar.gz
             cross: true
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15
             archive: tar.gz
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -70,7 +70,7 @@ jobs:
           Compress-Archive -Path target/${{ matrix.target }}/release/accountir.exe -DestinationPath accountir-${{ inputs.ref_name }}-${{ matrix.target }}.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: accountir-${{ matrix.target }}
           path: accountir-${{ inputs.ref_name }}-${{ matrix.target }}.*
