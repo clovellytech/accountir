@@ -901,18 +901,19 @@ impl App {
             return;
         }
 
-        // If journal has an active modal (reassign, void confirm, bulk void confirm, multiselect),
-        // let journal handle keys first before global keys
+        // If journal has an active modal (reassign, void confirm, bulk void confirm) or
+        // any rows are currently selected for a bulk operation, let journal handle keys
+        // first before global keys.
         if self.active_view == ActiveView::Journal {
             let has_modal = self.journal.is_reassigning()
                 || self.journal.is_confirming_void()
                 || self.journal.is_confirming_bulk_void()
-                || self.journal.multiselect_mode;
+                || self.journal.has_selections();
 
             if has_modal {
-                let wants_reassign = self.journal.handle_key(key);
+                let wants_reassign = self.journal.handle_key(key, modifiers);
                 if wants_reassign && key == KeyCode::Char('a') {
-                    if self.journal.multiselect_mode {
+                    if self.journal.has_selections() {
                         self.pending_bulk_reassign = true;
                     } else {
                         self.pending_reassign = self.request_reassign();
@@ -1033,9 +1034,13 @@ impl App {
                         }
                     }
                 } else {
-                    let wants_reassign = self.journal.handle_key(key);
+                    let wants_reassign = self.journal.handle_key(key, modifiers);
                     if wants_reassign && key == KeyCode::Char('a') {
-                        self.pending_reassign = self.request_reassign();
+                        if self.journal.has_selections() {
+                            self.pending_bulk_reassign = true;
+                        } else {
+                            self.pending_reassign = self.request_reassign();
+                        }
                     }
                 }
             }

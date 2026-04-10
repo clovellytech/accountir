@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table},
     Frame,
 };
 use std::path::PathBuf;
@@ -102,6 +102,12 @@ pub struct CsvImportModal {
     pub amount_column: Option<usize>,
     pub active_field: ColumnField,
 
+    // Confirm step preview: full parsed result of the entire file using the
+    // current configuration. Built when entering the Confirm step so the user
+    // can verify what will actually be imported.
+    pub confirm_summary: Option<ConfirmSummary>,
+    pub confirm_scroll: usize,
+
     // Target account for import
     pub target_account_id: Option<String>,
     pub target_account_name: Option<String>,
@@ -123,6 +129,8 @@ impl CsvImportModal {
             account_state: ListState::default(),
             preview: None,
             error_message: None,
+            confirm_summary: None,
+            confirm_scroll: 0,
             raw_content: None,
             skip_lines: 0,
             has_header: true,
@@ -149,6 +157,8 @@ impl CsvImportModal {
         self.account_state = ListState::default();
         self.preview = None;
         self.error_message = None;
+        self.confirm_summary = None;
+        self.confirm_scroll = 0;
         self.raw_content = None;
         self.skip_lines = 0;
         self.has_header = true;
@@ -337,6 +347,8 @@ impl CsvImportModal {
                     && self.description_column.is_some()
                     && self.amount_column.is_some()
                 {
+                    self.build_confirm_summary();
+                    self.confirm_scroll = 0;
                     self.step = ImportStep::Confirm;
                 } else {
                     self.error_message = Some("Please map all required columns".to_string());
@@ -401,17 +413,137 @@ impl CsvImportModal {
 
     fn handle_confirm_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Esc => {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.step = ImportStep::MapColumns;
+                self.confirm_summary = None;
             }
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.ready_to_import = true;
+                if self
+                    .confirm_summary
+                    .as_ref()
+                    .map(|s| !s.parsed.is_empty())
+                    .unwrap_or(false)
+                {
+                    self.ready_to_import = true;
+                }
             }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.step = ImportStep::MapColumns;
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.confirm_scroll = self.confirm_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = self
+                    .confirm_summary
+                    .as_ref()
+                    .map(|s| s.parsed.len().saturating_sub(1))
+                    .unwrap_or(0);
+                if self.confirm_scroll < max {
+                    self.confirm_scroll += 1;
+                }
+            }
+            KeyCode::PageUp => {
+                self.confirm_scroll = self.confirm_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                let max = self
+                    .confirm_summary
+                    .as_ref()
+                    .map(|s| s.parsed.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.confirm_scroll = (self.confirm_scroll + 10).min(max);
+            }
+            KeyCode::Home => {
+                self.confirm_scroll = 0;
+            }
+            KeyCode::End => {
+                let max = self
+                    .confirm_summary
+                    .as_ref()
+                    .map(|s| s.parsed.len().saturating_sub(1))
+                    .unwrap_or(0);
+                self.confirm_scroll = max;
             }
             _ => {}
         }
+    }
+
+    /// Re-parse the entire cached file using the current configuration and
+    /// build a `ConfirmSummary` so the user can review what will be imported.
+    fn build_confirm_summary(&mut self) {
+        let Some(ref content) = self.raw_content else {
+            self.confirm_summary = None;
+            return;
+        };
+        let (Some(date_col), Some(desc_col), Some(amount_col)) =
+            (self.date_column, self.description_column, self.amount_column)
+        else {
+            self.confirm_summary = None;
+            return;
+        };
+
+        let mut lines = content.lines();
+        for _ in 0..self.skip_lines {
+            if lines.next().is_none() {
+                self.confirm_summary = Some(ConfirmSummary::default());
+                return;
+            }
+        }
+        if self.has_header {
+            lines.next();
+        }
+
+        let mut summary = ConfirmSummary::default();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            summary.total_rows += 1;
+            let fields = parse_delimited_line(line, self.delimiter);
+            let date_str = fields.get(date_col).map(|s| s.as_str()).unwrap_or("");
+            let desc_str = fields.get(desc_col).map(|s| s.as_str()).unwrap_or("");
+            let amount_str = fields.get(amount_col).map(|s| s.as_str()).unwrap_or("");
+
+            let date = match parse_date(date_str) {
+                Some(d) => d,
+                None => {
+                    summary.invalid_date += 1;
+                    continue;
+                }
+            };
+            let amount = match parse_amount(amount_str) {
+                Some(a) => a,
+                None => {
+                    summary.invalid_amount += 1;
+                    continue;
+                }
+            };
+            if amount == 0 {
+                summary.zero_amount += 1;
+                continue;
+            }
+
+            if amount > 0 {
+                summary.total_positive += amount;
+            } else {
+                summary.total_negative += amount;
+            }
+            match summary.min_date {
+                None => summary.min_date = Some(date),
+                Some(d) if date < d => summary.min_date = Some(date),
+                _ => {}
+            }
+            match summary.max_date {
+                None => summary.max_date = Some(date),
+                Some(d) if date > d => summary.max_date = Some(date),
+                _ => {}
+            }
+            summary.parsed.push(ParsedRow {
+                date,
+                description: desc_str.to_string(),
+                amount,
+            });
+        }
+
+        self.confirm_summary = Some(summary);
     }
 
     fn update_suggestions(&mut self) {
@@ -1160,50 +1292,280 @@ impl CsvImportModal {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent))
-            .title(" Import CSV - Confirm ");
+            .title(" Import CSV - Review & Confirm ");
         frame.render_widget(block, area);
 
-        let inner = inner_rect(area, 2, 2);
+        let inner = inner_rect(area, 2, 1);
 
-        let row_count = self.preview.as_ref().map(|p| p.rows.len()).unwrap_or(0);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(6), // Header info
+                Constraint::Length(4), // Stats
+                Constraint::Min(5),    // Sample table
+                Constraint::Length(2), // Help
+            ])
+            .split(inner);
+
         let target = self
             .target_account_name
             .as_deref()
             .unwrap_or("(no account selected)");
+        let summary = self.confirm_summary.as_ref();
 
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "Ready to import",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(format!("File: {}", self.file_path)),
-            Line::from(format!("Target account: {}", target)),
-            Line::from(format!("Rows to import: {} (preview)", row_count)),
-            Line::from(""),
-            Line::from("Unmatched entries will be posted to 'Uncategorized' account."),
-            Line::from(""),
+        // ----- Header info -----
+        let preview = self.preview.as_ref();
+        let date_col_label = self
+            .date_column
+            .and_then(|i| preview.and_then(|p| p.headers.get(i)))
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let desc_col_label = self
+            .description_column
+            .and_then(|i| preview.and_then(|p| p.headers.get(i)))
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        let amount_col_label = self
+            .amount_column
+            .and_then(|i| preview.and_then(|p| p.headers.get(i)))
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+
+        let header_lines = vec![
             Line::from(vec![
-                Span::styled("Press ", Style::default()),
+                Span::styled("File:    ", Style::default().fg(theme.header)),
+                Span::raw(self.file_path.clone()),
+            ]),
+            Line::from(vec![
+                Span::styled("Target:  ", Style::default().fg(theme.header)),
+                Span::raw(target.to_string()),
+            ]),
+            Line::from(vec![
+                Span::styled("Columns: ", Style::default().fg(theme.header)),
+                Span::raw(format!(
+                    "Date={}, Description={}, Amount={}",
+                    date_col_label, desc_col_label, amount_col_label
+                )),
+            ]),
+            Line::from(vec![
+                Span::styled("Parse:   ", Style::default().fg(theme.header)),
+                Span::raw(format!(
+                    "skip {} line{}, header={}, delimiter={}",
+                    self.skip_lines,
+                    if self.skip_lines == 1 { "" } else { "s" },
+                    if self.has_header { "yes" } else { "no" },
+                    delimiter_label_short(self.delimiter),
+                )),
+            ]),
+        ];
+        frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+
+        // ----- Stats -----
+        let stats_lines = if let Some(s) = summary {
+            let valid = s.parsed.len();
+            let skipped = s.invalid_date + s.invalid_amount + s.zero_amount;
+            let date_range = match (s.min_date, s.max_date) {
+                (Some(min), Some(max)) => format!("{} → {}", min, max),
+                _ => "(none)".to_string(),
+            };
+            let net = s.total_positive + s.total_negative;
+            vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} entries will be imported", valid),
+                        Style::default()
+                            .fg(theme.success)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  •  "),
+                    Span::styled(
+                        format!("{} skipped", skipped),
+                        if skipped > 0 {
+                            Style::default().fg(theme.error)
+                        } else {
+                            Style::default().fg(theme.fg_dim)
+                        },
+                    ),
+                    Span::raw(if skipped > 0 {
+                        format!(
+                            " ({} bad date, {} bad amount, {} zero)",
+                            s.invalid_date, s.invalid_amount, s.zero_amount
+                        )
+                    } else {
+                        String::new()
+                    }),
+                ]),
+                Line::from(vec![
+                    Span::styled("Date range: ", Style::default().fg(theme.header)),
+                    Span::raw(date_range),
+                ]),
+                Line::from(vec![
+                    Span::styled("Totals:     ", Style::default().fg(theme.header)),
+                    Span::styled(
+                        format!("+{}", format_amount(s.total_positive)),
+                        Style::default().fg(theme.success),
+                    ),
+                    Span::raw("   "),
+                    Span::styled(
+                        format_amount(s.total_negative),
+                        Style::default().fg(theme.error),
+                    ),
+                    Span::raw("   net "),
+                    Span::raw(format_amount(net)),
+                ]),
+            ]
+        } else {
+            vec![Line::from(Span::styled(
+                "(no preview available)",
+                Style::default().fg(theme.error),
+            ))]
+        };
+        frame.render_widget(Paragraph::new(stats_lines), chunks[1]);
+
+        // ----- Sample table -----
+        let table_area = chunks[2];
+        if let Some(s) = summary {
+            if s.parsed.is_empty() {
+                let msg = Paragraph::new(Span::styled(
+                    "No valid rows would be imported. Check column mapping and parse options.",
+                    Style::default().fg(theme.error),
+                ))
+                .block(Block::default().borders(Borders::ALL).title(" Preview "));
+                frame.render_widget(msg, table_area);
+            } else {
+                // Visible rows = inner height of the table block (subtract borders + header).
+                let visible_rows = table_area.height.saturating_sub(4) as usize;
+                let visible_rows = visible_rows.max(1);
+                let start = self.confirm_scroll.min(s.parsed.len().saturating_sub(1));
+                let end = (start + visible_rows).min(s.parsed.len());
+
+                let rows: Vec<Row> = s.parsed[start..end]
+                    .iter()
+                    .map(|r| {
+                        let amount_style = if r.amount >= 0 {
+                            Style::default().fg(theme.success)
+                        } else {
+                            Style::default().fg(theme.error)
+                        };
+                        Row::new(vec![
+                            Span::raw(r.date.format("%Y-%m-%d").to_string()),
+                            Span::raw(r.description.clone()),
+                            Span::styled(format_amount(r.amount), amount_style),
+                        ])
+                    })
+                    .collect();
+
+                let scroll_info = if s.parsed.len() > visible_rows {
+                    format!(
+                        " Preview ({}–{} of {}) ",
+                        start + 1,
+                        end,
+                        s.parsed.len()
+                    )
+                } else {
+                    format!(" Preview ({} rows) ", s.parsed.len())
+                };
+
+                let widths = [
+                    Constraint::Length(12),
+                    Constraint::Min(20),
+                    Constraint::Length(14),
+                ];
+                let table = Table::new(rows, widths)
+                    .header(
+                        Row::new(vec!["Date", "Description", "Amount"])
+                            .style(
+                                Style::default()
+                                    .fg(theme.header)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                            .bottom_margin(1),
+                    )
+                    .block(Block::default().borders(Borders::ALL).title(scroll_info));
+                frame.render_widget(table, table_area);
+            }
+        }
+
+        // ----- Help / prompt -----
+        let can_import = summary.map(|s| !s.parsed.is_empty()).unwrap_or(false);
+        let help = if can_import {
+            Line::from(vec![
                 Span::styled(
                     "Y/Enter",
                     Style::default()
                         .fg(theme.success)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" to import or "),
+                Span::raw(": import  "),
                 Span::styled(
                     "N/Esc",
                     Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(" to go back"),
-            ]),
-        ];
-
-        let content = Paragraph::new(lines);
-        frame.render_widget(content, inner);
+                Span::raw(": back  "),
+                Span::styled("↑↓/PgUp/PgDn", Style::default().fg(theme.header)),
+                Span::raw(": scroll preview"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    "N/Esc",
+                    Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(": go back and fix mapping/parse options"),
+            ])
+        };
+        frame.render_widget(Paragraph::new(help), chunks[3]);
     }
+}
+
+fn delimiter_label_short(d: char) -> &'static str {
+    match d {
+        ',' => ",",
+        '\t' => "\\t",
+        ';' => ";",
+        '|' => "|",
+        _ => "?",
+    }
+}
+
+fn format_amount(cents: i64) -> String {
+    let dollars = cents as f64 / 100.0;
+    if cents < 0 {
+        format!("-${:.2}", -dollars)
+    } else {
+        format!("${:.2}", dollars)
+    }
+}
+
+/// One row of parsed CSV data, ready to be turned into a journal entry.
+#[derive(Debug, Clone)]
+pub struct ParsedRow {
+    pub date: chrono::NaiveDate,
+    pub description: String,
+    /// Amount as it appears in the CSV (positive or negative cents).
+    pub amount: i64,
+}
+
+/// Result of dry-running the parse over the whole file with the user's
+/// current mapping and parse options.
+#[derive(Debug, Clone, Default)]
+pub struct ConfirmSummary {
+    /// Total non-empty rows seen after skipping leading lines and the header.
+    pub total_rows: usize,
+    /// Rows skipped because the date column couldn't be parsed.
+    pub invalid_date: usize,
+    /// Rows skipped because the amount column couldn't be parsed.
+    pub invalid_amount: usize,
+    /// Rows skipped because the parsed amount was zero.
+    pub zero_amount: usize,
+    pub min_date: Option<chrono::NaiveDate>,
+    pub max_date: Option<chrono::NaiveDate>,
+    /// Sum of positive amounts (in cents).
+    pub total_positive: i64,
+    /// Sum of negative amounts (in cents).
+    pub total_negative: i64,
+    /// All successfully-parsed rows, in file order.
+    pub parsed: Vec<ParsedRow>,
 }
 
 impl Default for CsvImportModal {

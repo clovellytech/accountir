@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crossterm::event::KeyCode;
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::domain::Account;
+use crate::domain::{Account, AccountType};
 use crate::queries::search::EntrySearchResult;
 use crate::tui::theme::Theme;
 
@@ -95,11 +95,7 @@ pub struct JournalView {
     pub show_void: bool,
     /// Whether to show ID column
     pub show_id_column: bool,
-    /// Multiselect mode (ledger view only)
-    pub multiselect_mode: bool,
-    /// Whether navigation selects entries (toggled with space in multiselect mode)
-    pub multiselect_selecting: bool,
-    /// Selected entry IDs for multiselect
+    /// Selected entry IDs for bulk operations (ledger view only)
     pub selected_entry_ids: HashSet<String>,
     /// Reassignment mode
     pub reassign_mode: bool,
@@ -134,8 +130,6 @@ impl JournalView {
             running_balances: Vec::new(),
             show_void: true,
             show_id_column: false,
-            multiselect_mode: false,
-            multiselect_selecting: false,
             selected_entry_ids: HashSet::new(),
             reassign_mode: false,
             reassign_pending: None,
@@ -231,36 +225,21 @@ impl JournalView {
         self.bulk_reassign_confirmed.take()
     }
 
-    /// Toggle multiselect mode (ledger view only)
-    pub fn toggle_multiselect(&mut self) {
-        if self.filter_account.is_none() {
-            return; // Only in ledger view
-        }
-        self.multiselect_mode = !self.multiselect_mode;
-        if !self.multiselect_mode {
-            self.selected_entry_ids.clear();
-            self.multiselect_selecting = false;
-        } else {
-            // Start with selection active
-            self.multiselect_selecting = true;
-            // Select current entry when entering multiselect
-            if let Some(entry) = self.selected_entry() {
-                if !entry.is_void {
-                    self.selected_entry_ids.insert(entry.entry_id.clone());
-                }
-            }
-        }
-    }
-
-    /// Exit multiselect mode
-    pub fn exit_multiselect(&mut self) {
-        self.multiselect_mode = false;
-        self.multiselect_selecting = false;
+    /// Clear all selected entries.
+    pub fn clear_selections(&mut self) {
         self.selected_entry_ids.clear();
     }
 
-    /// Toggle selection of current entry
+    /// Whether any entries are currently selected for bulk operations.
+    pub fn has_selections(&self) -> bool {
+        !self.selected_entry_ids.is_empty()
+    }
+
+    /// Toggle selection of the current entry (only in ledger view).
     pub fn toggle_current_selection(&mut self) {
+        if self.filter_account.is_none() {
+            return;
+        }
         if let Some(entry) = self.selected_entry() {
             if entry.is_void {
                 return; // Can't select voided entries
@@ -274,8 +253,11 @@ impl JournalView {
         }
     }
 
-    /// Select current entry (used when navigating in multiselect mode)
+    /// Add the current entry to the selection (used by Shift+arrow extend).
     fn select_current(&mut self) {
+        if self.filter_account.is_none() {
+            return;
+        }
         if let Some(entry) = self.selected_entry() {
             if !entry.is_void {
                 self.selected_entry_ids.insert(entry.entry_id.clone());
@@ -358,9 +340,18 @@ impl JournalView {
     /// Calculate running balances for ledger view (must be called after sorting by date ascending)
     pub fn calculate_running_balances(&mut self) {
         self.running_balances.clear();
-        if self.filter_account.is_none() {
+        let Some(ref account) = self.filter_account else {
             return;
-        }
+        };
+
+        // `account_amount` on each entry is signed in debit-positive terms
+        // (positive = debit, negative = credit). For credit-normal accounts
+        // (Liability, Equity, Revenue) we flip the sign so the running balance
+        // matches the natural display direction used by the Chart of Accounts.
+        let credit_normal = matches!(
+            account.account_type,
+            AccountType::Liability | AccountType::Equity | AccountType::Revenue
+        );
 
         // For running balance, we need entries sorted by date ascending
         // But we display them in whatever sort order the user wants
@@ -381,7 +372,8 @@ impl JournalView {
         let mut running = 0i64;
         for (idx, _date, amount, is_void) in date_sorted {
             if !is_void {
-                running += amount;
+                let signed = if credit_normal { -amount } else { amount };
+                running += signed;
             }
             balances_by_index[idx] = running;
         }
@@ -397,7 +389,7 @@ impl JournalView {
 
     pub fn clear_filter(&mut self) {
         self.filter_account = None;
-        self.exit_multiselect(); // Exit multiselect when leaving ledger view
+        self.clear_selections(); // Drop bulk selections when leaving ledger view
     }
 
     pub fn is_filtered(&self) -> bool {
@@ -462,7 +454,7 @@ impl JournalView {
         self.sort_entries();
     }
 
-    pub fn handle_key(&mut self, key: KeyCode) -> bool {
+    pub fn handle_key(&mut self, key: KeyCode, modifiers: KeyModifiers) -> bool {
         // Handle reassignment mode
         if self.reassign_mode {
             return self.handle_reassign_key(key);
@@ -490,7 +482,7 @@ impl JournalView {
                     let entry_ids: Vec<String> = self.selected_entry_ids.iter().cloned().collect();
                     self.bulk_void_confirmed = Some(entry_ids);
                     self.bulk_void_pending = false;
-                    self.exit_multiselect();
+                    self.clear_selections();
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
                     self.bulk_void_pending = false;
@@ -501,71 +493,44 @@ impl JournalView {
         }
 
         let is_ledger = self.filter_account.is_some();
-
-        // Handle multiselect mode (ledger view only)
-        if self.multiselect_mode {
-            match key {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.previous();
-                    if self.multiselect_selecting {
-                        self.select_current();
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.next();
-                    if self.multiselect_selecting {
-                        self.select_current();
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    // Toggle selection mode and select/deselect current entry
-                    self.multiselect_selecting = !self.multiselect_selecting;
-                    if self.multiselect_selecting {
-                        self.select_current();
-                    } else {
-                        // Deselect current entry when turning off selection
-                        let entry_id = self.selected_entry().map(|e| e.entry_id.clone());
-                        if let Some(id) = entry_id {
-                            self.selected_entry_ids.remove(&id);
-                        }
-                    }
-                }
-                KeyCode::Char('a') => return true, // Signal to app.rs to start bulk reassignment
-                KeyCode::Char('x') => {
-                    if !self.selected_entry_ids.is_empty() {
-                        self.bulk_void_pending = true;
-                    }
-                }
-                KeyCode::Esc => {
-                    self.exit_multiselect();
-                }
-                KeyCode::Home => self.first(),
-                KeyCode::End => self.last(),
-                _ => {}
-            }
-            return false;
-        }
+        let shift = modifiers.contains(KeyModifiers::SHIFT);
 
         match key {
+            // Shift+Up/Down: extend selection while moving the cursor (ledger only)
+            KeyCode::Up if shift && is_ledger => {
+                self.select_current(); // ensure starting row is in the set
+                self.previous();
+                self.select_current();
+            }
+            KeyCode::Down if shift && is_ledger => {
+                self.select_current();
+                self.next();
+                self.select_current();
+            }
+
             KeyCode::Up | KeyCode::Char('k') => self.previous(),
             KeyCode::Down | KeyCode::Char('j') => self.next(),
             KeyCode::Home => self.first(),
             KeyCode::End => self.last(),
             KeyCode::PageUp => self.page_up(),
             KeyCode::PageDown => self.page_down(),
+            KeyCode::Char(' ') if is_ledger => {
+                // Toggle selection of the current row (ledger view only)
+                self.toggle_current_selection();
+            }
             KeyCode::Char('s') => self.next_sort_field(),
             KeyCode::Char('r') => self.toggle_sort_direction(),
-            KeyCode::Char('v') => {
-                if is_ledger {
-                    self.toggle_multiselect();
-                }
-            }
             KeyCode::Char('x') => {
-                self.start_void();
+                if self.has_selections() {
+                    // Bulk void confirmation
+                    self.bulk_void_pending = true;
+                } else {
+                    self.start_void();
+                }
             }
             KeyCode::Char('h') => self.toggle_show_void(),
             KeyCode::Char('c') => self.toggle_id_column(),
-            KeyCode::Char('a') => return true, // Signal to app.rs to start reassignment
+            KeyCode::Char('a') => return true, // Signal to app.rs to start (bulk) reassignment
             KeyCode::Char('g') => {
                 // Jump to other account's ledger (only in ledger view)
                 if is_ledger {
@@ -573,7 +538,10 @@ impl JournalView {
                 }
             }
             KeyCode::Esc | KeyCode::Backspace => {
-                if self.filter_account.is_some() {
+                if self.has_selections() {
+                    // First Esc clears the selection set; the filter stays.
+                    self.clear_selections();
+                } else if self.filter_account.is_some() {
                     self.clear_filter();
                     return true; // Signal that filter was cleared
                 }
@@ -659,7 +627,7 @@ impl JournalView {
                             let entry_ids: Vec<String> =
                                 self.selected_entry_ids.iter().cloned().collect();
                             self.bulk_reassign_confirmed = Some((entry_ids, account.id.clone()));
-                            self.exit_multiselect();
+                            self.clear_selections();
                         } else if let Some(ref pending) = self.reassign_pending {
                             // Single reassignment
                             self.reassign_confirmed = Some((
@@ -871,16 +839,11 @@ impl JournalView {
         let void_info = if self.show_void { "" } else { " [hiding void]" };
 
         if let Some(ref account) = self.filter_account {
-            if self.multiselect_mode {
+            if self.has_selections() {
                 let count = self.selected_entry_ids.len();
-                let select_status = if self.multiselect_selecting {
-                    "selecting"
-                } else {
-                    "paused"
-                };
                 format!(
-                    " MULTISELECT ({} selected, {}) - ↑↓: move, Space: toggle select, a: assign, x: void, Esc: cancel ",
-                    count, select_status
+                    " Ledger: {} - {} {}{}  •  {} selected (Space: toggle, Shift+↑↓: extend, a: assign, x: void, Esc: clear) ",
+                    account.account_number, account.name, sort_info, void_info, count
                 )
             } else {
                 format!(
@@ -1081,7 +1044,7 @@ impl JournalView {
             .split(modal_area);
 
         let title = if is_bulk {
-            format!(" Assign {} Transactions ", self.selected_entry_ids.len())
+            " Assign Transfer Account ".to_string()
         } else {
             " Reassign Transaction ".to_string()
         };
@@ -1093,16 +1056,19 @@ impl JournalView {
 
         // Current account info
         let current_text = if is_bulk {
-            format!(
-                "Assigning {} transactions to new account",
-                self.selected_entry_ids.len()
-            )
+            let n = self.selected_entry_ids.len();
+            let noun = if n == 1 { "transaction" } else { "transactions" };
+            format!("{} {} selected", n, noun)
         } else if let Some(ref pending) = self.reassign_pending {
             format!("Current: {}", pending.current_account_name)
         } else {
             "Select new account".to_string()
         };
-        let current = Paragraph::new(current_text).style(Style::default().fg(theme.header));
+        let current = Paragraph::new(current_text).style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        );
         frame.render_widget(current, chunks[0]);
 
         // Filter input
