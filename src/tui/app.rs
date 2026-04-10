@@ -39,7 +39,9 @@ use super::views::{
     account_form::{AccountForm, AccountFormResult},
     accounts::AccountsView,
     bank_import::{BankImportModal, BankImportResult, ParsedTransaction, PendingImport},
-    csv_import::{parse_amount, parse_csv_line, parse_date, CsvImportModal, ImportConfig},
+    csv_import::{
+        parse_amount, parse_date, parse_delimited_line, CsvImportModal, ImportConfig,
+    },
     dashboard::DashboardView,
     entry_detail::{EntryDetail, EntryDetailModal, EntryLineDetail},
     entry_form::{EntryForm, EntryFormResult},
@@ -2932,8 +2934,15 @@ fn perform_csv_import(
 
     let mut lines = content.lines();
 
-    // Skip header
-    lines.next();
+    // Skip any leading lines the user marked as non-data (e.g. bank preamble).
+    for _ in 0..config.skip_lines {
+        lines.next();
+    }
+
+    // Skip header row if the user said there is one.
+    if config.has_header {
+        lines.next();
+    }
 
     // Target account is required
     let target_account_id = config
@@ -2955,7 +2964,7 @@ fn perform_csv_import(
     let mut commands = EntryCommands::new(store, "csv-import".to_string());
 
     for line in lines {
-        let fields = parse_csv_line(line);
+        let fields = parse_delimited_line(line, config.delimiter);
 
         // Extract fields based on column mapping
         let date_str = fields

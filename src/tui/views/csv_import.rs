@@ -13,10 +13,27 @@ use crate::tui::theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportStep {
     SelectFile,
+    Parsing,
     SelectAccount,
     MapColumns,
     Confirm,
 }
+
+/// Which parse-options field is currently active on the Parsing step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParseField {
+    SkipLines,
+    HasHeader,
+    Delimiter,
+}
+
+/// Delimiter options the user can cycle through on the Parsing step.
+const DELIMITER_CHOICES: &[(char, &str)] = &[
+    (',', "Comma  ,"),
+    ('\t', "Tab    ⇥"),
+    (';', "Semicolon ;"),
+    ('|', "Pipe   |"),
+];
 
 #[derive(Debug, Clone)]
 pub struct CsvPreview {
@@ -68,6 +85,17 @@ pub struct CsvImportModal {
     pub preview: Option<CsvPreview>,
     pub error_message: Option<String>,
 
+    // Raw file content (cached so we can re-parse when parse options change)
+    pub raw_content: Option<String>,
+    // Number of leading lines to skip before the header (or first data) row
+    pub skip_lines: usize,
+    // Whether the first non-skipped row is a header row
+    pub has_header: bool,
+    // Field delimiter used to split each row into columns
+    pub delimiter: char,
+    // Currently active field on the Parsing step
+    pub active_parse_field: ParseField,
+
     // Column mapping
     pub date_column: Option<usize>,
     pub description_column: Option<usize>,
@@ -95,6 +123,11 @@ impl CsvImportModal {
             account_state: ListState::default(),
             preview: None,
             error_message: None,
+            raw_content: None,
+            skip_lines: 0,
+            has_header: true,
+            delimiter: ',',
+            active_parse_field: ParseField::SkipLines,
             date_column: None,
             description_column: None,
             amount_column: None,
@@ -116,6 +149,11 @@ impl CsvImportModal {
         self.account_state = ListState::default();
         self.preview = None;
         self.error_message = None;
+        self.raw_content = None;
+        self.skip_lines = 0;
+        self.has_header = true;
+        self.delimiter = ',';
+        self.active_parse_field = ParseField::SkipLines;
         self.date_column = None;
         self.description_column = None;
         self.amount_column = None;
@@ -134,6 +172,7 @@ impl CsvImportModal {
     pub fn handle_key(&mut self, key: KeyCode) {
         match self.step {
             ImportStep::SelectFile => self.handle_file_select_key(key),
+            ImportStep::Parsing => self.handle_parsing_key(key),
             ImportStep::SelectAccount => self.handle_account_select_key(key),
             ImportStep::MapColumns => self.handle_map_columns_key(key),
             ImportStep::Confirm => self.handle_confirm_key(key),
@@ -229,7 +268,7 @@ impl CsvImportModal {
 
         match key {
             KeyCode::Esc => {
-                self.step = ImportStep::SelectFile;
+                self.step = ImportStep::Parsing;
                 self.error_message = None;
             }
             KeyCode::Enter => {
@@ -430,39 +469,206 @@ impl CsvImportModal {
 
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let mut lines = content.lines();
+                self.raw_content = Some(content);
+                self.skip_lines = 0;
+                self.has_header = true;
+                self.delimiter = self.guess_delimiter();
+                self.active_parse_field = ParseField::SkipLines;
+                self.recompute_preview();
 
-                // Parse header
-                let headers: Vec<String> = match lines.next() {
-                    Some(line) => parse_csv_line(line),
-                    None => {
-                        self.error_message = Some("Empty file".to_string());
-                        return;
-                    }
-                };
-
-                if headers.is_empty() {
-                    self.error_message = Some("No columns found".to_string());
+                if self.error_message.is_some() {
                     return;
                 }
 
-                // Parse first few rows for preview
-                let rows: Vec<Vec<String>> = lines.take(5).map(parse_csv_line).collect();
-
-                self.preview = Some(CsvPreview { headers, rows });
-                self.error_message = None;
-
-                // Go to account selection step
-                self.step = ImportStep::SelectAccount;
-                self.account_state.select(Some(0));
-
-                // Try to auto-detect columns
-                self.auto_detect_columns();
+                // Move on to the parsing-options step where the user can adjust
+                // skip count, header detection, and delimiter.
+                self.step = ImportStep::Parsing;
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to read file: {}", e));
             }
         }
+    }
+
+    /// Best-effort guess at the delimiter by counting field counts on the first
+    /// non-empty line for each candidate. Defaults to comma on a tie.
+    fn guess_delimiter(&self) -> char {
+        let Some(ref content) = self.raw_content else {
+            return ',';
+        };
+        let Some(line) = content.lines().find(|l| !l.trim().is_empty()) else {
+            return ',';
+        };
+
+        let mut best = (',', 0usize);
+        for (delim, _) in DELIMITER_CHOICES {
+            let count = parse_delimited_line(line, *delim).len();
+            if count > best.1 {
+                best = (*delim, count);
+            }
+        }
+        best.0
+    }
+
+    /// Re-parse the cached file content using the current parse options and
+    /// refresh the preview / auto-detected column mapping.
+    fn recompute_preview(&mut self) {
+        let Some(ref content) = self.raw_content else {
+            return;
+        };
+
+        let mut lines = content.lines();
+        for _ in 0..self.skip_lines {
+            if lines.next().is_none() {
+                self.preview = None;
+                self.error_message =
+                    Some("Skip count exceeds the number of lines in the file".to_string());
+                return;
+            }
+        }
+
+        let headers: Vec<String>;
+        let rows: Vec<Vec<String>>;
+
+        if self.has_header {
+            headers = match lines.next() {
+                Some(line) => parse_delimited_line(line, self.delimiter),
+                None => {
+                    self.preview = None;
+                    self.error_message = Some("No header row after skipped lines".to_string());
+                    return;
+                }
+            };
+
+            if headers.is_empty() {
+                self.preview = None;
+                self.error_message = Some("No columns found".to_string());
+                return;
+            }
+
+            rows = lines
+                .take(5)
+                .map(|l| parse_delimited_line(l, self.delimiter))
+                .collect();
+        } else {
+            // No header row — generate synthetic column names from the widest
+            // of the first few data rows so the user has something to map to.
+            rows = lines
+                .take(5)
+                .map(|l| parse_delimited_line(l, self.delimiter))
+                .collect();
+
+            if rows.is_empty() {
+                self.preview = None;
+                self.error_message = Some("No data rows after skipped lines".to_string());
+                return;
+            }
+
+            let column_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+            if column_count == 0 {
+                self.preview = None;
+                self.error_message = Some("No columns found".to_string());
+                return;
+            }
+
+            headers = (1..=column_count).map(|i| format!("Column {}", i)).collect();
+        }
+
+        self.preview = Some(CsvPreview { headers, rows });
+        self.error_message = None;
+
+        // Re-run auto-detection — headers / column count may have changed.
+        // Auto-detection only meaningfully works on real headers; for synthetic
+        // ones it'll be a no-op, which is fine.
+        self.date_column = None;
+        self.description_column = None;
+        self.amount_column = None;
+        self.auto_detect_columns();
+    }
+
+    fn handle_parsing_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Esc => {
+                self.step = ImportStep::SelectFile;
+                self.error_message = None;
+            }
+            KeyCode::Enter => {
+                if self.preview.is_some() {
+                    self.step = ImportStep::SelectAccount;
+                    self.account_state.select(Some(0));
+                    self.error_message = None;
+                }
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                self.active_parse_field = match self.active_parse_field {
+                    ParseField::SkipLines => ParseField::HasHeader,
+                    ParseField::HasHeader => ParseField::Delimiter,
+                    ParseField::Delimiter => ParseField::SkipLines,
+                };
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                self.active_parse_field = match self.active_parse_field {
+                    ParseField::SkipLines => ParseField::Delimiter,
+                    ParseField::HasHeader => ParseField::SkipLines,
+                    ParseField::Delimiter => ParseField::HasHeader,
+                };
+            }
+            KeyCode::Left => match self.active_parse_field {
+                ParseField::SkipLines => {
+                    self.skip_lines = self.skip_lines.saturating_sub(1);
+                    self.recompute_preview();
+                }
+                ParseField::HasHeader => {
+                    self.has_header = !self.has_header;
+                    self.recompute_preview();
+                }
+                ParseField::Delimiter => {
+                    self.cycle_delimiter(-1);
+                    self.recompute_preview();
+                }
+            },
+            KeyCode::Right => match self.active_parse_field {
+                ParseField::SkipLines => {
+                    self.skip_lines = self.skip_lines.saturating_add(1);
+                    self.recompute_preview();
+                }
+                ParseField::HasHeader => {
+                    self.has_header = !self.has_header;
+                    self.recompute_preview();
+                }
+                ParseField::Delimiter => {
+                    self.cycle_delimiter(1);
+                    self.recompute_preview();
+                }
+            },
+            KeyCode::Backspace if self.active_parse_field == ParseField::SkipLines => {
+                self.skip_lines /= 10;
+                self.recompute_preview();
+            }
+            KeyCode::Char(c)
+                if c.is_ascii_digit() && self.active_parse_field == ParseField::SkipLines =>
+            {
+                let digit = c.to_digit(10).unwrap() as usize;
+                // Cap to a sensible upper bound to avoid overflow on long input.
+                if self.skip_lines < 1_000_000 {
+                    self.skip_lines = self.skip_lines * 10 + digit;
+                    self.recompute_preview();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Cycle the active delimiter forward (`+1`) or backward (`-1`) through
+    /// `DELIMITER_CHOICES`.
+    fn cycle_delimiter(&mut self, direction: i32) {
+        let len = DELIMITER_CHOICES.len() as i32;
+        let current = DELIMITER_CHOICES
+            .iter()
+            .position(|(c, _)| *c == self.delimiter)
+            .unwrap_or(0) as i32;
+        let next = ((current + direction).rem_euclid(len)) as usize;
+        self.delimiter = DELIMITER_CHOICES[next].0;
     }
 
     fn auto_detect_columns(&mut self) {
@@ -509,6 +715,9 @@ impl CsvImportModal {
             description_column: self.description_column?,
             amount_column: self.amount_column?,
             target_account_id: self.target_account_id.clone(),
+            skip_lines: self.skip_lines,
+            has_header: self.has_header,
+            delimiter: self.delimiter,
         })
     }
 
@@ -522,6 +731,7 @@ impl CsvImportModal {
 
         match self.step {
             ImportStep::SelectFile => self.draw_file_select(frame, modal_area, theme),
+            ImportStep::Parsing => self.draw_parsing(frame, modal_area, theme),
             ImportStep::SelectAccount => self.draw_account_select(frame, modal_area, theme),
             ImportStep::MapColumns => self.draw_map_columns(frame, modal_area, theme),
             ImportStep::Confirm => self.draw_confirm(frame, modal_area, theme),
@@ -602,6 +812,162 @@ impl CsvImportModal {
                 Span::raw(": open  "),
                 Span::styled("Esc", Style::default().fg(theme.header)),
                 Span::raw(": cancel"),
+            ])
+        };
+        let help = Paragraph::new(help_text);
+        frame.render_widget(help, chunks[3]);
+    }
+
+    fn draw_parsing(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.accent))
+            .title(" Import CSV - Parse Options ");
+        frame.render_widget(block, area);
+
+        let inner = inner_rect(area, 2, 2);
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5), // Parse options block
+                Constraint::Length(1), // Spacer / preview label
+                Constraint::Min(5),    // Preview
+                Constraint::Length(2), // Help / error
+            ])
+            .split(inner);
+
+        // ----- Parse options field block -----
+        let active_style = Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD);
+        let inactive_style = Style::default();
+        let marker = |field: ParseField| {
+            if self.active_parse_field == field {
+                "► "
+            } else {
+                "  "
+            }
+        };
+        let style_for = |field: ParseField| {
+            if self.active_parse_field == field {
+                active_style
+            } else {
+                inactive_style
+            }
+        };
+
+        let delim_label = DELIMITER_CHOICES
+            .iter()
+            .find(|(c, _)| *c == self.delimiter)
+            .map(|(_, l)| *l)
+            .unwrap_or("?");
+
+        let header_label = if self.has_header { "Yes" } else { "No" };
+
+        let option_lines = vec![
+            Line::from(Span::styled(
+                format!(
+                    "{}Leading lines to skip?  [ {} ]",
+                    marker(ParseField::SkipLines),
+                    self.skip_lines
+                ),
+                style_for(ParseField::SkipLines),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "{}Has header row?         [ {} ]",
+                    marker(ParseField::HasHeader),
+                    header_label
+                ),
+                style_for(ParseField::HasHeader),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "{}Delimiter:              [ {} ]",
+                    marker(ParseField::Delimiter),
+                    delim_label
+                ),
+                style_for(ParseField::Delimiter),
+            )),
+        ];
+        let options_widget = Paragraph::new(option_lines)
+            .block(Block::default().borders(Borders::ALL).title(" Options "));
+        frame.render_widget(options_widget, chunks[0]);
+
+        // ----- Preview label -----
+        let preview_label = Paragraph::new(Span::styled(
+            "Preview (header in accent color, then data rows):",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        frame.render_widget(preview_label, chunks[1]);
+
+        // ----- Preview pane -----
+        let mut preview_lines: Vec<Line> = Vec::new();
+        if let Some(ref preview) = self.preview {
+            let header_style = if self.has_header {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.header)
+                    .add_modifier(Modifier::DIM | Modifier::ITALIC)
+            };
+            let header_line: Vec<Span> = preview
+                .headers
+                .iter()
+                .enumerate()
+                .flat_map(|(i, h)| {
+                    let mut spans =
+                        vec![Span::styled(format!("{}: {}", i + 1, h), header_style)];
+                    if i + 1 < preview.headers.len() {
+                        spans.push(Span::raw("  |  "));
+                    }
+                    spans
+                })
+                .collect();
+            preview_lines.push(Line::from(header_line));
+            preview_lines.push(Line::from(""));
+
+            for row in &preview.rows {
+                let row_spans: Vec<Span> = row
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, val)| {
+                        let mut spans = vec![Span::raw(val.clone())];
+                        if i + 1 < row.len() {
+                            spans.push(Span::raw("  |  "));
+                        }
+                        spans
+                    })
+                    .collect();
+                preview_lines.push(Line::from(row_spans));
+            }
+        } else {
+            preview_lines.push(Line::from(Span::styled(
+                "(no preview available)",
+                Style::default().fg(theme.error),
+            )));
+        }
+
+        let preview_widget =
+            Paragraph::new(preview_lines).block(Block::default().borders(Borders::ALL));
+        frame.render_widget(preview_widget, chunks[2]);
+
+        // ----- Help / error -----
+        let help_text = if let Some(ref err) = self.error_message {
+            Line::from(Span::styled(err, Style::default().fg(theme.error)))
+        } else {
+            Line::from(vec![
+                Span::styled("Tab/↑↓", Style::default().fg(theme.header)),
+                Span::raw(": switch field  "),
+                Span::styled("←→", Style::default().fg(theme.header)),
+                Span::raw(": adjust  "),
+                Span::styled("Enter", Style::default().fg(theme.header)),
+                Span::raw(": continue  "),
+                Span::styled("Esc", Style::default().fg(theme.header)),
+                Span::raw(": back"),
             ])
         };
         let help = Paragraph::new(help_text);
@@ -854,6 +1220,9 @@ pub struct ImportConfig {
     pub description_column: usize,
     pub amount_column: usize,
     pub target_account_id: Option<String>,
+    pub skip_lines: usize,
+    pub has_header: bool,
+    pub delimiter: char,
 }
 
 /// Expand a leading `~` or `~/` in a path to the user's home directory.
@@ -870,8 +1239,14 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// Parse a CSV line, handling quoted fields
+/// Parse a CSV line using a comma delimiter, handling quoted fields.
+/// Kept for callers that don't need to choose a delimiter.
 pub fn parse_csv_line(line: &str) -> Vec<String> {
+    parse_delimited_line(line, ',')
+}
+
+/// Parse a delimited line, handling double-quoted fields with escaped quotes.
+pub fn parse_delimited_line(line: &str, delimiter: char) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
@@ -892,7 +1267,7 @@ pub fn parse_csv_line(line: &str) -> Vec<String> {
                     in_quotes = true;
                 }
             }
-            ',' if !in_quotes => {
+            c if c == delimiter && !in_quotes => {
                 fields.push(current.trim().to_string());
                 current = String::new();
             }
