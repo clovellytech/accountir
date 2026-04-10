@@ -1,13 +1,14 @@
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table},
     Frame,
 };
 
 use crate::domain::Account;
+use crate::tui::theme::Theme;
 use chrono::NaiveDate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,7 +412,7 @@ impl EntryForm {
         });
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -421,11 +422,11 @@ impl EntryForm {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(" New Journal Entry ")
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -452,6 +453,7 @@ impl EntryForm {
             "Date (YYYY-MM-DD)",
             &self.date_str,
             self.active_field == FormField::Date,
+            theme,
         );
 
         // Memo field
@@ -461,6 +463,7 @@ impl EntryForm {
             "Memo (optional)",
             &self.memo,
             self.active_field == FormField::Memo,
+            theme,
         );
 
         // Reference field
@@ -470,17 +473,18 @@ impl EntryForm {
             "Reference (optional)",
             &self.reference,
             self.active_field == FormField::Reference,
+            theme,
         );
 
         // Lines table
-        self.draw_lines_table(frame, chunks[3]);
+        self.draw_lines_table(frame, chunks[3], theme);
 
         // Balance display
         let total: i64 = self.lines.iter().map(|l| l.amount()).sum();
         let balance_style = if total == 0 {
-            Style::default().fg(Color::Green)
+            Style::default().fg(theme.success)
         } else {
-            Style::default().fg(Color::Red)
+            Style::default().fg(theme.error)
         };
         let balance_text = if total == 0 {
             "Balanced".to_string()
@@ -497,16 +501,16 @@ impl EntryForm {
 
         // Error or help text
         let help_text = if let Some(ref err) = self.error_message {
-            Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red)))
+            Line::from(Span::styled(err.clone(), Style::default().fg(theme.error)))
         } else {
             Line::from(vec![
-                Span::styled("Ctrl+S", Style::default().fg(Color::Yellow)),
+                Span::styled("Ctrl+S", Style::default().fg(theme.header)),
                 Span::raw(": save  "),
-                Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                Span::styled("Tab", Style::default().fg(theme.header)),
                 Span::raw(": next  "),
-                Span::styled("n", Style::default().fg(Color::Yellow)),
+                Span::styled("n", Style::default().fg(theme.header)),
                 Span::raw(": new line  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme.header)),
                 Span::raw(": cancel"),
             ])
         };
@@ -515,7 +519,7 @@ impl EntryForm {
 
         // Draw account dropdown if in selection mode
         if self.line_edit_mode == LineEditMode::SelectAccount {
-            self.draw_account_dropdown(frame, chunks[3]);
+            self.draw_account_dropdown(frame, chunks[3], theme);
         }
     }
 
@@ -526,17 +530,18 @@ impl EntryForm {
         label: &str,
         value: &str,
         is_active: bool,
+        theme: &Theme,
     ) {
         let style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_fg)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.input_inactive_fg)
         };
 
         let border_style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_border)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.input_inactive_border)
         };
 
         let display = if is_active {
@@ -555,13 +560,13 @@ impl EntryForm {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_lines_table(&self, frame: &mut Frame, area: Rect) {
+    fn draw_lines_table(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let is_active = self.active_field == FormField::Lines;
 
         let border_style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_border)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.input_inactive_border)
         };
 
         let rows: Vec<Row> = self
@@ -585,7 +590,7 @@ impl EntryForm {
                 };
 
                 let row_style = if is_selected {
-                    Style::default().bg(Color::DarkGray)
+                    theme.selected_style()
                 } else {
                     Style::default()
                 };
@@ -623,7 +628,7 @@ impl EntryForm {
             .style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
-                    .fg(Color::Yellow),
+                    .fg(theme.header),
             )
             .bottom_margin(1);
 
@@ -646,7 +651,7 @@ impl EntryForm {
         frame.render_widget(table, area);
     }
 
-    fn draw_account_dropdown(&self, frame: &mut Frame, anchor: Rect) {
+    fn draw_account_dropdown(&self, frame: &mut Frame, anchor: Rect, theme: &Theme) {
         let items: Vec<ListItem> = self
             .available_accounts
             .iter()
@@ -671,14 +676,10 @@ impl EntryForm {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(theme.accent))
                     .title(" Select Account "),
             )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme.selected_style())
             .highlight_symbol("> ");
 
         frame.render_stateful_widget(list, dropdown_area, &mut self.account_list_state.clone());

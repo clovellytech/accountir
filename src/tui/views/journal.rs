@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
@@ -13,6 +13,7 @@ use ratatui::{
 
 use crate::domain::Account;
 use crate::queries::search::EntrySearchResult;
+use crate::tui::theme::Theme;
 
 /// Account choice for reassignment picker
 #[derive(Debug, Clone)]
@@ -892,7 +893,7 @@ impl JournalView {
         }
     }
 
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let is_ledger = self.filter_account.is_some();
 
         // Calculate and store visible height for scroll margin calculations
@@ -920,9 +921,9 @@ impl JournalView {
                 };
 
                 let style = if entry.is_void {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(theme.fg_disabled)
                 } else if is_selected {
-                    Style::default().fg(Color::Cyan)
+                    Style::default().fg(theme.accent)
                 } else {
                     Style::default()
                 };
@@ -1011,7 +1012,7 @@ impl JournalView {
                     .style(
                         Style::default()
                             .add_modifier(Modifier::BOLD)
-                            .fg(Color::Yellow),
+                            .fg(theme.header),
                     )
                     .bottom_margin(1),
                 constraints,
@@ -1038,7 +1039,7 @@ impl JournalView {
                     .style(
                         Style::default()
                             .add_modifier(Modifier::BOLD)
-                            .fg(Color::Yellow),
+                            .fg(theme.header),
                     )
                     .bottom_margin(1),
                 constraints,
@@ -1052,21 +1053,17 @@ impl JournalView {
                     .borders(Borders::ALL)
                     .title(self.get_title()),
             )
-            .row_highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .row_highlight_style(theme.selected_style());
 
         frame.render_stateful_widget(table, area, &mut self.state.clone());
 
         // Draw reassignment modal if active
         if self.reassign_mode {
-            self.draw_reassign_modal(frame, area);
+            self.draw_reassign_modal(frame, area, theme);
         }
     }
 
-    fn draw_reassign_modal(&self, frame: &mut Frame, area: Rect) {
+    fn draw_reassign_modal(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let modal_area = centered_rect(60, 60, area);
         frame.render_widget(Clear, modal_area);
 
@@ -1090,7 +1087,7 @@ impl JournalView {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(title);
         frame.render_widget(block, modal_area);
 
@@ -1105,7 +1102,7 @@ impl JournalView {
         } else {
             "Select new account".to_string()
         };
-        let current = Paragraph::new(current_text).style(Style::default().fg(Color::Yellow));
+        let current = Paragraph::new(current_text).style(Style::default().fg(theme.header));
         frame.render_widget(current, chunks[0]);
 
         // Filter input
@@ -1125,23 +1122,19 @@ impl JournalView {
 
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(" Accounts "))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_style(theme.selected_style());
 
         frame.render_stateful_widget(list, chunks[2], &mut self.reassign_state.clone());
 
         // Help
         let help_text = Line::from(vec![
-            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+            Span::styled("↑↓", Style::default().fg(theme.header)),
             Span::raw(": select  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", Style::default().fg(theme.header)),
             Span::raw(": confirm  "),
-            Span::styled("Type", Style::default().fg(Color::Yellow)),
+            Span::styled("Type", Style::default().fg(theme.header)),
             Span::raw(": filter  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme.header)),
             Span::raw(": cancel"),
         ]);
         let help = Paragraph::new(help_text);

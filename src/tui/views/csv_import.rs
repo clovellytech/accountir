@@ -1,12 +1,14 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use std::path::PathBuf;
+
+use crate::tui::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportStep {
@@ -210,12 +212,12 @@ impl CsvImportModal {
             KeyCode::Backspace => {
                 self.file_path.pop();
                 self.update_suggestions();
-                self.suggestion_state.select(None);
+                self.suggestion_state = ListState::default();
             }
             KeyCode::Char(c) => {
                 self.file_path.push(c);
                 self.update_suggestions();
-                self.suggestion_state.select(None);
+                self.suggestion_state = ListState::default();
             }
             _ => {}
         }
@@ -379,7 +381,7 @@ impl CsvImportModal {
         let path = if self.file_path.is_empty() {
             PathBuf::from(".")
         } else {
-            PathBuf::from(&self.file_path)
+            expand_tilde(&self.file_path)
         };
 
         let (dir, prefix) = if path.is_dir() {
@@ -410,12 +412,12 @@ impl CsvImportModal {
                 .collect();
 
             suggestions.sort();
-            self.file_suggestions = suggestions.into_iter().take(10).collect();
+            self.file_suggestions = suggestions;
         }
     }
 
     fn load_csv_preview(&mut self) {
-        let path = PathBuf::from(&self.file_path);
+        let path = expand_tilde(&self.file_path);
 
         if !path.exists() {
             self.error_message = Some("File not found".to_string());
@@ -511,7 +513,7 @@ impl CsvImportModal {
         })
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -520,14 +522,14 @@ impl CsvImportModal {
         frame.render_widget(Clear, modal_area);
 
         match self.step {
-            ImportStep::SelectFile => self.draw_file_select(frame, modal_area),
-            ImportStep::SelectAccount => self.draw_account_select(frame, modal_area),
-            ImportStep::MapColumns => self.draw_map_columns(frame, modal_area),
-            ImportStep::Confirm => self.draw_confirm(frame, modal_area),
+            ImportStep::SelectFile => self.draw_file_select(frame, modal_area, theme),
+            ImportStep::SelectAccount => self.draw_account_select(frame, modal_area, theme),
+            ImportStep::MapColumns => self.draw_map_columns(frame, modal_area, theme),
+            ImportStep::Confirm => self.draw_confirm(frame, modal_area, theme),
         }
     }
 
-    fn draw_file_select(&self, frame: &mut Frame, area: Rect) {
+    fn draw_file_select(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -541,7 +543,7 @@ impl CsvImportModal {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(" Import CSV - Select File ");
         frame.render_widget(block, area);
 
@@ -551,7 +553,7 @@ impl CsvImportModal {
         } else {
             "Import transactions (select target account first)".to_string()
         };
-        let target = Paragraph::new(target_text).style(Style::default().fg(Color::Yellow));
+        let target = Paragraph::new(target_text).style(Style::default().fg(theme.header));
         frame.render_widget(target, chunks[0]);
 
         // File path input
@@ -584,26 +586,22 @@ impl CsvImportModal {
                     .borders(Borders::ALL)
                     .title(" Suggestions "),
             )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_style(theme.selected_style());
 
         frame.render_stateful_widget(list, chunks[2], &mut self.suggestion_state.clone());
 
         // Error or help
         let help_text = if let Some(ref err) = self.error_message {
-            Line::from(Span::styled(err, Style::default().fg(Color::Red)))
+            Line::from(Span::styled(err, Style::default().fg(theme.error)))
         } else {
             Line::from(vec![
-                Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                Span::styled("Tab", Style::default().fg(theme.header)),
                 Span::raw(": autocomplete  "),
-                Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+                Span::styled("↑↓", Style::default().fg(theme.header)),
                 Span::raw(": select  "),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter", Style::default().fg(theme.header)),
                 Span::raw(": open  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme.header)),
                 Span::raw(": cancel"),
             ])
         };
@@ -611,7 +609,7 @@ impl CsvImportModal {
         frame.render_widget(help, chunks[3]);
     }
 
-    fn draw_account_select(&self, frame: &mut Frame, area: Rect) {
+    fn draw_account_select(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
@@ -624,7 +622,7 @@ impl CsvImportModal {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(" Import CSV - Select Target Account ");
         frame.render_widget(block, area);
 
@@ -645,33 +643,29 @@ impl CsvImportModal {
 
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(" Accounts "))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
+            .highlight_style(theme.selected_style());
 
         frame.render_stateful_widget(list, chunks[1], &mut self.account_state.clone());
 
         // Help
         let help_text = Line::from(vec![
-            Span::styled("↑↓", Style::default().fg(Color::Yellow)),
+            Span::styled("↑↓", Style::default().fg(theme.header)),
             Span::raw(": select  "),
-            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::styled("Enter", Style::default().fg(theme.header)),
             Span::raw(": confirm  "),
-            Span::styled("Type", Style::default().fg(Color::Yellow)),
+            Span::styled("Type", Style::default().fg(theme.header)),
             Span::raw(": filter  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme.header)),
             Span::raw(": back"),
         ]);
         let help = Paragraph::new(help_text);
         frame.render_widget(help, chunks[2]);
     }
 
-    fn draw_map_columns(&self, frame: &mut Frame, area: Rect) {
+    fn draw_map_columns(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(" Import CSV - Map Columns ");
         frame.render_widget(block, area);
 
@@ -737,7 +731,7 @@ impl CsvImportModal {
 
                 let style = if is_active {
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -780,16 +774,16 @@ impl CsvImportModal {
 
         // Error or help
         let help_text = if let Some(ref err) = self.error_message {
-            Line::from(Span::styled(err, Style::default().fg(Color::Red)))
+            Line::from(Span::styled(err, Style::default().fg(theme.error)))
         } else {
             Line::from(vec![
-                Span::styled("↑↓/Tab", Style::default().fg(Color::Yellow)),
+                Span::styled("↑↓/Tab", Style::default().fg(theme.header)),
                 Span::raw(": select field  "),
-                Span::styled("←→/1-9", Style::default().fg(Color::Yellow)),
+                Span::styled("←→/1-9", Style::default().fg(theme.header)),
                 Span::raw(": choose column  "),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter", Style::default().fg(theme.header)),
                 Span::raw(": continue  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme.header)),
                 Span::raw(": back"),
             ])
         };
@@ -797,10 +791,10 @@ impl CsvImportModal {
         frame.render_widget(help, chunks[3]);
     }
 
-    fn draw_confirm(&self, frame: &mut Frame, area: Rect) {
+    fn draw_confirm(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(" Import CSV - Confirm ");
         frame.render_widget(block, area);
 
@@ -830,13 +824,13 @@ impl CsvImportModal {
                 Span::styled(
                     "Y/Enter",
                     Style::default()
-                        .fg(Color::Green)
+                        .fg(theme.success)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" to import or "),
                 Span::styled(
                     "N/Esc",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" to go back"),
             ]),
@@ -861,6 +855,20 @@ pub struct ImportConfig {
     pub description_column: usize,
     pub amount_column: usize,
     pub target_account_id: Option<String>,
+}
+
+/// Expand a leading `~` or `~/` in a path to the user's home directory.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
 }
 
 /// Parse a CSV line, handling quoted fields

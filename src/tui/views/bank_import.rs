@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
     Frame,
@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::csv_import::{parse_amount, parse_csv_line, parse_date};
 use crate::domain::Account;
+use crate::tui::theme::Theme;
 
 /// A pending import from the bank sync
 #[derive(Debug, Clone)]
@@ -532,7 +533,7 @@ impl BankImportModal {
         self.available_accounts.get(self.selected_account_index)
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -553,23 +554,23 @@ impl BankImportModal {
         frame.render_widget(Clear, modal_area);
 
         match self.phase {
-            ImportPhase::SelectImport => self.draw_select_import(frame, modal_area),
-            ImportPhase::SelectAccount => self.draw_select_account(frame, modal_area),
-            ImportPhase::MapColumns => self.draw_map_columns(frame, modal_area),
-            ImportPhase::Preview => self.draw_preview(frame, modal_area),
-            ImportPhase::Complete => self.draw_complete(frame, modal_area),
+            ImportPhase::SelectImport => self.draw_select_import(frame, modal_area, theme),
+            ImportPhase::SelectAccount => self.draw_select_account(frame, modal_area, theme),
+            ImportPhase::MapColumns => self.draw_map_columns(frame, modal_area, theme),
+            ImportPhase::Preview => self.draw_preview(frame, modal_area, theme),
+            ImportPhase::Complete => self.draw_complete(frame, modal_area, theme),
         }
     }
 
-    fn draw_select_import(&self, frame: &mut Frame, area: Rect) {
+    fn draw_select_import(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let title = format!(" Bank Imports ({}) ", self.pending_imports.len());
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(title)
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -577,7 +578,8 @@ impl BankImportModal {
         frame.render_widget(block, area);
 
         if self.pending_imports.is_empty() {
-            let msg = Paragraph::new("No pending imports").style(Style::default().fg(Color::Gray));
+            let msg =
+                Paragraph::new("No pending imports").style(Style::default().fg(theme.fg_dim));
             frame.render_widget(msg, inner);
             return;
         }
@@ -595,15 +597,15 @@ impl BankImportModal {
                     Span::styled(
                         &import.bank_name,
                         Style::default()
-                            .fg(Color::White)
+                            .fg(theme.fg)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(count),
                     Span::raw(" - "),
-                    Span::styled(&import.file_name, Style::default().fg(Color::Gray)),
+                    Span::styled(&import.file_name, Style::default().fg(theme.fg_dim)),
                 ]);
                 let style = if i == self.selected_import_index {
-                    Style::default().bg(Color::DarkGray)
+                    theme.selected_style()
                 } else {
                     Style::default()
                 };
@@ -621,17 +623,17 @@ impl BankImportModal {
         frame.render_widget(list, chunks[0]);
 
         let help = Paragraph::new(Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::styled("Enter", Style::default().fg(theme.success)),
             Span::raw(" select  "),
-            Span::styled("d", Style::default().fg(Color::Red)),
+            Span::styled("d", Style::default().fg(theme.error)),
             Span::raw(" skip  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme.header)),
             Span::raw(" close"),
         ]));
         frame.render_widget(help, chunks[1]);
     }
 
-    fn draw_select_account(&self, frame: &mut Frame, area: Rect) {
+    fn draw_select_account(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let import_name = self
             .processing_import
             .as_ref()
@@ -640,11 +642,11 @@ impl BankImportModal {
         let title = format!(" Select Account for {} ", import_name);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(title)
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -659,16 +661,16 @@ impl BankImportModal {
                 let content = Line::from(vec![
                     Span::styled(
                         format!("{} ", account.account_number),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme.header),
                     ),
                     Span::raw(&account.name),
                     Span::styled(
                         format!(" ({})", account.account_type),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(theme.fg_dim),
                     ),
                 ]);
                 let style = if i == self.selected_account_index {
-                    Style::default().bg(Color::DarkGray)
+                    theme.selected_style()
                 } else {
                     Style::default()
                 };
@@ -686,22 +688,22 @@ impl BankImportModal {
         frame.render_widget(list, chunks[0]);
 
         let help = Paragraph::new(Line::from(vec![
-            Span::styled("Enter", Style::default().fg(Color::Green)),
+            Span::styled("Enter", Style::default().fg(theme.success)),
             Span::raw(" select  "),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme.header)),
             Span::raw(" back"),
         ]));
         frame.render_widget(help, chunks[1]);
     }
 
-    fn draw_map_columns(&self, frame: &mut Frame, area: Rect) {
+    fn draw_map_columns(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(" Map Columns ")
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -784,7 +786,7 @@ impl BankImportModal {
 
                 let style = if is_active {
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
@@ -830,16 +832,16 @@ impl BankImportModal {
 
         // Error or help
         let help_text = if let Some(ref err) = self.mapping_error {
-            Line::from(Span::styled(err, Style::default().fg(Color::Red)))
+            Line::from(Span::styled(err, Style::default().fg(theme.error)))
         } else {
             Line::from(vec![
-                Span::styled("↑↓/Tab", Style::default().fg(Color::Yellow)),
+                Span::styled("↑↓/Tab", Style::default().fg(theme.header)),
                 Span::raw(": field  "),
-                Span::styled("←→/1-9", Style::default().fg(Color::Yellow)),
+                Span::styled("←→/1-9", Style::default().fg(theme.header)),
                 Span::raw(": column  "),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter", Style::default().fg(theme.header)),
                 Span::raw(": continue  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme.header)),
                 Span::raw(": back"),
             ])
         };
@@ -847,7 +849,7 @@ impl BankImportModal {
         frame.render_widget(help, chunks[3]);
     }
 
-    fn draw_preview(&self, frame: &mut Frame, area: Rect) {
+    fn draw_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let account_name = self
             .get_selected_account()
             .map(|a| a.name.as_str())
@@ -855,11 +857,11 @@ impl BankImportModal {
         let title = format!(" Preview Import to {} ", account_name);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(title)
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -873,14 +875,14 @@ impl BankImportModal {
             .map(|txn| {
                 let amount_str = format!("{:.2}", txn.amount as f64 / 100.0);
                 let amount_color = if txn.amount >= 0 {
-                    Color::Green
+                    theme.success
                 } else {
-                    Color::Red
+                    theme.error
                 };
                 let content = Line::from(vec![
                     Span::styled(
                         format!("{} ", txn.date.format("%m/%d")),
-                        Style::default().fg(Color::Gray),
+                        Style::default().fg(theme.fg_dim),
                     ),
                     Span::raw(truncate_str(&txn.description, 40)),
                     Span::raw(" "),
@@ -913,32 +915,32 @@ impl BankImportModal {
         frame.render_widget(list, chunks[0]);
 
         if !more_msg.is_empty() {
-            let more = Paragraph::new(more_msg).style(Style::default().fg(Color::Gray));
+            let more = Paragraph::new(more_msg).style(Style::default().fg(theme.fg_dim));
             frame.render_widget(more, chunks[1]);
         }
 
         let total: i64 = self.parsed_transactions.iter().map(|t| t.amount).sum();
         let help = Paragraph::new(Line::from(vec![
-            Span::styled("Enter/i", Style::default().fg(Color::Green)),
+            Span::styled("Enter/i", Style::default().fg(theme.success)),
             Span::raw(format!(
                 " import {} txns (net: {:.2})  ",
                 self.parsed_transactions.len(),
                 total as f64 / 100.0
             )),
-            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc", Style::default().fg(theme.header)),
             Span::raw(" back"),
         ]));
         frame.render_widget(help, chunks[2]);
     }
 
-    fn draw_complete(&self, frame: &mut Frame, area: Rect) {
+    fn draw_complete(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green))
+            .border_style(Style::default().fg(theme.success))
             .title(" Import Complete ")
             .title_style(
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -947,7 +949,7 @@ impl BankImportModal {
 
         let msg =
             Paragraph::new("Transactions imported successfully!\n\nPress any key to continue.")
-                .style(Style::default().fg(Color::White));
+                .style(Style::default().fg(theme.fg));
         frame.render_widget(msg, inner);
     }
 }

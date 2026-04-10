@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::tui::theme::ThemePreset;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub plaid: PlaidConfig,
+    #[serde(default)]
+    pub theme: ThemePreset,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

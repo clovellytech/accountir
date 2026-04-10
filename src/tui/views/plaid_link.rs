@@ -1,11 +1,13 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+
+use crate::tui::theme::Theme;
 
 /// A Plaid account available for linking
 #[derive(Debug, Clone)]
@@ -153,7 +155,7 @@ impl PlaidLinkModal {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -174,11 +176,11 @@ impl PlaidLinkModal {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(format!(" Plaid Link: {} ", self.local_account_name))
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -195,7 +197,7 @@ impl PlaidLinkModal {
                 .map(|m| format!(" (***{})", m))
                 .unwrap_or_default();
             lines.push(Line::from(vec![
-                Span::styled("Linked: ", Style::default().fg(Color::Green)),
+                Span::styled("Linked: ", Style::default().fg(theme.success)),
                 Span::raw(format!(
                     "{} - {}{}",
                     mapping.institution_name, mapping.plaid_account_name, mask_str
@@ -205,7 +207,7 @@ impl PlaidLinkModal {
                 Span::styled(
                     "  u: unlink",
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(theme.header)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  Esc: cancel"),
@@ -213,7 +215,7 @@ impl PlaidLinkModal {
         } else {
             lines.push(Line::from(Span::styled(
                 "Not linked to any Plaid account",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg_dim),
             )));
         }
 
@@ -223,14 +225,14 @@ impl PlaidLinkModal {
         if self.available_accounts.is_empty() {
             lines.push(Line::from(Span::styled(
                 "No Plaid items connected.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg_dim),
             )));
             lines.push(Line::from(vec![
-                Span::styled("Press ", Style::default().fg(Color::DarkGray)),
-                Span::styled("6", Style::default().fg(Color::Yellow)),
+                Span::styled("Press ", Style::default().fg(theme.fg_dim)),
+                Span::styled("6", Style::default().fg(theme.header)),
                 Span::styled(
                     " to open the Plaid view and connect a bank.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.fg_dim),
                 ),
             ]));
         } else {
@@ -253,11 +255,9 @@ impl PlaidLinkModal {
                 let is_mapped_elsewhere = acct.mapped_to_local_id.is_some() && !is_mapped_here;
 
                 let style = if is_selected {
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD)
+                    theme.selected_style()
                 } else if is_mapped_elsewhere {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(theme.fg_disabled)
                 } else {
                     Style::default()
                 };
@@ -276,12 +276,12 @@ impl PlaidLinkModal {
                 ];
 
                 if is_mapped_here {
-                    spans.push(Span::styled(" (current)", style.fg(Color::Green)));
+                    spans.push(Span::styled(" (current)", style.fg(theme.success)));
                 } else if is_mapped_elsewhere {
                     let mapped_name = acct.mapped_to_local_name.as_deref().unwrap_or("?");
                     spans.push(Span::styled(
                         format!(" (mapped to {})", mapped_name),
-                        style.fg(Color::DarkGray),
+                        style.fg(theme.fg_disabled),
                     ));
                 }
 
@@ -290,11 +290,11 @@ impl PlaidLinkModal {
 
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter", Style::default().fg(theme.header)),
                 Span::raw(": link  "),
-                Span::styled("j/k", Style::default().fg(Color::Yellow)),
+                Span::styled("j/k", Style::default().fg(theme.header)),
                 Span::raw(": navigate  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme.header)),
                 Span::raw(": cancel"),
             ]));
         }

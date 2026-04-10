@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     widgets::{Block, Borders, Row, Table, TableState},
     Frame,
 };
@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use crate::domain::{Account, AccountType};
 use crate::queries::account_queries::AccountBalance;
+use crate::tui::theme::Theme;
 
 /// Summary of a Plaid mapping for display in the accounts table
 #[derive(Debug, Clone)]
@@ -257,7 +258,7 @@ impl AccountsView {
         prefix
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let rows: Vec<Row> = self
             .tree_nodes
             .iter()
@@ -293,9 +294,9 @@ impl AccountsView {
                     .unwrap_or_default();
 
                 let style = if !acc.is_active {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(theme.fg_disabled)
                 } else {
-                    Style::default()
+                    Style::default().fg(theme.fg)
                 };
 
                 // Build the name with tree prefix
@@ -315,11 +316,7 @@ impl AccountsView {
             .collect();
 
         let header = Row::new(vec!["Number", "Name", "Type", "Balance", "Plaid", "Status"])
-            .style(
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(Color::Yellow),
-            )
+            .style(theme.header_style())
             .bottom_margin(1);
 
         let table = Table::new(
@@ -339,11 +336,7 @@ impl AccountsView {
                 .borders(Borders::ALL)
                 .title(" Chart of Accounts (a: new, e: edit, p: plaid link, Enter: view ledger) "),
         )
-        .row_highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
+        .row_highlight_style(theme.selected_style());
 
         frame.render_stateful_widget(table, area, &mut self.state.clone());
     }

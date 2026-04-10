@@ -1,10 +1,12 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
+
+use crate::tui::theme::Theme;
 
 /// Help content for different views
 pub struct HelpModal {
@@ -28,7 +30,7 @@ impl HelpModal {
         self.visible = false;
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect, context: HelpContext) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, context: HelpContext, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -39,144 +41,124 @@ impl HelpModal {
         // Clear the area behind the modal
         frame.render_widget(Clear, modal_area);
 
-        let content = self.get_help_content(context);
+        let content = self.get_help_content(context, theme);
 
         let paragraph = Paragraph::new(content)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(theme.border_style())
                     .title(" Help - Press ? or Esc to close ")
-                    .title_style(
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    .title_style(theme.modal_title_style()),
             )
-            .style(Style::default().fg(Color::White));
+            .style(theme.text_style());
 
         frame.render_widget(paragraph, modal_area);
     }
 
-    fn get_help_content(&self, context: HelpContext) -> Vec<Line<'static>> {
+    fn get_help_content(&self, context: HelpContext, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "  Global Keys",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                theme.header_style(),
             )),
             Line::from(""),
-            Self::key_line("  ?", "Toggle this help menu"),
-            Self::key_line("  Esc", "Close file / go back"),
-            Self::key_line("  q", "Quit application"),
-            Self::key_line("  Ctrl+C", "Force quit"),
-            Self::key_line("  Tab", "Next view"),
-            Self::key_line("  Shift+Tab", "Previous view"),
+            Self::key_line("  ?", "Toggle this help menu", theme),
+            Self::key_line("  Esc", "Close file / go back", theme),
+            Self::key_line("  q", "Quit application", theme),
+            Self::key_line("  Ctrl+C", "Force quit", theme),
+            Self::key_line("  Tab", "Next view", theme),
+            Self::key_line("  Shift+Tab", "Previous view", theme),
+            Self::key_line("  ,", "Open settings", theme),
             Self::key_line(
                 "  1-6",
                 "Jump to view (Dashboard/Accounts/Journal/Reports/Events/Plaid)",
+                theme,
             ),
             Line::from(""),
         ];
 
         // Add context-specific help
         let context_lines = match context {
-            HelpContext::Startup => self.startup_help(),
-            HelpContext::Dashboard => self.dashboard_help(),
-            HelpContext::Accounts => self.accounts_help(),
-            HelpContext::Journal => self.journal_help(),
-            HelpContext::Reports => self.reports_help(),
-            HelpContext::EventLog => self.event_log_help(),
-            HelpContext::Plaid => self.plaid_help(),
+            HelpContext::Startup => self.startup_help(theme),
+            HelpContext::Dashboard => self.dashboard_help(theme),
+            HelpContext::Accounts => self.accounts_help(theme),
+            HelpContext::Journal => self.journal_help(theme),
+            HelpContext::Reports => self.reports_help(theme),
+            HelpContext::EventLog => self.event_log_help(theme),
+            HelpContext::Plaid => self.plaid_help(theme),
         };
 
         lines.extend(context_lines);
         lines
     }
 
-    fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
+    fn key_line(key: &'static str, description: &'static str, theme: &Theme) -> Line<'static> {
         Line::from(vec![
-            Span::styled(format!("{:<16}", key), Style::default().fg(Color::Green)),
+            Span::styled(format!("{:<16}", key), Style::default().fg(theme.success)),
             Span::raw(description),
         ])
     }
 
-    fn startup_help(&self) -> Vec<Line<'static>> {
+    fn section_header(title: &'static str, theme: &Theme) -> Line<'static> {
+        Line::from(Span::styled(title, theme.header_style()))
+    }
+
+    fn section_label(label: &'static str, theme: &Theme) -> Line<'static> {
+        Line::from(Span::styled(label, Style::default().fg(theme.info)))
+    }
+
+    fn startup_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
-            Line::from(Span::styled(
-                "  Startup Screen",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Self::section_header("  Startup Screen", theme),
             Line::from(""),
-            Self::key_line("  ↑/↓ or j/k", "Navigate menu"),
-            Self::key_line("  Enter", "Select option"),
-            Self::key_line("  Esc", "Cancel input"),
+            Self::key_line("  ↑/↓ or j/k", "Navigate menu", theme),
+            Self::key_line("  Enter", "Select option", theme),
+            Self::key_line("  Esc", "Cancel input", theme),
             Line::from(""),
-            Line::from(Span::styled("  Options:", Style::default().fg(Color::Cyan))),
+            Self::section_label("  Options:", theme),
             Line::from("  • Create New Database - Start a fresh accounting file"),
             Line::from("  • Open Database - Open an existing .db file"),
             Line::from("  • Recent Databases - Quick access to found .db files"),
         ]
     }
 
-    fn dashboard_help(&self) -> Vec<Line<'static>> {
+    fn dashboard_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
-            Line::from(Span::styled(
-                "  Dashboard View",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Self::section_header("  Dashboard View", theme),
             Line::from(""),
             Line::from("  The dashboard shows a financial overview:"),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Summary Section:",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  Summary Section:", theme),
             Line::from("  • Total Assets, Liabilities, and Equity"),
             Line::from("  • Net Income for the period"),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Account Breakdown:",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  Account Breakdown:", theme),
             Line::from("  • Assets and Liabilities (left side)"),
             Line::from("  • Revenue and Expenses (right side)"),
         ]
     }
 
-    fn accounts_help(&self) -> Vec<Line<'static>> {
+    fn accounts_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
-            Line::from(Span::styled(
-                "  Accounts View",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Self::section_header("  Accounts View", theme),
             Line::from(""),
-            Self::key_line("  Enter", "View account ledger"),
-            Self::key_line("  a", "Create new account"),
-            Self::key_line("  e", "Edit selected account"),
-            Self::key_line("  p", "Link/unlink Plaid account (Asset/Liability only)"),
-            Self::key_line("  ↑/↓ or j/k", "Navigate accounts"),
-            Self::key_line("  Home", "Jump to first account"),
-            Self::key_line("  End", "Jump to last account"),
+            Self::key_line("  Enter", "View account ledger", theme),
+            Self::key_line("  a", "Create new account", theme),
+            Self::key_line("  e", "Edit selected account", theme),
+            Self::key_line("  p", "Link/unlink Plaid account (Asset/Liability only)", theme),
+            Self::key_line("  ↑/↓ or j/k", "Navigate accounts", theme),
+            Self::key_line("  Home", "Jump to first account", theme),
+            Self::key_line("  End", "Jump to last account", theme),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Account Form (Parent field):",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  Account Form (Parent field):", theme),
             Line::from("  • Type to search/filter accounts"),
             Line::from("  • ↑/↓ to navigate matches"),
             Line::from("  • Enter to confirm selection"),
             Line::from("  • Esc to clear filter"),
             Line::from(""),
-            Line::from(Span::styled("  Columns:", Style::default().fg(Color::Cyan))),
+            Self::section_label("  Columns:", theme),
             Line::from("  • Number - Account number (e.g., 1000)"),
             Line::from("  • Name - Account name (indented for children)"),
             Line::from("  • Type - Asset/Liability/Equity/Revenue/Expense"),
@@ -186,112 +168,82 @@ impl HelpModal {
         ]
     }
 
-    fn journal_help(&self) -> Vec<Line<'static>> {
+    fn journal_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
-            Line::from(Span::styled(
-                "  Journal View",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Self::section_header("  Journal View", theme),
             Line::from(""),
-            Self::key_line("  Enter", "View transaction details"),
-            Self::key_line("  e", "Create new journal entry"),
-            Self::key_line("  i", "Import transactions from CSV"),
-            Self::key_line("  a", "Reassign transaction to different account"),
-            Self::key_line("  g", "Go to other account's ledger (ledger only)"),
-            Self::key_line("  x", "Void selected entry"),
-            Self::key_line("  v", "Enter multiselect mode (ledger only)"),
-            Self::key_line("  s", "Cycle sort field (Date/Memo/Reference/Amount)"),
-            Self::key_line("  r", "Reverse sort direction"),
-            Self::key_line("  h", "Toggle showing voided entries"),
-            Self::key_line("  c", "Toggle ID column visibility"),
-            Self::key_line("  ↑/↓ or j/k", "Navigate entries"),
-            Self::key_line("  PgUp/PgDn", "Page through entries"),
-            Self::key_line("  Home", "Jump to first entry"),
-            Self::key_line("  End", "Jump to last entry"),
+            Self::key_line("  Enter", "View transaction details", theme),
+            Self::key_line("  e", "Create new journal entry", theme),
+            Self::key_line("  i", "Import transactions from CSV", theme),
+            Self::key_line("  a", "Reassign transaction to different account", theme),
+            Self::key_line("  g", "Go to other account's ledger (ledger only)", theme),
+            Self::key_line("  x", "Void selected entry", theme),
+            Self::key_line("  v", "Enter multiselect mode (ledger only)", theme),
+            Self::key_line("  s", "Cycle sort field (Date/Memo/Reference/Amount)", theme),
+            Self::key_line("  r", "Reverse sort direction", theme),
+            Self::key_line("  h", "Toggle showing voided entries", theme),
+            Self::key_line("  c", "Toggle ID column visibility", theme),
+            Self::key_line("  ↑/↓ or j/k", "Navigate entries", theme),
+            Self::key_line("  PgUp/PgDn", "Page through entries", theme),
+            Self::key_line("  Home", "Jump to first entry", theme),
+            Self::key_line("  End", "Jump to last entry", theme),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Multiselect Mode (ledger view only):",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  Multiselect Mode (ledger view only):", theme),
             Line::from("  Press 'v' to enter multiselect mode"),
-            Self::key_line("  ↑/↓", "Navigate (selects when active)"),
-            Self::key_line("  Space", "Toggle selection on/off"),
+            Self::key_line("  ↑/↓", "Navigate (selects when active)", theme),
+            Self::key_line("  Space", "Toggle selection on/off", theme),
             Line::from("    Selection starts active; Space pauses/resumes"),
-            Self::key_line("  a", "Assign all selected to an account"),
-            Self::key_line("  x", "Void all selected entries"),
-            Self::key_line("  Esc", "Exit multiselect mode"),
+            Self::key_line("  a", "Assign all selected to an account", theme),
+            Self::key_line("  x", "Void all selected entries", theme),
+            Self::key_line("  Esc", "Exit multiselect mode", theme),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Journal Columns:",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  Journal Columns:", theme),
             Line::from("  • Date, Memo, Reference, Amount, Status"),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Ledger Columns (when viewing single account):",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  Ledger Columns (when viewing single account):", theme),
             Line::from("  • Date, Account, Memo, Reference, Debit, Credit, Balance"),
         ]
     }
 
-    fn reports_help(&self) -> Vec<Line<'static>> {
+    fn reports_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
-            Line::from(Span::styled(
-                "  Reports View",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Self::section_header("  Reports View", theme),
             Line::from(""),
-            Self::key_line("  ←/→ or h/l", "Switch between reports"),
-            Self::key_line("  ↑/↓ or j/k", "Scroll report content"),
-            Self::key_line("  d", "Enter specific date (YYYY-MM-DD)"),
-            Self::key_line("  [", "Previous day"),
-            Self::key_line("  ]", "Next day"),
-            Self::key_line("  t", "Reset to today"),
+            Self::key_line("  ←/→ or h/l", "Switch between reports", theme),
+            Self::key_line("  ↑/↓ or j/k", "Scroll report content", theme),
+            Self::key_line("  d", "Enter specific date (YYYY-MM-DD)", theme),
+            Self::key_line("  [", "Previous day", theme),
+            Self::key_line("  ]", "Next day", theme),
+            Self::key_line("  t", "Reset to today", theme),
             Line::from(""),
-            Line::from(Span::styled(
-                "  Available Reports:",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  Available Reports:", theme),
             Line::from("  • Trial Balance - All accounts with debit/credit totals"),
             Line::from("  • Balance Sheet - Assets = Liabilities + Equity"),
             Line::from("  • Income Statement - Revenue - Expenses = Net Income"),
             Line::from(""),
-            Line::from(Span::styled("  Note:", Style::default().fg(Color::Cyan))),
+            Self::section_label("  Note:", theme),
             Line::from("  Balance sheet and income statement use the"),
             Line::from("  selected report date. Use [/] to change date."),
         ]
     }
 
-    fn plaid_help(&self) -> Vec<Line<'static>> {
+    fn plaid_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
-            Line::from(Span::styled(
-                "  Plaid View",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Self::section_header("  Plaid View", theme),
             Line::from(""),
-            Self::key_line("  C", "Configure Plaid proxy URL and API key"),
-            Self::key_line("  c", "Connect a new bank via Plaid Link"),
-            Self::key_line("  s", "Sync transactions for selected item"),
-            Self::key_line("  S", "Sync all active items"),
-            Self::key_line("  d", "Disconnect selected item"),
-            Self::key_line("  ↑/↓ or j/k", "Navigate items"),
+            Self::key_line("  C", "Configure Plaid proxy URL and API key", theme),
+            Self::key_line("  c", "Connect a new bank via Plaid Link", theme),
+            Self::key_line("  s", "Sync transactions for selected item", theme),
+            Self::key_line("  S", "Sync all active items", theme),
+            Self::key_line("  d", "Disconnect selected item", theme),
+            Self::key_line("  ↑/↓ or j/k", "Navigate items", theme),
             Line::from(""),
-            Line::from(Span::styled(
-                "  About Plaid:",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  About Plaid:", theme),
             Line::from("  Connect bank accounts via Plaid to automatically"),
             Line::from("  import transactions. Use the Accounts view (key p)"),
             Line::from("  to link Plaid accounts to local accounts."),
             Line::from(""),
-            Line::from(Span::styled("  Setup:", Style::default().fg(Color::Cyan))),
+            Self::section_label("  Setup:", theme),
             Line::from("  1. Press 'C' to configure proxy URL and API key"),
             Line::from("  2. Press 'c' to connect a bank"),
             Line::from("  3. Map accounts in the Accounts view (p)"),
@@ -299,24 +251,16 @@ impl HelpModal {
         ]
     }
 
-    fn event_log_help(&self) -> Vec<Line<'static>> {
+    fn event_log_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
-            Line::from(Span::styled(
-                "  Event Log View",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Self::section_header("  Event Log View", theme),
             Line::from(""),
-            Self::key_line("  ↑/↓ or j/k", "Navigate events"),
-            Self::key_line("  PgUp/PgDn", "Page through events"),
-            Self::key_line("  Home", "Jump to oldest event"),
-            Self::key_line("  End", "Jump to newest event"),
+            Self::key_line("  ↑/↓ or j/k", "Navigate events", theme),
+            Self::key_line("  PgUp/PgDn", "Page through events", theme),
+            Self::key_line("  Home", "Jump to oldest event", theme),
+            Self::key_line("  End", "Jump to newest event", theme),
             Line::from(""),
-            Line::from(Span::styled(
-                "  About the Event Log:",
-                Style::default().fg(Color::Cyan),
-            )),
+            Self::section_label("  About the Event Log:", theme),
             Line::from("  The event log shows all changes made to the"),
             Line::from("  accounting data in chronological order."),
             Line::from(""),

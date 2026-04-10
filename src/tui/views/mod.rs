@@ -12,5 +12,6 @@ pub mod plaid;
 pub mod plaid_config;
 pub mod plaid_link;
 pub mod reports;
+pub mod settings;
 pub mod startup;
 pub mod welcome;

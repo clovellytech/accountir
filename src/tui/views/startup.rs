@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
+
+use crate::tui::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartupAction {
@@ -201,7 +203,7 @@ impl StartupView {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -212,31 +214,31 @@ impl StartupView {
             .margin(2)
             .split(area);
 
-        self.draw_title(frame, chunks[0]);
-        self.draw_menu(frame, chunks[1]);
-        self.draw_input_or_help(frame, chunks[2]);
+        self.draw_title(frame, chunks[0], theme);
+        self.draw_menu(frame, chunks[1], theme);
+        self.draw_input_or_help(frame, chunks[2], theme);
     }
 
-    fn draw_title(&self, frame: &mut Frame, area: Rect) {
+    fn draw_title(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let title = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "  ╔═══════════════════════════════════════╗",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.accent),
             )),
             Line::from(Span::styled(
                 "  ║          A C C O U N T I R            ║",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 "  ║   Event-Sourced Accounting System     ║",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.accent),
             )),
             Line::from(Span::styled(
                 "  ╚═══════════════════════════════════════╝",
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme.accent),
             )),
         ];
 
@@ -244,18 +246,18 @@ impl StartupView {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_menu(&self, frame: &mut Frame, area: Rect) {
+    fn draw_menu(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let items: Vec<ListItem> = self
             .get_menu_items()
             .iter()
             .enumerate()
             .map(|(i, item)| {
                 let style = if item.starts_with("───") {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(theme.fg_dim)
                 } else if i == 0 || i == 1 {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(theme.fg)
                 } else {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(theme.header)
                 };
                 ListItem::new(Line::from(Span::styled(item.clone(), style)))
             })
@@ -267,25 +269,21 @@ impl StartupView {
                     .borders(Borders::ALL)
                     .title(" Select an Option "),
             )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme.selected_style())
             .highlight_symbol("> ");
 
         frame.render_stateful_widget(list, area, &mut self.menu_state.clone());
     }
 
-    fn draw_input_or_help(&self, frame: &mut Frame, area: Rect) {
+    fn draw_input_or_help(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         match self.input_mode {
             InputMode::Menu => {
                 let help = Paragraph::new(Line::from(vec![
-                    Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
+                    Span::styled("↑/↓", Style::default().fg(theme.header)),
                     Span::raw(" navigate  "),
-                    Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                    Span::styled("Enter", Style::default().fg(theme.header)),
                     Span::raw(" select  "),
-                    Span::styled("q", Style::default().fg(Color::Yellow)),
+                    Span::styled("q", Style::default().fg(theme.header)),
                     Span::raw(" quit"),
                 ]))
                 .block(Block::default().borders(Borders::ALL));
@@ -299,9 +297,9 @@ impl StartupView {
                 };
 
                 let input_style = if self.error_message.is_some() {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(theme.error)
                 } else {
-                    Style::default().fg(Color::Yellow)
+                    Style::default().fg(theme.input_active_fg)
                 };
 
                 let display_text = if let Some(ref err) = self.error_message {

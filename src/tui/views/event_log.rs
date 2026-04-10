@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use crate::events::types::StoredEvent;
+use crate::tui::theme::Theme;
 
 pub struct EventLogView {
     pub events: Vec<StoredEvent>,
@@ -81,14 +82,14 @@ impl EventLogView {
         self.selected = Some(new_idx);
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(" Event Log ")
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -97,7 +98,7 @@ impl EventLogView {
 
         if self.events.is_empty() {
             let empty = Paragraph::new("No events recorded yet")
-                .style(Style::default().fg(Color::DarkGray));
+                .style(Style::default().fg(theme.fg_dim));
             frame.render_widget(empty, inner);
             return;
         }
@@ -128,7 +129,7 @@ impl EventLogView {
             .map(|(idx, event)| {
                 let is_selected = self.selected == Some(idx);
                 let style = if is_selected {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                    theme.selected_style()
                 } else {
                     Style::default()
                 };
@@ -139,20 +140,20 @@ impl EventLogView {
                 // Format event type with color
                 let event_type = event.event.event_type();
                 let type_color = match event_type {
-                    t if t.starts_with("journal") => Color::Green,
-                    t if t.starts_with("account") => Color::Yellow,
+                    t if t.starts_with("journal") => theme.success,
+                    t if t.starts_with("account") => theme.header,
                     t if t.starts_with("company") => Color::Magenta,
                     t if t.starts_with("user") => Color::Blue,
                     t if t.starts_with("reconciliation") || t.starts_with("transaction") => {
-                        Color::Cyan
+                        theme.accent
                     }
                     t if t.starts_with("fiscal")
                         || t.starts_with("period")
                         || t.starts_with("year") =>
                     {
-                        Color::Red
+                        theme.error
                     }
-                    _ => Color::White,
+                    _ => theme.fg,
                 };
 
                 // Format entity ID if present
@@ -167,10 +168,10 @@ impl EventLogView {
                 let summary = format_event_summary(&event.event);
 
                 Line::from(vec![
-                    Span::styled(format!("{:>5} ", event.id), style.fg(Color::DarkGray)),
+                    Span::styled(format!("{:>5} ", event.id), style.fg(theme.fg_dim)),
                     Span::styled(format!("{} ", timestamp), style),
                     Span::styled(format!("{:<28} ", event_type), style.fg(type_color)),
-                    Span::styled(format!("{:<15} ", entity_display), style.fg(Color::Cyan)),
+                    Span::styled(format!("{:<15} ", entity_display), style.fg(theme.accent)),
                     Span::styled(summary, style),
                 ])
             })

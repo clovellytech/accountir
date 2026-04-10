@@ -1,13 +1,14 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
 use crate::domain::{Account, AccountType};
+use crate::tui::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountFormResult {
@@ -536,7 +537,7 @@ impl AccountForm {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -552,11 +553,11 @@ impl AccountForm {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(title)
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -584,6 +585,7 @@ impl AccountForm {
                 chunks[0],
                 "Account Type (read-only)",
                 &format!("{:?}", ACCOUNT_TYPES[self.account_type_index]),
+                theme,
             );
         } else {
             self.draw_dropdown_field(
@@ -592,6 +594,7 @@ impl AccountForm {
                 "Account Type",
                 &format!("{:?}", ACCOUNT_TYPES[self.account_type_index]),
                 self.active_field == FormField::AccountType,
+                theme,
             );
         }
 
@@ -602,6 +605,7 @@ impl AccountForm {
             "Account Number",
             &self.account_number,
             self.active_field == FormField::AccountNumber,
+            theme,
         );
 
         // Name field
@@ -611,6 +615,7 @@ impl AccountForm {
             "Name",
             &self.name,
             self.active_field == FormField::Name,
+            theme,
         );
 
         // Parent field - show filter text when typing, otherwise show selected value
@@ -623,6 +628,7 @@ impl AccountForm {
                 "Parent Account (type to search)",
                 &self.parent_filter,
                 true,
+                theme,
             );
         } else {
             // Show selected value
@@ -640,6 +646,7 @@ impl AccountForm {
                 "Parent Account",
                 &parent_display,
                 is_parent_active,
+                theme,
             );
         }
 
@@ -650,18 +657,19 @@ impl AccountForm {
             "Description",
             &self.description,
             self.active_field == FormField::Description,
+            theme,
         );
 
         // Error or help text
         let help_text = if let Some(ref err) = self.error_message {
-            Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red)))
+            Line::from(Span::styled(err.clone(), Style::default().fg(theme.error)))
         } else {
             Line::from(vec![
-                Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                Span::styled("Tab", Style::default().fg(theme.header)),
                 Span::raw(": next field  "),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter", Style::default().fg(theme.header)),
                 Span::raw(": select/submit  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme.header)),
                 Span::raw(": cancel"),
             ])
         };
@@ -670,10 +678,10 @@ impl AccountForm {
 
         // Draw dropdowns on top
         if self.show_type_dropdown {
-            self.draw_type_dropdown(frame, chunks[0]);
+            self.draw_type_dropdown(frame, chunks[0], theme);
         }
         if self.show_parent_dropdown {
-            self.draw_parent_dropdown(frame, chunks[3]);
+            self.draw_parent_dropdown(frame, chunks[3], theme);
         }
     }
 
@@ -684,17 +692,18 @@ impl AccountForm {
         label: &str,
         value: &str,
         is_active: bool,
+        theme: &Theme,
     ) {
         let style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_fg)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.input_inactive_fg)
         };
 
         let border_style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_border)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.input_inactive_border)
         };
 
         let display = if is_active {
@@ -713,13 +722,13 @@ impl AccountForm {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_readonly_field(&self, frame: &mut Frame, area: Rect, label: &str, value: &str) {
+    fn draw_readonly_field(&self, frame: &mut Frame, area: Rect, label: &str, value: &str, theme: &Theme) {
         let paragraph = Paragraph::new(value.to_string())
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(theme.fg_disabled))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray))
+                    .border_style(Style::default().fg(theme.fg_disabled))
                     .title(format!(" {} ", label)),
             );
 
@@ -733,17 +742,18 @@ impl AccountForm {
         label: &str,
         value: &str,
         is_active: bool,
+        theme: &Theme,
     ) {
         let style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_fg)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.input_inactive_fg)
         };
 
         let border_style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_border)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.input_inactive_border)
         };
 
         let display = format!("{} ▼", value);
@@ -765,9 +775,10 @@ impl AccountForm {
         label: &str,
         filter: &str,
         _is_active: bool,
+        theme: &Theme,
     ) {
-        let style = Style::default().fg(Color::Yellow);
-        let border_style = Style::default().fg(Color::Yellow);
+        let style = Style::default().fg(theme.input_active_fg);
+        let border_style = Style::default().fg(theme.input_active_border);
 
         // Show filter text with cursor
         let display = format!("{}█", filter);
@@ -782,7 +793,7 @@ impl AccountForm {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_type_dropdown(&self, frame: &mut Frame, anchor: Rect) {
+    fn draw_type_dropdown(&self, frame: &mut Frame, anchor: Rect, theme: &Theme) {
         let items: Vec<ListItem> = ACCOUNT_TYPES
             .iter()
             .map(|t| ListItem::new(format!("{:?}", t)))
@@ -801,19 +812,15 @@ impl AccountForm {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
+                    .border_style(Style::default().fg(theme.accent)),
             )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme.selected_style())
             .highlight_symbol("> ");
 
         frame.render_stateful_widget(list, dropdown_area, &mut self.type_list_state.clone());
     }
 
-    fn draw_parent_dropdown(&self, frame: &mut Frame, anchor: Rect) {
+    fn draw_parent_dropdown(&self, frame: &mut Frame, anchor: Rect, theme: &Theme) {
         // Get filtered indices
         let filtered_indices = self.filtered_parent_indices();
 
@@ -840,11 +847,11 @@ impl AccountForm {
             };
             frame.render_widget(Clear, dropdown_area);
             let no_match = Paragraph::new("  No matches found")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(theme.fg_dim))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::Cyan)),
+                        .border_style(Style::default().fg(theme.accent)),
                 );
             frame.render_widget(no_match, dropdown_area);
             return;
@@ -870,14 +877,10 @@ impl AccountForm {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(theme.accent))
                     .title(title),
             )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(theme.selected_style())
             .highlight_symbol("> ");
 
         frame.render_stateful_widget(list, dropdown_area, &mut self.parent_list_state.clone());

@@ -2,13 +2,14 @@ use chrono::NaiveDate;
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table, Tabs},
     Frame,
 };
 
 use crate::queries::reports::{BalanceSheet, IncomeStatement, TrialBalanceLine};
+use crate::tui::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportType {
@@ -175,7 +176,7 @@ impl ReportsView {
         self.scroll_offset = self.scroll_offset.saturating_add(1);
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -193,23 +194,23 @@ impl ReportsView {
                     .title(" Reports (h/l to switch) "),
             )
             .select(self.active_report.index())
-            .style(Style::default().fg(Color::White))
+            .style(Style::default().fg(theme.fg))
             .highlight_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
         frame.render_widget(tabs, chunks[0]);
 
         // Draw active report
         match self.active_report {
-            ReportType::TrialBalance => self.draw_trial_balance(frame, chunks[1]),
-            ReportType::BalanceSheet => self.draw_balance_sheet(frame, chunks[1]),
-            ReportType::IncomeStatement => self.draw_income_statement(frame, chunks[1]),
+            ReportType::TrialBalance => self.draw_trial_balance(frame, chunks[1], theme),
+            ReportType::BalanceSheet => self.draw_balance_sheet(frame, chunks[1], theme),
+            ReportType::IncomeStatement => self.draw_income_statement(frame, chunks[1], theme),
         }
     }
 
-    fn draw_trial_balance(&self, frame: &mut Frame, area: Rect) {
+    fn draw_trial_balance(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let rows: Vec<Row> = self
             .trial_balance
             .iter()
@@ -231,7 +232,7 @@ impl ReportsView {
             .style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
-                    .fg(Color::Yellow),
+                    .fg(theme.header),
             )
             .bottom_margin(1);
 
@@ -265,7 +266,7 @@ impl ReportsView {
         frame.render_widget(table, area);
     }
 
-    fn draw_balance_sheet(&self, frame: &mut Frame, area: Rect) {
+    fn draw_balance_sheet(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let Some(bs) = &self.balance_sheet else {
             let msg = Paragraph::new("No balance sheet data available").block(
                 Block::default()
@@ -364,7 +365,7 @@ impl ReportsView {
             ),
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .fg(Color::Yellow),
+                .fg(theme.header),
         )));
 
         let le_widget = Paragraph::new(le_lines).block(
@@ -375,7 +376,7 @@ impl ReportsView {
         frame.render_widget(le_widget, chunks[1]);
     }
 
-    fn draw_income_statement(&self, frame: &mut Frame, area: Rect) {
+    fn draw_income_statement(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let Some(is) = &self.income_statement else {
             let msg = Paragraph::new("No income statement data available").block(
                 Block::default()
@@ -391,7 +392,7 @@ impl ReportsView {
                 "REVENUE",
                 Style::default()
                     .add_modifier(Modifier::BOLD)
-                    .fg(Color::Green),
+                    .fg(theme.success),
             )),
             Line::from(""),
         ];
@@ -411,7 +412,7 @@ impl ReportsView {
 
         lines.push(Line::from(Span::styled(
             "EXPENSES",
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Red),
+            Style::default().add_modifier(Modifier::BOLD).fg(theme.error),
         )));
         lines.push(Line::from(""));
 
@@ -433,9 +434,9 @@ impl ReportsView {
         let net_income_style = if is.net_income >= 0 {
             Style::default()
                 .add_modifier(Modifier::BOLD)
-                .fg(Color::Green)
+                .fg(theme.success)
         } else {
-            Style::default().add_modifier(Modifier::BOLD).fg(Color::Red)
+            Style::default().add_modifier(Modifier::BOLD).fg(theme.error)
         };
 
         lines.push(Line::from(Span::styled(

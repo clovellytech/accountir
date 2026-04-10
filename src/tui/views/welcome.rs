@@ -8,6 +8,8 @@ use ratatui::{
 };
 use std::path::PathBuf;
 
+use crate::tui::theme::Theme;
+
 /// Config file location for storing preferences
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|p| p.join("accountir").join("config.json"))
@@ -105,11 +107,11 @@ impl WelcomeView {
         )
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Create layout with padding
         let outer_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .padding(Padding::new(2, 2, 1, 1));
 
         let inner_area = outer_block.inner(area);
@@ -126,28 +128,28 @@ impl WelcomeView {
             .split(inner_area);
 
         // Draw title
-        self.draw_title(frame, chunks[0]);
+        self.draw_title(frame, chunks[0], theme);
 
         // Draw main content
-        self.draw_content(frame, chunks[1]);
+        self.draw_content(frame, chunks[1], theme);
 
         // Draw footer with key hints
-        self.draw_footer(frame, chunks[2]);
+        self.draw_footer(frame, chunks[2], theme);
     }
 
-    fn draw_title(&self, frame: &mut Frame, area: Rect) {
+    fn draw_title(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let title_lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "Welcome to Accountir",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "Event-Sourced Double-Entry Accounting System",
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.header),
             )),
         ];
 
@@ -155,7 +157,7 @@ impl WelcomeView {
         frame.render_widget(title, area);
     }
 
-    fn draw_content(&self, frame: &mut Frame, area: Rect) {
+    fn draw_content(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Create two columns
         let columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -163,18 +165,18 @@ impl WelcomeView {
             .split(area);
 
         // Left column - About & Getting Started
-        self.draw_left_column(frame, columns[0]);
+        self.draw_left_column(frame, columns[0], theme);
 
         // Right column - Key Commands & Views
-        self.draw_right_column(frame, columns[1]);
+        self.draw_right_column(frame, columns[1], theme);
     }
 
-    fn draw_left_column(&self, frame: &mut Frame, area: Rect) {
+    fn draw_left_column(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let content = vec![
             Line::from(Span::styled(
                 "About",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -187,7 +189,7 @@ impl WelcomeView {
             Line::from(Span::styled(
                 "Getting Started",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -201,7 +203,7 @@ impl WelcomeView {
             Line::from(Span::styled(
                 "Data Storage",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -214,48 +216,48 @@ impl WelcomeView {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_right_column(&self, frame: &mut Frame, area: Rect) {
+    fn draw_right_column(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let content = vec![
             Line::from(Span::styled(
                 "Key Commands",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Self::key_line("?", "Open context-sensitive help"),
-            Self::key_line("Tab / 1-5", "Navigate between views"),
-            Self::key_line("Enter", "Select items or view details"),
-            Self::key_line("a", "Add new account (Accounts view)"),
-            Self::key_line("e", "Create journal entry (Journal view)"),
-            Self::key_line("i", "Import transactions from CSV"),
-            Self::key_line("Esc", "Close database / go back"),
-            Self::key_line("q", "Quit application"),
+            Self::key_line("?", "Open context-sensitive help", theme),
+            Self::key_line("Tab / 1-5", "Navigate between views", theme),
+            Self::key_line("Enter", "Select items or view details", theme),
+            Self::key_line("a", "Add new account (Accounts view)", theme),
+            Self::key_line("e", "Create journal entry (Journal view)", theme),
+            Self::key_line("i", "Import transactions from CSV", theme),
+            Self::key_line("Esc", "Close database / go back", theme),
+            Self::key_line("q", "Quit application", theme),
             Line::from(""),
             Line::from(""),
             Line::from(Span::styled(
                 "Views",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Self::view_line("1", "Dashboard", "Financial summary"),
-            Self::view_line("2", "Accounts", "Chart of accounts"),
-            Self::view_line("3", "Journal", "Transactions & ledger"),
-            Self::view_line("4", "Reports", "Financial statements"),
-            Self::view_line("5", "Events", "Complete audit log"),
+            Self::view_line("1", "Dashboard", "Financial summary", theme),
+            Self::view_line("2", "Accounts", "Chart of accounts", theme),
+            Self::view_line("3", "Journal", "Transactions & ledger", theme),
+            Self::view_line("4", "Reports", "Financial statements", theme),
+            Self::view_line("5", "Events", "Complete audit log", theme),
         ];
 
         let paragraph = Paragraph::new(content);
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+    fn draw_footer(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let footer_lines = vec![
             Line::from(Span::styled(
                 "─".repeat(area.width.saturating_sub(4) as usize),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.fg_dim),
             )),
             Line::from(""),
             Line::from(vec![
@@ -263,11 +265,11 @@ impl WelcomeView {
                 Span::styled(
                     "any key",
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(theme.accent)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" to continue    "),
-                Span::styled("d", Style::default().fg(Color::Yellow)),
+                Span::styled("d", Style::default().fg(theme.header)),
                 Span::raw(" = don't show again    "),
                 Span::styled("r", Style::default().fg(Color::Magenta)),
                 Span::raw(" = reset (show next time)"),
@@ -278,10 +280,10 @@ impl WelcomeView {
         frame.render_widget(footer, area);
     }
 
-    fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
+    fn key_line(key: &'static str, description: &'static str, theme: &Theme) -> Line<'static> {
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!("{:<12}", key), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{:<12}", key), Style::default().fg(theme.accent)),
             Span::raw(description),
         ])
     }
@@ -290,13 +292,14 @@ impl WelcomeView {
         key: &'static str,
         name: &'static str,
         description: &'static str,
+        theme: &Theme,
     ) -> Line<'static> {
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(key.to_string(), Style::default().fg(Color::Cyan)),
+            Span::styled(key.to_string(), Style::default().fg(theme.accent)),
             Span::raw(" "),
-            Span::styled(format!("{:<12}", name), Style::default().fg(Color::White)),
-            Span::styled(description, Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{:<12}", name), Style::default().fg(theme.fg)),
+            Span::styled(description, Style::default().fg(theme.fg_dim)),
         ])
     }
 }

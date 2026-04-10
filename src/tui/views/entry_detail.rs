@@ -1,13 +1,15 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Row, Table},
     Frame,
 };
 
 use chrono::NaiveDate;
+
+use crate::tui::theme::Theme;
 
 #[derive(Debug, Clone)]
 pub struct EntryLineDetail {
@@ -74,7 +76,7 @@ impl EntryDetailModal {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -93,9 +95,9 @@ impl EntryDetailModal {
         };
 
         let border_color = if entry.is_void {
-            Color::Red
+            theme.error
         } else {
-            Color::Cyan
+            theme.accent
         };
 
         let block = Block::default()
@@ -125,20 +127,20 @@ impl EntryDetailModal {
         // Header info
         let header_lines = vec![
             Line::from(vec![
-                Span::styled("Date: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Date: ", Style::default().fg(theme.fg_dim)),
                 Span::raw(entry.date.format("%Y-%m-%d").to_string()),
             ]),
             Line::from(vec![
-                Span::styled("Entry ID: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Entry ID: ", Style::default().fg(theme.fg_dim)),
                 Span::raw(&entry.entry_id),
             ]),
             Line::from(vec![
-                Span::styled("Reference: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Reference: ", Style::default().fg(theme.fg_dim)),
                 Span::raw(entry.reference.as_deref().unwrap_or("-")),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("Memo: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("Memo: ", Style::default().fg(theme.fg_dim)),
                 Span::raw(&entry.memo),
             ]),
         ];
@@ -174,7 +176,7 @@ impl EntryDetailModal {
             .style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
-                    .fg(Color::Yellow),
+                    .fg(theme.header),
             )
             .bottom_margin(1);
 
@@ -191,7 +193,7 @@ impl EntryDetailModal {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_style(Style::default().fg(theme.fg_dim))
                 .title(" Line Items "),
         );
 
@@ -202,18 +204,18 @@ impl EntryDetailModal {
         let total_credits: i64 = entry.lines.iter().map(|l| l.credit).sum();
 
         let totals = Paragraph::new(Line::from(vec![
-            Span::styled("Totals: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Debits ", Style::default().fg(Color::Green)),
+            Span::styled("Totals: ", Style::default().fg(theme.fg_dim)),
+            Span::styled("Debits ", Style::default().fg(theme.success)),
             Span::raw(format_currency(total_debits)),
             Span::raw("  "),
-            Span::styled("Credits ", Style::default().fg(Color::Red)),
+            Span::styled("Credits ", Style::default().fg(theme.error)),
             Span::raw(format_currency(total_credits)),
         ]));
         frame.render_widget(totals, chunks[2]);
 
         // Help
         let help = Paragraph::new(Line::from(vec![
-            Span::styled("Esc/Enter/q", Style::default().fg(Color::Yellow)),
+            Span::styled("Esc/Enter/q", Style::default().fg(theme.header)),
             Span::raw(": close"),
         ]));
         frame.render_widget(help, chunks[3]);

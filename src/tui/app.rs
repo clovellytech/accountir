@@ -4,14 +4,16 @@ use std::time::Duration;
 
 use chrono::Datelike;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Tabs},
     Frame, Terminal,
@@ -32,6 +34,7 @@ use crate::commands::entry_commands::{
 use crate::domain::AccountType;
 use crate::events::types::{Event as DomainEvent, JournalEntrySource};
 
+use super::theme::Theme;
 use super::views::{
     account_form::{AccountForm, AccountFormResult},
     accounts::AccountsView,
@@ -47,6 +50,7 @@ use super::views::{
     plaid_config::{PlaidConfigModal, PlaidConfigResult},
     plaid_link::{PlaidLinkModal, PlaidLinkResult},
     reports::ReportsView,
+    settings::{SettingsModal, SettingsResult},
     startup::{StartupAction, StartupView},
     welcome::{should_show_welcome, WelcomeView},
 };
@@ -121,6 +125,8 @@ pub struct App {
     pub bank_import: BankImportModal,
     pub plaid_link: PlaidLinkModal,
     pub plaid_config: PlaidConfigModal,
+    pub settings: SettingsModal,
+    pub theme: Theme,
     pub pending_plaid_link: Option<String>, // local_account_id to show plaid link modal for
     pub pending_plaid_action: Option<PlaidAction>, // Action from PlaidView to process
     pub status_message: Option<String>,
@@ -146,6 +152,9 @@ impl App {
             AppPhase::Startup
         };
 
+        let config = crate::config::AppConfig::load();
+        let theme = Theme::from_preset(config.theme);
+
         Self {
             phase: initial_phase,
             active_view: ActiveView::Dashboard,
@@ -167,6 +176,8 @@ impl App {
             bank_import: BankImportModal::new(),
             plaid_link: PlaidLinkModal::new(),
             plaid_config: PlaidConfigModal::new(),
+            settings: SettingsModal::new(),
+            theme,
             pending_plaid_link: None,
             pending_plaid_action: None,
             status_message: None,
@@ -222,6 +233,7 @@ impl App {
         self.bank_import = BankImportModal::new();
         self.plaid_link = PlaidLinkModal::new();
         self.plaid_config = PlaidConfigModal::new();
+        self.settings = SettingsModal::new();
         self.welcome = WelcomeView::new();
         self.pending_import_count = 0;
 
@@ -614,6 +626,33 @@ impl App {
             return;
         }
 
+        // Handle settings modal - it captures all input when visible
+        if self.settings.visible {
+            let was_enter = key == KeyCode::Enter;
+            self.settings.handle_key(key);
+            match &self.settings.result {
+                SettingsResult::Saved(preset) => {
+                    self.theme = Theme::from_preset(*preset);
+                    if was_enter {
+                        self.settings.hide();
+                        self.status_message = Some("Theme saved".to_string());
+                    }
+                }
+                SettingsResult::Cancel => {
+                    // Restore original theme from config
+                    let config = crate::config::AppConfig::load();
+                    self.theme = Theme::from_preset(config.theme);
+                    self.settings.hide();
+                }
+                SettingsResult::None => {}
+            }
+            // Reset result after processing (except Cancel which already hid)
+            if self.settings.result != SettingsResult::Cancel {
+                self.settings.result = SettingsResult::None;
+            }
+            return;
+        }
+
         // Handle plaid link modal - it captures all input when visible
         if self.plaid_link.visible {
             self.plaid_link.handle_key(key);
@@ -943,6 +982,10 @@ impl App {
                     return;
                 }
             }
+            KeyCode::Char(',') => {
+                self.settings.show();
+                return;
+            }
             _ => {}
         }
 
@@ -1019,19 +1062,20 @@ impl Default for App {
 
 fn draw_welcome(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
-    app.welcome.draw(frame, size);
+    app.welcome.draw(frame, size, &app.theme);
 }
 
 fn draw_startup(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
-    app.startup.draw(frame, size);
+    app.startup.draw(frame, size, &app.theme);
 
     // Draw help modal on top if visible
-    app.help.draw(frame, size, app.help_context());
+    app.help.draw(frame, size, app.help_context(), &app.theme);
 }
 
 fn draw_main(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
+    let theme = &app.theme;
 
     // Create main layout
     let chunks = Layout::default()
@@ -1063,33 +1107,30 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title(title))
         .select(app.active_view.index())
-        .style(Style::default().fg(Color::White))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+        .style(theme.text_style())
+        .highlight_style(theme.tab_highlight_style());
     frame.render_widget(tabs, chunks[0]);
 
     // Draw active view
     match app.active_view {
-        ActiveView::Dashboard => app.dashboard.draw(frame, chunks[1]),
-        ActiveView::Accounts => app.accounts.draw(frame, chunks[1]),
-        ActiveView::Journal => app.journal.draw(frame, chunks[1]),
-        ActiveView::Reports => app.reports.draw(frame, chunks[1]),
-        ActiveView::EventLog => app.event_log.draw(frame, chunks[1]),
-        ActiveView::Plaid => app.plaid_view.render(frame, chunks[1]),
+        ActiveView::Dashboard => app.dashboard.draw(frame, chunks[1], theme),
+        ActiveView::Accounts => app.accounts.draw(frame, chunks[1], theme),
+        ActiveView::Journal => app.journal.draw(frame, chunks[1], theme),
+        ActiveView::Reports => app.reports.draw(frame, chunks[1], theme),
+        ActiveView::EventLog => app.event_log.draw(frame, chunks[1], theme),
+        ActiveView::Plaid => app.plaid_view.render(frame, chunks[1], theme),
     }
 
     // Draw status bar
     let status_text = if let Some(ref msg) = app.status_message {
         msg.clone()
     } else {
-        "Tab: switch views | 1-6: jump to view | ?: help | Esc: close file | q: quit".to_string()
+        "Tab: switch views | 1-6: jump to view | ,: settings | ?: help | Esc: close file | q: quit"
+            .to_string()
     };
 
     let sync_indicator = if app.sync_server_running {
-        Span::styled(" Sync: :9876 ", Style::default().fg(Color::Green))
+        Span::styled(" Sync: :9876 ", theme.success_style())
     } else {
         Span::styled("", Style::default())
     };
@@ -1106,7 +1147,7 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
                 }
             ),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.header)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
@@ -1115,7 +1156,7 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
 
     let status = Paragraph::new(Line::from(vec![
         Span::raw(" "),
-        Span::styled(status_text, Style::default().fg(Color::DarkGray)),
+        Span::styled(status_text, theme.dim_style()),
         Span::raw("  "),
         import_indicator,
         sync_indicator,
@@ -1123,28 +1164,31 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
     frame.render_widget(status, chunks[2]);
 
     // Draw help modal on top if visible
-    app.help.draw(frame, size, app.help_context());
+    app.help.draw(frame, size, app.help_context(), theme);
 
     // Draw account form on top if visible
-    app.account_form.draw(frame, size);
+    app.account_form.draw(frame, size, theme);
 
     // Draw entry form on top if visible
-    app.entry_form.draw(frame, size);
+    app.entry_form.draw(frame, size, theme);
 
     // Draw entry detail modal on top if visible
-    app.entry_detail.draw(frame, size);
+    app.entry_detail.draw(frame, size, theme);
 
     // Draw CSV import modal on top if visible
-    app.csv_import.draw(frame, size);
+    app.csv_import.draw(frame, size, theme);
 
     // Draw bank import modal on top if visible
-    app.bank_import.draw(frame, size);
+    app.bank_import.draw(frame, size, theme);
 
     // Draw plaid link modal on top if visible
-    app.plaid_link.draw(frame, size);
+    app.plaid_link.draw(frame, size, theme);
 
     // Draw plaid config modal on top if visible
-    app.plaid_config.draw(frame, size);
+    app.plaid_config.draw(frame, size, theme);
+
+    // Draw settings modal on top if visible
+    app.settings.draw(frame, size, theme);
 }
 
 fn draw_ui(frame: &mut Frame, app: &mut App) {
@@ -1156,21 +1200,20 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
 
     // Draw quit confirmation dialog on top of everything
     if app.show_quit_confirm {
-        draw_quit_confirm(frame);
+        draw_quit_confirm(frame, &app.theme);
     }
 
     // Draw default accounts confirmation dialog
     if app.pending_default_accounts {
-        draw_default_accounts_confirm(frame);
+        draw_default_accounts_confirm(frame, &app.theme);
     }
 }
 
-fn draw_quit_confirm(frame: &mut Frame) {
+fn draw_quit_confirm(frame: &mut Frame, theme: &Theme) {
     use ratatui::widgets::Clear;
 
     let area = frame.area();
 
-    // Create a small centered dialog
     let dialog_width = 30;
     let dialog_height = 5;
     let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
@@ -1183,23 +1226,16 @@ fn draw_quit_confirm(frame: &mut Frame) {
         height: dialog_height,
     };
 
-    // Clear the area behind the dialog
     frame.render_widget(Clear, dialog_area);
 
-    // Draw the dialog box
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(theme.header))
         .title(" Quit ")
-        .title_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(theme.header_style());
 
     frame.render_widget(block, dialog_area);
 
-    // Draw the message
     let inner = ratatui::layout::Rect {
         x: dialog_area.x + 2,
         y: dialog_area.y + 1,
@@ -1212,11 +1248,11 @@ fn draw_quit_confirm(frame: &mut Frame) {
         Line::from(""),
         Line::from(vec![
             Span::raw("Press "),
-            Span::styled("y", Style::default().fg(Color::Green)),
+            Span::styled("y", theme.success_style()),
             Span::raw(" to quit, "),
             Span::styled(
                 "N",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                theme.error_style().add_modifier(Modifier::BOLD),
             ),
             Span::raw("/Enter to cancel"),
         ]),
@@ -1226,7 +1262,7 @@ fn draw_quit_confirm(frame: &mut Frame) {
     frame.render_widget(paragraph, inner);
 }
 
-fn draw_default_accounts_confirm(frame: &mut Frame) {
+fn draw_default_accounts_confirm(frame: &mut Frame, theme: &Theme) {
     use ratatui::widgets::Clear;
 
     let area = frame.area();
@@ -1247,13 +1283,9 @@ fn draw_default_accounts_confirm(frame: &mut Frame) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(theme.border_style())
         .title(" Default Accounts ")
-        .title_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        );
+        .title_style(theme.modal_title_style());
 
     frame.render_widget(block, dialog_area);
 
@@ -1264,45 +1296,46 @@ fn draw_default_accounts_confirm(frame: &mut Frame) {
         height: dialog_area.height.saturating_sub(2),
     };
 
+    let acct_num_style = Style::default().fg(theme.header);
     let text = vec![
         Line::from("No accounts found. Create defaults?"),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  1000", Style::default().fg(Color::Yellow)),
+            Span::styled("  1000", acct_num_style),
             Span::raw("  Assets"),
         ]),
         Line::from(vec![
-            Span::styled("  1001", Style::default().fg(Color::Yellow)),
+            Span::styled("  1001", acct_num_style),
             Span::raw("    Business Checking"),
         ]),
         Line::from(vec![
-            Span::styled("  2000", Style::default().fg(Color::Yellow)),
+            Span::styled("  2000", acct_num_style),
             Span::raw("  Income"),
         ]),
         Line::from(vec![
-            Span::styled("  3000", Style::default().fg(Color::Yellow)),
+            Span::styled("  3000", acct_num_style),
             Span::raw("  Expenses"),
         ]),
         Line::from(vec![
-            Span::styled("  4000", Style::default().fg(Color::Yellow)),
+            Span::styled("  4000", acct_num_style),
             Span::raw("  Equity"),
         ]),
         Line::from(vec![
-            Span::styled("  4001", Style::default().fg(Color::Yellow)),
+            Span::styled("  4001", acct_num_style),
             Span::raw("    Opening Balances"),
         ]),
         Line::from(vec![
-            Span::styled("  5000", Style::default().fg(Color::Yellow)),
+            Span::styled("  5000", acct_num_style),
             Span::raw("  Liabilities"),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::raw("Press "),
-            Span::styled("y", Style::default().fg(Color::Green)),
+            Span::styled("y", theme.success_style()),
             Span::raw(" to create, "),
             Span::styled(
                 "N",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                theme.error_style().add_modifier(Modifier::BOLD),
             ),
             Span::raw("/Esc to skip"),
         ]),
@@ -1934,7 +1967,12 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
         // Poll for events with timeout
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                app.handle_key(key.code, key.modifiers);
+                // Only process Press events, not Release/Repeat (crossterm 0.28+
+                // sends multiple event kinds on terminals with kitty keyboard
+                // protocol support, which would otherwise cause duplicated input).
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key(key.code, key.modifiers);
+                }
             }
         }
 
@@ -2498,7 +2536,12 @@ pub fn run_app_with_database(
         // Poll for events with timeout
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                app.handle_key(key.code, key.modifiers);
+                // Only process Press events, not Release/Repeat (crossterm 0.28+
+                // sends multiple event kinds on terminals with kitty keyboard
+                // protocol support, which would otherwise cause duplicated input).
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key(key.code, key.modifiers);
+                }
             }
         }
 

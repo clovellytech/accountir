@@ -1,11 +1,13 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame,
 };
+
+use crate::tui::theme::Theme;
 
 pub struct PlaidView {
     pub items: Vec<PlaidItemDisplay>,
@@ -95,24 +97,24 @@ impl PlaidView {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect) {
+    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(" Plaid Bank Connections (C: config, c: connect, s: sync, S: sync all, d: disconnect) ")
-            .title_style(Style::default().fg(Color::Cyan));
+            .title_style(Style::default().fg(theme.accent));
 
         if self.items.is_empty() {
             let config = crate::config::AppConfig::load();
             let config_status = if config.plaid.is_configured() {
                 Line::from(Span::styled(
                     "Plaid is configured.",
-                    Style::default().fg(Color::Green),
+                    Style::default().fg(theme.success),
                 ))
             } else {
                 Line::from(vec![
-                    Span::styled("Plaid is not configured. ", Style::default().fg(Color::Red)),
+                    Span::styled("Plaid is not configured. ", Style::default().fg(theme.error)),
                     Span::raw("Press "),
-                    Span::styled("C", Style::default().fg(Color::Yellow)),
+                    Span::styled("C", Style::default().fg(theme.header)),
                     Span::raw(" to set up proxy URL and API key."),
                 ])
             };
@@ -121,14 +123,14 @@ impl PlaidView {
                 Line::from(""),
                 Line::from(Span::styled(
                     "No banks connected via Plaid.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.fg_dim),
                 )),
                 Line::from(""),
                 config_status,
                 Line::from(""),
                 Line::from(vec![
                     Span::raw("Press "),
-                    Span::styled("c", Style::default().fg(Color::Yellow)),
+                    Span::styled("c", Style::default().fg(theme.header)),
                     Span::raw(" to connect a bank account."),
                 ]),
             ];
@@ -145,7 +147,7 @@ impl PlaidView {
         ])
         .style(
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.header)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -155,9 +157,9 @@ impl PlaidView {
             .enumerate()
             .map(|(i, item)| {
                 let status_color = match item.status.as_str() {
-                    "active" => Color::Green,
-                    "disconnected" | "revoked" => Color::Red,
-                    _ => Color::DarkGray,
+                    "active" => theme.success,
+                    "disconnected" | "revoked" => theme.error,
+                    _ => theme.fg_dim,
                 };
 
                 let account_summary: String = item
@@ -178,7 +180,7 @@ impl PlaidView {
                 let last_sync = item.last_synced_at.as_deref().unwrap_or("Never");
 
                 let style = if i == self.selected {
-                    Style::default().bg(Color::DarkGray)
+                    theme.selected_style()
                 } else {
                     Style::default()
                 };
@@ -220,7 +222,7 @@ impl PlaidView {
             };
             let status = Paragraph::new(Span::styled(
                 msg.as_str(),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.header),
             ));
             frame.render_widget(status, status_area);
         }

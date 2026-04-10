@@ -1,13 +1,14 @@
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::config::AppConfig;
+use crate::tui::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaidConfigResult {
@@ -193,7 +194,7 @@ impl PlaidConfigModal {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect) {
+    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -203,11 +204,11 @@ impl PlaidConfigModal {
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(theme.accent))
             .title(" Plaid Configuration ")
             .title_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -228,15 +229,15 @@ impl PlaidConfigModal {
                 ])
                 .split(inner);
 
-            self.draw_text_field(frame, chunks[0], "Proxy URL", &self.proxy_url, true);
+            self.draw_text_field(frame, chunks[0], "Proxy URL", &self.proxy_url, true, theme);
 
             let status = Paragraph::new(Line::from(Span::styled(
                 "  Registered (API key saved)",
-                Style::default().fg(Color::Green),
+                Style::default().fg(theme.success),
             )));
             frame.render_widget(status, chunks[1]);
 
-            self.draw_help(frame, chunks[3]);
+            self.draw_help(frame, chunks[3], theme);
         } else {
             // Registration mode: proxy URL + email
             let chunks = Layout::default()
@@ -256,6 +257,7 @@ impl PlaidConfigModal {
                 "Proxy URL",
                 &self.proxy_url,
                 self.active_field == ConfigField::ProxyUrl,
+                theme,
             );
             self.draw_text_field(
                 frame,
@@ -263,22 +265,23 @@ impl PlaidConfigModal {
                 "Email (for registration)",
                 &self.email,
                 self.active_field == ConfigField::Email,
+                theme,
             );
 
-            self.draw_help(frame, chunks[3]);
+            self.draw_help(frame, chunks[3], theme);
         }
     }
 
-    fn draw_help(&self, frame: &mut Frame, area: Rect) {
+    fn draw_help(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let message = if let Some(ref err) = self.error_message {
-            Line::from(Span::styled(err.clone(), Style::default().fg(Color::Red)))
+            Line::from(Span::styled(err.clone(), Style::default().fg(theme.error)))
         } else {
             Line::from(vec![
-                Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                Span::styled("Tab", Style::default().fg(theme.header)),
                 Span::raw(": next  "),
-                Span::styled("Enter", Style::default().fg(Color::Yellow)),
+                Span::styled("Enter", Style::default().fg(theme.header)),
                 Span::raw(": save  "),
-                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::styled("Esc", Style::default().fg(theme.header)),
                 Span::raw(": cancel"),
             ])
         };
@@ -292,17 +295,18 @@ impl PlaidConfigModal {
         label: &str,
         value: &str,
         is_active: bool,
+        theme: &Theme,
     ) {
         let style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_fg)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme.input_inactive_fg)
         };
 
         let border_style = if is_active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(theme.input_active_border)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.input_inactive_border)
         };
 
         let display = if is_active {
