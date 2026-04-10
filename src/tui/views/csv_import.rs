@@ -406,8 +406,7 @@ impl CsvImportModal {
                         .unwrap_or_default();
                     let prefix_lower = prefix.to_lowercase();
 
-                    // Filter by prefix and show directories or CSV files
-                    name.starts_with(&prefix_lower) && (p.is_dir() || name.ends_with(".csv"))
+                    name.starts_with(&prefix_lower)
                 })
                 .collect();
 
