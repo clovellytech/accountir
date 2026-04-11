@@ -85,6 +85,7 @@ pub struct EntryForm {
     // Account selection
     available_accounts: Vec<Account>,
     account_list_state: ListState,
+    account_filter: String,
 
     error_message: Option<String>,
 }
@@ -137,6 +138,7 @@ impl EntryForm {
             line_edit_mode: LineEditMode::Navigation,
             available_accounts: Vec::new(),
             account_list_state,
+            account_filter: String::new(),
             error_message: None,
         }
     }
@@ -174,6 +176,7 @@ impl EntryForm {
         self.available_accounts = existing_accounts;
         self.error_message = None;
         self.account_list_state.select(Some(0));
+        self.account_filter.clear();
     }
 
     pub fn hide(&mut self) {
@@ -217,9 +220,25 @@ impl EntryForm {
             }
             KeyCode::Enter => {
                 if self.active_field == FormField::Lines {
-                    // Enter line edit mode - start with account selection
-                    self.line_edit_mode = LineEditMode::SelectAccount;
-                    self.account_list_state.select(Some(0));
+                    // If the current line already has an account, skip the
+                    // picker and go straight to debit/credit editing — the
+                    // account was prefilled (e.g. from the open ledger view)
+                    // and re-confirming it is just a redundant keystroke.
+                    if self
+                        .lines
+                        .get(self.selected_line)
+                        .and_then(|l| l.account_id.as_ref())
+                        .is_some()
+                    {
+                        self.line_edit_mode = LineEditMode::EditAmount;
+                        if let Some(line) = self.lines.get_mut(self.selected_line) {
+                            line.editing_debit = true;
+                        }
+                    } else {
+                        self.line_edit_mode = LineEditMode::SelectAccount;
+                        self.account_filter.clear();
+                        self.account_list_state.select(Some(0));
+                    }
                 } else {
                     self.submit();
                 }
@@ -228,6 +247,21 @@ impl EntryForm {
                 // Add new line
                 self.lines.push(EditableLine::new());
                 self.selected_line = self.lines.len() - 1;
+            }
+            KeyCode::Char('a') if self.active_field == FormField::Lines => {
+                // Re-open the account picker for the selected line, even
+                // when an account is already set, so it can be changed.
+                self.line_edit_mode = LineEditMode::SelectAccount;
+                self.account_filter.clear();
+                let preselect = self
+                    .lines
+                    .get(self.selected_line)
+                    .and_then(|l| l.account_id.as_ref())
+                    .and_then(|id| {
+                        self.available_accounts.iter().position(|a| &a.id == id)
+                    })
+                    .unwrap_or(0);
+                self.account_list_state.select(Some(preselect));
             }
             KeyCode::Char('d') if self.active_field == FormField::Lines => {
                 // Delete line (keep at least 2)
@@ -258,39 +292,74 @@ impl EntryForm {
         match key {
             KeyCode::Esc => {
                 self.line_edit_mode = LineEditMode::Navigation;
+                self.account_filter.clear();
             }
             KeyCode::Enter => {
-                if let Some(i) = self.account_list_state.selected() {
-                    if let Some(account) = self.available_accounts.get(i) {
+                let filtered = self.filtered_account_indices();
+                let visible_idx = self.account_list_state.selected().unwrap_or(0);
+                if let Some(&real_idx) = filtered.get(visible_idx) {
+                    if let Some(account) = self.available_accounts.get(real_idx) {
                         self.lines[self.selected_line].account_id = Some(account.id.clone());
                         self.lines[self.selected_line].account_display =
                             format!("{} - {}", account.account_number, account.name);
                     }
+                    // Move to amount editing
+                    self.line_edit_mode = LineEditMode::EditAmount;
+                    self.account_filter.clear();
+                    self.lines[self.selected_line].editing_debit = true;
                 }
-                // Move to amount editing
-                self.line_edit_mode = LineEditMode::EditAmount;
-                self.lines[self.selected_line].editing_debit = true;
+                // If the filter excluded everything, stay in picker so the
+                // user can correct their query rather than silently bailing.
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
+                let len = self.filtered_account_indices().len();
+                if len == 0 {
+                    return;
+                }
                 let i = self.account_list_state.selected().unwrap_or(0);
-                let new_i = if i == 0 {
-                    self.available_accounts.len().saturating_sub(1)
-                } else {
-                    i - 1
-                };
+                let new_i = if i == 0 { len - 1 } else { i - 1 };
                 self.account_list_state.select(Some(new_i));
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
+                let len = self.filtered_account_indices().len();
+                if len == 0 {
+                    return;
+                }
                 let i = self.account_list_state.selected().unwrap_or(0);
-                let new_i = if i >= self.available_accounts.len().saturating_sub(1) {
-                    0
-                } else {
-                    i + 1
-                };
+                let new_i = if i >= len - 1 { 0 } else { i + 1 };
                 self.account_list_state.select(Some(new_i));
+            }
+            KeyCode::Char(c) => {
+                self.account_filter.push(c);
+                self.account_list_state.select(Some(0));
+            }
+            KeyCode::Backspace => {
+                self.account_filter.pop();
+                self.account_list_state.select(Some(0));
             }
             _ => {}
         }
+    }
+
+    /// Returns indices into `available_accounts` that match the current
+    /// filter (case-insensitive substring against "<number> - <name>").
+    fn filtered_account_indices(&self) -> Vec<usize> {
+        if self.account_filter.is_empty() {
+            return (0..self.available_accounts.len()).collect();
+        }
+        let needle = self.account_filter.to_lowercase();
+        self.available_accounts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                let hay = format!("{} - {}", a.account_number, a.name).to_lowercase();
+                if hay.contains(&needle) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn handle_amount_edit_key(&mut self, key: KeyCode) {
@@ -508,6 +577,8 @@ impl EntryForm {
                 Span::raw(": save  "),
                 Span::styled("Tab", Style::default().fg(theme.header)),
                 Span::raw(": next  "),
+                Span::styled("a", Style::default().fg(theme.header)),
+                Span::raw(": account  "),
                 Span::styled("n", Style::default().fg(theme.header)),
                 Span::raw(": new line  "),
                 Span::styled("Esc", Style::default().fg(theme.header)),
@@ -645,24 +716,28 @@ impl EntryForm {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(" Lines (j/k: nav, Enter: edit, n: new, d: delete) "),
+                .title(" Lines (j/k: nav, Enter: edit, a: account, n: new, d: delete) "),
         );
 
         frame.render_widget(table, area);
     }
 
     fn draw_account_dropdown(&self, frame: &mut Frame, anchor: Rect, theme: &Theme) {
-        let items: Vec<ListItem> = self
-            .available_accounts
-            .iter()
-            .map(|a| ListItem::new(format!("{} - {}", a.account_number, a.name)))
-            .collect();
-
-        if items.is_empty() {
+        if self.available_accounts.is_empty() {
             return;
         }
 
-        let dropdown_height = (items.len() as u16 + 2).min(10);
+        let filtered = self.filtered_account_indices();
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .map(|&i| {
+                let a = &self.available_accounts[i];
+                ListItem::new(format!("{} - {}", a.account_number, a.name))
+            })
+            .collect();
+
+        let item_count = items.len().max(1) as u16;
+        let dropdown_height = (item_count + 2).min(12);
         let dropdown_area = Rect {
             x: anchor.x + 1,
             y: anchor.y + 3 + (self.selected_line as u16).min(5),
@@ -672,12 +747,33 @@ impl EntryForm {
 
         frame.render_widget(Clear, dropdown_area);
 
+        let title = if self.account_filter.is_empty() {
+            " Select Account (type to filter) ".to_string()
+        } else {
+            format!(" Select Account: {}_ ", self.account_filter)
+        };
+
+        if items.is_empty() {
+            let empty = Paragraph::new(Line::from(Span::styled(
+                "  No matches",
+                Style::default().fg(theme.error),
+            )))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.accent))
+                    .title(title),
+            );
+            frame.render_widget(empty, dropdown_area);
+            return;
+        }
+
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.accent))
-                    .title(" Select Account "),
+                    .title(title),
             )
             .highlight_style(theme.selected_style())
             .highlight_symbol("> ");
