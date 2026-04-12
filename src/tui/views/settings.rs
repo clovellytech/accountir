@@ -103,7 +103,7 @@ impl SettingsModal {
             .constraints([
                 Constraint::Length(2), // Section header
                 Constraint::Length(1), // Spacer
-                Constraint::Min(6),   // Theme options
+                Constraint::Min(6),    // Theme options
                 Constraint::Length(1), // Spacer
                 Constraint::Length(2), // Preview info
                 Constraint::Length(1), // Spacer
@@ -113,10 +113,7 @@ impl SettingsModal {
             .split(inner);
 
         // Section header
-        let header = Paragraph::new(Line::from(Span::styled(
-            "  Theme",
-            theme.header_style(),
-        )));
+        let header = Paragraph::new(Line::from(Span::styled("  Theme", theme.header_style())));
         frame.render_widget(header, chunks[0]);
 
         // Theme options
@@ -131,9 +128,7 @@ impl SettingsModal {
                 theme.text_style()
             };
             let desc_style = if is_selected {
-                Style::default()
-                    .fg(theme.fg_selected)
-                    .bg(theme.bg_selected)
+                Style::default().fg(theme.fg_selected).bg(theme.bg_selected)
             } else {
                 theme.dim_style()
             };

@@ -112,7 +112,10 @@ impl PlaidView {
                 ))
             } else {
                 Line::from(vec![
-                    Span::styled("Plaid is not configured. ", Style::default().fg(theme.error)),
+                    Span::styled(
+                        "Plaid is not configured. ",
+                        Style::default().fg(theme.error),
+                    ),
                     Span::raw("Press "),
                     Span::styled("C", Style::default().fg(theme.header)),
                     Span::raw(" to set up proxy URL and API key."),

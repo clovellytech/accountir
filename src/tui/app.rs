@@ -39,9 +39,7 @@ use super::views::{
     account_form::{AccountForm, AccountFormResult},
     accounts::AccountsView,
     bank_import::{BankImportModal, BankImportResult, ParsedTransaction, PendingImport},
-    csv_import::{
-        parse_amount, parse_date, parse_delimited_line, CsvImportModal, ImportConfig,
-    },
+    csv_import::{parse_amount, parse_date, parse_delimited_line, CsvImportModal, ImportConfig},
     dashboard::DashboardView,
     entry_detail::{EntryDetail, EntryDetailModal, EntryLineDetail},
     entry_form::{EntryForm, EntryFormResult},
@@ -1257,10 +1255,7 @@ fn draw_quit_confirm(frame: &mut Frame, theme: &Theme) {
             Span::raw("Press "),
             Span::styled("y", theme.success_style()),
             Span::raw(" to quit, "),
-            Span::styled(
-                "N",
-                theme.error_style().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("N", theme.error_style().add_modifier(Modifier::BOLD)),
             Span::raw("/Enter to cancel"),
         ]),
     ];
@@ -1340,10 +1335,7 @@ fn draw_default_accounts_confirm(frame: &mut Frame, theme: &Theme) {
             Span::raw("Press "),
             Span::styled("y", theme.success_style()),
             Span::raw(" to create, "),
-            Span::styled(
-                "N",
-                theme.error_style().add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("N", theme.error_style().add_modifier(Modifier::BOLD)),
             Span::raw("/Esc to skip"),
         ]),
     ];

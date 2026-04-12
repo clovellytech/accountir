@@ -97,8 +97,8 @@ impl EventLogView {
         frame.render_widget(block, area);
 
         if self.events.is_empty() {
-            let empty = Paragraph::new("No events recorded yet")
-                .style(Style::default().fg(theme.fg_dim));
+            let empty =
+                Paragraph::new("No events recorded yet").style(Style::default().fg(theme.fg_dim));
             frame.render_widget(empty, inner);
             return;
         }

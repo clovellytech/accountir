@@ -1057,7 +1057,11 @@ impl JournalView {
         // Current account info
         let current_text = if is_bulk {
             let n = self.selected_entry_ids.len();
-            let noun = if n == 1 { "transaction" } else { "transactions" };
+            let noun = if n == 1 {
+                "transaction"
+            } else {
+                "transactions"
+            };
             format!("{} {} selected", n, noun)
         } else if let Some(ref pending) = self.reassign_pending {
             format!("Current: {}", pending.current_account_name)

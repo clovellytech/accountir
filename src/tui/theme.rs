@@ -2,9 +2,10 @@ use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 
 /// Named theme presets
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemePreset {
+    #[default]
     Dark,
     Light,
     HighContrast,
@@ -46,12 +47,6 @@ impl ThemePreset {
     }
 }
 
-impl Default for ThemePreset {
-    fn default() -> Self {
-        ThemePreset::Dark
-    }
-}
-
 /// Color palette used throughout the TUI
 #[derive(Debug, Clone)]
 pub struct Theme {
@@ -65,12 +60,12 @@ pub struct Theme {
     pub fg_selected: Color,
 
     // Accents
-    pub accent: Color,       // borders, active elements (cyan/blue)
-    pub header: Color,       // column headers, section titles (yellow)
-    pub highlight: Color,    // active tab, selected tab text
-    pub success: Color,      // positive values, success indicators
-    pub error: Color,        // errors, voided entries, negative
-    pub info: Color,         // informational text
+    pub accent: Color,    // borders, active elements (cyan/blue)
+    pub header: Color,    // column headers, section titles (yellow)
+    pub highlight: Color, // active tab, selected tab text
+    pub success: Color,   // positive values, success indicators
+    pub error: Color,     // errors, voided entries, negative
+    pub info: Color,      // informational text
 
     // Input fields
     pub input_active_border: Color,

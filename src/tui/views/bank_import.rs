@@ -578,8 +578,7 @@ impl BankImportModal {
         frame.render_widget(block, area);
 
         if self.pending_imports.is_empty() {
-            let msg =
-                Paragraph::new("No pending imports").style(Style::default().fg(theme.fg_dim));
+            let msg = Paragraph::new("No pending imports").style(Style::default().fg(theme.fg_dim));
             frame.render_widget(msg, inner);
             return;
         }
@@ -596,9 +595,7 @@ impl BankImportModal {
                 let content = Line::from(vec![
                     Span::styled(
                         &import.bank_name,
-                        Style::default()
-                            .fg(theme.fg)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(count),
                     Span::raw(" - "),

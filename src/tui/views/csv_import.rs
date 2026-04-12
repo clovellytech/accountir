@@ -473,9 +473,11 @@ impl CsvImportModal {
             self.confirm_summary = None;
             return;
         };
-        let (Some(date_col), Some(desc_col), Some(amount_col)) =
-            (self.date_column, self.description_column, self.amount_column)
-        else {
+        let (Some(date_col), Some(desc_col), Some(amount_col)) = (
+            self.date_column,
+            self.description_column,
+            self.amount_column,
+        ) else {
             self.confirm_summary = None;
             return;
         };
@@ -703,7 +705,9 @@ impl CsvImportModal {
                 return;
             }
 
-            headers = (1..=column_count).map(|i| format!("Column {}", i)).collect();
+            headers = (1..=column_count)
+                .map(|i| format!("Column {}", i))
+                .collect();
         }
 
         self.preview = Some(CsvPreview { headers, rows });
@@ -1051,8 +1055,7 @@ impl CsvImportModal {
                 .iter()
                 .enumerate()
                 .flat_map(|(i, h)| {
-                    let mut spans =
-                        vec![Span::styled(format!("{}: {}", i + 1, h), header_style)];
+                    let mut spans = vec![Span::styled(format!("{}: {}", i + 1, h), header_style)];
                     if i + 1 < preview.headers.len() {
                         spans.push(Span::raw("  |  "));
                     }
@@ -1456,12 +1459,7 @@ impl CsvImportModal {
                     .collect();
 
                 let scroll_info = if s.parsed.len() > visible_rows {
-                    format!(
-                        " Preview ({}–{} of {}) ",
-                        start + 1,
-                        end,
-                        s.parsed.len()
-                    )
+                    format!(" Preview ({}–{} of {}) ", start + 1, end, s.parsed.len())
                 } else {
                     format!(" Preview ({} rows) ", s.parsed.len())
                 };
@@ -1499,7 +1497,9 @@ impl CsvImportModal {
                 Span::raw(": import  "),
                 Span::styled(
                     "N/Esc",
-                    Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.error)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(": back  "),
                 Span::styled("↑↓/PgUp/PgDn", Style::default().fg(theme.header)),
@@ -1509,7 +1509,9 @@ impl CsvImportModal {
             Line::from(vec![
                 Span::styled(
                     "N/Esc",
-                    Style::default().fg(theme.error).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.error)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(": go back and fix mapping/parse options"),
             ])

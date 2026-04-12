@@ -407,11 +407,8 @@ impl ReportsView {
         asset_rows.push(Row::new(vec!["ASSETS", "", ""]).style(bold));
         asset_rows.push(Row::new(vec!["", "", ""]));
 
-        let asset_tree = build_report_rows(
-            &bs_to_inputs(&bs.assets.lines),
-            self.collapse_depth,
-        );
-        render_report_rows(&asset_tree, |b| format_currency(b), &mut asset_rows);
+        let asset_tree = build_report_rows(&bs_to_inputs(&bs.assets.lines), self.collapse_depth);
+        render_report_rows(&asset_tree, format_currency, &mut asset_rows);
 
         push_single_rule(&mut asset_rows);
         asset_rows.push(
@@ -426,10 +423,7 @@ impl ReportsView {
 
         let depth_hint = format!("depth: {} (+/-)", self.collapse_depth_label());
         let date_title = if self.editing_date {
-            format!(
-                " Enter date: {}▏ (Enter/Esc) ",
-                self.date_input
-            )
+            format!(" Enter date: {}▏ (Enter/Esc) ", self.date_input)
         } else {
             format!(
                 " Assets (as of {}) [/]: nav, d: date, t: today, {} ",
@@ -452,10 +446,8 @@ impl ReportsView {
         le_rows.push(Row::new(vec!["LIABILITIES", "", ""]).style(bold));
         le_rows.push(Row::new(vec!["", "", ""]));
 
-        let liab_tree = build_report_rows(
-            &bs_to_inputs(&bs.liabilities.lines),
-            self.collapse_depth,
-        );
+        let liab_tree =
+            build_report_rows(&bs_to_inputs(&bs.liabilities.lines), self.collapse_depth);
         render_report_rows(&liab_tree, |b| format_currency(b.abs()), &mut le_rows);
 
         push_single_rule(&mut le_rows);
@@ -472,10 +464,7 @@ impl ReportsView {
         le_rows.push(Row::new(vec!["EQUITY", "", ""]).style(bold));
         le_rows.push(Row::new(vec!["", "", ""]));
 
-        let equity_tree = build_report_rows(
-            &bs_to_inputs(&bs.equity.lines),
-            self.collapse_depth,
-        );
+        let equity_tree = build_report_rows(&bs_to_inputs(&bs.equity.lines), self.collapse_depth);
         render_report_rows(&equity_tree, |b| format_currency(b.abs()), &mut le_rows);
 
         push_single_rule(&mut le_rows);
@@ -536,11 +525,8 @@ impl ReportsView {
 
         rows.push(Row::new(vec!["REVENUE", "", ""]).style(bold.fg(theme.success)));
         rows.push(Row::new(vec!["", "", ""]));
-        let rev_tree = build_report_rows(
-            &is_to_inputs(&is.revenue.lines),
-            self.collapse_depth,
-        );
-        render_report_rows(&rev_tree, |b| format_currency(b), &mut rows);
+        let rev_tree = build_report_rows(&is_to_inputs(&is.revenue.lines), self.collapse_depth);
+        render_report_rows(&rev_tree, format_currency, &mut rows);
         push_single_rule(&mut rows);
         rows.push(
             Row::new(vec![
@@ -555,11 +541,8 @@ impl ReportsView {
 
         rows.push(Row::new(vec!["EXPENSES", "", ""]).style(bold.fg(theme.error)));
         rows.push(Row::new(vec!["", "", ""]));
-        let exp_tree = build_report_rows(
-            &is_to_inputs(&is.expenses.lines),
-            self.collapse_depth,
-        );
-        render_report_rows(&exp_tree, |b| format_currency(b), &mut rows);
+        let exp_tree = build_report_rows(&is_to_inputs(&is.expenses.lines), self.collapse_depth);
+        render_report_rows(&exp_tree, format_currency, &mut rows);
         push_single_rule(&mut rows);
         rows.push(
             Row::new(vec![
@@ -595,10 +578,7 @@ impl ReportsView {
 
         let depth_hint = format!("depth: {} (+/-)", self.collapse_depth_label());
         let date_title = if self.editing_date {
-            format!(
-                " Enter date: {}▏ (Enter/Esc) ",
-                self.date_input
-            )
+            format!(" Enter date: {}▏ (Enter/Esc) ", self.date_input)
         } else {
             format!(
                 " Income Statement ({} to {}) [/]: nav, d: date, {} ",
@@ -735,8 +715,7 @@ fn build_report_rows(inputs: &[TreeInput<'_>], collapse_depth: Option<usize>) ->
         return Vec::new();
     }
 
-    let id_set: std::collections::HashSet<&str> =
-        inputs.iter().map(|l| l.account_id).collect();
+    let id_set: std::collections::HashSet<&str> = inputs.iter().map(|l| l.account_id).collect();
 
     // Build parent->children index map
     let mut children_map: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
@@ -750,7 +729,7 @@ fn build_report_rows(inputs: &[TreeInput<'_>], collapse_depth: Option<usize>) ->
 
     // Sort children by account number
     for children in children_map.values_mut() {
-        children.sort_by(|&a, &b| inputs[a].account_number.cmp(&inputs[b].account_number));
+        children.sort_by(|&a, &b| inputs[a].account_number.cmp(inputs[b].account_number));
     }
 
     // Compute subtotals for every node (own balance + all descendants)
@@ -775,12 +754,7 @@ fn build_report_rows(inputs: &[TreeInput<'_>], collapse_depth: Option<usize>) ->
                 children
                     .iter()
                     .map(|&idx| {
-                        compute_subtotal(
-                            inputs,
-                            children_map,
-                            inputs[idx].account_id,
-                            subtotals,
-                        )
+                        compute_subtotal(inputs, children_map, inputs[idx].account_id, subtotals)
                     })
                     .sum()
             })
@@ -797,6 +771,7 @@ fn build_report_rows(inputs: &[TreeInput<'_>], collapse_depth: Option<usize>) ->
     // Walk the tree and emit ReportRows
     let mut result = Vec::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_rows<'a>(
         inputs: &[TreeInput<'a>],
         children_map: &HashMap<Option<&'a str>, Vec<usize>>,
@@ -914,9 +889,7 @@ fn render_report_rows(
             } => {
                 let prefix = make_tree_prefix(*depth, *is_last_child, ancestor_is_last);
                 let name_col = format!("  {}{}", prefix, name);
-                out.push(
-                    Row::new(vec![name_col, String::new(), String::new()]).style(bold),
-                );
+                out.push(Row::new(vec![name_col, String::new(), String::new()]).style(bold));
             }
             ReportRow::Subtotal {
                 parent_name,
@@ -932,10 +905,7 @@ fn render_report_rows(
                 // Indent the subtotal line to align with the parent's children
                 let indent = "   ".repeat(*depth);
                 let name_col = format!("  {}  Total {}", indent, parent_name);
-                out.push(
-                    Row::new(vec![name_col, String::new(), fmt_balance(*amount)])
-                        .style(bold),
-                );
+                out.push(Row::new(vec![name_col, String::new(), fmt_balance(*amount)]).style(bold));
             }
         }
     }

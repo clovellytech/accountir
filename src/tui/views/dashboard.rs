@@ -143,8 +143,20 @@ impl DashboardView {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[1]);
 
-        self.draw_account_type_table(frame, right_chunks[0], AccountType::Revenue, " Revenue ", theme);
-        self.draw_account_type_table(frame, right_chunks[1], AccountType::Expense, " Expenses ", theme);
+        self.draw_account_type_table(
+            frame,
+            right_chunks[0],
+            AccountType::Revenue,
+            " Revenue ",
+            theme,
+        );
+        self.draw_account_type_table(
+            frame,
+            right_chunks[1],
+            AccountType::Expense,
+            " Expenses ",
+            theme,
+        );
     }
 
     fn draw_account_type_table(
@@ -187,8 +199,11 @@ impl DashboardView {
             ],
         )
         .header(
-            Row::new(vec!["Number", "Name", "Balance"])
-                .style(Style::default().fg(theme.header).add_modifier(Modifier::BOLD)),
+            Row::new(vec!["Number", "Name", "Balance"]).style(
+                Style::default()
+                    .fg(theme.header)
+                    .add_modifier(Modifier::BOLD),
+            ),
         )
         .block(Block::default().borders(Borders::ALL).title(title));
 

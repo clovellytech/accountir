@@ -59,10 +59,7 @@ impl HelpModal {
     fn get_help_content(&self, context: HelpContext, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = vec![
             Line::from(""),
-            Line::from(Span::styled(
-                "  Global Keys",
-                theme.header_style(),
-            )),
+            Line::from(Span::styled("  Global Keys", theme.header_style())),
             Line::from(""),
             Self::key_line("  ?", "Toggle this help menu", theme),
             Self::key_line("  Esc", "Close file / go back", theme),
@@ -147,7 +144,11 @@ impl HelpModal {
             Self::key_line("  Enter", "View account ledger", theme),
             Self::key_line("  a", "Create new account", theme),
             Self::key_line("  e", "Edit selected account", theme),
-            Self::key_line("  p", "Link/unlink Plaid account (Asset/Liability only)", theme),
+            Self::key_line(
+                "  p",
+                "Link/unlink Plaid account (Asset/Liability only)",
+                theme,
+            ),
             Self::key_line("  ↑/↓ or j/k", "Navigate accounts", theme),
             Self::key_line("  Home", "Jump to first account", theme),
             Self::key_line("  End", "Jump to last account", theme),
@@ -179,7 +180,11 @@ impl HelpModal {
             Self::key_line("  g", "Go to other account's ledger (ledger only)", theme),
             Self::key_line("  x", "Void selected entry", theme),
             Self::key_line("  v", "Enter multiselect mode (ledger only)", theme),
-            Self::key_line("  s", "Cycle sort field (Date/Memo/Reference/Amount)", theme),
+            Self::key_line(
+                "  s",
+                "Cycle sort field (Date/Memo/Reference/Amount)",
+                theme,
+            ),
             Self::key_line("  r", "Reverse sort direction", theme),
             Self::key_line("  h", "Toggle showing voided entries", theme),
             Self::key_line("  c", "Toggle ID column visibility", theme),

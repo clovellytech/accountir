@@ -722,7 +722,14 @@ impl AccountForm {
         frame.render_widget(paragraph, area);
     }
 
-    fn draw_readonly_field(&self, frame: &mut Frame, area: Rect, label: &str, value: &str, theme: &Theme) {
+    fn draw_readonly_field(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &str,
+        value: &str,
+        theme: &Theme,
+    ) {
         let paragraph = Paragraph::new(value.to_string())
             .style(Style::default().fg(theme.fg_disabled))
             .block(

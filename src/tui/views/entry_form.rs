@@ -257,9 +257,7 @@ impl EntryForm {
                     .lines
                     .get(self.selected_line)
                     .and_then(|l| l.account_id.as_ref())
-                    .and_then(|id| {
-                        self.available_accounts.iter().position(|a| &a.id == id)
-                    })
+                    .and_then(|id| self.available_accounts.iter().position(|a| &a.id == id))
                     .unwrap_or(0);
                 self.account_list_state.select(Some(preselect));
             }
