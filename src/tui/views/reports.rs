@@ -3,12 +3,15 @@ use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
-    text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Row, Table, Tabs},
     Frame,
 };
 
-use crate::queries::reports::{BalanceSheet, IncomeStatement, TrialBalanceLine};
+use std::collections::HashMap;
+
+use crate::queries::reports::{
+    BalanceSheet, BalanceSheetLine, IncomeStatement, IncomeStatementLine, TrialBalanceLine,
+};
 use crate::tui::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,32 @@ impl ReportType {
     }
 }
 
+/// A row in the rendered report tree
+#[derive(Debug, Clone)]
+enum ReportRow {
+    /// A leaf account or collapsed parent — balance in the Balance column
+    Account {
+        name: String,
+        balance: i64,
+        depth: usize,
+        is_last_child: bool,
+        ancestor_is_last: Vec<bool>,
+    },
+    /// A parent header when children are visible — no amount shown
+    ParentHeader {
+        name: String,
+        depth: usize,
+        is_last_child: bool,
+        ancestor_is_last: Vec<bool>,
+    },
+    /// "Total [Parent Name]" after children — amount in Subtotal column
+    Subtotal {
+        parent_name: String,
+        amount: i64,
+        depth: usize,
+    },
+}
+
 pub struct ReportsView {
     pub active_report: ReportType,
     pub trial_balance: Vec<TrialBalanceLine>,
@@ -51,6 +80,9 @@ pub struct ReportsView {
     pub editing_date: bool,
     /// Buffer for date input
     pub date_input: String,
+    /// Collapse depth: accounts deeper than this are aggregated into parents.
+    /// None means fully expanded (no collapsing).
+    pub collapse_depth: Option<usize>,
 }
 
 impl ReportsView {
@@ -65,6 +97,7 @@ impl ReportsView {
             needs_reload: false,
             editing_date: false,
             date_input: String::new(),
+            collapse_depth: None,
         }
     }
 
@@ -88,6 +121,69 @@ impl ReportsView {
     pub fn reset_to_today(&mut self) {
         self.report_date = chrono::Local::now().date_naive();
         self.needs_reload = true;
+    }
+
+    fn increase_depth(&mut self) {
+        match self.collapse_depth {
+            None => {}
+            Some(d) => {
+                let max = self.max_account_depth();
+                if d + 1 > max {
+                    self.collapse_depth = None;
+                } else {
+                    self.collapse_depth = Some(d + 1);
+                }
+            }
+        }
+    }
+
+    fn decrease_depth(&mut self) {
+        match self.collapse_depth {
+            None => {
+                let max = self.max_account_depth();
+                if max > 0 {
+                    self.collapse_depth = Some(max);
+                }
+            }
+            Some(d) if d > 0 => {
+                self.collapse_depth = Some(d - 1);
+            }
+            _ => {}
+        }
+    }
+
+    /// Find the maximum depth in the current report's account tree
+    fn max_account_depth(&self) -> usize {
+        match self.active_report {
+            ReportType::BalanceSheet => {
+                let Some(bs) = &self.balance_sheet else {
+                    return 0;
+                };
+                let all_lines: Vec<_> = bs
+                    .assets
+                    .lines
+                    .iter()
+                    .chain(bs.liabilities.lines.iter())
+                    .chain(bs.equity.lines.iter())
+                    .map(|l| (l.account_id.as_str(), l.parent_id.as_deref()))
+                    .collect();
+                compute_max_depth(&all_lines)
+            }
+            ReportType::IncomeStatement => {
+                let Some(is) = &self.income_statement else {
+                    return 0;
+                };
+                let all_lines: Vec<_> = is
+                    .revenue
+                    .lines
+                    .iter()
+                    .chain(is.expenses.lines.iter())
+                    .map(|l| (l.account_id.as_str(), l.parent_id.as_deref()))
+                    .collect();
+                compute_max_depth(&all_lines)
+            }
+            ReportType::TrialBalance => 0,
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
@@ -117,26 +213,23 @@ impl ReportsView {
             KeyCode::Right | KeyCode::Char('l') => self.next_report(),
             KeyCode::Up | KeyCode::Char('k') => self.scroll_up(),
             KeyCode::Down | KeyCode::Char('j') => self.scroll_down(),
-            // Date navigation for balance sheet/income statement
             KeyCode::Char('[') => self.previous_day(),
             KeyCode::Char(']') => self.next_day(),
             KeyCode::Char('t') => self.reset_to_today(),
             KeyCode::Char('d') => self.start_date_edit(),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.increase_depth(),
+            KeyCode::Char('-') => self.decrease_depth(),
             _ => {}
         }
     }
 
-    /// Start editing the date
     fn start_date_edit(&mut self) {
         self.editing_date = true;
         self.date_input = self.report_date.format("%Y-%m-%d").to_string();
     }
 
-    /// Apply the date input
     fn apply_date_input(&mut self) {
-        // Try parsing different formats
         let input = self.date_input.replace('/', "-");
-
         if let Ok(date) = NaiveDate::parse_from_str(&input, "%Y-%m-%d") {
             self.report_date = date;
             self.needs_reload = true;
@@ -147,7 +240,6 @@ impl ReportsView {
             self.report_date = date;
             self.needs_reload = true;
         }
-
         self.editing_date = false;
         self.date_input.clear();
     }
@@ -176,6 +268,13 @@ impl ReportsView {
         self.scroll_offset = self.scroll_offset.saturating_add(1);
     }
 
+    fn collapse_depth_label(&self) -> String {
+        match self.collapse_depth {
+            None => "all".to_string(),
+            Some(d) => d.to_string(),
+        }
+    }
+
     pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -185,7 +284,6 @@ impl ReportsView {
             ])
             .split(area);
 
-        // Draw report type tabs
         let titles = vec!["Trial Balance", "Balance Sheet", "Income Statement"];
         let tabs = Tabs::new(titles)
             .block(
@@ -202,7 +300,6 @@ impl ReportsView {
             );
         frame.render_widget(tabs, chunks[0]);
 
-        // Draw active report
         match self.active_report {
             ReportType::TrialBalance => self.draw_trial_balance(frame, chunks[1], theme),
             ReportType::BalanceSheet => self.draw_balance_sheet(frame, chunks[1], theme),
@@ -211,7 +308,10 @@ impl ReportsView {
     }
 
     fn draw_trial_balance(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let rows: Vec<Row> = self
+        let table_area = constrain_width(area, 80);
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+
+        let mut rows: Vec<Row> = self
             .trial_balance
             .iter()
             .skip(self.scroll_offset)
@@ -236,22 +336,40 @@ impl ReportsView {
             )
             .bottom_margin(1);
 
-        let footer_text = format!(
-            "Totals: Debits {} | Credits {} | {}",
-            format_currency(total_debits),
-            format_currency(total_credits),
-            if total_debits == total_credits {
-                "BALANCED"
-            } else {
-                "OUT OF BALANCE"
-            }
+        let balanced_label = if total_debits == total_credits {
+            "BALANCED"
+        } else {
+            "OUT OF BALANCE"
+        };
+
+        // Totals with rules
+        rows.push(Row::new(vec![
+            String::new(),
+            String::new(),
+            SINGLE_LINE.to_string(),
+            SINGLE_LINE.to_string(),
+        ]));
+        rows.push(
+            Row::new(vec![
+                String::new(),
+                "Totals".to_string(),
+                format_currency(total_debits),
+                format_currency(total_credits),
+            ])
+            .style(bold),
         );
+        rows.push(Row::new(vec![
+            String::new(),
+            String::new(),
+            DOUBLE_LINE.to_string(),
+            DOUBLE_LINE.to_string(),
+        ]));
 
         let table = Table::new(
             rows,
             [
                 Constraint::Length(10),
-                Constraint::Min(30),
+                Constraint::Fill(1),
                 Constraint::Length(15),
                 Constraint::Length(15),
             ],
@@ -260,10 +378,10 @@ impl ReportsView {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Trial Balance - {} ", footer_text)),
+                .title(format!(" Trial Balance - {} ", balanced_label)),
         );
 
-        frame.render_widget(table, area);
+        frame.render_widget(table, table_area);
     }
 
     fn draw_balance_sheet(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -282,98 +400,121 @@ impl ReportsView {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
 
-        // Assets
-        let mut asset_lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                "ASSETS",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
-        for acc in &bs.assets.lines {
-            asset_lines.push(Line::from(format!(
-                "  {} {}",
-                acc.account_name,
-                format_currency(acc.balance)
-            )));
-        }
-        asset_lines.push(Line::from(""));
-        asset_lines.push(Line::from(Span::styled(
-            format!("Total Assets: {}", format_currency(bs.total_assets)),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
+        let bold = Style::default().add_modifier(Modifier::BOLD);
 
+        // Assets
+        let mut asset_rows: Vec<Row> = Vec::new();
+        asset_rows.push(Row::new(vec!["ASSETS", "", ""]).style(bold));
+        asset_rows.push(Row::new(vec!["", "", ""]));
+
+        let asset_tree = build_report_rows(
+            &bs_to_inputs(&bs.assets.lines),
+            self.collapse_depth,
+        );
+        render_report_rows(&asset_tree, |b| format_currency(b), &mut asset_rows);
+
+        push_single_rule(&mut asset_rows);
+        asset_rows.push(
+            Row::new(vec![
+                "Total Assets".to_string(),
+                String::new(),
+                format_currency(bs.total_assets),
+            ])
+            .style(bold),
+        );
+        push_double_rule(&mut asset_rows);
+
+        let depth_hint = format!("depth: {} (+/-)", self.collapse_depth_label());
         let date_title = if self.editing_date {
             format!(
-                " Assets - Enter date: {}▏ (Enter: apply, Esc: cancel) ",
+                " Enter date: {}▏ (Enter/Esc) ",
                 self.date_input
             )
         } else {
             format!(
-                " Assets (as of {}) d: pick date, [/]: prev/next, t: today ",
-                bs.as_of_date
+                " Assets (as of {}) [/]: nav, d: date, t: today, {} ",
+                bs.as_of_date, depth_hint
             )
         };
-        let assets_widget = Paragraph::new(asset_lines)
-            .block(Block::default().borders(Borders::ALL).title(date_title));
-        frame.render_widget(assets_widget, chunks[0]);
+        let assets_table = Table::new(
+            asset_rows,
+            [
+                Constraint::Fill(1),
+                Constraint::Length(15),
+                Constraint::Length(15),
+            ],
+        )
+        .block(Block::default().borders(Borders::ALL).title(date_title));
+        frame.render_widget(assets_table, chunks[0]);
 
         // Liabilities & Equity
-        let mut le_lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                "LIABILITIES",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-        ];
-        for acc in &bs.liabilities.lines {
-            le_lines.push(Line::from(format!(
-                "  {} {}",
-                acc.account_name,
-                format_currency(acc.balance.abs())
-            )));
-        }
-        le_lines.push(Line::from(Span::styled(
-            format!(
-                "Total Liabilities: {}",
-                format_currency(bs.liabilities.total)
-            ),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        le_lines.push(Line::from(""));
-        le_lines.push(Line::from(Span::styled(
-            "EQUITY",
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        le_lines.push(Line::from(""));
-        for acc in &bs.equity.lines {
-            le_lines.push(Line::from(format!(
-                "  {} {}",
-                acc.account_name,
-                format_currency(acc.balance.abs())
-            )));
-        }
-        le_lines.push(Line::from(Span::styled(
-            format!("Total Equity: {}", format_currency(bs.equity.total)),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        le_lines.push(Line::from(""));
-        le_lines.push(Line::from(Span::styled(
-            format!(
-                "Total L+E: {}",
-                format_currency(bs.total_liabilities_and_equity)
-            ),
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(theme.header),
-        )));
+        let mut le_rows: Vec<Row> = Vec::new();
+        le_rows.push(Row::new(vec!["LIABILITIES", "", ""]).style(bold));
+        le_rows.push(Row::new(vec!["", "", ""]));
 
-        let le_widget = Paragraph::new(le_lines).block(
+        let liab_tree = build_report_rows(
+            &bs_to_inputs(&bs.liabilities.lines),
+            self.collapse_depth,
+        );
+        render_report_rows(&liab_tree, |b| format_currency(b.abs()), &mut le_rows);
+
+        push_single_rule(&mut le_rows);
+        le_rows.push(
+            Row::new(vec![
+                "Total Liabilities".to_string(),
+                String::new(),
+                format_currency(bs.liabilities.total),
+            ])
+            .style(bold),
+        );
+        push_single_rule(&mut le_rows);
+        le_rows.push(Row::new(vec!["", "", ""]));
+        le_rows.push(Row::new(vec!["EQUITY", "", ""]).style(bold));
+        le_rows.push(Row::new(vec!["", "", ""]));
+
+        let equity_tree = build_report_rows(
+            &bs_to_inputs(&bs.equity.lines),
+            self.collapse_depth,
+        );
+        render_report_rows(&equity_tree, |b| format_currency(b.abs()), &mut le_rows);
+
+        push_single_rule(&mut le_rows);
+        le_rows.push(
+            Row::new(vec![
+                "Total Equity".to_string(),
+                String::new(),
+                format_currency(bs.equity.total),
+            ])
+            .style(bold),
+        );
+        push_single_rule(&mut le_rows);
+        le_rows.push(Row::new(vec!["", "", ""]));
+
+        push_single_rule(&mut le_rows);
+        le_rows.push(
+            Row::new(vec![
+                "Total L+E".to_string(),
+                String::new(),
+                format_currency(bs.total_liabilities_and_equity),
+            ])
+            .style(bold.fg(theme.header)),
+        );
+        push_double_rule(&mut le_rows);
+
+        let le_table = Table::new(
+            le_rows,
+            [
+                Constraint::Fill(1),
+                Constraint::Length(15),
+                Constraint::Length(15),
+            ],
+        )
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Liabilities & Equity "),
         );
-        frame.render_widget(le_widget, chunks[1]);
+        frame.render_widget(le_table, chunks[1]);
     }
 
     fn draw_income_statement(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -387,84 +528,93 @@ impl ReportsView {
             return;
         };
 
-        let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                "REVENUE",
-                Style::default()
-                    .add_modifier(Modifier::BOLD)
-                    .fg(theme.success),
-            )),
-            Line::from(""),
-        ];
+        // Constrain width so the table isn't too spread out
+        let table_area = constrain_width(area, 75);
 
-        for acc in &is.revenue.lines {
-            lines.push(Line::from(format!(
-                "  {} {}",
-                acc.account_name,
-                format_currency(acc.balance)
-            )));
-        }
-        lines.push(Line::from(Span::styled(
-            format!("Total Revenue: {}", format_currency(is.revenue.total)),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let mut rows: Vec<Row> = Vec::new();
 
-        lines.push(Line::from(Span::styled(
-            "EXPENSES",
-            Style::default().add_modifier(Modifier::BOLD).fg(theme.error),
-        )));
-        lines.push(Line::from(""));
+        rows.push(Row::new(vec!["REVENUE", "", ""]).style(bold.fg(theme.success)));
+        rows.push(Row::new(vec!["", "", ""]));
+        let rev_tree = build_report_rows(
+            &is_to_inputs(&is.revenue.lines),
+            self.collapse_depth,
+        );
+        render_report_rows(&rev_tree, |b| format_currency(b), &mut rows);
+        push_single_rule(&mut rows);
+        rows.push(
+            Row::new(vec![
+                "Total Revenue".to_string(),
+                String::new(),
+                format_currency(is.revenue.total),
+            ])
+            .style(bold),
+        );
+        push_single_rule(&mut rows);
+        rows.push(Row::new(vec!["", "", ""]));
 
-        for acc in &is.expenses.lines {
-            lines.push(Line::from(format!(
-                "  {} {}",
-                acc.account_name,
-                format_currency(acc.balance)
-            )));
-        }
-        lines.push(Line::from(Span::styled(
-            format!("Total Expenses: {}", format_currency(is.expenses.total)),
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from("═".repeat(40)));
-        lines.push(Line::from(""));
+        rows.push(Row::new(vec!["EXPENSES", "", ""]).style(bold.fg(theme.error)));
+        rows.push(Row::new(vec!["", "", ""]));
+        let exp_tree = build_report_rows(
+            &is_to_inputs(&is.expenses.lines),
+            self.collapse_depth,
+        );
+        render_report_rows(&exp_tree, |b| format_currency(b), &mut rows);
+        push_single_rule(&mut rows);
+        rows.push(
+            Row::new(vec![
+                "Total Expenses".to_string(),
+                String::new(),
+                format_currency(is.expenses.total),
+            ])
+            .style(bold),
+        );
+        push_single_rule(&mut rows);
+        rows.push(Row::new(vec!["", "", ""]));
 
         let net_income_style = if is.net_income >= 0 {
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(theme.success)
+            bold.fg(theme.success)
         } else {
-            Style::default().add_modifier(Modifier::BOLD).fg(theme.error)
+            bold.fg(theme.error)
         };
+        let net_income_str = if is.net_income >= 0 {
+            format_currency(is.net_income)
+        } else {
+            format!("({}) LOSS", format_currency(-is.net_income))
+        };
+        push_single_rule(&mut rows);
+        rows.push(
+            Row::new(vec![
+                "NET INCOME".to_string(),
+                String::new(),
+                net_income_str,
+            ])
+            .style(net_income_style),
+        );
+        push_double_rule(&mut rows);
 
-        lines.push(Line::from(Span::styled(
-            format!(
-                "NET INCOME: {}",
-                if is.net_income >= 0 {
-                    format_currency(is.net_income)
-                } else {
-                    format!("({}) LOSS", format_currency(-is.net_income))
-                }
-            ),
-            net_income_style,
-        )));
-
+        let depth_hint = format!("depth: {} (+/-)", self.collapse_depth_label());
         let date_title = if self.editing_date {
             format!(
-                " Income Statement - Enter date: {}▏ (Enter: apply, Esc: cancel) ",
+                " Enter date: {}▏ (Enter/Esc) ",
                 self.date_input
             )
         } else {
             format!(
-                " Income Statement ({} to {}) d: pick date, [/]: prev/next, t: today ",
-                is.start_date, is.end_date
+                " Income Statement ({} to {}) [/]: nav, d: date, {} ",
+                is.start_date, is.end_date, depth_hint
             )
         };
-        let widget =
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(date_title));
-        frame.render_widget(widget, area);
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Fill(1),
+                Constraint::Length(15),
+                Constraint::Length(15),
+            ],
+        )
+        .block(Block::default().borders(Borders::ALL).title(date_title));
+        frame.render_widget(table, table_area);
     }
 }
 
@@ -477,4 +627,340 @@ impl Default for ReportsView {
 fn format_currency(cents: i64) -> String {
     let dollars = cents as f64 / 100.0;
     format!("${:.2}", dollars)
+}
+
+const SINGLE_LINE: &str = "───────────────";
+const DOUBLE_LINE: &str = "═══════════════";
+
+/// Push a single horizontal rule row (3-column: empty | line | line)
+fn push_single_rule(rows: &mut Vec<Row>) {
+    rows.push(Row::new(vec![
+        String::new(),
+        SINGLE_LINE.to_string(),
+        SINGLE_LINE.to_string(),
+    ]));
+}
+
+/// Push a double horizontal rule row (3-column: empty | line | line)
+fn push_double_rule(rows: &mut Vec<Row>) {
+    rows.push(Row::new(vec![
+        String::new(),
+        DOUBLE_LINE.to_string(),
+        DOUBLE_LINE.to_string(),
+    ]));
+}
+
+/// Constrain an area to a max width, left-aligned
+fn constrain_width(area: Rect, max_width: u16) -> Rect {
+    if area.width <= max_width {
+        area
+    } else {
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: max_width,
+            height: area.height,
+        }
+    }
+}
+
+// --- Tree building infrastructure ---
+
+/// Common input for the tree builder, extracted from either BS or IS lines
+struct TreeInput<'a> {
+    account_id: &'a str,
+    account_number: &'a str,
+    account_name: &'a str,
+    parent_id: Option<&'a str>,
+    balance: i64,
+}
+
+fn bs_to_inputs(lines: &[BalanceSheetLine]) -> Vec<TreeInput<'_>> {
+    lines
+        .iter()
+        .map(|l| TreeInput {
+            account_id: &l.account_id,
+            account_number: &l.account_number,
+            account_name: &l.account_name,
+            parent_id: l.parent_id.as_deref(),
+            balance: l.balance,
+        })
+        .collect()
+}
+
+fn is_to_inputs(lines: &[IncomeStatementLine]) -> Vec<TreeInput<'_>> {
+    lines
+        .iter()
+        .map(|l| TreeInput {
+            account_id: &l.account_id,
+            account_number: &l.account_number,
+            account_name: &l.account_name,
+            parent_id: l.parent_id.as_deref(),
+            balance: l.balance,
+        })
+        .collect()
+}
+
+/// Compute the max depth of accounts in a set of (id, parent_id) pairs
+fn compute_max_depth(lines: &[(&str, Option<&str>)]) -> usize {
+    let ids: std::collections::HashSet<&str> = lines.iter().map(|(id, _)| *id).collect();
+    let parent_map: HashMap<&str, Option<&str>> =
+        lines.iter().map(|(id, pid)| (*id, *pid)).collect();
+
+    let mut max_depth = 0;
+    for (id, _) in lines {
+        let mut depth = 0;
+        let mut current = *id;
+        while let Some(Some(pid)) = parent_map.get(current) {
+            if ids.contains(pid) {
+                depth += 1;
+                current = pid;
+            } else {
+                break;
+            }
+        }
+        if depth > max_depth {
+            max_depth = depth;
+        }
+    }
+    max_depth
+}
+
+/// Build a flat list of ReportRows from tree inputs.
+///
+/// - Parent accounts with visible children emit: ParentHeader, children..., Subtotal
+/// - Leaf accounts or collapsed parents emit: Account (with balance/aggregated total)
+fn build_report_rows(inputs: &[TreeInput<'_>], collapse_depth: Option<usize>) -> Vec<ReportRow> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+
+    let id_set: std::collections::HashSet<&str> =
+        inputs.iter().map(|l| l.account_id).collect();
+
+    // Build parent->children index map
+    let mut children_map: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+    for (idx, input) in inputs.iter().enumerate() {
+        let effective_parent = match input.parent_id {
+            Some(pid) if id_set.contains(pid) => Some(pid),
+            _ => None,
+        };
+        children_map.entry(effective_parent).or_default().push(idx);
+    }
+
+    // Sort children by account number
+    for children in children_map.values_mut() {
+        children.sort_by(|&a, &b| inputs[a].account_number.cmp(&inputs[b].account_number));
+    }
+
+    // Compute subtotals for every node (own balance + all descendants)
+    let mut subtotals: HashMap<&str, i64> = HashMap::new();
+    fn compute_subtotal<'a>(
+        inputs: &[TreeInput<'a>],
+        children_map: &HashMap<Option<&'a str>, Vec<usize>>,
+        account_id: &'a str,
+        subtotals: &mut HashMap<&'a str, i64>,
+    ) -> i64 {
+        if let Some(&cached) = subtotals.get(account_id) {
+            return cached;
+        }
+        let own_balance = inputs
+            .iter()
+            .find(|i| i.account_id == account_id)
+            .map(|i| i.balance)
+            .unwrap_or(0);
+        let children_total: i64 = children_map
+            .get(&Some(account_id))
+            .map(|children| {
+                children
+                    .iter()
+                    .map(|&idx| {
+                        compute_subtotal(
+                            inputs,
+                            children_map,
+                            inputs[idx].account_id,
+                            subtotals,
+                        )
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        let total = own_balance + children_total;
+        subtotals.insert(account_id, total);
+        total
+    }
+
+    for input in inputs {
+        compute_subtotal(inputs, &children_map, input.account_id, &mut subtotals);
+    }
+
+    // Walk the tree and emit ReportRows
+    let mut result = Vec::new();
+
+    fn emit_rows<'a>(
+        inputs: &[TreeInput<'a>],
+        children_map: &HashMap<Option<&'a str>, Vec<usize>>,
+        subtotals: &HashMap<&str, i64>,
+        parent_id: Option<&'a str>,
+        depth: usize,
+        collapse_depth: Option<usize>,
+        ancestor_is_last: &[bool],
+        result: &mut Vec<ReportRow>,
+    ) {
+        let Some(children) = children_map.get(&parent_id) else {
+            return;
+        };
+        let count = children.len();
+        for (i, &idx) in children.iter().enumerate() {
+            let input = &inputs[idx];
+            let is_last = i == count - 1;
+            let has_visible_children = {
+                let has_kids = children_map
+                    .get(&Some(input.account_id))
+                    .map(|c| !c.is_empty())
+                    .unwrap_or(false);
+                let within_depth = match collapse_depth {
+                    None => true,
+                    Some(max_d) => depth < max_d,
+                };
+                has_kids && within_depth
+            };
+
+            if has_visible_children {
+                // Parent with visible children: emit header, recurse, emit subtotal
+                result.push(ReportRow::ParentHeader {
+                    name: input.account_name.to_string(),
+                    depth,
+                    is_last_child: is_last,
+                    ancestor_is_last: ancestor_is_last.to_vec(),
+                });
+
+                let mut new_ancestors = ancestor_is_last.to_vec();
+                new_ancestors.push(is_last);
+                emit_rows(
+                    inputs,
+                    children_map,
+                    subtotals,
+                    Some(input.account_id),
+                    depth + 1,
+                    collapse_depth,
+                    &new_ancestors,
+                    result,
+                );
+
+                result.push(ReportRow::Subtotal {
+                    parent_name: input.account_name.to_string(),
+                    amount: subtotals[input.account_id],
+                    depth,
+                });
+            } else {
+                // Leaf or collapsed parent: show aggregated balance
+                result.push(ReportRow::Account {
+                    name: input.account_name.to_string(),
+                    balance: subtotals[input.account_id],
+                    depth,
+                    is_last_child: is_last,
+                    ancestor_is_last: ancestor_is_last.to_vec(),
+                });
+            }
+        }
+    }
+
+    emit_rows(
+        inputs,
+        &children_map,
+        &subtotals,
+        None,
+        0,
+        collapse_depth,
+        &[],
+        &mut result,
+    );
+
+    result
+}
+
+/// Convert ReportRows into table Rows (3-column: Account | Balance | Subtotal).
+/// `fmt_balance` controls how the raw i64 balance is formatted (e.g. abs() for liabilities).
+fn render_report_rows(
+    report_rows: &[ReportRow],
+    fmt_balance: impl Fn(i64) -> String,
+    out: &mut Vec<Row>,
+) {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+
+    for row in report_rows {
+        match row {
+            ReportRow::Account {
+                name,
+                balance,
+                depth,
+                is_last_child,
+                ancestor_is_last,
+            } => {
+                let prefix = make_tree_prefix(*depth, *is_last_child, ancestor_is_last);
+                let name_col = format!("  {}{}", prefix, name);
+                out.push(Row::new(vec![
+                    name_col,
+                    fmt_balance(*balance),
+                    String::new(),
+                ]));
+            }
+            ReportRow::ParentHeader {
+                name,
+                depth,
+                is_last_child,
+                ancestor_is_last,
+            } => {
+                let prefix = make_tree_prefix(*depth, *is_last_child, ancestor_is_last);
+                let name_col = format!("  {}{}", prefix, name);
+                out.push(
+                    Row::new(vec![name_col, String::new(), String::new()]).style(bold),
+                );
+            }
+            ReportRow::Subtotal {
+                parent_name,
+                amount,
+                depth,
+            } => {
+                // Single rule above subtotal
+                out.push(Row::new(vec![
+                    String::new(),
+                    String::new(),
+                    SINGLE_LINE.to_string(),
+                ]));
+                // Indent the subtotal line to align with the parent's children
+                let indent = "   ".repeat(*depth);
+                let name_col = format!("  {}  Total {}", indent, parent_name);
+                out.push(
+                    Row::new(vec![name_col, String::new(), fmt_balance(*amount)])
+                        .style(bold),
+                );
+            }
+        }
+    }
+}
+
+/// Generate tree prefix string for a node at given depth
+fn make_tree_prefix(depth: usize, is_last_child: bool, ancestor_is_last: &[bool]) -> String {
+    if depth == 0 {
+        return String::new();
+    }
+
+    let mut prefix = String::new();
+    for &ail in ancestor_is_last {
+        if ail {
+            prefix.push_str("   ");
+        } else {
+            prefix.push_str("│  ");
+        }
+    }
+
+    if is_last_child {
+        prefix.push_str("└─ ");
+    } else {
+        prefix.push_str("├─ ");
+    }
+
+    prefix
 }

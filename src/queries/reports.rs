@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::domain::AccountType;
 use crate::queries::account_queries::AccountQueries;
 use chrono::NaiveDate;
@@ -37,9 +39,11 @@ pub struct TrialBalance {
 /// A line in the balance sheet
 #[derive(Debug, Clone)]
 pub struct BalanceSheetLine {
+    pub account_id: String,
     pub account_number: String,
     pub account_name: String,
     pub account_type: AccountType,
+    pub parent_id: Option<String>,
     pub balance: i64,
 }
 
@@ -66,8 +70,10 @@ pub struct BalanceSheet {
 /// A line in the income statement
 #[derive(Debug, Clone)]
 pub struct IncomeStatementLine {
+    pub account_id: String,
     pub account_number: String,
     pub account_name: String,
+    pub parent_id: Option<String>,
     pub balance: i64,
 }
 
@@ -171,10 +177,13 @@ impl<'a> Reports<'a> {
                 continue;
             }
 
+            let account = queries.get_account(&balance.account_id)?;
             let line = BalanceSheetLine {
+                account_id: balance.account_id,
                 account_number: balance.account_number,
                 account_name: balance.account_name,
                 account_type: balance.account_type,
+                parent_id: account.parent_id,
                 balance: balance.balance,
             };
 
@@ -190,12 +199,19 @@ impl<'a> Reports<'a> {
         let income = self.calculate_net_income(None, Some(as_of_date))?;
         if income != 0 {
             equity.push(BalanceSheetLine {
+                account_id: "__net_income__".to_string(),
                 account_number: "".to_string(),
                 account_name: "Current Year Net Income".to_string(),
                 account_type: AccountType::Equity,
+                parent_id: None,
                 balance: -income, // Credit balance
             });
         }
+
+        // Backfill ancestor accounts so the tree is complete
+        self.backfill_bs_ancestors(&queries, &mut assets)?;
+        self.backfill_bs_ancestors(&queries, &mut liabilities)?;
+        self.backfill_bs_ancestors(&queries, &mut equity)?;
 
         let total_assets: i64 = assets.iter().map(|l| l.balance).sum();
         // For credit-normal accounts, negate balance to convert:
@@ -262,8 +278,10 @@ impl<'a> Reports<'a> {
             }
 
             let line = IncomeStatementLine {
+                account_id: account.id.clone(),
                 account_number: account.account_number,
                 account_name: account.name,
+                parent_id: account.parent_id,
                 balance: period_change.abs(),
             };
 
@@ -273,6 +291,10 @@ impl<'a> Reports<'a> {
                 _ => {}
             }
         }
+
+        // Backfill ancestor accounts so the tree is complete
+        self.backfill_is_ancestors(&queries, &mut revenue_lines)?;
+        self.backfill_is_ancestors(&queries, &mut expense_lines)?;
 
         let total_revenue: i64 = revenue_lines.iter().map(|l| l.balance).sum();
         let total_expenses: i64 = expense_lines.iter().map(|l| l.balance).sum();
@@ -293,6 +315,75 @@ impl<'a> Reports<'a> {
             },
             net_income,
         })
+    }
+
+    /// Ensure all ancestor accounts are present in a balance sheet section.
+    /// Parent accounts that have no direct balance are added with balance 0
+    /// so the tree structure is complete for display.
+    fn backfill_bs_ancestors(
+        &self,
+        queries: &AccountQueries,
+        lines: &mut Vec<BalanceSheetLine>,
+    ) -> Result<(), ReportError> {
+        let existing_ids: HashSet<String> = lines.iter().map(|l| l.account_id.clone()).collect();
+        let mut to_add: Vec<BalanceSheetLine> = Vec::new();
+        let mut seen: HashSet<String> = existing_ids.clone();
+
+        for line in lines.iter() {
+            let mut parent_id = line.parent_id.clone();
+            while let Some(pid) = parent_id {
+                if seen.contains(&pid) {
+                    break;
+                }
+                seen.insert(pid.clone());
+                let parent = queries.get_account(&pid)?;
+                parent_id = parent.parent_id.clone();
+                to_add.push(BalanceSheetLine {
+                    account_id: parent.id,
+                    account_number: parent.account_number,
+                    account_name: parent.name,
+                    account_type: parent.account_type,
+                    parent_id: parent.parent_id,
+                    balance: 0,
+                });
+            }
+        }
+
+        lines.extend(to_add);
+        Ok(())
+    }
+
+    /// Ensure all ancestor accounts are present in an income statement section.
+    fn backfill_is_ancestors(
+        &self,
+        queries: &AccountQueries,
+        lines: &mut Vec<IncomeStatementLine>,
+    ) -> Result<(), ReportError> {
+        let existing_ids: HashSet<String> = lines.iter().map(|l| l.account_id.clone()).collect();
+        let mut to_add: Vec<IncomeStatementLine> = Vec::new();
+        let mut seen: HashSet<String> = existing_ids.clone();
+
+        for line in lines.iter() {
+            let mut parent_id = line.parent_id.clone();
+            while let Some(pid) = parent_id {
+                if seen.contains(&pid) {
+                    break;
+                }
+                seen.insert(pid.clone());
+                let parent = queries.get_account(&pid)?;
+                parent_id = parent.parent_id.clone();
+                to_add.push(IncomeStatementLine {
+                    account_id: parent.id,
+                    account_number: parent.account_number,
+                    account_name: parent.name,
+                    parent_id: parent.parent_id,
+                    balance: 0,
+                });
+            }
+        }
+
+        lines.extend(to_add);
+        Ok(())
     }
 
     /// Calculate net income for a period
