@@ -231,8 +231,11 @@ impl EntryForm {
                         .is_some()
                     {
                         self.line_edit_mode = LineEditMode::EditAmount;
+                        self.prefill_balancing_amount();
                         if let Some(line) = self.lines.get_mut(self.selected_line) {
-                            line.editing_debit = true;
+                            if line.debit_str.is_empty() && line.credit_str.is_empty() {
+                                line.editing_debit = true;
+                            }
                         }
                     } else {
                         self.line_edit_mode = LineEditMode::SelectAccount;
@@ -247,6 +250,9 @@ impl EntryForm {
                 // Add new line
                 self.lines.push(EditableLine::new());
                 self.selected_line = self.lines.len() - 1;
+                // Pre-fill balancing amount (uses the helper which checks
+                // all other lines)
+                self.prefill_balancing_amount();
             }
             KeyCode::Char('a') if self.active_field == FormField::Lines => {
                 // Re-open the account picker for the selected line, even
@@ -286,6 +292,33 @@ impl EntryForm {
         }
     }
 
+    /// If the current line has no amount, pre-fill it with the value that
+    /// would balance the transaction against all *other* lines.
+    fn prefill_balancing_amount(&mut self) {
+        let line = &self.lines[self.selected_line];
+        if !line.debit_str.is_empty() || !line.credit_str.is_empty() {
+            return; // already has an amount, don't overwrite
+        }
+        let imbalance: i64 = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != self.selected_line)
+            .map(|(_, l)| l.amount())
+            .sum();
+        if imbalance == 0 {
+            return;
+        }
+        let line = &mut self.lines[self.selected_line];
+        if imbalance > 0 {
+            line.credit_str = format!("{:.2}", imbalance as f64 / 100.0);
+            line.editing_debit = false;
+        } else {
+            line.debit_str = format!("{:.2}", (-imbalance) as f64 / 100.0);
+            line.editing_debit = true;
+        }
+    }
+
     fn handle_account_selection_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Esc => {
@@ -304,7 +337,12 @@ impl EntryForm {
                     // Move to amount editing
                     self.line_edit_mode = LineEditMode::EditAmount;
                     self.account_filter.clear();
-                    self.lines[self.selected_line].editing_debit = true;
+                    self.prefill_balancing_amount();
+                    if self.lines[self.selected_line].debit_str.is_empty()
+                        && self.lines[self.selected_line].credit_str.is_empty()
+                    {
+                        self.lines[self.selected_line].editing_debit = true;
+                    }
                 }
                 // If the filter excluded everything, stay in picker so the
                 // user can correct their query rather than silently bailing.
@@ -374,6 +412,16 @@ impl EntryForm {
             KeyCode::Tab => {
                 // Toggle between debit and credit
                 line.editing_debit = !line.editing_debit;
+            }
+            KeyCode::BackTab => {
+                // Shift+Tab: go back to previous field
+                if line.editing_debit {
+                    // Already on first field (debit), exit amount editing
+                    self.line_edit_mode = LineEditMode::Navigation;
+                } else {
+                    // On credit, go back to debit
+                    line.editing_debit = true;
+                }
             }
             KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
                 let field = if line.editing_debit {

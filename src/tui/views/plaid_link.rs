@@ -68,6 +68,9 @@ pub struct PlaidLinkModal {
 
     /// Selected index in the available accounts list
     selected: usize,
+
+    /// Scroll offset for the account list
+    scroll_offset: u16,
 }
 
 impl PlaidLinkModal {
@@ -80,6 +83,7 @@ impl PlaidLinkModal {
             current_mapping: None,
             available_accounts: Vec::new(),
             selected: 0,
+            scroll_offset: 0,
         }
     }
 
@@ -97,6 +101,7 @@ impl PlaidLinkModal {
         self.current_mapping = current_mapping;
         self.available_accounts = available_accounts;
         self.selected = 0;
+        self.scroll_offset = 0;
     }
 
     pub fn hide(&mut self) {
@@ -106,6 +111,7 @@ impl PlaidLinkModal {
         self.current_mapping = None;
         self.available_accounts.clear();
         self.selected = 0;
+        self.scroll_offset = 0;
     }
 
     pub fn handle_key(&mut self, key: KeyCode) {
@@ -155,7 +161,7 @@ impl PlaidLinkModal {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if !self.visible {
             return;
         }
@@ -299,7 +305,25 @@ impl PlaidLinkModal {
             ]));
         }
 
-        let paragraph = Paragraph::new(lines);
+        // The account list starts after the header lines (status + blank + "Available..." + blank = 4 lines).
+        // Each account is 1 line, then 1 blank + 1 help line at the bottom.
+        // We need the selected account line to be visible within `inner.height`.
+        let header_lines = if self.current_mapping.is_some() { 2 } else { 1 };
+        // +1 blank, +1 "Available...", +1 blank = 3 more before account items
+        let lines_before_accounts = (header_lines + 3) as u16;
+        let visible_height = inner.height;
+
+        // Line of the selected account within the full content
+        let selected_line = lines_before_accounts + self.selected as u16;
+
+        // Adjust scroll so selected item is visible
+        if selected_line < self.scroll_offset {
+            self.scroll_offset = selected_line;
+        } else if selected_line >= self.scroll_offset + visible_height {
+            self.scroll_offset = selected_line - visible_height + 1;
+        }
+
+        let paragraph = Paragraph::new(lines).scroll((self.scroll_offset, 0));
         frame.render_widget(paragraph, inner);
     }
 }

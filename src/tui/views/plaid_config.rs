@@ -18,16 +18,32 @@ pub enum PlaidConfigResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    Register,
+    Login,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigField {
     ProxyUrl,
     Email,
+    Password,
 }
 
 impl ConfigField {
     fn next(&self) -> Self {
         match self {
             ConfigField::ProxyUrl => ConfigField::Email,
+            ConfigField::Email => ConfigField::Password,
+            ConfigField::Password => ConfigField::ProxyUrl,
+        }
+    }
+
+    fn prev(&self) -> Self {
+        match self {
+            ConfigField::ProxyUrl => ConfigField::Password,
             ConfigField::Email => ConfigField::ProxyUrl,
+            ConfigField::Password => ConfigField::Email,
         }
     }
 }
@@ -39,7 +55,9 @@ pub struct PlaidConfigModal {
     active_field: ConfigField,
     proxy_url: String,
     email: String,
+    password: String,
     already_registered: bool,
+    auth_mode: AuthMode,
     error_message: Option<String>,
 }
 
@@ -51,7 +69,9 @@ impl PlaidConfigModal {
             active_field: ConfigField::ProxyUrl,
             proxy_url: String::new(),
             email: String::new(),
+            password: String::new(),
             already_registered: false,
+            auth_mode: AuthMode::Register,
             error_message: None,
         }
     }
@@ -61,9 +81,11 @@ impl PlaidConfigModal {
         self.proxy_url = config.plaid.proxy_url.unwrap_or_default();
         self.already_registered = config.plaid.api_key.is_some();
         self.email.clear();
+        self.password.clear();
         self.visible = true;
         self.result = PlaidConfigResult::None;
         self.active_field = ConfigField::ProxyUrl;
+        self.auth_mode = AuthMode::Register;
         self.error_message = None;
     }
 
@@ -76,9 +98,14 @@ impl PlaidConfigModal {
             KeyCode::Esc => {
                 self.result = PlaidConfigResult::Cancel;
             }
-            KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
+            KeyCode::Tab | KeyCode::Down => {
                 if !self.already_registered {
                     self.active_field = self.active_field.next();
+                }
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                if !self.already_registered {
+                    self.active_field = self.active_field.prev();
                 }
             }
             KeyCode::Enter => {
@@ -89,6 +116,7 @@ impl PlaidConfigModal {
                 match self.active_field {
                     ConfigField::ProxyUrl => self.proxy_url.push(c),
                     ConfigField::Email => self.email.push(c),
+                    ConfigField::Password => self.password.push(c),
                 }
             }
             KeyCode::Backspace => {
@@ -100,6 +128,9 @@ impl PlaidConfigModal {
                     ConfigField::Email => {
                         self.email.pop();
                     }
+                    ConfigField::Password => {
+                        self.password.pop();
+                    }
                 }
             }
             _ => {}
@@ -109,7 +140,7 @@ impl PlaidConfigModal {
     fn normalize_url(&self) -> String {
         let mut url = self.proxy_url.trim().to_string();
         if !url.is_empty() && !url.starts_with("http://") && !url.starts_with("https://") {
-            url = format!("http://{}", url);
+            url = format!("https://{}", url);
         }
         url.trim_end_matches('/').to_string()
     }
@@ -142,17 +173,32 @@ impl PlaidConfigModal {
             return;
         }
 
-        // Register with the proxy to get an API key.
-        // All reqwest work (including reading/dropping the response) must happen
-        // on a separate thread to avoid "cannot drop a runtime" inside tokio.
-        let register_url = format!("{}/auth/register", proxy_url);
-        let api_key: Result<String, String> = std::thread::spawn(move || {
+        let password = self.password.clone();
+        if password.len() < 8 {
+            self.error_message = Some("Password must be at least 8 characters".to_string());
+            self.active_field = ConfigField::Password;
+            return;
+        }
+
+        let auth_mode = self.auth_mode;
+        let (endpoint, body) = match auth_mode {
+            AuthMode::Register => (
+                format!("{}/auth/register", proxy_url),
+                serde_json::json!({ "email": email, "password": password }),
+            ),
+            AuthMode::Login => (
+                format!("{}/auth/login", proxy_url),
+                serde_json::json!({ "email": email, "password": password }),
+            ),
+        };
+
+        let api_key: Result<String, (String, bool)> = std::thread::spawn(move || {
             let client = reqwest::blocking::Client::new();
             let resp = client
-                .post(&register_url)
-                .json(&serde_json::json!({ "email": email }))
+                .post(&endpoint)
+                .json(&body)
                 .send()
-                .map_err(|e| format!("Connection failed: {}", e))?;
+                .map_err(|e| (format!("Connection failed: {}", e), false))?;
 
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -161,25 +207,35 @@ impl PlaidConfigModal {
                     .ok()
                     .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
                     .unwrap_or(text);
-                return Err(format!("Registration failed ({}): {}", status, msg));
+
+                let is_already_registered = auth_mode == AuthMode::Register
+                    && msg.to_lowercase().contains("already registered");
+
+                return Err((format!("{} ({})", msg, status), is_already_registered));
             }
 
             let body: serde_json::Value = resp
                 .json()
-                .map_err(|e| format!("Invalid response: {}", e))?;
+                .map_err(|e| (format!("Invalid response: {}", e), false))?;
 
             body["api_key"]
                 .as_str()
                 .map(|s| s.to_string())
-                .ok_or_else(|| "No API key in response".to_string())
+                .ok_or_else(|| ("No API key in response".to_string(), false))
         })
         .join()
-        .unwrap_or_else(|_| Err("Registration thread panicked".to_string()));
+        .unwrap_or_else(|_| Err(("Request thread panicked".to_string(), false)));
 
         let api_key = match api_key {
             Ok(k) => k,
-            Err(e) => {
-                self.error_message = Some(e);
+            Err((msg, is_already_registered)) => {
+                if is_already_registered {
+                    self.auth_mode = AuthMode::Login;
+                    self.error_message =
+                        Some("Email already registered — enter your password to log in".to_string());
+                } else {
+                    self.error_message = Some(msg);
+                }
                 return;
             }
         };
@@ -199,13 +255,18 @@ impl PlaidConfigModal {
             return;
         }
 
-        let modal_area = centered_rect(50, 40, area);
+        let modal_area = centered_rect(50, 50, area);
         frame.render_widget(Clear, modal_area);
+
+        let title = match self.auth_mode {
+            AuthMode::Register => " Plaid Configuration ",
+            AuthMode::Login => " Plaid Login ",
+        };
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent))
-            .title(" Plaid Configuration ")
+            .title(title)
             .title_style(
                 Style::default()
                     .fg(theme.accent)
@@ -229,7 +290,7 @@ impl PlaidConfigModal {
                 ])
                 .split(inner);
 
-            self.draw_text_field(frame, chunks[0], "Proxy URL", &self.proxy_url, true, theme);
+            self.draw_text_field(frame, chunks[0], "Proxy URL", &self.proxy_url, false, true, theme);
 
             let status = Paragraph::new(Line::from(Span::styled(
                 "  Registered (API key saved)",
@@ -239,36 +300,53 @@ impl PlaidConfigModal {
 
             self.draw_help(frame, chunks[3], theme);
         } else {
-            // Registration mode: proxy URL + email
+            // Auth mode: proxy URL + email + password
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3), // Proxy URL
                     Constraint::Length(3), // Email
+                    Constraint::Length(3), // Password
                     Constraint::Length(1), // spacer
                     Constraint::Length(2), // Help
                     Constraint::Min(0),
                 ])
                 .split(inner);
 
+            let mode_label = match self.auth_mode {
+                AuthMode::Register => "Email",
+                AuthMode::Login => "Email",
+            };
+
             self.draw_text_field(
                 frame,
                 chunks[0],
                 "Proxy URL",
                 &self.proxy_url,
+                false,
                 self.active_field == ConfigField::ProxyUrl,
                 theme,
             );
             self.draw_text_field(
                 frame,
                 chunks[1],
-                "Email (for registration)",
+                mode_label,
                 &self.email,
+                false,
                 self.active_field == ConfigField::Email,
                 theme,
             );
+            self.draw_text_field(
+                frame,
+                chunks[2],
+                "Password",
+                &self.password,
+                true,
+                self.active_field == ConfigField::Password,
+                theme,
+            );
 
-            self.draw_help(frame, chunks[3], theme);
+            self.draw_help(frame, chunks[4], theme);
         }
     }
 
@@ -294,6 +372,7 @@ impl PlaidConfigModal {
         area: Rect,
         label: &str,
         value: &str,
+        is_secret: bool,
         is_active: bool,
         theme: &Theme,
     ) {
@@ -309,10 +388,16 @@ impl PlaidConfigModal {
             Style::default().fg(theme.input_inactive_border)
         };
 
-        let display = if is_active {
-            format!("{}█", value)
+        let displayed_value = if is_secret {
+            "*".repeat(value.len())
         } else {
             value.to_string()
+        };
+
+        let display = if is_active {
+            format!("{}█", displayed_value)
+        } else {
+            displayed_value
         };
 
         let paragraph = Paragraph::new(display).style(style).block(
