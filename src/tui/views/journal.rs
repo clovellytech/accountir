@@ -496,13 +496,13 @@ impl JournalView {
         let shift = modifiers.contains(KeyModifiers::SHIFT);
 
         match key {
-            // Shift+Up/Down: extend selection while moving the cursor (ledger only)
-            KeyCode::Up if shift && is_ledger => {
+            // Shift+Up/Down/k/j: extend selection while moving the cursor (ledger only)
+            KeyCode::Up | KeyCode::Char('K') if shift && is_ledger => {
                 self.select_current(); // ensure starting row is in the set
                 self.previous();
                 self.select_current();
             }
-            KeyCode::Down if shift && is_ledger => {
+            KeyCode::Down | KeyCode::Char('J') if shift && is_ledger => {
                 self.select_current();
                 self.next();
                 self.select_current();
