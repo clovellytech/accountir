@@ -13,6 +13,8 @@ pub struct PlaidView {
     pub items: Vec<PlaidItemDisplay>,
     pub selected: usize,
     pub status_message: Option<String>,
+    pub staged_count: usize,
+    pub transfer_count: usize,
 }
 
 pub struct PlaidItemDisplay {
@@ -38,6 +40,7 @@ pub enum PlaidAction {
     Sync(String),
     SyncAll,
     Disconnect(String),
+    ReviewStaged,
 }
 
 impl Default for PlaidView {
@@ -52,6 +55,8 @@ impl PlaidView {
             items: Vec::new(),
             selected: 0,
             status_message: None,
+            staged_count: 0,
+            transfer_count: 0,
         }
     }
 
@@ -64,6 +69,7 @@ impl PlaidView {
 
     pub fn handle_key(&mut self, key: KeyCode) -> PlaidAction {
         match key {
+            KeyCode::Char('r') => PlaidAction::ReviewStaged,
             KeyCode::Char('C') => PlaidAction::Configure,
             KeyCode::Char('c') => PlaidAction::Connect,
             KeyCode::Char('s') => {
@@ -100,7 +106,10 @@ impl PlaidView {
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Plaid Bank Connections (C: config, c: connect, s: sync, S: sync all, d: disconnect) ")
+            .title(format!(
+                " Plaid Bank Connections (C: config, c: connect, s: sync, S: sync all, r: review staged [{}], d: disconnect) ",
+                self.staged_count
+            ))
             .title_style(Style::default().fg(theme.accent));
 
         if self.items.is_empty() {

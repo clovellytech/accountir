@@ -10,6 +10,7 @@ pub mod help;
 pub mod journal;
 pub mod plaid;
 pub mod plaid_config;
+pub mod plaid_staged;
 pub mod plaid_link;
 pub mod reports;
 pub mod settings;

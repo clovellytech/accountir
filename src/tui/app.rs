@@ -48,6 +48,9 @@ use super::views::{
     journal::JournalView,
     plaid::{PlaidAccountDisplay, PlaidAction, PlaidItemDisplay, PlaidView},
     plaid_config::{PlaidConfigModal, PlaidConfigResult},
+    plaid_staged::{
+        PlaidStagedView, StagedAction, StagedTransactionDisplay, TransferCandidateDisplay,
+    },
     plaid_link::{PlaidLinkModal, PlaidLinkResult},
     reports::ReportsView,
     settings::{SettingsModal, SettingsResult},
@@ -116,6 +119,7 @@ pub struct App {
     pub reports: ReportsView,
     pub event_log: EventLogView,
     pub plaid_view: PlaidView,
+    pub plaid_staged: PlaidStagedView,
     pub help: HelpModal,
     pub welcome: WelcomeView,
     pub account_form: AccountForm,
@@ -129,6 +133,7 @@ pub struct App {
     pub theme: Theme,
     pub pending_plaid_link: Option<String>, // local_account_id to show plaid link modal for
     pub pending_plaid_action: Option<PlaidAction>, // Action from PlaidView to process
+    pub pending_staged_action: Option<StagedAction>, // Action from PlaidStagedView to process
     pub status_message: Option<String>,
     pub pending_import_count: usize,
     pub journal_needs_reload: bool,
@@ -167,6 +172,7 @@ impl App {
             reports: ReportsView::new(),
             event_log: EventLogView::new(),
             plaid_view: PlaidView::new(),
+            plaid_staged: PlaidStagedView::new(),
             help: HelpModal::new(),
             welcome: WelcomeView::new(),
             account_form: AccountForm::new(),
@@ -180,6 +186,7 @@ impl App {
             theme,
             pending_plaid_link: None,
             pending_plaid_action: None,
+            pending_staged_action: None,
             status_message: None,
             pending_import_count: 0,
             journal_needs_reload: false,
@@ -404,6 +411,107 @@ impl App {
             .collect();
 
         self.plaid_view.set_items(items);
+
+        // Load staged transaction counts
+        if let Ok((staged, transfers)) =
+            crate::commands::plaid_commands::staged_counts(conn)
+        {
+            self.plaid_view.staged_count = staged as usize;
+            self.plaid_view.transfer_count = transfers as usize;
+        }
+    }
+
+    /// Load staged transaction data for the review view
+    fn load_plaid_staged(&mut self, conn: &rusqlite::Connection) {
+        let candidates =
+            crate::commands::plaid_commands::load_pending_transfers(conn).unwrap_or_default();
+        let unmatched =
+            crate::commands::plaid_commands::load_pending_staged(conn).unwrap_or_default();
+
+        self.plaid_staged.transfer_candidates = candidates
+            .iter()
+            .map(|c| {
+                let txn1_account = c
+                    .txn1
+                    .local_account_id
+                    .as_ref()
+                    .and_then(|aid| {
+                        conn.query_row(
+                            "SELECT name FROM accounts WHERE id = ?1",
+                            [aid],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_else(|| "Unmapped".to_string());
+                let txn2_account = c
+                    .txn2
+                    .local_account_id
+                    .as_ref()
+                    .and_then(|aid| {
+                        conn.query_row(
+                            "SELECT name FROM accounts WHERE id = ?1",
+                            [aid],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_else(|| "Unmapped".to_string());
+
+                TransferCandidateDisplay {
+                    candidate_id: c.id.clone(),
+                    txn1_name: c
+                        .txn1
+                        .merchant_name
+                        .as_deref()
+                        .unwrap_or(&c.txn1.name)
+                        .to_string(),
+                    txn1_account,
+                    txn1_date: c.txn1.date.clone(),
+                    txn1_amount_cents: c.txn1.amount_cents,
+                    txn2_name: c
+                        .txn2
+                        .merchant_name
+                        .as_deref()
+                        .unwrap_or(&c.txn2.name)
+                        .to_string(),
+                    txn2_account,
+                    txn2_date: c.txn2.date.clone(),
+                    txn2_amount_cents: c.txn2.amount_cents,
+                    confidence: c.confidence,
+                }
+            })
+            .collect();
+
+        self.plaid_staged.unmatched = unmatched
+            .iter()
+            .map(|t| {
+                let account_name = t
+                    .local_account_id
+                    .as_ref()
+                    .and_then(|aid| {
+                        conn.query_row(
+                            "SELECT name FROM accounts WHERE id = ?1",
+                            [aid],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_else(|| "Unmapped".to_string());
+
+                StagedTransactionDisplay {
+                    id: t.id.clone(),
+                    date: t.date.clone(),
+                    name: t
+                        .merchant_name
+                        .as_deref()
+                        .unwrap_or(&t.name)
+                        .to_string(),
+                    account_name,
+                    amount_cents: t.amount_cents,
+                }
+            })
+            .collect();
     }
 
     /// Load pending bank imports
@@ -928,6 +1036,13 @@ impl App {
             }
         }
 
+        // In plaid staged view, Esc goes back to plaid (not close database)
+        if key == KeyCode::Esc && self.active_view == ActiveView::Plaid && self.plaid_staged.visible
+        {
+            self.pending_staged_action = Some(StagedAction::Back);
+            return;
+        }
+
         // Global keys
         match key {
             KeyCode::Char('q') => {
@@ -945,12 +1060,20 @@ impl App {
                 return;
             }
             KeyCode::Tab => {
-                self.next_tab();
-                return;
+                if self.plaid_staged.visible && self.active_view == ActiveView::Plaid {
+                    // Let the staged view handle Tab for section switching
+                } else {
+                    self.next_tab();
+                    return;
+                }
             }
             KeyCode::BackTab => {
-                self.previous_tab();
-                return;
+                if self.plaid_staged.visible && self.active_view == ActiveView::Plaid {
+                    // Let the staged view handle BackTab for section switching
+                } else {
+                    self.previous_tab();
+                    return;
+                }
             }
             KeyCode::Char('1') => {
                 self.active_view = ActiveView::Dashboard;
@@ -1047,11 +1170,21 @@ impl App {
                 self.event_log.handle_key(key);
             }
             ActiveView::Plaid => {
-                let action = self.plaid_view.handle_key(key);
-                match action {
-                    PlaidAction::None => {}
-                    other => {
-                        self.pending_plaid_action = Some(other);
+                if self.plaid_staged.visible {
+                    let action = self.plaid_staged.handle_key(key);
+                    match action {
+                        StagedAction::None => {}
+                        other => {
+                            self.pending_staged_action = Some(other);
+                        }
+                    }
+                } else {
+                    let action = self.plaid_view.handle_key(key);
+                    match action {
+                        PlaidAction::None => {}
+                        other => {
+                            self.pending_plaid_action = Some(other);
+                        }
                     }
                 }
             }
@@ -1123,7 +1256,13 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
         ActiveView::Journal => app.journal.draw(frame, chunks[1], theme),
         ActiveView::Reports => app.reports.draw(frame, chunks[1], theme),
         ActiveView::EventLog => app.event_log.draw(frame, chunks[1], theme),
-        ActiveView::Plaid => app.plaid_view.render(frame, chunks[1], theme),
+        ActiveView::Plaid => {
+            if app.plaid_staged.visible {
+                app.plaid_staged.render(frame, chunks[1], theme);
+            } else {
+                app.plaid_view.render(frame, chunks[1], theme);
+            }
+        }
     }
 
     // Draw status bar
@@ -1647,6 +1786,13 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
         if let Some(action) = app.pending_plaid_action.take() {
             if let Some(ref mut s) = store {
                 handle_plaid_action(&mut app, s, action);
+            }
+        }
+
+        // Handle staged transaction review actions
+        if let Some(action) = app.pending_staged_action.take() {
+            if let Some(ref mut s) = store {
+                handle_staged_action(&mut app, s, action);
             }
         }
 
@@ -2245,6 +2391,11 @@ pub fn run_app_with_database(
             handle_plaid_action(&mut app, &mut store, action);
         }
 
+        // Handle staged transaction review actions
+        if let Some(action) = app.pending_staged_action.take() {
+            handle_staged_action(&mut app, &mut store, action);
+        }
+
         // Handle pending Plaid link (load data and show modal)
         if let Some(local_account_id) = app.pending_plaid_link.take() {
             open_plaid_link_modal(&mut app, store.connection(), &local_account_id);
@@ -2646,10 +2797,14 @@ fn handle_plaid_action(app: &mut App, store: &mut EventStore, action: PlaidActio
 
             match sync_result {
                 Ok(body) => {
-                    let added = body["added"].as_u64().unwrap_or(0);
+                    let staged = body["staged"].as_u64().unwrap_or(0);
                     let skipped = body["skipped"].as_u64().unwrap_or(0);
-                    app.status_message =
-                        Some(format!("Synced: {} added, {} skipped", added, skipped));
+                    let transfers = body["transfer_candidates"].as_u64().unwrap_or(0);
+                    let mut msg = format!("Synced: {} staged, {} skipped", staged, skipped);
+                    if transfers > 0 {
+                        msg.push_str(&format!(", {} transfer candidates detected", transfers));
+                    }
+                    app.status_message = Some(msg);
                     app.load_data(store);
                 }
                 Err(e) => {
@@ -2682,7 +2837,7 @@ fn handle_plaid_action(app: &mut App, store: &mut EventStore, action: PlaidActio
                 // Parse the status message to accumulate counts
                 if let Some(ref msg) = app.status_message {
                     if msg.starts_with("Synced:") {
-                        // Parse "Synced: X added, Y skipped"
+                        // Parse "Synced: X staged, Y skipped"
                         let parts: Vec<&str> = msg.split_whitespace().collect();
                         if parts.len() >= 4 {
                             total_added += parts[1].parse::<u32>().unwrap_or(0);
@@ -2712,7 +2867,117 @@ fn handle_plaid_action(app: &mut App, store: &mut EventStore, action: PlaidActio
                 }
             }
         }
+        PlaidAction::ReviewStaged => {
+            app.load_plaid_staged(store.connection());
+            app.plaid_staged.show();
+        }
         PlaidAction::None => {}
+    }
+}
+
+fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAction) {
+    match action {
+        StagedAction::Back => {
+            app.plaid_staged.hide();
+        }
+        StagedAction::ConfirmTransfer(candidate_id) => {
+            let mut commands =
+                crate::commands::plaid_commands::PlaidCommands::new(store, "tui-user".to_string());
+            match commands.import_transfer(&candidate_id) {
+                Ok(_) => {
+                    app.plaid_staged.status_message =
+                        Some("Transfer imported successfully".to_string());
+                    app.load_plaid_staged(store.connection());
+                    app.load_data(store);
+                }
+                Err(e) => {
+                    app.plaid_staged.status_message =
+                        Some(format!("Failed to import transfer: {}", e));
+                }
+            }
+        }
+        StagedAction::RejectTransfer(candidate_id) => {
+            match crate::commands::plaid_commands::reject_transfer(
+                store.connection(),
+                &candidate_id,
+            ) {
+                Ok(_) => {
+                    app.plaid_staged.status_message =
+                        Some("Transfer candidate rejected".to_string());
+                    app.load_plaid_staged(store.connection());
+                }
+                Err(e) => {
+                    app.plaid_staged.status_message =
+                        Some(format!("Failed to reject transfer: {}", e));
+                }
+            }
+        }
+        StagedAction::ConfirmAllTransfers => {
+            let candidate_ids: Vec<String> = app
+                .plaid_staged
+                .transfer_candidates
+                .iter()
+                .map(|c| c.candidate_id.clone())
+                .collect();
+            let mut imported = 0u32;
+            let mut errors = 0u32;
+            for cid in candidate_ids {
+                let mut commands = crate::commands::plaid_commands::PlaidCommands::new(
+                    store,
+                    "tui-user".to_string(),
+                );
+                match commands.import_transfer(&cid) {
+                    Ok(_) => imported += 1,
+                    Err(_) => errors += 1,
+                }
+            }
+            app.plaid_staged.status_message = Some(format!(
+                "Confirmed {} transfers, {} errors",
+                imported, errors
+            ));
+            app.load_plaid_staged(store.connection());
+            app.load_data(store);
+        }
+        StagedAction::ImportUnmatched(staged_id) => {
+            let mut commands =
+                crate::commands::plaid_commands::PlaidCommands::new(store, "tui-user".to_string());
+            match commands.import_single_staged(&staged_id) {
+                Ok(_) => {
+                    app.plaid_staged.status_message =
+                        Some("Transaction imported".to_string());
+                    app.load_plaid_staged(store.connection());
+                    app.load_data(store);
+                }
+                Err(e) => {
+                    app.plaid_staged.status_message =
+                        Some(format!("Failed to import: {}", e));
+                }
+            }
+        }
+        StagedAction::ImportAll => {
+            let mut commands =
+                crate::commands::plaid_commands::PlaidCommands::new(store, "tui-user".to_string());
+            match commands.import_all_staged() {
+                Ok((transfers, unmatched)) => {
+                    app.plaid_staged.status_message = Some(format!(
+                        "Imported {} transfers, {} unmatched",
+                        transfers, unmatched
+                    ));
+                    app.load_plaid_staged(store.connection());
+                    app.load_data(store);
+                    if app.plaid_staged.total_pending() == 0 {
+                        app.plaid_staged.hide();
+                        app.status_message =
+                            Some("All staged transactions imported".to_string());
+                    }
+                }
+                Err(e) => {
+                    app.plaid_staged.status_message =
+                        Some(format!("Import failed: {}", e));
+                }
+            }
+        }
+        StagedAction::None => {}
     }
 }
 
