@@ -172,7 +172,7 @@ impl PlaidStagedView {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // summary
+                Constraint::Length(1), // summary
                 Constraint::Min(5),    // transfers
                 Constraint::Min(5),    // unmatched
                 Constraint::Length(1), // help
@@ -180,16 +180,14 @@ impl PlaidStagedView {
             .split(area);
 
         // Summary line
-        let summary = Line::from(vec![
-            Span::styled(
-                format!(
-                    " {} transfer candidates, {} unmatched transactions ",
-                    self.transfer_candidates.len(),
-                    self.unmatched.len()
-                ),
-                Style::default().fg(theme.header),
+        let summary = Line::from(vec![Span::styled(
+            format!(
+                " {} transfer candidates, {} unmatched transactions ",
+                self.transfer_candidates.len(),
+                self.unmatched.len()
             ),
-        ]);
+            Style::default().fg(theme.header),
+        )]);
         frame.render_widget(Paragraph::new(summary), chunks[0]);
 
         // Transfers section
@@ -244,23 +242,24 @@ impl PlaidStagedView {
                 .skip(self.transfer_scroll)
                 .take(transfer_visible)
                 .map(|(i, c)| {
-                    let (from_name, from_date, to_name, to_date, amount) = if c.txn1_amount_cents < 0 {
-                        (
-                            &c.txn1_account,
-                            &c.txn1_date,
-                            &c.txn2_account,
-                            &c.txn2_date,
-                            c.txn1_amount_cents.unsigned_abs(),
-                        )
-                    } else {
-                        (
-                            &c.txn2_account,
-                            &c.txn2_date,
-                            &c.txn1_account,
-                            &c.txn1_date,
-                            c.txn2_amount_cents.unsigned_abs(),
-                        )
-                    };
+                    let (from_name, from_date, to_name, to_date, amount) =
+                        if c.txn1_amount_cents < 0 {
+                            (
+                                &c.txn1_account,
+                                &c.txn1_date,
+                                &c.txn2_account,
+                                &c.txn2_date,
+                                c.txn1_amount_cents.unsigned_abs(),
+                            )
+                        } else {
+                            (
+                                &c.txn2_account,
+                                &c.txn2_date,
+                                &c.txn1_account,
+                                &c.txn1_date,
+                                c.txn2_amount_cents.unsigned_abs(),
+                            )
+                        };
 
                     let style = if transfers_active && i == self.transfer_index {
                         theme.selected_style()
@@ -347,7 +346,8 @@ impl PlaidStagedView {
                 if self.unmatched_index < self.unmatched_scroll {
                     self.unmatched_scroll = self.unmatched_index;
                 } else if self.unmatched_index >= self.unmatched_scroll + unmatched_visible {
-                    self.unmatched_scroll = self.unmatched_index.saturating_sub(unmatched_visible - 1);
+                    self.unmatched_scroll =
+                        self.unmatched_index.saturating_sub(unmatched_visible - 1);
                 }
             }
 

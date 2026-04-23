@@ -894,6 +894,13 @@ async fn plaid_sync(
             continue;
         }
 
+        // Skip if account is not mapped to a local account
+        let local_account_id = mappings.get(&txn.account_id).and_then(|o| o.clone());
+        if local_account_id.is_none() {
+            skipped += 1;
+            continue;
+        }
+
         // Skip if already staged or already imported
         let already_exists: bool = conn
             .query_row(
@@ -911,7 +918,6 @@ async fn plaid_sync(
             continue;
         }
 
-        let local_account_id = mappings.get(&txn.account_id).and_then(|o| o.clone());
         let amount_cents = (txn.amount * 100.0).round() as i64;
         let currency = txn.iso_currency_code.as_deref().unwrap_or("USD");
         let id = uuid::Uuid::new_v4().to_string();
@@ -922,15 +928,27 @@ async fn plaid_sync(
               amount_cents, date, name, merchant_name, currency, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending')",
             rusqlite::params![
-                id, req.item_id, txn.transaction_id, txn.account_id,
-                local_account_id, amount_cents, txn.date, txn.name,
-                txn.merchant_name, currency
+                id,
+                req.item_id,
+                txn.transaction_id,
+                txn.account_id,
+                local_account_id,
+                amount_cents,
+                txn.date,
+                txn.name,
+                txn.merchant_name,
+                currency
             ],
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            success: false,
-            error: format!("DB error: {}", e),
-        })))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    success: false,
+                    error: format!("DB error: {}", e),
+                }),
+            )
+        })?;
 
         staged += 1;
     }
@@ -943,10 +961,13 @@ async fn plaid_sync(
     );
 
     // Run transfer detection
-    let transfer_candidates = crate::commands::plaid_commands::detect_transfers(conn)
-        .unwrap_or(0);
+    let transfer_candidates = crate::commands::plaid_commands::detect_transfers(conn).unwrap_or(0);
 
-    Ok(Json(PlaidSyncResponse { staged, skipped, transfer_candidates }))
+    Ok(Json(PlaidSyncResponse {
+        staged,
+        skipped,
+        transfer_candidates,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -992,25 +1013,40 @@ async fn plaid_staged_list(
     ))?;
     let conn = active.store.connection();
 
-    let candidates = crate::commands::plaid_commands::load_pending_transfers(conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            success: false,
-            error: format!("DB error: {}", e),
-        })))?;
+    let candidates =
+        crate::commands::plaid_commands::load_pending_transfers(conn).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    success: false,
+                    error: format!("DB error: {}", e),
+                }),
+            )
+        })?;
 
-    let unmatched = crate::commands::plaid_commands::load_pending_staged(conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            success: false,
-            error: format!("DB error: {}", e),
-        })))?;
+    let unmatched = crate::commands::plaid_commands::load_pending_staged(conn).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("DB error: {}", e),
+            }),
+        )
+    })?;
 
     fn resolve_account_name(conn: &rusqlite::Connection, id: &Option<String>) -> Option<String> {
         id.as_ref().and_then(|aid| {
-            conn.query_row("SELECT name FROM accounts WHERE id = ?1", [aid], |row| row.get(0)).ok()
+            conn.query_row("SELECT name FROM accounts WHERE id = ?1", [aid], |row| {
+                row.get(0)
+            })
+            .ok()
         })
     }
 
-    fn to_json(conn: &rusqlite::Connection, t: &crate::commands::plaid_commands::StagedTransaction) -> StagedTransactionJson {
+    fn to_json(
+        conn: &rusqlite::Connection,
+        t: &crate::commands::plaid_commands::StagedTransaction,
+    ) -> StagedTransactionJson {
         StagedTransactionJson {
             id: t.id.clone(),
             date: t.date.clone(),
@@ -1033,10 +1069,8 @@ async fn plaid_staged_list(
         })
         .collect();
 
-    let unmatched_json: Vec<StagedTransactionJson> = unmatched
-        .iter()
-        .map(|t| to_json(conn, t))
-        .collect();
+    let unmatched_json: Vec<StagedTransactionJson> =
+        unmatched.iter().map(|t| to_json(conn, t)).collect();
 
     Ok(Json(PlaidStagedListResponse {
         transfer_candidates,
@@ -1074,20 +1108,44 @@ async fn plaid_import_transfer(
     })))?;
 
     // Load both transactions
-    let txn1 = load_staged_sync(conn, &txn1_id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-        success: false, error: format!("DB error: {}", e),
-    })))?;
-    let txn2 = load_staged_sync(conn, &txn2_id).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-        success: false, error: format!("DB error: {}", e),
-    })))?;
+    let txn1 = load_staged_sync(conn, &txn1_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("DB error: {}", e),
+            }),
+        )
+    })?;
+    let txn2 = load_staged_sync(conn, &txn2_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("DB error: {}", e),
+            }),
+        )
+    })?;
 
-    let (from_txn, to_txn) = if txn1.4 < 0 { (&txn1, &txn2) } else { (&txn2, &txn1) };
-    let from_account = from_txn.3.as_ref().ok_or((StatusCode::BAD_REQUEST, Json(ErrorResponse {
-        success: false, error: "Source account not mapped".to_string(),
-    })))?;
-    let to_account = to_txn.3.as_ref().ok_or((StatusCode::BAD_REQUEST, Json(ErrorResponse {
-        success: false, error: "Destination account not mapped".to_string(),
-    })))?;
+    let (from_txn, to_txn) = if txn1.4 < 0 {
+        (&txn1, &txn2)
+    } else {
+        (&txn2, &txn1)
+    };
+    let from_account = from_txn.3.as_ref().ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            success: false,
+            error: "Source account not mapped".to_string(),
+        }),
+    ))?;
+    let to_account = to_txn.3.as_ref().ok_or((
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            success: false,
+            error: "Destination account not mapped".to_string(),
+        }),
+    ))?;
 
     let date = chrono::NaiveDate::parse_from_str(&from_txn.5, "%Y-%m-%d")
         .unwrap_or_else(|_| chrono::Utc::now().date_naive());
@@ -1132,7 +1190,9 @@ async fn plaid_import_transfer(
         rusqlite::params![event_type, payload, hash, "plaid-sync", timestamp],
     ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { success: false, error: format!("DB error: {}", e) })))?;
 
-    let ev_id: i64 = conn.query_row("SELECT last_insert_rowid()", [], |row| row.get(0)).unwrap_or(0);
+    let ev_id: i64 = conn
+        .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
+        .unwrap_or(0);
 
     conn.execute(
         "INSERT INTO journal_entries (id, date, memo, reference, source, is_void, posted_at_event) VALUES (?1, ?2, ?3, ?4, 'plaid', 0, ?5)",
@@ -1160,12 +1220,20 @@ async fn plaid_import_transfer(
     ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { success: false, error: format!("DB error: {}", e) })))?;
 
     // Update statuses
-    conn.execute("UPDATE plaid_staged_transactions SET status = 'imported' WHERE id IN (?1, ?2)",
-        rusqlite::params![txn1_id, txn2_id]).ok();
-    conn.execute("UPDATE plaid_transfer_candidates SET status = 'confirmed' WHERE id = ?1",
-        [&req.candidate_id]).ok();
+    conn.execute(
+        "UPDATE plaid_staged_transactions SET status = 'imported' WHERE id IN (?1, ?2)",
+        rusqlite::params![txn1_id, txn2_id],
+    )
+    .ok();
+    conn.execute(
+        "UPDATE plaid_transfer_candidates SET status = 'confirmed' WHERE id = ?1",
+        [&req.candidate_id],
+    )
+    .ok();
 
-    Ok(Json(serde_json::json!({ "success": true, "entry_id": entry_id })))
+    Ok(Json(
+        serde_json::json!({ "success": true, "entry_id": entry_id }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1187,11 +1255,15 @@ async fn plaid_reject_transfer(
     ))?;
     let conn = active.store.connection();
 
-    crate::commands::plaid_commands::reject_transfer(conn, &req.candidate_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            success: false,
-            error: format!("DB error: {}", e),
-        })))?;
+    crate::commands::plaid_commands::reject_transfer(conn, &req.candidate_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("DB error: {}", e),
+            }),
+        )
+    })?;
 
     Ok(Json(serde_json::json!({ "success": true })))
 }
@@ -1224,10 +1296,15 @@ async fn plaid_import_all(
     // The server endpoint is primarily for the browser extension.
     // For now, return the counts and let the TUI handle actual imports.
 
-    let uncategorized = find_or_create_uncategorized_sync(conn)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            success: false, error: format!("DB error: {}", e),
-        })))?;
+    let uncategorized = find_or_create_uncategorized_sync(conn).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("DB error: {}", e),
+            }),
+        )
+    })?;
 
     let mut unmatched_imported = 0u32;
 
@@ -1236,7 +1313,8 @@ async fn plaid_import_all(
         // Load pair
         if let Ok((tid1, tid2)) = conn.query_row(
             "SELECT staged_txn_id_1, staged_txn_id_2 FROM plaid_transfer_candidates WHERE id = ?1",
-            [cid], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            [cid],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         ) {
             let txn1 = load_staged_sync(conn, &tid1);
             let txn2 = load_staged_sync(conn, &tid2);
@@ -1278,7 +1356,8 @@ async fn plaid_import_all(
                     let payload = serde_json::to_string(&entry_event).unwrap();
                     let event_type = entry_event.event_type();
                     let timestamp = chrono::Utc::now().to_rfc3339();
-                    let hash = sha2_hash(format!("{}{}{}", event_type, payload, timestamp).as_bytes());
+                    let hash =
+                        sha2_hash(format!("{}{}{}", event_type, payload, timestamp).as_bytes());
 
                     if conn.execute(
                         "INSERT INTO events (event_type, payload, hash, user_id, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -1325,7 +1404,18 @@ async fn plaid_import_all(
         })
         .unwrap_or_default();
 
-    for (id, item_id, plaid_txn_id, local_account_id, amount_cents, date_str, name, merchant_name, currency) in &remaining {
+    for (
+        id,
+        item_id,
+        plaid_txn_id,
+        local_account_id,
+        amount_cents,
+        date_str,
+        name,
+        merchant_name,
+        currency,
+    ) in &remaining
+    {
         let bank_account = local_account_id.as_deref().unwrap_or(&uncategorized);
         let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
             .unwrap_or_else(|_| chrono::Utc::now().date_naive());
@@ -1401,7 +1491,20 @@ async fn plaid_import_all(
 fn load_staged_sync(
     conn: &rusqlite::Connection,
     id: &str,
-) -> Result<(String, String, String, Option<String>, i64, String, String, Option<String>, String), rusqlite::Error> {
+) -> Result<
+    (
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        String,
+        String,
+        Option<String>,
+        String,
+    ),
+    rusqlite::Error,
+> {
     conn.query_row(
         "SELECT id, item_id, plaid_transaction_id, local_account_id, amount_cents, date, name, merchant_name, currency
          FROM plaid_staged_transactions WHERE id = ?1",

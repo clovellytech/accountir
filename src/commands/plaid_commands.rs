@@ -177,10 +177,14 @@ impl<'a> PlaidCommands<'a> {
                 continue;
             }
 
-            let local_account_id = mappings
-                .get(&txn.account_id)
-                .and_then(|opt| opt.clone())
-                .unwrap_or_else(|| uncategorized_id.clone());
+            // Skip if account is not mapped to a local account
+            let local_account_id = match mappings.get(&txn.account_id).and_then(|opt| opt.clone()) {
+                Some(id) => id,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
 
             let date = NaiveDate::parse_from_str(&txn.date, "%Y-%m-%d")
                 .unwrap_or_else(|_| Utc::now().date_naive());
@@ -282,6 +286,13 @@ impl<'a> PlaidCommands<'a> {
                     continue;
                 }
 
+                // Skip if account is not mapped to a local account
+                let local_account_id = mappings.get(&txn.account_id).and_then(|o| o.clone());
+                if local_account_id.is_none() {
+                    skipped += 1;
+                    continue;
+                }
+
                 let already_exists: bool = conn
                     .query_row(
                         "SELECT 1 FROM plaid_staged_transactions WHERE plaid_transaction_id = ?1
@@ -297,8 +308,6 @@ impl<'a> PlaidCommands<'a> {
                     skipped += 1;
                     continue;
                 }
-
-                let local_account_id = mappings.get(&txn.account_id).and_then(|o| o.clone());
                 let amount_cents = (txn.amount * 100.0).round() as i64;
                 let currency = txn.iso_currency_code.as_deref().unwrap_or("USD");
                 let id = Uuid::new_v4().to_string();
@@ -309,9 +318,16 @@ impl<'a> PlaidCommands<'a> {
                       amount_cents, date, name, merchant_name, currency, status)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending')",
                     rusqlite::params![
-                        id, item_id, txn.transaction_id, txn.account_id,
-                        local_account_id, amount_cents, txn.date, txn.name,
-                        txn.merchant_name, currency
+                        id,
+                        item_id,
+                        txn.transaction_id,
+                        txn.account_id,
+                        local_account_id,
+                        amount_cents,
+                        txn.date,
+                        txn.name,
+                        txn.merchant_name,
+                        currency
                     ],
                 )?;
                 staged += 1;
@@ -363,16 +379,12 @@ impl<'a> PlaidCommands<'a> {
         let entry_id = Uuid::new_v4().to_string();
         let memo = format!(
             "Transfer: {}",
-            from_txn
-                .merchant_name
-                .as_deref()
-                .unwrap_or(&from_txn.name)
+            from_txn.merchant_name.as_deref().unwrap_or(&from_txn.name)
         );
 
-        let from_account = from_txn
-            .local_account_id
-            .as_ref()
-            .ok_or_else(|| PlaidCommandError::AccountNotMapped(from_txn.plaid_account_id.clone()))?;
+        let from_account = from_txn.local_account_id.as_ref().ok_or_else(|| {
+            PlaidCommandError::AccountNotMapped(from_txn.plaid_account_id.clone())
+        })?;
         let to_account = to_txn
             .local_account_id
             .as_ref()
@@ -519,10 +531,10 @@ impl<'a> PlaidCommands<'a> {
         // Collect pending transfer candidate IDs
         let candidate_ids: Vec<String> = {
             let conn = self.store.connection();
-            let mut stmt = conn.prepare(
-                "SELECT id FROM plaid_transfer_candidates WHERE status = 'pending'",
-            )?;
-            let ids: Vec<String> = stmt.query_map([], |row| row.get(0))?
+            let mut stmt =
+                conn.prepare("SELECT id FROM plaid_transfer_candidates WHERE status = 'pending'")?;
+            let ids: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
                 .filter_map(|r| r.ok())
                 .collect();
             ids
@@ -537,10 +549,10 @@ impl<'a> PlaidCommands<'a> {
         // Collect remaining pending staged transaction IDs
         let pending_ids: Vec<String> = {
             let conn = self.store.connection();
-            let mut stmt = conn.prepare(
-                "SELECT id FROM plaid_staged_transactions WHERE status = 'pending'",
-            )?;
-            let ids: Vec<String> = stmt.query_map([], |row| row.get(0))?
+            let mut stmt =
+                conn.prepare("SELECT id FROM plaid_staged_transactions WHERE status = 'pending'")?;
+            let ids: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
                 .filter_map(|r| r.ok())
                 .collect();
             ids

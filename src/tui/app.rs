@@ -48,10 +48,10 @@ use super::views::{
     journal::JournalView,
     plaid::{PlaidAccountDisplay, PlaidAction, PlaidItemDisplay, PlaidView},
     plaid_config::{PlaidConfigModal, PlaidConfigResult},
+    plaid_link::{PlaidLinkModal, PlaidLinkResult},
     plaid_staged::{
         PlaidStagedView, StagedAction, StagedTransactionDisplay, TransferCandidateDisplay,
     },
-    plaid_link::{PlaidLinkModal, PlaidLinkResult},
     reports::ReportsView,
     settings::{SettingsModal, SettingsResult},
     startup::{StartupAction, StartupView},
@@ -413,9 +413,7 @@ impl App {
         self.plaid_view.set_items(items);
 
         // Load staged transaction counts
-        if let Ok((staged, transfers)) =
-            crate::commands::plaid_commands::staged_counts(conn)
-        {
+        if let Ok((staged, transfers)) = crate::commands::plaid_commands::staged_counts(conn) {
             self.plaid_view.staged_count = staged as usize;
             self.plaid_view.transfer_count = transfers as usize;
         }
@@ -436,11 +434,9 @@ impl App {
                     .local_account_id
                     .as_ref()
                     .and_then(|aid| {
-                        conn.query_row(
-                            "SELECT name FROM accounts WHERE id = ?1",
-                            [aid],
-                            |row| row.get::<_, String>(0),
-                        )
+                        conn.query_row("SELECT name FROM accounts WHERE id = ?1", [aid], |row| {
+                            row.get::<_, String>(0)
+                        })
                         .ok()
                     })
                     .unwrap_or_else(|| "Unmapped".to_string());
@@ -449,11 +445,9 @@ impl App {
                     .local_account_id
                     .as_ref()
                     .and_then(|aid| {
-                        conn.query_row(
-                            "SELECT name FROM accounts WHERE id = ?1",
-                            [aid],
-                            |row| row.get::<_, String>(0),
-                        )
+                        conn.query_row("SELECT name FROM accounts WHERE id = ?1", [aid], |row| {
+                            row.get::<_, String>(0)
+                        })
                         .ok()
                     })
                     .unwrap_or_else(|| "Unmapped".to_string());
@@ -490,11 +484,9 @@ impl App {
                     .local_account_id
                     .as_ref()
                     .and_then(|aid| {
-                        conn.query_row(
-                            "SELECT name FROM accounts WHERE id = ?1",
-                            [aid],
-                            |row| row.get::<_, String>(0),
-                        )
+                        conn.query_row("SELECT name FROM accounts WHERE id = ?1", [aid], |row| {
+                            row.get::<_, String>(0)
+                        })
                         .ok()
                     })
                     .unwrap_or_else(|| "Unmapped".to_string());
@@ -502,11 +494,7 @@ impl App {
                 StagedTransactionDisplay {
                     id: t.id.clone(),
                     date: t.date.clone(),
-                    name: t
-                        .merchant_name
-                        .as_deref()
-                        .unwrap_or(&t.name)
-                        .to_string(),
+                    name: t.merchant_name.as_deref().unwrap_or(&t.name).to_string(),
                     account_name,
                     amount_cents: t.amount_cents,
                 }
@@ -2943,14 +2931,12 @@ fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAct
                 crate::commands::plaid_commands::PlaidCommands::new(store, "tui-user".to_string());
             match commands.import_single_staged(&staged_id) {
                 Ok(_) => {
-                    app.plaid_staged.status_message =
-                        Some("Transaction imported".to_string());
+                    app.plaid_staged.status_message = Some("Transaction imported".to_string());
                     app.load_plaid_staged(store.connection());
                     app.load_data(store);
                 }
                 Err(e) => {
-                    app.plaid_staged.status_message =
-                        Some(format!("Failed to import: {}", e));
+                    app.plaid_staged.status_message = Some(format!("Failed to import: {}", e));
                 }
             }
         }
@@ -2967,13 +2953,11 @@ fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAct
                     app.load_data(store);
                     if app.plaid_staged.total_pending() == 0 {
                         app.plaid_staged.hide();
-                        app.status_message =
-                            Some("All staged transactions imported".to_string());
+                        app.status_message = Some("All staged transactions imported".to_string());
                     }
                 }
                 Err(e) => {
-                    app.plaid_staged.status_message =
-                        Some(format!("Import failed: {}", e));
+                    app.plaid_staged.status_message = Some(format!("Import failed: {}", e));
                 }
             }
         }

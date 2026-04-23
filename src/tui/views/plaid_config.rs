@@ -231,8 +231,9 @@ impl PlaidConfigModal {
             Err((msg, is_already_registered)) => {
                 if is_already_registered {
                     self.auth_mode = AuthMode::Login;
-                    self.error_message =
-                        Some("Email already registered — enter your password to log in".to_string());
+                    self.error_message = Some(
+                        "Email already registered — enter your password to log in".to_string(),
+                    );
                 } else {
                     self.error_message = Some(msg);
                 }
@@ -290,7 +291,15 @@ impl PlaidConfigModal {
                 ])
                 .split(inner);
 
-            self.draw_text_field(frame, chunks[0], "Proxy URL", &self.proxy_url, false, true, theme);
+            self.draw_text_field(
+                frame,
+                chunks[0],
+                "Proxy URL",
+                &self.proxy_url,
+                false,
+                true,
+                theme,
+            );
 
             let status = Paragraph::new(Line::from(Span::styled(
                 "  Registered (API key saved)",
