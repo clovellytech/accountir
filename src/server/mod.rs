@@ -1227,155 +1227,42 @@ async fn plaid_import_transfer(
     State(state): State<Arc<SharedState>>,
     Json(req): Json<ImportTransferRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let guard = state.db.lock().unwrap();
-    let active = guard.as_ref().ok_or((
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse {
             success: false,
             error: "No database open".to_string(),
         }),
     ))?;
-    let conn = active.store.connection();
 
-    // Load the transfer pair
-    let (txn1_id, txn2_id): (String, String) = conn.query_row(
-        "SELECT staged_txn_id_1, staged_txn_id_2 FROM plaid_transfer_candidates WHERE id = ?1 AND status = 'pending'",
-        [&req.candidate_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).map_err(|_| (StatusCode::NOT_FOUND, Json(ErrorResponse {
-        success: false,
-        error: "Transfer candidate not found".to_string(),
-    })))?;
+    let mut commands = crate::commands::plaid_commands::PlaidCommands::new(
+        &mut active.store,
+        "plaid-sync".to_string(),
+    );
 
-    // Load both transactions
-    let txn1 = load_staged_sync(conn, &txn1_id).map_err(|e| {
-        (
+    match commands.import_transfer(&req.candidate_id) {
+        Ok(stored) => {
+            let entry_id =
+                if let crate::events::types::Event::JournalEntryPosted { entry_id, .. } =
+                    &stored.event
+                {
+                    entry_id.clone()
+                } else {
+                    String::new()
+                };
+            Ok(Json(
+                serde_json::json!({ "success": true, "entry_id": entry_id }),
+            ))
+        }
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 success: false,
-                error: format!("DB error: {}", e),
+                error: format!("Import failed: {}", e),
             }),
-        )
-    })?;
-    let txn2 = load_staged_sync(conn, &txn2_id).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                success: false,
-                error: format!("DB error: {}", e),
-            }),
-        )
-    })?;
-
-    // Plaid amounts are positive when money leaves the account, negative when it arrives.
-    // The positive-amount side is the "from" account (money leaving), negative is "to".
-    let (from_txn, to_txn) = if txn1.4 > 0 {
-        (&txn1, &txn2)
-    } else {
-        (&txn2, &txn1)
-    };
-    let from_account = from_txn.3.as_ref().ok_or((
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            success: false,
-            error: "Source account not mapped".to_string(),
-        }),
-    ))?;
-    let to_account = to_txn.3.as_ref().ok_or((
-        StatusCode::BAD_REQUEST,
-        Json(ErrorResponse {
-            success: false,
-            error: "Destination account not mapped".to_string(),
-        }),
-    ))?;
-
-    let date = chrono::NaiveDate::parse_from_str(&from_txn.5, "%Y-%m-%d")
-        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
-    let abs_amount = (from_txn.4 as i64).unsigned_abs() as i64;
-    let entry_id = uuid::Uuid::new_v4().to_string();
-    let memo = format!("Transfer: {}", from_txn.7.as_deref().unwrap_or(&from_txn.6));
-    let currency = &from_txn.8;
-
-    let entry_event = crate::events::types::Event::JournalEntryPosted {
-        entry_id: entry_id.clone(),
-        date,
-        memo: memo.clone(),
-        lines: vec![
-            crate::events::types::JournalLineData {
-                line_id: format!("{}-line-1", entry_id),
-                account_id: from_account.clone(),
-                amount: -abs_amount,
-                currency: currency.clone(),
-                exchange_rate: None,
-                memo: None,
-            },
-            crate::events::types::JournalLineData {
-                line_id: format!("{}-line-2", entry_id),
-                account_id: to_account.clone(),
-                amount: abs_amount,
-                currency: currency.clone(),
-                exchange_rate: None,
-                memo: None,
-            },
-        ],
-        reference: Some(format!("transfer:{}:{}", from_txn.2, to_txn.2)),
-        source: Some(crate::events::types::JournalEntrySource::Plaid),
-    };
-
-    let payload = serde_json::to_string(&entry_event).unwrap();
-    let event_type = entry_event.event_type();
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let hash = sha2_hash(format!("{}{}{}", event_type, payload, timestamp).as_bytes());
-
-    conn.execute(
-        "INSERT INTO events (event_type, payload, hash, user_id, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![event_type, payload, hash, "plaid-sync", timestamp],
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { success: false, error: format!("DB error: {}", e) })))?;
-
-    let ev_id: i64 = conn
-        .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
-        .unwrap_or(0);
-
-    conn.execute(
-        "INSERT INTO journal_entries (id, date, memo, reference, source, is_void, posted_at_event) VALUES (?1, ?2, ?3, ?4, 'plaid', 0, ?5)",
-        rusqlite::params![entry_id, date.to_string(), memo, format!("transfer:{}:{}", from_txn.2, to_txn.2), ev_id],
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { success: false, error: format!("DB error: {}", e) })))?;
-
-    conn.execute(
-        "INSERT INTO journal_lines (id, entry_id, account_id, amount, currency, is_cleared) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-        rusqlite::params![format!("{}-line-1", entry_id), entry_id, from_account, -abs_amount, currency],
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { success: false, error: format!("DB error: {}", e) })))?;
-
-    conn.execute(
-        "INSERT INTO journal_lines (id, entry_id, account_id, amount, currency, is_cleared) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-        rusqlite::params![format!("{}-line-2", entry_id), entry_id, to_account, abs_amount, currency],
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { success: false, error: format!("DB error: {}", e) })))?;
-
-    // Dedup records for both transactions
-    conn.execute(
-        "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-        rusqlite::params![from_txn.2, from_txn.1, entry_id],
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { success: false, error: format!("DB error: {}", e) })))?;
-    conn.execute(
-        "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-        rusqlite::params![to_txn.2, to_txn.1, entry_id],
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { success: false, error: format!("DB error: {}", e) })))?;
-
-    // Update statuses
-    conn.execute(
-        "UPDATE plaid_staged_transactions SET status = 'imported' WHERE id IN (?1, ?2)",
-        rusqlite::params![txn1_id, txn2_id],
-    )
-    .ok();
-    conn.execute(
-        "UPDATE plaid_transfer_candidates SET status = 'confirmed' WHERE id = ?1",
-        [&req.candidate_id],
-    )
-    .ok();
-
-    Ok(Json(
-        serde_json::json!({ "success": true, "entry_id": entry_id }),
-    ))
+        )),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1413,247 +1300,38 @@ async fn plaid_reject_transfer(
 async fn plaid_import_all(
     State(state): State<Arc<SharedState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let guard = state.db.lock().unwrap();
-    let active = guard.as_ref().ok_or((
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse {
             success: false,
             error: "No database open".to_string(),
         }),
     ))?;
-    let conn = active.store.connection();
 
-    // Import all pending transfer candidates
-    let candidate_ids: Vec<String> = conn
-        .prepare("SELECT id FROM plaid_transfer_candidates WHERE status = 'pending'")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| row.get(0))
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
+    let mut commands = crate::commands::plaid_commands::PlaidCommands::new(
+        &mut active.store,
+        "plaid-sync".to_string(),
+    );
 
-    let mut transfers_imported = 0u32;
-    // For each candidate, we'd need full import logic - for the server path,
-    // the TUI handles this via PlaidCommands which has &mut EventStore.
-    // The server endpoint is primarily for the browser extension.
-    // For now, return the counts and let the TUI handle actual imports.
-
-    let uncategorized = find_or_create_uncategorized_sync(conn).map_err(|e| {
-        (
+    match commands.import_all_staged() {
+        Ok((transfers_imported, unmatched_imported)) => Ok(Json(serde_json::json!({
+            "success": true,
+            "transfers_imported": transfers_imported,
+            "unmatched_imported": unmatched_imported
+        }))),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 success: false,
-                error: format!("DB error: {}", e),
+                error: format!("Import failed: {}", e),
             }),
-        )
-    })?;
-
-    let mut unmatched_imported = 0u32;
-
-    // First import all transfer candidates
-    for cid in &candidate_ids {
-        // Load pair
-        if let Ok((tid1, tid2)) = conn.query_row(
-            "SELECT staged_txn_id_1, staged_txn_id_2 FROM plaid_transfer_candidates WHERE id = ?1",
-            [cid],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        ) {
-            let txn1 = load_staged_sync(conn, &tid1);
-            let txn2 = load_staged_sync(conn, &tid2);
-            if let (Ok(t1), Ok(t2)) = (txn1, txn2) {
-                let (from_t, to_t) = if t1.4 > 0 { (&t1, &t2) } else { (&t2, &t1) };
-                if let (Some(from_acct), Some(to_acct)) = (&from_t.3, &to_t.3) {
-                    let date = chrono::NaiveDate::parse_from_str(&from_t.5, "%Y-%m-%d")
-                        .unwrap_or_else(|_| chrono::Utc::now().date_naive());
-                    let abs_amount = (from_t.4 as i64).unsigned_abs() as i64;
-                    let entry_id = uuid::Uuid::new_v4().to_string();
-                    let memo = format!("Transfer: {}", from_t.7.as_deref().unwrap_or(&from_t.6));
-
-                    let entry_event = crate::events::types::Event::JournalEntryPosted {
-                        entry_id: entry_id.clone(),
-                        date,
-                        memo: memo.clone(),
-                        lines: vec![
-                            crate::events::types::JournalLineData {
-                                line_id: format!("{}-line-1", entry_id),
-                                account_id: from_acct.clone(),
-                                amount: -abs_amount,
-                                currency: from_t.8.clone(),
-                                exchange_rate: None,
-                                memo: None,
-                            },
-                            crate::events::types::JournalLineData {
-                                line_id: format!("{}-line-2", entry_id),
-                                account_id: to_acct.clone(),
-                                amount: abs_amount,
-                                currency: to_t.8.clone(),
-                                exchange_rate: None,
-                                memo: None,
-                            },
-                        ],
-                        reference: Some(format!("transfer:{}:{}", from_t.2, to_t.2)),
-                        source: Some(crate::events::types::JournalEntrySource::Plaid),
-                    };
-
-                    let payload = serde_json::to_string(&entry_event).unwrap();
-                    let event_type = entry_event.event_type();
-                    let timestamp = chrono::Utc::now().to_rfc3339();
-                    let hash =
-                        sha2_hash(format!("{}{}{}", event_type, payload, timestamp).as_bytes());
-
-                    if conn.execute(
-                        "INSERT INTO events (event_type, payload, hash, user_id, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        rusqlite::params![event_type, payload, hash, "plaid-sync", timestamp],
-                    ).is_ok() {
-                        let ev_id: i64 = conn.query_row("SELECT last_insert_rowid()", [], |row| row.get(0)).unwrap_or(0);
-                        let _ = conn.execute(
-                            "INSERT INTO journal_entries (id, date, memo, reference, source, is_void, posted_at_event) VALUES (?1, ?2, ?3, ?4, 'plaid', 0, ?5)",
-                            rusqlite::params![entry_id, date.to_string(), memo, format!("transfer:{}:{}", from_t.2, to_t.2), ev_id],
-                        );
-                        let _ = conn.execute(
-                            "INSERT INTO journal_lines (id, entry_id, account_id, amount, currency, is_cleared) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-                            rusqlite::params![format!("{}-line-1", entry_id), entry_id, from_acct, -abs_amount, from_t.8],
-                        );
-                        let _ = conn.execute(
-                            "INSERT INTO journal_lines (id, entry_id, account_id, amount, currency, is_cleared) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-                            rusqlite::params![format!("{}-line-2", entry_id), entry_id, to_acct, abs_amount, to_t.8],
-                        );
-                        let _ = conn.execute("INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![from_t.2, from_t.1, entry_id]);
-                        let _ = conn.execute("INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-                            rusqlite::params![to_t.2, to_t.1, entry_id]);
-                        let _ = conn.execute("UPDATE plaid_staged_transactions SET status = 'imported' WHERE id IN (?1, ?2)",
-                            rusqlite::params![tid1, tid2]);
-                        let _ = conn.execute("UPDATE plaid_transfer_candidates SET status = 'confirmed' WHERE id = ?1", [cid]);
-                        transfers_imported += 1;
-                    }
-                }
-            }
-        }
+        )),
     }
-
-    // Now import remaining pending as uncategorized
-    // Re-query since some may have been imported as transfers
-    let remaining: Vec<(String, String, String, Option<String>, i64, String, String, Option<String>, String)> = conn
-        .prepare(
-            "SELECT id, item_id, plaid_transaction_id, local_account_id, amount_cents, date, name, merchant_name, currency
-             FROM plaid_staged_transactions WHERE status = 'pending'"
-        )
-        .and_then(|mut stmt| {
-            stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?))
-            }).map(|rows| rows.filter_map(|r| r.ok()).collect())
-        })
-        .unwrap_or_default();
-
-    for (
-        id,
-        item_id,
-        plaid_txn_id,
-        local_account_id,
-        amount_cents,
-        date_str,
-        name,
-        merchant_name,
-        currency,
-    ) in &remaining
-    {
-        let bank_account = local_account_id.as_deref().unwrap_or(&uncategorized);
-        let date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-            .unwrap_or_else(|_| chrono::Utc::now().date_naive());
-        let entry_id = uuid::Uuid::new_v4().to_string();
-        let memo = merchant_name.as_deref().unwrap_or(name);
-
-        let entry_event = crate::events::types::Event::JournalEntryPosted {
-            entry_id: entry_id.clone(),
-            date,
-            memo: memo.to_string(),
-            lines: vec![
-                crate::events::types::JournalLineData {
-                    line_id: format!("{}-line-1", entry_id),
-                    account_id: bank_account.to_string(),
-                    amount: -amount_cents,
-                    currency: currency.clone(),
-                    exchange_rate: None,
-                    memo: None,
-                },
-                crate::events::types::JournalLineData {
-                    line_id: format!("{}-line-2", entry_id),
-                    account_id: uncategorized.clone(),
-                    amount: *amount_cents,
-                    currency: currency.clone(),
-                    exchange_rate: None,
-                    memo: None,
-                },
-            ],
-            reference: Some(plaid_txn_id.clone()),
-            source: Some(crate::events::types::JournalEntrySource::Plaid),
-        };
-
-        let payload = serde_json::to_string(&entry_event).unwrap();
-        let event_type = entry_event.event_type();
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        let hash = sha2_hash(format!("{}{}{}", event_type, payload, timestamp).as_bytes());
-
-        if conn.execute(
-            "INSERT INTO events (event_type, payload, hash, user_id, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![event_type, payload, hash, "plaid-sync", timestamp],
-        ).is_ok() {
-            let ev_id: i64 = conn.query_row("SELECT last_insert_rowid()", [], |row| row.get(0)).unwrap_or(0);
-            let _ = conn.execute(
-                "INSERT INTO journal_entries (id, date, memo, reference, source, is_void, posted_at_event) VALUES (?1, ?2, ?3, ?4, 'plaid', 0, ?5)",
-                rusqlite::params![entry_id, date.to_string(), memo, plaid_txn_id, ev_id],
-            );
-            let _ = conn.execute(
-                "INSERT INTO journal_lines (id, entry_id, account_id, amount, currency, is_cleared) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-                rusqlite::params![format!("{}-line-1", entry_id), entry_id, bank_account, -amount_cents, currency],
-            );
-            let _ = conn.execute(
-                "INSERT INTO journal_lines (id, entry_id, account_id, amount, currency, is_cleared) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
-                rusqlite::params![format!("{}-line-2", entry_id), entry_id, uncategorized, *amount_cents, currency],
-            );
-            let _ = conn.execute(
-                "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-                rusqlite::params![plaid_txn_id, item_id, entry_id],
-            );
-            let _ = conn.execute("UPDATE plaid_staged_transactions SET status = 'imported' WHERE id = ?1", [id]);
-            unmatched_imported += 1;
-        }
-    }
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "transfers_imported": transfers_imported,
-        "unmatched_imported": unmatched_imported
-    })))
 }
 
 /// Load a staged transaction as a tuple for server-side processing.
 /// Returns (id, item_id, plaid_txn_id, local_account_id, amount_cents, date, name, merchant_name, currency)
-fn load_staged_sync(
-    conn: &rusqlite::Connection,
-    id: &str,
-) -> Result<
-    (
-        String,
-        String,
-        String,
-        Option<String>,
-        i64,
-        String,
-        String,
-        Option<String>,
-        String,
-    ),
-    rusqlite::Error,
-> {
-    conn.query_row(
-        "SELECT id, item_id, plaid_transaction_id, local_account_id, amount_cents, date, name, merchant_name, currency
-         FROM plaid_staged_transactions WHERE id = ?1",
-        [id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?)),
-    )
-}
 
 #[derive(Serialize)]
 struct PlaidItemInfo {
@@ -1811,47 +1489,6 @@ fn sha2_hash(input: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(input);
     hasher.finalize().to_vec()
-}
-
-fn find_or_create_uncategorized_sync(
-    conn: &rusqlite::Connection,
-) -> Result<String, rusqlite::Error> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM accounts WHERE name = 'Uncategorized' AND is_active = 1",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-
-    let max_number: Option<String> = conn
-        .query_row(
-            "SELECT MAX(account_number) FROM accounts WHERE account_number LIKE '9%'",
-            [],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten();
-
-    let next_number = match max_number {
-        Some(n) => {
-            let num: u32 = n.parse().unwrap_or(8999);
-            format!("{}", num + 1)
-        }
-        None => "9000".to_string(),
-    };
-
-    let account_id = uuid::Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO accounts (id, account_type, account_number, name, is_active) VALUES (?1, 'expense', ?2, 'Uncategorized', 1)",
-        rusqlite::params![account_id, next_number],
-    )?;
-
-    Ok(account_id)
 }
 
 // ---------------------------------------------------------------------------

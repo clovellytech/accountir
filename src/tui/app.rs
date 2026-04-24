@@ -33,14 +33,13 @@ use crate::commands::entry_commands::{
     VoidEntryCommand,
 };
 use crate::domain::AccountType;
-use crate::events::types::{Event as DomainEvent, JournalEntrySource};
 
 use super::theme::Theme;
 use super::views::{
     account_form::{AccountForm, AccountFormResult},
     accounts::AccountsView,
     bank_import::{BankImportModal, BankImportResult, ParsedTransaction, PendingImport},
-    csv_import::{parse_amount, parse_date, parse_delimited_line, CsvImportModal, ImportConfig},
+    csv_import::{CsvImportModal, ImportConfig},
     dashboard::DashboardView,
     entry_detail::{EntryDetail, EntryDetailModal, EntryLineDetail},
     entry_form::{EntryForm, EntryFormResult},
@@ -3406,76 +3405,18 @@ fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAct
 
 /// Create opening balance journal entries for the given proposals.
 fn create_opening_balance_entries(store: &mut EventStore, proposals: &[OpeningBalanceProposal]) {
-    use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
-
-    // Find or create an "Opening Balances" equity account
-    let equity_account_id: String = store
-        .connection()
-        .query_row(
-            "SELECT id FROM accounts WHERE LOWER(name) = 'opening balances' LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or_else(|_| {
-            let mut acct_commands = crate::commands::account_commands::AccountCommands::new(
-                store,
-                "tui-user".to_string(),
-            );
-            match acct_commands.create_account(
-                crate::commands::account_commands::CreateAccountCommand {
-                    account_type: crate::domain::AccountType::Equity,
-                    account_number: "3000".to_string(),
-                    name: "Opening Balances".to_string(),
-                    parent_id: None,
-                    currency: None,
-                    description: Some("Equity account for opening balance entries".to_string()),
-                },
-            ) {
-                Ok(stored) => {
-                    // Extract account_id from the stored event
-                    if let crate::events::types::Event::AccountCreated { account_id, .. } =
-                        &stored.event
-                    {
-                        account_id.clone()
-                    } else {
-                        uuid::Uuid::new_v4().to_string()
-                    }
-                }
-                Err(_) => uuid::Uuid::new_v4().to_string(),
-            }
-        });
-
-    let mut commands = EntryCommands::new(store, "tui-user".to_string());
-
-    for proposal in proposals {
-        let date = chrono::NaiveDate::from_ymd_opt(proposal.earliest_year, 1, 1)
-            .unwrap_or_else(|| chrono::Utc::now().date_naive());
-
-        let lines = vec![
-            EntryLine {
-                account_id: proposal.local_account_id.clone(),
-                amount: proposal.opening_balance_cents,
-                currency: "USD".to_string(),
-                exchange_rate: None,
-                memo: None,
-            },
-            EntryLine {
-                account_id: equity_account_id.clone(),
-                amount: -proposal.opening_balance_cents,
-                currency: "USD".to_string(),
-                exchange_rate: None,
-                memo: None,
-            },
-        ];
-
-        let _ = commands.post_entry(PostEntryCommand {
-            date,
-            memo: format!("Opening balance: {}", proposal.account_name),
-            lines,
-            reference: Some("opening-balance".to_string()),
-            source: Some(JournalEntrySource::System),
-        });
-    }
+    let entries: Vec<(String, String, i64, i32)> = proposals
+        .iter()
+        .map(|p| {
+            (
+                p.local_account_id.clone(),
+                p.account_name.clone(),
+                p.opening_balance_cents,
+                p.earliest_year,
+            )
+        })
+        .collect();
+    crate::commands::account_commands::create_opening_balance_entries(store, &entries);
 }
 
 /// Check which mapped Plaid accounts need opening balances and compute proposals.
@@ -3719,135 +3660,15 @@ fn open_plaid_link_modal(app: &mut App, conn: &rusqlite::Connection, local_accou
 }
 
 fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Option<String> {
-    let has_company: bool = store
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM company WHERE id = 'default'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-
-    if has_company {
-        return None;
-    }
-
-    let company_name = db_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("My Company")
-        .to_string();
-    let company_id = uuid::Uuid::new_v4().to_string();
-    let envelope = crate::events::types::EventEnvelope::new(
-        DomainEvent::CompanyCreated {
-            company_id,
-            name: company_name.clone(),
-            base_currency: "USD".to_string(),
-            fiscal_year_start: 1,
-        },
-        "system".to_string(),
-    );
-    match store.append(envelope) {
-        Ok(stored) => {
-            let projector = crate::store::projections::Projector::new(store.connection());
-            if let Err(e) = projector.apply(&stored) {
-                return Some(format!("Failed to project company: {}", e));
-            }
-            Some(format!("Company '{}' created for sync", company_name))
-        }
-        Err(e) => Some(format!("Failed to create company: {}", e)),
-    }
+    crate::commands::account_commands::ensure_company(store, db_path)
 }
 
-/// Check if the database has any accounts
 fn has_no_accounts(store: &EventStore) -> bool {
-    let count: i64 = store
-        .connection()
-        .query_row(
-            "SELECT COUNT(*) FROM accounts WHERE is_active = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    count == 0
+    crate::commands::account_commands::has_no_accounts(store)
 }
 
-/// Create the default chart of accounts
 fn create_default_accounts(store: &mut EventStore) -> Result<usize, String> {
-    use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
-    use crate::domain::AccountType;
-
-    // Define the default accounts: (number, name, type, parent_number)
-    let defaults: Vec<(&str, &str, AccountType, Option<&str>)> = vec![
-        ("1000", "Assets", AccountType::Asset, None),
-        (
-            "1001",
-            "Business Checking",
-            AccountType::Asset,
-            Some("1000"),
-        ),
-        ("2000", "Income", AccountType::Revenue, None),
-        ("3000", "Expenses", AccountType::Expense, None),
-        ("4000", "Equity", AccountType::Equity, None),
-        (
-            "4001",
-            "Opening Balances",
-            AccountType::Equity,
-            Some("4000"),
-        ),
-        ("5000", "Liabilities", AccountType::Liability, None),
-    ];
-
-    // First pass: create accounts without parent references, collect IDs
-    let mut account_ids: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    let mut created = 0;
-
-    for (number, name, account_type, _parent_number) in &defaults {
-        let mut commands = AccountCommands::new(store, "system".to_string());
-        let cmd = CreateAccountCommand {
-            account_type: *account_type,
-            account_number: number.to_string(),
-            name: name.to_string(),
-            parent_id: None,
-            currency: Some("USD".to_string()),
-            description: None,
-        };
-        match commands.create_account(cmd) {
-            Ok(stored) => {
-                if let crate::events::types::Event::AccountCreated { account_id, .. } =
-                    &stored.event
-                {
-                    account_ids.insert(number.to_string(), account_id.clone());
-                }
-                created += 1;
-            }
-            Err(e) => return Err(format!("Failed to create account {}: {}", number, e)),
-        }
-    }
-
-    // Second pass: set parent_id for child accounts
-    for (number, _name, _account_type, parent_number) in &defaults {
-        if let Some(parent_num) = parent_number {
-            let account_id = account_ids.get(*number).cloned();
-            let parent_id = account_ids.get(*parent_num).cloned();
-            if let (Some(aid), Some(pid)) = (account_id, parent_id) {
-                let mut commands = AccountCommands::new(store, "system".to_string());
-                let cmd = crate::commands::account_commands::UpdateAccountCommand {
-                    account_id: aid,
-                    account_number: None,
-                    name: None,
-                    parent_id: Some(Some(pid)),
-                    description: None,
-                };
-                if let Err(e) = commands.update_account(cmd) {
-                    return Err(format!("Failed to set parent for {}: {}", number, e));
-                }
-            }
-        }
-    }
-
-    Ok(created)
+    crate::commands::account_commands::create_default_accounts(store)
 }
 
 /// Perform CSV import
@@ -3856,166 +3677,32 @@ fn perform_csv_import(
     config: &ImportConfig,
     existing_accounts: &[crate::domain::Account],
 ) -> Result<usize, String> {
-    // Read the CSV file
-    let content = std::fs::read_to_string(&config.file_path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
-
-    let mut lines = content.lines();
-
-    // Skip any leading lines the user marked as non-data (e.g. bank preamble).
-    for _ in 0..config.skip_lines {
-        lines.next();
-    }
-
-    // Skip header row if the user said there is one.
-    if config.has_header {
-        lines.next();
-    }
-
-    // Target account is required
     let target_account_id = config
         .target_account_id
         .clone()
         .ok_or("Target account is required for CSV import")?;
 
-    // Find or create Uncategorized account for offset entries
-    let uncategorized_id = find_or_create_uncategorized_account(store, existing_accounts)?;
-
-    // Get target account type to determine debit/credit direction
     let target_is_asset = existing_accounts
         .iter()
         .find(|a| a.id == target_account_id)
         .map(|a| matches!(a.account_type, AccountType::Asset))
         .unwrap_or(true);
 
-    let mut count = 0;
-    let mut commands = EntryCommands::new(store, "csv-import".to_string());
+    let params = crate::commands::import_commands::CsvImportParams {
+        file_path: config.file_path.clone(),
+        date_column: config.date_column,
+        description_column: config.description_column,
+        amount_column: config.amount_column,
+        target_account_id,
+        target_is_asset,
+        skip_lines: config.skip_lines,
+        has_header: config.has_header,
+        delimiter: config.delimiter,
+    };
 
-    for line in lines {
-        let fields = parse_delimited_line(line, config.delimiter);
-
-        // Extract fields based on column mapping
-        let date_str = fields
-            .get(config.date_column)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let description = fields
-            .get(config.description_column)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let amount_str = fields
-            .get(config.amount_column)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        // Parse date
-        let date = match parse_date(date_str) {
-            Some(d) => d,
-            None => continue, // Skip rows with invalid dates
-        };
-
-        // Parse amount
-        let amount = match parse_amount(amount_str) {
-            Some(a) if a != 0 => a,
-            _ => continue, // Skip rows with invalid or zero amounts
-        };
-
-        // For asset accounts (like checking):
-        // - Positive amount = money coming in = debit to asset, credit to uncategorized
-        // - Negative amount = money going out = credit to asset, debit to uncategorized
-        //
-        // For liability/expense accounts, the logic reverses
-
-        let (target_amount, offset_amount) = if target_is_asset {
-            // Asset account: positive CSV amount = debit (increase)
-            (amount, -amount)
-        } else {
-            // Liability/equity/revenue: positive CSV amount = credit (increase)
-            (-amount, amount)
-        };
-
-        // Create journal entry
-        let entry_lines = vec![
-            EntryLine {
-                account_id: target_account_id.clone(),
-                amount: target_amount,
-                currency: "USD".to_string(),
-                exchange_rate: None,
-                memo: None,
-            },
-            EntryLine {
-                account_id: uncategorized_id.clone(),
-                amount: offset_amount,
-                currency: "USD".to_string(),
-                exchange_rate: None,
-                memo: None,
-            },
-        ];
-
-        match commands.post_entry(PostEntryCommand {
-            date,
-            memo: description.to_string(),
-            lines: entry_lines,
-            reference: None,
-            source: Some(JournalEntrySource::Import),
-        }) {
-            Ok(_) => count += 1,
-            Err(e) => {
-                // Log error but continue with other entries
-                eprintln!("Failed to import row: {}", e);
-            }
-        }
-    }
-
-    Ok(count)
+    crate::commands::import_commands::import_csv(store, &params).map_err(|e| e.to_string())
 }
 
-/// Find or create the Uncategorized account
-fn find_or_create_uncategorized_account(
-    store: &mut EventStore,
-    existing_accounts: &[crate::domain::Account],
-) -> Result<String, String> {
-    // Look for existing Uncategorized account
-    for account in existing_accounts {
-        if account.name.to_lowercase() == "uncategorized" {
-            return Ok(account.id.clone());
-        }
-    }
-
-    // Create new Uncategorized account
-    let mut commands = AccountCommands::new(store, "csv-import".to_string());
-
-    // Find next available account number in 9000 range (other expenses)
-    let mut next_number = 9000;
-    for account in existing_accounts {
-        if let Ok(num) = account.account_number.parse::<u32>() {
-            if (9000..10000).contains(&num) && num >= next_number {
-                next_number = num + 1;
-            }
-        }
-    }
-
-    match commands.create_account(CreateAccountCommand {
-        account_type: AccountType::Expense,
-        account_number: next_number.to_string(),
-        name: "Uncategorized".to_string(),
-        parent_id: None,
-        currency: Some("USD".to_string()),
-        description: Some("Uncategorized transactions from CSV import".to_string()),
-    }) {
-        Ok(stored_event) => {
-            // Extract account_id from the stored event
-            if let DomainEvent::AccountCreated { account_id, .. } = stored_event.event {
-                Ok(account_id)
-            } else {
-                Err("Unexpected event type returned".to_string())
-            }
-        }
-        Err(e) => Err(format!("Failed to create Uncategorized account: {}", e)),
-    }
-}
-
-/// Perform the bank import - create journal entries for all transactions
 fn perform_bank_import(
     store: &mut EventStore,
     import_id: i64,
@@ -4024,102 +3711,36 @@ fn perform_bank_import(
     transactions: &[ParsedTransaction],
     existing_accounts: &[crate::domain::Account],
 ) -> Result<usize, String> {
-    // Get the pending import info to access bank_id
-    let (bank_id, bank_name): (Option<String>, String) = store
-        .connection()
-        .query_row(
-            "SELECT bank_id, bank_name FROM pending_imports WHERE id = ?1",
-            [import_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|e| format!("Failed to get import info: {}", e))?;
+    let target_account_type = existing_accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .map(|a| a.account_type)
+        .unwrap_or(AccountType::Asset);
 
-    // Find or create Uncategorized account for offset entries
-    let uncategorized_id = find_or_create_uncategorized_account(store, existing_accounts)?;
+    let import_txns: Vec<crate::commands::import_commands::ImportTransaction> = transactions
+        .iter()
+        .filter(|t| t.selected)
+        .map(|t| crate::commands::import_commands::ImportTransaction {
+            date: t.date,
+            description: t.description.clone(),
+            amount: t.amount,
+        })
+        .collect();
 
-    // Get target account type to determine debit/credit direction
-    let target_account = existing_accounts.iter().find(|a| a.id == account_id);
-    let target_is_asset = target_account
-        .map(|a| matches!(a.account_type, AccountType::Asset))
-        .unwrap_or(true);
-    let target_is_liability = target_account
-        .map(|a| matches!(a.account_type, AccountType::Liability))
-        .unwrap_or(false);
+    let count = crate::commands::import_commands::import_bank_transactions(
+        store,
+        account_id,
+        target_account_type,
+        &import_txns,
+    )
+    .map_err(|e| e.to_string())?;
 
-    let mut count = 0;
-    let mut commands = EntryCommands::new(store, "bank-import".to_string());
-
-    for txn in transactions.iter().filter(|t| t.selected) {
-        // Determine the correct debit/credit direction based on account type and sign
-        //
-        // For ASSET accounts (e.g., checking):
-        //   - Positive amount (deposit) = debit to asset (increase), credit to uncategorized
-        //   - Negative amount (withdrawal) = credit to asset (decrease), debit to uncategorized
-        //
-        // For LIABILITY accounts (e.g., credit card):
-        //   - Positive amount (payment) = debit to liability (decrease), credit to uncategorized
-        //   - Negative amount (charge) = credit to liability (increase), debit to uncategorized
-        //
-        // The user specified:
-        //   - Asset accounts: positives increase balance, negatives decrease balance
-        //   - Liability accounts: positives are payments (decrease balance), negatives are charges (increase balance)
-
-        let (target_amount, offset_amount) = if target_is_asset {
-            // Asset account: positive = debit (increase), negative = credit (decrease)
-            (txn.amount, -txn.amount)
-        } else if target_is_liability {
-            // Liability account: positive = payment (debit to decrease), negative = charge (credit to increase)
-            (txn.amount, -txn.amount)
-        } else {
-            // Other account types: same as asset for now
-            (txn.amount, -txn.amount)
-        };
-
-        let entry_lines = vec![
-            EntryLine {
-                account_id: account_id.to_string(),
-                amount: target_amount,
-                currency: "USD".to_string(),
-                exchange_rate: None,
-                memo: None,
-            },
-            EntryLine {
-                account_id: uncategorized_id.clone(),
-                amount: offset_amount,
-                currency: "USD".to_string(),
-                exchange_rate: None,
-                memo: None,
-            },
-        ];
-
-        match commands.post_entry(PostEntryCommand {
-            date: txn.date,
-            memo: txn.description.clone(),
-            lines: entry_lines,
-            reference: None,
-            source: Some(JournalEntrySource::Import),
-        }) {
-            Ok(_) => count += 1,
-            Err(e) => {
-                eprintln!("Failed to import transaction: {}", e);
-            }
-        }
-    }
-
-    // Save the bank-account mapping if requested and we have a bank_id
-    if save_mapping {
-        if let Some(ref bid) = bank_id {
-            let _ = store.connection().execute(
-                "INSERT OR REPLACE INTO bank_accounts (bank_id, bank_name, account_id) VALUES (?1, ?2, ?3)",
-                rusqlite::params![bid, bank_name, account_id],
-            );
-        }
-    }
-
-    // Mark the import as processed
-    let _ = store.connection().execute(
-        "UPDATE pending_imports SET status = 'imported', imported_count = ?1, processed_at = datetime('now') WHERE id = ?2",
-        rusqlite::params![count as i64, import_id],
+    crate::commands::import_commands::finalize_bank_import(
+        store,
+        import_id,
+        account_id,
+        save_mapping,
+        count,
     );
 
     Ok(count)

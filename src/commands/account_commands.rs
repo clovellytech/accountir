@@ -21,6 +21,55 @@ pub enum AccountCommandError {
     HasBalance,
 }
 
+/// Find or create the "Uncategorized" expense account.
+/// Uses the event store so the creation is properly event-sourced.
+pub fn find_or_create_uncategorized(store: &mut EventStore) -> Result<String, AccountCommandError> {
+    let conn = store.connection();
+
+    // Check if it already exists
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM accounts WHERE LOWER(name) = 'uncategorized' AND is_active = 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+
+    // Find next available account number in 9000 range
+    let next_number: String = conn
+        .query_row(
+            "SELECT MAX(CAST(account_number AS INTEGER)) FROM accounts WHERE account_number LIKE '9%'",
+            [],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+        .map(|n| format!("{}", n + 1))
+        .unwrap_or_else(|| "9000".to_string());
+
+    let mut commands = AccountCommands::new(store, "system".to_string());
+    let stored = commands.create_account(CreateAccountCommand {
+        account_type: AccountType::Expense,
+        account_number: next_number,
+        name: "Uncategorized".to_string(),
+        parent_id: None,
+        currency: Some("USD".to_string()),
+        description: Some("Uncategorized transactions".to_string()),
+    })?;
+
+    if let Event::AccountCreated { account_id, .. } = &stored.event {
+        Ok(account_id.clone())
+    } else {
+        Err(AccountCommandError::InvalidData(
+            "Unexpected event type".to_string(),
+        ))
+    }
+}
+
 /// Command to create a new account
 #[derive(Debug, Clone)]
 pub struct CreateAccountCommand {
@@ -360,6 +409,201 @@ impl<'a> AccountCommands<'a> {
         projector.apply(&stored)?;
 
         Ok(stored)
+    }
+}
+
+/// Check if the database has any active accounts.
+pub fn has_no_accounts(store: &EventStore) -> bool {
+    let count: i64 = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) FROM accounts WHERE is_active = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    count == 0
+}
+
+/// Ensure a default company exists. Returns a status message if one was created.
+pub fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Option<String> {
+    let has_company: bool = store
+        .connection()
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM company WHERE id = 'default'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if has_company {
+        return None;
+    }
+
+    let company_name = db_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("My Company")
+        .to_string();
+    let company_id = Uuid::new_v4().to_string();
+    let envelope = crate::events::types::EventEnvelope::new(
+        Event::CompanyCreated {
+            company_id,
+            name: company_name.clone(),
+            base_currency: "USD".to_string(),
+            fiscal_year_start: 1,
+        },
+        "system".to_string(),
+    );
+    match store.append(envelope) {
+        Ok(stored) => {
+            let projector = crate::store::projections::Projector::new(store.connection());
+            if let Err(e) = projector.apply(&stored) {
+                return Some(format!("Failed to project company: {}", e));
+            }
+            Some(format!("Company '{}' created for sync", company_name))
+        }
+        Err(e) => Some(format!("Failed to create company: {}", e)),
+    }
+}
+
+/// Create the default chart of accounts. Returns the count of accounts created.
+pub fn create_default_accounts(store: &mut EventStore) -> Result<usize, String> {
+    let defaults: Vec<(&str, &str, AccountType, Option<&str>)> = vec![
+        ("1000", "Assets", AccountType::Asset, None),
+        (
+            "1001",
+            "Business Checking",
+            AccountType::Asset,
+            Some("1000"),
+        ),
+        ("2000", "Income", AccountType::Revenue, None),
+        ("3000", "Expenses", AccountType::Expense, None),
+        ("4000", "Equity", AccountType::Equity, None),
+        (
+            "4001",
+            "Opening Balances",
+            AccountType::Equity,
+            Some("4000"),
+        ),
+        ("5000", "Liabilities", AccountType::Liability, None),
+    ];
+
+    let mut account_ids: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut created = 0;
+
+    for (number, name, account_type, _parent_number) in &defaults {
+        let mut commands = AccountCommands::new(store, "system".to_string());
+        let cmd = CreateAccountCommand {
+            account_type: *account_type,
+            account_number: number.to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            currency: Some("USD".to_string()),
+            description: None,
+        };
+        match commands.create_account(cmd) {
+            Ok(stored) => {
+                if let Event::AccountCreated { account_id, .. } = &stored.event {
+                    account_ids.insert(number.to_string(), account_id.clone());
+                }
+                created += 1;
+            }
+            Err(e) => return Err(format!("Failed to create account {}: {}", number, e)),
+        }
+    }
+
+    for (number, _name, _account_type, parent_number) in &defaults {
+        if let Some(parent_num) = parent_number {
+            let account_id = account_ids.get(*number).cloned();
+            let parent_id = account_ids.get(*parent_num).cloned();
+            if let (Some(aid), Some(pid)) = (account_id, parent_id) {
+                let mut commands = AccountCommands::new(store, "system".to_string());
+                let cmd = UpdateAccountCommand {
+                    account_id: aid,
+                    account_number: None,
+                    name: None,
+                    parent_id: Some(Some(pid)),
+                    description: None,
+                };
+                if let Err(e) = commands.update_account(cmd) {
+                    return Err(format!("Failed to set parent for {}: {}", number, e));
+                }
+            }
+        }
+    }
+
+    Ok(created)
+}
+
+/// Create opening balance journal entries for accounts.
+pub fn create_opening_balance_entries(
+    store: &mut EventStore,
+    entries: &[(String, String, i64, i32)], // (account_id, account_name, amount_cents, year)
+) {
+    use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
+    use crate::events::types::JournalEntrySource;
+
+    // Find or create an "Opening Balances" equity account
+    let equity_account_id: String = store
+        .connection()
+        .query_row(
+            "SELECT id FROM accounts WHERE LOWER(name) = 'opening balances' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| {
+            let mut acct_commands = AccountCommands::new(store, "system".to_string());
+            match acct_commands.create_account(CreateAccountCommand {
+                account_type: AccountType::Equity,
+                account_number: "3000".to_string(),
+                name: "Opening Balances".to_string(),
+                parent_id: None,
+                currency: None,
+                description: Some("Equity account for opening balance entries".to_string()),
+            }) {
+                Ok(stored) => {
+                    if let Event::AccountCreated { account_id, .. } = &stored.event {
+                        account_id.clone()
+                    } else {
+                        Uuid::new_v4().to_string()
+                    }
+                }
+                Err(_) => Uuid::new_v4().to_string(),
+            }
+        });
+
+    let mut commands = EntryCommands::new(store, "system".to_string());
+
+    for (account_id, account_name, amount_cents, year) in entries {
+        let date = chrono::NaiveDate::from_ymd_opt(*year, 1, 1)
+            .unwrap_or_else(|| chrono::Utc::now().date_naive());
+
+        let lines = vec![
+            EntryLine {
+                account_id: account_id.clone(),
+                amount: *amount_cents,
+                currency: "USD".to_string(),
+                exchange_rate: None,
+                memo: None,
+            },
+            EntryLine {
+                account_id: equity_account_id.clone(),
+                amount: -*amount_cents,
+                currency: "USD".to_string(),
+                exchange_rate: None,
+                memo: None,
+            },
+        ];
+
+        let _ = commands.post_entry(PostEntryCommand {
+            date,
+            memo: format!("Opening balance: {}", account_name),
+            lines,
+            reference: Some("opening-balance".to_string()),
+            source: Some(JournalEntrySource::System),
+        });
     }
 }
 

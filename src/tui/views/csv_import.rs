@@ -1610,98 +1610,10 @@ pub fn parse_csv_line(line: &str) -> Vec<String> {
 }
 
 /// Parse a delimited line, handling double-quoted fields with escaped quotes.
-pub fn parse_delimited_line(line: &str, delimiter: char) -> Vec<String> {
-    let mut fields = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-    let mut chars = line.chars().peekable();
+pub use crate::commands::import_commands::parse_delimited_line;
 
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => {
-                if in_quotes {
-                    // Check for escaped quote
-                    if chars.peek() == Some(&'"') {
-                        current.push('"');
-                        chars.next();
-                    } else {
-                        in_quotes = false;
-                    }
-                } else {
-                    in_quotes = true;
-                }
-            }
-            c if c == delimiter && !in_quotes => {
-                fields.push(current.trim().to_string());
-                current = String::new();
-            }
-            _ => {
-                current.push(c);
-            }
-        }
-    }
-
-    fields.push(current.trim().to_string());
-    fields
-}
-
-/// Parse a date string in various formats
-pub fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
-    let s = s.trim();
-
-    // Try yyyy/mm/dd or yyyy-mm-dd
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y/%m/%d") {
-        return Some(date);
-    }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Some(date);
-    }
-
-    // Try mm/dd/yy or mm-dd-yy
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%m/%d/%y") {
-        return Some(date);
-    }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%m-%d-%y") {
-        return Some(date);
-    }
-
-    // Try mm/dd/yyyy or mm-dd-yyyy
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%m/%d/%Y") {
-        return Some(date);
-    }
-    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%m-%d-%Y") {
-        return Some(date);
-    }
-
-    None
-}
-
-/// Parse an amount string, handling currency symbols and negative formats
-pub fn parse_amount(s: &str) -> Option<i64> {
-    let s = s.trim();
-
-    // Handle parentheses for negative: (123.45) -> -123.45
-    let (is_negative, s) =
-        if let Some(inner) = s.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
-            (true, inner)
-        } else if let Some(rest) = s.strip_prefix('-') {
-            (true, rest)
-        } else {
-            (false, s)
-        };
-
-    // Remove currency symbols and commas
-    let cleaned: String = s
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-
-    // Parse as float and convert to cents
-    let value: f64 = cleaned.parse().ok()?;
-    let cents = (value * 100.0).round() as i64;
-
-    Some(if is_negative { -cents } else { cents })
-}
+pub use crate::commands::import_commands::parse_amount;
+pub use crate::commands::import_commands::parse_date;
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let popup_layout = Layout::default()

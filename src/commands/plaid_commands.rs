@@ -20,6 +20,8 @@ pub enum PlaidCommandError {
     AccountNotMapped(String),
     #[error("Database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
+    #[error("Account error: {0}")]
+    AccountError(#[from] crate::commands::account_commands::AccountCommandError),
 }
 
 pub struct PlaidCommands<'a> {
@@ -133,8 +135,12 @@ impl<'a> PlaidCommands<'a> {
         item_id: &str,
         transactions: &[SyncedTransaction],
     ) -> Result<(u32, u32), PlaidCommandError> {
+        // Get uncategorized account first (needs &mut store)
+        let uncategorized_id =
+            crate::commands::account_commands::find_or_create_uncategorized(self.store)?;
+
         // Pre-load all data we need into owned values, then drop the borrows
-        let (mappings, uncategorized_id, already_imported_set) = {
+        let (mappings, already_imported_set) = {
             let conn = self.store.connection();
 
             let mut stmt = conn.prepare(
@@ -146,8 +152,6 @@ impl<'a> PlaidCommands<'a> {
                 })?
                 .filter_map(|r| r.ok())
                 .collect();
-
-            let uncategorized_id = find_or_create_uncategorized(conn)?;
 
             // Pre-check all transaction IDs for dedup
             let mut already_imported = std::collections::HashSet::new();
@@ -164,7 +168,7 @@ impl<'a> PlaidCommands<'a> {
                 }
             }
 
-            (mappings, uncategorized_id, already_imported)
+            (mappings, already_imported)
         };
         // All borrows of self.store.connection() are now dropped
 
@@ -468,10 +472,8 @@ impl<'a> PlaidCommands<'a> {
             load_staged_transaction(conn, staged_txn_id)?
         };
 
-        let uncategorized_id = {
-            let conn = self.store.connection();
-            find_or_create_uncategorized(conn)?
-        };
+        let uncategorized_id =
+            crate::commands::account_commands::find_or_create_uncategorized(self.store)?;
 
         let local_account_id = txn
             .local_account_id
@@ -902,45 +904,4 @@ pub fn staged_counts(conn: &rusqlite::Connection) -> Result<(u32, u32), PlaidCom
         |row| row.get(0),
     )?;
     Ok((staged, transfers))
-}
-
-fn find_or_create_uncategorized(conn: &rusqlite::Connection) -> Result<String, PlaidCommandError> {
-    // Check if "Uncategorized" account already exists
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM accounts WHERE name = 'Uncategorized' AND is_active = 1",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-
-    // Find next available account number in 9000 range
-    let max_number: Option<String> = conn
-        .query_row(
-            "SELECT MAX(account_number) FROM accounts WHERE account_number LIKE '9%'",
-            [],
-            |row| row.get(0),
-        )
-        .ok()
-        .flatten();
-
-    let next_number = match max_number {
-        Some(n) => {
-            let num: u32 = n.parse().unwrap_or(8999);
-            format!("{}", num + 1)
-        }
-        None => "9000".to_string(),
-    };
-
-    let account_id = Uuid::new_v4().to_string();
-    conn.execute(
-        "INSERT INTO accounts (id, account_type, account_number, name, is_active) VALUES (?1, 'expense', ?2, 'Uncategorized', 1)",
-        rusqlite::params![account_id, next_number],
-    )?;
-
-    Ok(account_id)
 }
