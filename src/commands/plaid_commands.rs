@@ -312,11 +312,17 @@ impl<'a> PlaidCommands<'a> {
                 let currency = txn.iso_currency_code.as_deref().unwrap_or("USD");
                 let id = Uuid::new_v4().to_string();
 
+                let payment_meta_json = txn
+                    .payment_meta
+                    .as_ref()
+                    .filter(|pm| !pm.is_empty())
+                    .and_then(|pm| serde_json::to_string(pm).ok());
+
                 conn.execute(
                     "INSERT INTO plaid_staged_transactions
                      (id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
-                      amount_cents, date, name, merchant_name, currency, status)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending')",
+                      amount_cents, date, name, merchant_name, currency, status, payment_meta)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
                     rusqlite::params![
                         id,
                         item_id,
@@ -327,7 +333,8 @@ impl<'a> PlaidCommands<'a> {
                         txn.date,
                         txn.name,
                         txn.merchant_name,
-                        currency
+                        currency,
+                        payment_meta_json
                     ],
                 )?;
                 staged += 1;
@@ -612,6 +619,33 @@ pub struct SyncedTransaction {
     pub iso_currency_code: Option<String>,
     #[serde(skip)]
     pub currency: Option<String>,
+    #[serde(default)]
+    pub payment_meta: Option<PaymentMeta>,
+}
+
+/// Payment metadata from Plaid (card holder, reference number, etc.)
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PaymentMeta {
+    pub by_order_of: Option<String>,
+    pub payee: Option<String>,
+    pub payer: Option<String>,
+    pub payment_method: Option<String>,
+    pub payment_processor: Option<String>,
+    pub reason: Option<String>,
+    pub reference_number: Option<String>,
+}
+
+impl PaymentMeta {
+    /// Returns true if all fields are None (Plaid sometimes sends an object with all nulls)
+    pub fn is_empty(&self) -> bool {
+        self.by_order_of.is_none()
+            && self.payee.is_none()
+            && self.payer.is_none()
+            && self.payment_method.is_none()
+            && self.payment_processor.is_none()
+            && self.reason.is_none()
+            && self.reference_number.is_none()
+    }
 }
 
 /// A staged Plaid transaction awaiting review/import.
@@ -628,6 +662,7 @@ pub struct StagedTransaction {
     pub merchant_name: Option<String>,
     pub currency: String,
     pub status: String,
+    pub payment_meta: Option<PaymentMeta>,
 }
 
 /// A detected transfer candidate pair for display.
@@ -745,13 +780,17 @@ fn load_transfer_pair(
 }
 
 /// Load a single staged transaction by ID.
+fn parse_payment_meta(json: Option<String>) -> Option<PaymentMeta> {
+    json.and_then(|s| serde_json::from_str(&s).ok())
+}
+
 fn load_staged_transaction(
     conn: &rusqlite::Connection,
     id: &str,
 ) -> Result<StagedTransaction, PlaidCommandError> {
     conn.query_row(
         "SELECT id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
-                amount_cents, date, name, merchant_name, currency, status
+                amount_cents, date, name, merchant_name, currency, status, payment_meta
          FROM plaid_staged_transactions WHERE id = ?1",
         [id],
         |row| {
@@ -767,6 +806,7 @@ fn load_staged_transaction(
                 merchant_name: row.get(8)?,
                 currency: row.get(9)?,
                 status: row.get(10)?,
+                payment_meta: parse_payment_meta(row.get(11)?),
             })
         },
     )
@@ -820,7 +860,7 @@ pub fn load_pending_staged(
 ) -> Result<Vec<StagedTransaction>, PlaidCommandError> {
     let mut stmt = conn.prepare(
         "SELECT id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
-                amount_cents, date, name, merchant_name, currency, status
+                amount_cents, date, name, merchant_name, currency, status, payment_meta
          FROM plaid_staged_transactions
          WHERE status = 'pending'
          ORDER BY date DESC",
@@ -840,6 +880,7 @@ pub fn load_pending_staged(
                 merchant_name: row.get(8)?,
                 currency: row.get(9)?,
                 status: row.get(10)?,
+                payment_meta: parse_payment_meta(row.get(11)?),
             })
         })?
         .filter_map(|r| r.ok())

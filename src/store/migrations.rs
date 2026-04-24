@@ -36,6 +36,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
         (3, include_str!("../../migrations/003_bank_imports.sql")),
         (4, include_str!("../../migrations/004_plaid.sql")),
         (5, include_str!("../../migrations/005_plaid_staging.sql")),
+        (6, include_str!("../../migrations/006_plaid_payment_meta.sql")),
     ];
 
     for (version, sql) in migrations {
@@ -264,7 +265,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             merchant_name TEXT,
             currency TEXT NOT NULL DEFAULT 'USD',
             staged_at TEXT NOT NULL DEFAULT (datetime('now')),
-            status TEXT NOT NULL DEFAULT 'pending'
+            status TEXT NOT NULL DEFAULT 'pending',
+            payment_meta TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_staged_status ON plaid_staged_transactions(status);

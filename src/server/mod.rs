@@ -921,12 +921,17 @@ async fn plaid_sync(
         let amount_cents = (txn.amount * 100.0).round() as i64;
         let currency = txn.iso_currency_code.as_deref().unwrap_or("USD");
         let id = uuid::Uuid::new_v4().to_string();
+        let payment_meta_json = txn
+            .payment_meta
+            .as_ref()
+            .filter(|pm| !pm.is_empty())
+            .and_then(|pm| serde_json::to_string(pm).ok());
 
         conn.execute(
             "INSERT INTO plaid_staged_transactions
              (id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
-              amount_cents, date, name, merchant_name, currency, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending')",
+              amount_cents, date, name, merchant_name, currency, status, payment_meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
             rusqlite::params![
                 id,
                 req.item_id,
@@ -937,7 +942,8 @@ async fn plaid_sync(
                 txn.date,
                 txn.name,
                 txn.merchant_name,
-                currency
+                currency,
+                payment_meta_json
             ],
         )
         .map_err(|e| {
@@ -998,6 +1004,8 @@ struct StagedTransactionJson {
     local_account_id: Option<String>,
     local_account_name: Option<String>,
     currency: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payment_meta: Option<crate::commands::plaid_commands::PaymentMeta>,
 }
 
 async fn plaid_staged_list(
@@ -1056,6 +1064,7 @@ async fn plaid_staged_list(
             local_account_id: t.local_account_id.clone(),
             local_account_name: resolve_account_name(conn, &t.local_account_id),
             currency: t.currency.clone(),
+            payment_meta: t.payment_meta.clone(),
         }
     }
 

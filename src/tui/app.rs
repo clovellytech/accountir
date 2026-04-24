@@ -527,12 +527,19 @@ impl App {
                     })
                     .unwrap_or_else(|| "Unmapped".to_string());
 
+                let card_holder = t.payment_meta.as_ref().and_then(|pm| {
+                    pm.by_order_of
+                        .clone()
+                        .or_else(|| pm.reference_number.clone())
+                });
+
                 StagedTransactionDisplay {
                     id: t.id.clone(),
                     date: t.date.clone(),
                     name: t.merchant_name.as_deref().unwrap_or(&t.name).to_string(),
                     account_name,
                     amount_cents: t.amount_cents,
+                    card_holder,
                 }
             })
             .collect();

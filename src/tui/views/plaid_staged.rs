@@ -46,6 +46,7 @@ pub struct StagedTransactionDisplay {
     pub name: String,
     pub account_name: String,
     pub amount_cents: i64,
+    pub card_holder: Option<String>,
 }
 
 pub enum StagedAction {
@@ -328,13 +329,25 @@ impl PlaidStagedView {
             .block(unmatched_block);
             frame.render_widget(msg, chunks[2]);
         } else {
-            let header = Row::new(vec![
-                Cell::from("Date"),
-                Cell::from("Name"),
-                Cell::from("Account"),
-                Cell::from("Amount"),
-            ])
-            .style(
+            let has_card_holders = self.unmatched.iter().any(|t| t.card_holder.is_some());
+
+            let header_cells = if has_card_holders {
+                vec![
+                    Cell::from("Date"),
+                    Cell::from("Name"),
+                    Cell::from("Account"),
+                    Cell::from("Card"),
+                    Cell::from("Amount"),
+                ]
+            } else {
+                vec![
+                    Cell::from("Date"),
+                    Cell::from("Name"),
+                    Cell::from("Account"),
+                    Cell::from("Amount"),
+                ]
+            };
+            let header = Row::new(header_cells).style(
                 Style::default()
                     .fg(theme.header)
                     .add_modifier(Modifier::BOLD),
@@ -370,30 +383,46 @@ impl PlaidStagedView {
                         theme.error
                     };
 
-                    Row::new(vec![
+                    let mut cells = vec![
                         Cell::from(t.date.clone()),
                         Cell::from(truncate(&t.name, 35)),
                         Cell::from(t.account_name.clone()),
-                        Cell::from(Span::styled(
-                            format_amount(t.amount_cents),
-                            Style::default().fg(amount_color),
-                        )),
-                    ])
-                    .style(style)
+                    ];
+                    if has_card_holders {
+                        cells.push(Cell::from(Span::styled(
+                            t.card_holder.as_deref().unwrap_or(""),
+                            Style::default().fg(theme.fg_dim),
+                        )));
+                    }
+                    cells.push(Cell::from(Span::styled(
+                        format_amount(t.amount_cents),
+                        Style::default().fg(amount_color),
+                    )));
+
+                    Row::new(cells).style(style)
                 })
                 .collect();
 
-            let table = Table::new(
-                rows,
-                [
+            let widths = if has_card_holders {
+                vec![
+                    Constraint::Percentage(12),
+                    Constraint::Percentage(30),
+                    Constraint::Percentage(22),
+                    Constraint::Percentage(18),
+                    Constraint::Percentage(18),
+                ]
+            } else {
+                vec![
                     Constraint::Percentage(15),
                     Constraint::Percentage(40),
                     Constraint::Percentage(25),
                     Constraint::Percentage(20),
-                ],
-            )
-            .header(header)
-            .block(unmatched_block);
+                ]
+            };
+
+            let table = Table::new(rows, widths)
+                .header(header)
+                .block(unmatched_block);
 
             frame.render_widget(table, chunks[2]);
         }
