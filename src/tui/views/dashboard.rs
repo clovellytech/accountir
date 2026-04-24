@@ -10,6 +10,7 @@ use ratatui::{
 use crate::domain::AccountType;
 use crate::queries::account_queries::AccountBalance;
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 pub struct DashboardView {
     pub balances: Vec<AccountBalance>,
@@ -81,24 +82,24 @@ impl DashboardView {
             Line::from(vec![
                 Span::raw("Total Assets: "),
                 Span::styled(
-                    format_currency(total_assets),
+                    widgets::format_currency(total_assets),
                     Style::default().fg(theme.success),
                 ),
                 Span::raw("  |  Total Liabilities: "),
                 Span::styled(
-                    format_currency(total_liabilities),
+                    widgets::format_currency(total_liabilities),
                     Style::default().fg(theme.error),
                 ),
                 Span::raw("  |  Equity: "),
                 Span::styled(
-                    format_currency(total_equity),
+                    widgets::format_currency(total_equity),
                     Style::default().fg(theme.info),
                 ),
             ]),
             Line::from(vec![
                 Span::raw("Net Income: "),
                 Span::styled(
-                    format_currency(net_income),
+                    widgets::format_currency(net_income),
                     Style::default().fg(if net_income >= 0 {
                         theme.success
                     } else {
@@ -185,7 +186,7 @@ impl DashboardView {
                 Row::new(vec![
                     acc.account_number.clone(),
                     acc.account_name.clone(),
-                    format_currency(display_balance),
+                    widgets::format_currency(display_balance),
                 ])
             })
             .collect();
@@ -217,11 +218,3 @@ impl Default for DashboardView {
     }
 }
 
-fn format_currency(cents: i64) -> String {
-    let dollars = cents as f64 / 100.0;
-    if cents < 0 {
-        format!("(${:.2})", -dollars)
-    } else {
-        format!("${:.2}", dollars)
-    }
-}

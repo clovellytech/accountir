@@ -10,6 +10,7 @@ use ratatui::{
 use chrono::NaiveDate;
 
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 #[derive(Debug, Clone)]
 pub struct EntryLineDetail {
@@ -85,7 +86,7 @@ impl EntryDetailModal {
             return;
         };
 
-        let modal_area = centered_rect(70, 70, area);
+        let modal_area = widgets::centered_rect(70, 70, area);
         frame.render_widget(Clear, modal_area);
 
         let title = if entry.is_void {
@@ -112,7 +113,7 @@ impl EntryDetailModal {
 
         frame.render_widget(block, modal_area);
 
-        let inner = inner_rect(modal_area, 2, 1);
+        let inner = widgets::inner_rect(modal_area, 2, 1);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -153,12 +154,12 @@ impl EntryDetailModal {
             .iter()
             .map(|line| {
                 let debit_str = if line.debit > 0 {
-                    format_currency(line.debit)
+                    widgets::format_currency(line.debit)
                 } else {
                     String::new()
                 };
                 let credit_str = if line.credit > 0 {
-                    format_currency(line.credit)
+                    widgets::format_currency(line.credit)
                 } else {
                     String::new()
                 };
@@ -206,10 +207,10 @@ impl EntryDetailModal {
         let totals = Paragraph::new(Line::from(vec![
             Span::styled("Totals: ", Style::default().fg(theme.fg_dim)),
             Span::styled("Debits ", Style::default().fg(theme.success)),
-            Span::raw(format_currency(total_debits)),
+            Span::raw(widgets::format_currency(total_debits)),
             Span::raw("  "),
             Span::styled("Credits ", Style::default().fg(theme.error)),
-            Span::raw(format_currency(total_credits)),
+            Span::raw(widgets::format_currency(total_credits)),
         ]));
         frame.render_widget(totals, chunks[2]);
 
@@ -228,36 +229,3 @@ impl Default for EntryDetailModal {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-fn inner_rect(area: Rect, margin_x: u16, margin_y: u16) -> Rect {
-    Rect {
-        x: area.x + margin_x,
-        y: area.y + margin_y,
-        width: area.width.saturating_sub(margin_x * 2),
-        height: area.height.saturating_sub(margin_y * 2),
-    }
-}
-
-fn format_currency(cents: i64) -> String {
-    let dollars = cents as f64 / 100.0;
-    format!("${:.2}", dollars)
-}

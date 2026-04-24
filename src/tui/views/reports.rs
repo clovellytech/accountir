@@ -13,6 +13,7 @@ use crate::queries::reports::{
     BalanceSheet, BalanceSheetLine, IncomeStatement, IncomeStatementLine, TrialBalanceLine,
 };
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportType {
@@ -319,8 +320,8 @@ impl ReportsView {
                 Row::new(vec![
                     row.account_number.clone(),
                     row.account_name.clone(),
-                    row.debit.map(format_currency).unwrap_or_default(),
-                    row.credit.map(format_currency).unwrap_or_default(),
+                    row.debit.map(widgets::format_currency).unwrap_or_default(),
+                    row.credit.map(widgets::format_currency).unwrap_or_default(),
                 ])
             })
             .collect();
@@ -353,8 +354,8 @@ impl ReportsView {
             Row::new(vec![
                 String::new(),
                 "Totals".to_string(),
-                format_currency(total_debits),
-                format_currency(total_credits),
+                widgets::format_currency(total_debits),
+                widgets::format_currency(total_credits),
             ])
             .style(bold),
         );
@@ -408,14 +409,14 @@ impl ReportsView {
         asset_rows.push(Row::new(vec!["", "", ""]));
 
         let asset_tree = build_report_rows(&bs_to_inputs(&bs.assets.lines), self.collapse_depth);
-        render_report_rows(&asset_tree, format_currency, &mut asset_rows);
+        render_report_rows(&asset_tree, widgets::format_currency, &mut asset_rows);
 
         push_single_rule(&mut asset_rows);
         asset_rows.push(
             Row::new(vec![
                 "Total Assets".to_string(),
                 String::new(),
-                format_currency(bs.total_assets),
+                widgets::format_currency(bs.total_assets),
             ])
             .style(bold),
         );
@@ -448,14 +449,14 @@ impl ReportsView {
 
         let liab_tree =
             build_report_rows(&bs_to_inputs(&bs.liabilities.lines), self.collapse_depth);
-        render_report_rows(&liab_tree, |b| format_currency(b.abs()), &mut le_rows);
+        render_report_rows(&liab_tree, |b| widgets::format_currency(b.abs()), &mut le_rows);
 
         push_single_rule(&mut le_rows);
         le_rows.push(
             Row::new(vec![
                 "Total Liabilities".to_string(),
                 String::new(),
-                format_currency(bs.liabilities.total),
+                widgets::format_currency(bs.liabilities.total),
             ])
             .style(bold),
         );
@@ -465,14 +466,14 @@ impl ReportsView {
         le_rows.push(Row::new(vec!["", "", ""]));
 
         let equity_tree = build_report_rows(&bs_to_inputs(&bs.equity.lines), self.collapse_depth);
-        render_report_rows(&equity_tree, |b| format_currency(b.abs()), &mut le_rows);
+        render_report_rows(&equity_tree, |b| widgets::format_currency(b.abs()), &mut le_rows);
 
         push_single_rule(&mut le_rows);
         le_rows.push(
             Row::new(vec![
                 "Total Equity".to_string(),
                 String::new(),
-                format_currency(bs.equity.total),
+                widgets::format_currency(bs.equity.total),
             ])
             .style(bold),
         );
@@ -484,7 +485,7 @@ impl ReportsView {
             Row::new(vec![
                 "Total L+E".to_string(),
                 String::new(),
-                format_currency(bs.total_liabilities_and_equity),
+                widgets::format_currency(bs.total_liabilities_and_equity),
             ])
             .style(bold.fg(theme.header)),
         );
@@ -526,13 +527,13 @@ impl ReportsView {
         rows.push(Row::new(vec!["REVENUE", "", ""]).style(bold.fg(theme.success)));
         rows.push(Row::new(vec!["", "", ""]));
         let rev_tree = build_report_rows(&is_to_inputs(&is.revenue.lines), self.collapse_depth);
-        render_report_rows(&rev_tree, format_currency, &mut rows);
+        render_report_rows(&rev_tree, widgets::format_currency, &mut rows);
         push_single_rule(&mut rows);
         rows.push(
             Row::new(vec![
                 "Total Revenue".to_string(),
                 String::new(),
-                format_currency(is.revenue.total),
+                widgets::format_currency(is.revenue.total),
             ])
             .style(bold),
         );
@@ -542,13 +543,13 @@ impl ReportsView {
         rows.push(Row::new(vec!["EXPENSES", "", ""]).style(bold.fg(theme.error)));
         rows.push(Row::new(vec!["", "", ""]));
         let exp_tree = build_report_rows(&is_to_inputs(&is.expenses.lines), self.collapse_depth);
-        render_report_rows(&exp_tree, format_currency, &mut rows);
+        render_report_rows(&exp_tree, widgets::format_currency, &mut rows);
         push_single_rule(&mut rows);
         rows.push(
             Row::new(vec![
                 "Total Expenses".to_string(),
                 String::new(),
-                format_currency(is.expenses.total),
+                widgets::format_currency(is.expenses.total),
             ])
             .style(bold),
         );
@@ -561,9 +562,9 @@ impl ReportsView {
             bold.fg(theme.error)
         };
         let net_income_str = if is.net_income >= 0 {
-            format_currency(is.net_income)
+            widgets::format_currency(is.net_income)
         } else {
-            format!("({}) LOSS", format_currency(-is.net_income))
+            format!("({}) LOSS", widgets::format_currency(-is.net_income))
         };
         push_single_rule(&mut rows);
         rows.push(
@@ -604,10 +605,6 @@ impl Default for ReportsView {
     }
 }
 
-fn format_currency(cents: i64) -> String {
-    let dollars = cents as f64 / 100.0;
-    format!("${:.2}", dollars)
-}
 
 const SINGLE_LINE: &str = "───────────────";
 const DOUBLE_LINE: &str = "═══════════════";

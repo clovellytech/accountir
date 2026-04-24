@@ -9,6 +9,7 @@ use ratatui::{
 
 use crate::config::AppConfig;
 use crate::tui::theme::{Theme, ThemePreset};
+use crate::tui::widgets;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsResult {
@@ -85,7 +86,7 @@ impl SettingsModal {
             return;
         }
 
-        let modal_area = centered_rect(50, 50, area);
+        let modal_area = widgets::centered_rect(50, 50, area);
         frame.render_widget(Clear, modal_area);
 
         let block = Block::default()
@@ -96,7 +97,7 @@ impl SettingsModal {
 
         frame.render_widget(block, modal_area);
 
-        let inner = inner_rect(modal_area, 2, 1);
+        let inner = widgets::inner_rect(modal_area, 2, 1);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -169,31 +170,3 @@ impl Default for SettingsModal {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-fn inner_rect(area: Rect, margin_x: u16, margin_y: u16) -> Rect {
-    Rect {
-        x: area.x + margin_x,
-        y: area.y + margin_y,
-        width: area.width.saturating_sub(margin_x * 2),
-        height: area.height.saturating_sub(margin_y * 2),
-    }
-}

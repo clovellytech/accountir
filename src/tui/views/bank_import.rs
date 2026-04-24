@@ -9,6 +9,7 @@ use ratatui::{
 use super::csv_import::{parse_amount, parse_csv_line, parse_date};
 use crate::domain::Account;
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 /// A pending import from the bank sync
 #[derive(Debug, Clone)]
@@ -808,13 +809,13 @@ impl BankImportModal {
 
                 if let Some(idx) = self.date_column {
                     let val = first_row.get(idx).map(|s| s.as_str()).unwrap_or("N/A");
-                    sample_lines.push(Line::from(format!("  Date: {}", truncate_str(val, 40))));
+                    sample_lines.push(Line::from(format!("  Date: {}", widgets::truncate(val, 40))));
                 }
                 if let Some(idx) = self.description_column {
                     let val = first_row.get(idx).map(|s| s.as_str()).unwrap_or("N/A");
                     sample_lines.push(Line::from(format!(
                         "  Description: {}",
-                        truncate_str(val, 40)
+                        widgets::truncate(val, 40)
                     )));
                 }
                 if let Some(idx) = self.amount_column {
@@ -881,7 +882,7 @@ impl BankImportModal {
                         format!("{} ", txn.date.format("%m/%d")),
                         Style::default().fg(theme.fg_dim),
                     ),
-                    Span::raw(truncate_str(&txn.description, 40)),
+                    Span::raw(widgets::truncate(&txn.description, 40)),
                     Span::raw(" "),
                     Span::styled(amount_str, Style::default().fg(amount_color)),
                 ]);
@@ -951,10 +952,3 @@ impl BankImportModal {
     }
 }
 
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
-    }
-}

@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 /// Help content for different views
 pub struct HelpModal {
@@ -36,7 +37,7 @@ impl HelpModal {
         }
 
         // Create a centered modal
-        let modal_area = centered_rect(60, 70, area);
+        let modal_area = widgets::centered_rect(60, 70, area);
 
         // Clear the area behind the modal
         frame.render_widget(Clear, modal_area);
@@ -299,23 +300,3 @@ pub enum HelpContext {
     Plaid,
 }
 
-/// Helper function to create a centered rectangle
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}

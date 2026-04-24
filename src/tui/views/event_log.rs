@@ -9,6 +9,7 @@ use ratatui::{
 
 use crate::events::types::StoredEvent;
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 pub struct EventLogView {
     pub events: Vec<StoredEvent>,
@@ -223,10 +224,10 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             format!("Added user '{}' as {:?}", username, role)
         }
         Event::UserModified { user_id, field, .. } => {
-            format!("Modified {} for user {}", field, truncate(user_id, 8))
+            format!("Modified {} for user {}", field, widgets::truncate(user_id, 8))
         }
         Event::UserRemoved { user_id } => {
-            format!("Removed user {}", truncate(user_id, 8))
+            format!("Removed user {}", widgets::truncate(user_id, 8))
         }
         Event::AccountCreated {
             account_number,
@@ -238,7 +239,7 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 "{} {} - {} ({:?})",
                 account_number,
                 name,
-                truncate(name, 20),
+                widgets::truncate(name, 20),
                 account_type
             )
         }
@@ -252,14 +253,14 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 "Updated {} to '{}' on {}",
                 field,
                 new_value,
-                truncate(account_id, 8)
+                widgets::truncate(account_id, 8)
             )
         }
         Event::AccountDeactivated { account_id, .. } => {
-            format!("Deactivated account {}", truncate(account_id, 8))
+            format!("Deactivated account {}", widgets::truncate(account_id, 8))
         }
         Event::AccountReactivated { account_id } => {
-            format!("Reactivated account {}", truncate(account_id, 8))
+            format!("Reactivated account {}", widgets::truncate(account_id, 8))
         }
         Event::JournalEntryPosted { memo, lines, .. } => {
             let amount = lines
@@ -267,20 +268,20 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 .filter(|l| l.amount > 0)
                 .map(|l| l.amount)
                 .sum::<i64>();
-            format!("{} (${:.2})", truncate(memo, 40), amount as f64 / 100.0)
+            format!("{} (${:.2})", widgets::truncate(memo, 40), amount as f64 / 100.0)
         }
         Event::JournalEntryVoided { entry_id, reason } => {
             format!(
                 "Voided {} - {}",
-                truncate(entry_id, 8),
-                truncate(reason, 30)
+                widgets::truncate(entry_id, 8),
+                widgets::truncate(reason, 30)
             )
         }
         Event::JournalEntryUnvoided { entry_id, reason } => {
             format!(
                 "Unvoided {} - {}",
-                truncate(entry_id, 8),
-                truncate(reason, 30)
+                widgets::truncate(entry_id, 8),
+                widgets::truncate(reason, 30)
             )
         }
         Event::JournalEntryAnnotated {
@@ -289,8 +290,8 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         } => {
             format!(
                 "Annotated {} - {}",
-                truncate(entry_id, 8),
-                truncate(annotation, 30)
+                widgets::truncate(entry_id, 8),
+                widgets::truncate(annotation, 30)
             )
         }
         Event::JournalLineReassigned {
@@ -300,8 +301,8 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         } => {
             format!(
                 "Reassigned line {} to account {}",
-                truncate(line_id, 8),
-                truncate(new_account_id, 8)
+                widgets::truncate(line_id, 8),
+                widgets::truncate(new_account_id, 8)
             )
         }
         Event::FiscalYearOpened { year, .. } => {
@@ -320,7 +321,7 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 "Reopened period {} of {} - {}",
                 period,
                 year,
-                truncate(reason, 20)
+                widgets::truncate(reason, 20)
             )
         }
         Event::YearEndClosed { year, .. } => {
@@ -344,15 +345,15 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         } => {
             format!(
                 "Started reconciliation for {} on {}",
-                truncate(account_id, 8),
+                widgets::truncate(account_id, 8),
                 statement_date
             )
         }
         Event::TransactionCleared { entry_id, .. } => {
-            format!("Cleared transaction {}", truncate(entry_id, 8))
+            format!("Cleared transaction {}", widgets::truncate(entry_id, 8))
         }
         Event::TransactionUncleared { entry_id, .. } => {
-            format!("Uncleared transaction {}", truncate(entry_id, 8))
+            format!("Uncleared transaction {}", widgets::truncate(entry_id, 8))
         }
         Event::ReconciliationCompleted {
             reconciliation_id,
@@ -360,14 +361,14 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         } => {
             format!(
                 "Completed reconciliation {} (diff: {})",
-                truncate(reconciliation_id, 8),
+                widgets::truncate(reconciliation_id, 8),
                 difference
             )
         }
         Event::ReconciliationAbandoned { reconciliation_id } => {
             format!(
                 "Abandoned reconciliation {}",
-                truncate(reconciliation_id, 8)
+                widgets::truncate(reconciliation_id, 8)
             )
         }
         Event::PlaidItemConnected {
@@ -384,8 +385,8 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::PlaidItemDisconnected { item_id, reason } => {
             format!(
                 "Disconnected {} - {}",
-                truncate(item_id, 8),
-                truncate(reason, 30)
+                widgets::truncate(item_id, 8),
+                widgets::truncate(reason, 30)
             )
         }
         Event::PlaidAccountMapped {
@@ -395,8 +396,8 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         } => {
             format!(
                 "Mapped Plaid {} to {}",
-                truncate(plaid_account_id, 8),
-                truncate(local_account_id, 8)
+                widgets::truncate(plaid_account_id, 8),
+                widgets::truncate(local_account_id, 8)
             )
         }
         Event::PlaidAccountUnmapped {
@@ -406,8 +407,8 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         } => {
             format!(
                 "Unmapped Plaid {} from {}",
-                truncate(plaid_account_id, 8),
-                truncate(local_account_id, 8)
+                widgets::truncate(plaid_account_id, 8),
+                widgets::truncate(local_account_id, 8)
             )
         }
         Event::PlaidTransactionsSynced {
@@ -418,16 +419,9 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             format!(
                 "Synced {} transactions for {}",
                 transactions_added,
-                truncate(item_id, 8)
+                widgets::truncate(item_id, 8)
             )
         }
     }
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
-    }
-}

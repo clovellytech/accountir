@@ -14,6 +14,7 @@ use ratatui::{
 use crate::domain::{Account, AccountType};
 use crate::queries::search::EntrySearchResult;
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 /// Account choice for reassignment picker
 #[derive(Debug, Clone)]
@@ -895,9 +896,9 @@ impl JournalView {
                     // Ledger view columns
                     let amount = entry.account_amount.unwrap_or(0);
                     let (debit, credit) = if amount > 0 {
-                        (format_currency(amount), String::new())
+                        (widgets::format_currency(amount), String::new())
                     } else if amount < 0 {
-                        (String::new(), format_currency(-amount))
+                        (String::new(), widgets::format_currency(-amount))
                     } else {
                         (String::new(), String::new())
                     };
@@ -919,7 +920,7 @@ impl JournalView {
                         entry.reference.clone().unwrap_or_default(),
                         debit,
                         credit,
-                        format_currency(balance),
+                        widgets::format_currency(balance),
                         status.to_string(),
                     ]);
                     Row::new(cells).style(style)
@@ -933,7 +934,7 @@ impl JournalView {
                         entry.date.format("%Y-%m-%d").to_string(),
                         entry.memo.clone(),
                         entry.reference.clone().unwrap_or_default(),
-                        format_currency(entry.total_amount),
+                        widgets::format_currency(entry.total_amount),
                         status.to_string(),
                     ]);
                     Row::new(cells).style(style)
@@ -1027,7 +1028,7 @@ impl JournalView {
     }
 
     fn draw_reassign_modal(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let modal_area = centered_rect(60, 60, area);
+        let modal_area = widgets::centered_rect(60, 60, area);
         frame.render_widget(Clear, modal_area);
 
         let is_bulk = self.reassign_pending.is_none();
@@ -1118,28 +1119,3 @@ impl Default for JournalView {
     }
 }
 
-fn format_currency(cents: i64) -> String {
-    let dollars = cents as f64 / 100.0;
-    format!("${:.2}", dollars)
-}
-
-/// Helper function to create a centered rectangle
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}

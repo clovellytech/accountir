@@ -9,6 +9,7 @@ use ratatui::{
 use std::path::PathBuf;
 
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportStep {
@@ -862,7 +863,7 @@ impl CsvImportModal {
             return;
         }
 
-        let modal_area = centered_rect(80, 80, area);
+        let modal_area = widgets::centered_rect(80, 80, area);
         frame.render_widget(Clear, modal_area);
 
         match self.step {
@@ -961,7 +962,7 @@ impl CsvImportModal {
             .title(" Import CSV - Parse Options ");
         frame.render_widget(block, area);
 
-        let inner = inner_rect(area, 2, 2);
+        let inner = widgets::inner_rect(area, 2, 2);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1169,7 +1170,7 @@ impl CsvImportModal {
             .title(" Import CSV - Map Columns ");
         frame.render_widget(block, area);
 
-        let inner = inner_rect(area, 2, 2);
+        let inner = widgets::inner_rect(area, 2, 2);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1298,7 +1299,7 @@ impl CsvImportModal {
             .title(" Import CSV - Review & Confirm ");
         frame.render_widget(block, area);
 
-        let inner = inner_rect(area, 2, 1);
+        let inner = widgets::inner_rect(area, 2, 1);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1615,31 +1616,3 @@ pub use crate::commands::import_commands::parse_delimited_line;
 pub use crate::commands::import_commands::parse_amount;
 pub use crate::commands::import_commands::parse_date;
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-fn inner_rect(area: Rect, margin_x: u16, margin_y: u16) -> Rect {
-    Rect {
-        x: area.x + margin_x,
-        y: area.y + margin_y,
-        width: area.width.saturating_sub(margin_x * 2),
-        height: area.height.saturating_sub(margin_y * 2),
-    }
-}

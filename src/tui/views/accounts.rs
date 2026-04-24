@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use crate::domain::{Account, AccountType};
 use crate::queries::account_queries::AccountBalance;
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 /// Summary of a Plaid mapping for display in the accounts table
 #[derive(Debug, Clone)]
@@ -307,7 +308,7 @@ impl AccountsView {
                     acc.account_number.clone(),
                     name_with_tree,
                     type_str.to_string(),
-                    format_currency(display_balance),
+                    widgets::format_currency(display_balance),
                     plaid_col,
                     status.to_string(),
                 ])
@@ -348,11 +349,3 @@ impl Default for AccountsView {
     }
 }
 
-fn format_currency(cents: i64) -> String {
-    let dollars = cents as f64 / 100.0;
-    if cents < 0 {
-        format!("(${:.2})", -dollars)
-    } else {
-        format!("${:.2}", dollars)
-    }
-}

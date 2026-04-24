@@ -9,6 +9,7 @@ use ratatui::{
 
 use crate::queries::subscriptions::DetectedSubscription;
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 pub struct SubscriptionsModal {
     pub visible: bool,
@@ -192,7 +193,7 @@ impl SubscriptionsModal {
                 };
 
                 Row::new(vec![
-                    Cell::from(truncate(&sub.memo, 40)),
+                    Cell::from(widgets::truncate(&sub.memo, 40)),
                     Cell::from(sub.frequency.label()),
                     Cell::from(format_amount(sub.avg_amount.abs())),
                     Cell::from(format!("{}", sub.occurrence_count)),
@@ -233,10 +234,3 @@ fn format_amount(cents: i64) -> String {
     format!("${}.{:02}", dollars, remainder)
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() > max {
-        format!("{}...", &s[..max.saturating_sub(3)])
-    } else {
-        s.to_string()
-    }
-}

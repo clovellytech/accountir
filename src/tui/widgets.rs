@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -72,4 +72,50 @@ pub fn draw_text_field(frame: &mut Frame, field: &TextField, theme: &Theme) {
     );
 
     frame.render_widget(paragraph, field.area);
+}
+
+pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
+
+pub fn inner_rect(area: Rect, margin_x: u16, margin_y: u16) -> Rect {
+    Rect {
+        x: area.x + margin_x,
+        y: area.y + margin_y,
+        width: area.width.saturating_sub(margin_x * 2),
+        height: area.height.saturating_sub(margin_y * 2),
+    }
+}
+
+pub fn format_currency(cents: i64) -> String {
+    let dollars = cents as f64 / 100.0;
+    if cents < 0 {
+        format!("(${:.2})", -dollars)
+    } else {
+        format!("${:.2}", dollars)
+    }
+}
+
+pub fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
 }

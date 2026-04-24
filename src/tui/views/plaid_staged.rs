@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use crate::tui::theme::Theme;
+use crate::tui::widgets;
 
 pub struct PlaidStagedView {
     pub transfer_candidates: Vec<TransferCandidateDisplay>,
@@ -386,7 +387,7 @@ impl PlaidStagedView {
 
                     let mut cells = vec![
                         Cell::from(t.date.clone()),
-                        Cell::from(truncate(&t.name, 35)),
+                        Cell::from(widgets::truncate(&t.name, 35)),
                         Cell::from(t.account_name.clone()),
                     ];
                     if has_card_holders {
@@ -473,10 +474,3 @@ fn format_amount(cents: i64) -> String {
     }
 }
 
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max_len.saturating_sub(3)])
-    }
-}
