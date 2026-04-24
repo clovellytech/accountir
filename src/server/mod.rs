@@ -1127,7 +1127,9 @@ async fn plaid_import_transfer(
         )
     })?;
 
-    let (from_txn, to_txn) = if txn1.4 < 0 {
+    // Plaid amounts are positive when money leaves the account, negative when it arrives.
+    // The positive-amount side is the "from" account (money leaving), negative is "to".
+    let (from_txn, to_txn) = if txn1.4 > 0 {
         (&txn1, &txn2)
     } else {
         (&txn2, &txn1)
@@ -1319,7 +1321,7 @@ async fn plaid_import_all(
             let txn1 = load_staged_sync(conn, &tid1);
             let txn2 = load_staged_sync(conn, &tid2);
             if let (Ok(t1), Ok(t2)) = (txn1, txn2) {
-                let (from_t, to_t) = if t1.4 < 0 { (&t1, &t2) } else { (&t2, &t1) };
+                let (from_t, to_t) = if t1.4 > 0 { (&t1, &t2) } else { (&t2, &t1) };
                 if let (Some(from_acct), Some(to_acct)) = (&from_t.3, &to_t.3) {
                     let date = chrono::NaiveDate::parse_from_str(&from_t.5, "%Y-%m-%d")
                         .unwrap_or_else(|_| chrono::Utc::now().date_naive());

@@ -366,8 +366,9 @@ impl<'a> PlaidCommands<'a> {
             load_transfer_pair(conn, candidate_id)?
         };
 
-        // The negative-amount side is the "from" account, positive is "to"
-        let (from_txn, to_txn) = if txn1.amount_cents < 0 {
+        // Plaid amounts are positive when money leaves the account, negative when it arrives.
+        // The positive-amount side is the "from" account (money leaving), negative is "to".
+        let (from_txn, to_txn) = if txn1.amount_cents > 0 {
             (&txn1, &txn2)
         } else {
             (&txn2, &txn1)
