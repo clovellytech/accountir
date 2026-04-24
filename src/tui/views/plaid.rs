@@ -33,6 +33,7 @@ pub struct PlaidAccountDisplay {
     pub local_account_name: Option<String>,
     pub plaid_balance_cents: Option<i64>,
     pub ledger_balance_cents: Option<i64>,
+    pub balance_updated_at: Option<String>,
 }
 
 pub enum PlaidAction {
@@ -155,8 +156,9 @@ impl PlaidView {
 
         let header = Row::new(vec![
             Cell::from("Institution"),
-            Cell::from("Status"),
-            Cell::from("Accounts"),
+            Cell::from("Account"),
+            Cell::from("Mapped To"),
+            Cell::from("Balance"),
             Cell::from("Last Synced"),
         ])
         .style(
@@ -165,73 +167,119 @@ impl PlaidView {
                 .add_modifier(Modifier::BOLD),
         );
 
-        let rows: Vec<Row> = self
-            .items
-            .iter()
-            .enumerate()
-            .map(|(i, item)| {
-                let status_color = match item.status.as_str() {
-                    "active" => theme.success,
-                    "disconnected" | "revoked" => theme.error,
-                    _ => theme.fg_dim,
-                };
+        let mut rows: Vec<Row> = Vec::new();
 
-                let account_summary: String = item
-                    .accounts
-                    .iter()
-                    .map(|a| {
-                        let mapped = if a.local_account_name.is_some() {
-                            ""
-                        } else {
-                            " [unmapped]"
-                        };
-                        let mask = a.mask.as_deref().unwrap_or("");
-                        let balance_info = match (a.plaid_balance_cents, a.ledger_balance_cents) {
-                            (Some(plaid), Some(ledger)) => {
-                                let diff = plaid - ledger;
-                                if diff == 0 {
-                                    " [balanced]".to_string()
-                                } else {
-                                    let abs = diff.unsigned_abs() as i64;
-                                    let sign = if diff > 0 { "+" } else { "-" };
-                                    format!(" [off by {}${}.{:02}]", sign, abs / 100, abs % 100)
-                                }
+        for (i, item) in self.items.iter().enumerate() {
+            let is_selected = i == self.selected;
+            let style = if is_selected {
+                theme.selected_style()
+            } else {
+                Style::default()
+            };
+            let status_color = match item.status.as_str() {
+                "active" => theme.success,
+                "disconnected" | "revoked" => theme.error,
+                _ => theme.fg_dim,
+            };
+
+            if item.accounts.is_empty() {
+                rows.push(
+                    Row::new(vec![
+                        Cell::from(item.institution_name.clone()),
+                        Cell::from(Span::styled(
+                            "No accounts",
+                            Style::default().fg(theme.fg_dim),
+                        )),
+                        Cell::from(""),
+                        Cell::from(Span::styled(
+                            item.status.clone(),
+                            Style::default().fg(status_color),
+                        )),
+                        Cell::from(
+                            item.last_synced_at
+                                .as_deref()
+                                .unwrap_or("Never")
+                                .to_string(),
+                        ),
+                    ])
+                    .style(style),
+                );
+            } else {
+                for (j, acct) in item.accounts.iter().enumerate() {
+                    let inst_col = if j == 0 {
+                        Cell::from(vec![Line::from(vec![
+                            Span::raw(item.institution_name.clone()),
+                            Span::raw(" "),
+                            Span::styled(item.status.clone(), Style::default().fg(status_color)),
+                        ])])
+                    } else {
+                        Cell::from("")
+                    };
+
+                    let mask = acct.mask.as_deref().unwrap_or("");
+                    let acct_label = format!("  {}({})", acct.name, mask);
+
+                    let mapped = acct.local_account_name.as_deref().unwrap_or("[unmapped]");
+                    let mapped_style = if acct.local_account_name.is_some() {
+                        Style::default()
+                    } else {
+                        Style::default().fg(theme.fg_dim)
+                    };
+
+                    let balance_cell = match (acct.plaid_balance_cents, acct.ledger_balance_cents) {
+                        (Some(plaid), Some(ledger)) => {
+                            let diff = plaid - ledger;
+                            if diff == 0 {
+                                Cell::from(Span::styled(
+                                    "Balanced",
+                                    Style::default().fg(theme.success),
+                                ))
+                            } else {
+                                let abs = diff.unsigned_abs() as i64;
+                                let sign = if diff > 0 { "+" } else { "-" };
+                                Cell::from(Span::styled(
+                                    format!("Off {}${}.{:02}", sign, abs / 100, abs % 100),
+                                    Style::default().fg(theme.error),
+                                ))
                             }
-                            _ => String::new(),
-                        };
-                        format!("{}({}){}{}", a.name, mask, mapped, balance_info)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                        }
+                        _ => Cell::from(""),
+                    };
 
-                let last_sync = item.last_synced_at.as_deref().unwrap_or("Never");
+                    let synced = acct
+                        .balance_updated_at
+                        .as_deref()
+                        .or(item.last_synced_at.as_deref())
+                        .unwrap_or("Never");
+                    // Show just the date portion if it's an RFC3339 timestamp
+                    let synced_short = if synced.len() > 10 {
+                        &synced[..10]
+                    } else {
+                        synced
+                    };
 
-                let style = if i == self.selected {
-                    theme.selected_style()
-                } else {
-                    Style::default()
-                };
-
-                Row::new(vec![
-                    Cell::from(item.institution_name.clone()),
-                    Cell::from(Span::styled(
-                        item.status.clone(),
-                        Style::default().fg(status_color),
-                    )),
-                    Cell::from(account_summary),
-                    Cell::from(last_sync.to_string()),
-                ])
-                .style(style)
-            })
-            .collect();
+                    rows.push(
+                        Row::new(vec![
+                            inst_col,
+                            Cell::from(acct_label),
+                            Cell::from(Span::styled(mapped.to_string(), mapped_style)),
+                            balance_cell,
+                            Cell::from(synced_short.to_string()),
+                        ])
+                        .style(style),
+                    );
+                }
+            }
+        }
 
         let table = Table::new(
             rows,
             [
-                Constraint::Percentage(25),
-                Constraint::Percentage(15),
-                Constraint::Percentage(40),
+                Constraint::Percentage(22),
+                Constraint::Percentage(22),
                 Constraint::Percentage(20),
+                Constraint::Percentage(18),
+                Constraint::Percentage(18),
             ],
         )
         .header(header)

@@ -38,6 +38,8 @@ impl ServerDb {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         match EventStore::open(&canonical) {
             Ok(store) => {
+                // Run migrations to ensure schema is up to date
+                let _ = crate::store::migrations::run_migrations(store.connection());
                 let mut guard = self.inner.db.lock().unwrap();
                 *guard = Some(ActiveDb {
                     store,
@@ -801,6 +803,16 @@ struct PlaidSyncResponse {
     staged: u32,
     skipped: u32,
     transfer_candidates: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    balance_discrepancies: Vec<BalanceDiscrepancy>,
+}
+
+#[derive(Serialize)]
+struct BalanceDiscrepancy {
+    account_name: String,
+    plaid_balance_cents: i64,
+    ledger_balance_cents: i64,
+    difference_cents: i64,
 }
 
 async fn plaid_sync(
@@ -975,18 +987,25 @@ async fn plaid_sync(
         (staged, skipped, transfer_candidates)
     }; // guard dropped here
 
-    // Fetch and store current Plaid balances for reconciliation
+    // Fetch and store current Plaid balances, then compute discrepancies
+    let mut balance_discrepancies = Vec::new();
+
     let mut balance_req = state
         .http_client
         .post(format!("{}/plaid/balances", plaid_cfg.proxy_url));
     if let Some(ref key) = plaid_cfg.api_key {
         balance_req = balance_req.bearer_auth(key);
     }
-    if let Ok(balance_resp) = balance_req
+    let balance_result = balance_req
         .json(&serde_json::json!({ "item_id": proxy_item_id }))
         .send()
-        .await
-    {
+        .await;
+
+    if let Err(ref e) = balance_result {
+        eprintln!("Balance fetch failed: {}", e);
+    }
+
+    if let Ok(balance_resp) = balance_result {
         if let Ok(body) = balance_resp.json::<serde_json::Value>().await {
             if let Some(accounts) = body["accounts"].as_array() {
                 let guard = state.db.lock().unwrap();
@@ -1001,8 +1020,51 @@ async fn plaid_sync(
                             let _ = conn.execute(
                                 "UPDATE plaid_local_accounts SET plaid_balance_cents = ?1, balance_updated_at = ?2
                                  WHERE item_id = ?3 AND plaid_account_id = ?4",
-                                rusqlite::params![balance_cents, now, req.item_id, plaid_id],
+                                rusqlite::params![balance_cents, &now, &req.item_id, plaid_id],
                             );
+
+                            // Check for discrepancy with ledger balance
+                            let mapping: Option<(String, String, String)> = conn
+                                .query_row(
+                                    "SELECT pla.local_account_id, a.name, pla.account_type
+                                     FROM plaid_local_accounts pla
+                                     JOIN accounts a ON pla.local_account_id = a.id
+                                     WHERE pla.item_id = ?1 AND pla.plaid_account_id = ?2
+                                       AND pla.local_account_id IS NOT NULL",
+                                    rusqlite::params![&req.item_id, plaid_id],
+                                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                                )
+                                .ok();
+
+                            if let Some((local_id, account_name, account_type)) = mapping {
+                                // Convert Plaid balance to our sign convention
+                                let plaid_in_ours = if account_type == "credit" {
+                                    -balance_cents
+                                } else {
+                                    balance_cents
+                                };
+
+                                let ledger_balance: i64 = conn
+                                    .query_row(
+                                        "SELECT COALESCE(SUM(jl.amount), 0)
+                                         FROM journal_lines jl
+                                         JOIN journal_entries je ON jl.entry_id = je.id
+                                         WHERE jl.account_id = ?1 AND je.is_void = 0",
+                                        [&local_id],
+                                        |row| row.get(0),
+                                    )
+                                    .unwrap_or(0);
+
+                                let diff = plaid_in_ours - ledger_balance;
+                                if diff != 0 {
+                                    balance_discrepancies.push(BalanceDiscrepancy {
+                                        account_name,
+                                        plaid_balance_cents: plaid_in_ours,
+                                        ledger_balance_cents: ledger_balance,
+                                        difference_cents: diff,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -1014,6 +1076,7 @@ async fn plaid_sync(
         staged,
         skipped,
         transfer_candidates,
+        balance_discrepancies,
     }))
 }
 

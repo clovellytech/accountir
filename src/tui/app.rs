@@ -437,7 +437,8 @@ impl App {
                 let accounts: Vec<PlaidAccountDisplay> = conn
                     .prepare(
                         "SELECT pa.plaid_account_id, pa.name, pa.account_type, pa.mask,
-                                pa.local_account_id, a.name, pa.plaid_balance_cents
+                                pa.local_account_id, a.name, pa.plaid_balance_cents,
+                                pa.balance_updated_at
                          FROM plaid_local_accounts pa
                          LEFT JOIN accounts a ON pa.local_account_id = a.id
                          WHERE pa.item_id = ?1",
@@ -482,6 +483,7 @@ impl App {
                                 local_account_name: row.get(5)?,
                                 plaid_balance_cents: plaid_in_our_convention,
                                 ledger_balance_cents,
+                                balance_updated_at: row.get(7)?,
                             })
                         })
                         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -3146,7 +3148,25 @@ fn handle_plaid_action(app: &mut App, store: &mut EventStore, action: PlaidActio
                     let transfers = body["transfer_candidates"].as_u64().unwrap_or(0);
                     let mut msg = format!("Synced: {} staged, {} skipped", staged, skipped);
                     if transfers > 0 {
-                        msg.push_str(&format!(", {} transfer candidates detected", transfers));
+                        msg.push_str(&format!(", {} transfer candidates", transfers));
+                    }
+                    // Show balance discrepancies
+                    if let Some(discs) = body["balance_discrepancies"].as_array() {
+                        if !discs.is_empty() {
+                            for d in discs {
+                                let name = d["account_name"].as_str().unwrap_or("?");
+                                let diff = d["difference_cents"].as_i64().unwrap_or(0);
+                                let abs = diff.unsigned_abs() as i64;
+                                let sign = if diff > 0 { "+" } else { "-" };
+                                msg.push_str(&format!(
+                                    " | {} off by {}${}.{:02}",
+                                    name,
+                                    sign,
+                                    abs / 100,
+                                    abs % 100
+                                ));
+                            }
+                        }
                     }
                     app.status_message = Some(msg);
                     app.load_data(store);
