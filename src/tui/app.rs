@@ -1,5 +1,6 @@
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use chrono::Datelike;
@@ -106,6 +107,20 @@ impl ActiveView {
     }
 }
 
+/// Result from a background import task
+enum BackgroundResult {
+    Staged { message: String, all_done: bool },
+    Csv(Result<usize, String>),
+    Bank(Result<usize, String>),
+}
+
+/// A background task running in a separate thread
+struct BackgroundTask {
+    label: String,
+    receiver: mpsc::Receiver<BackgroundResult>,
+    tick: u8,
+}
+
 /// Main application state
 pub struct App {
     pub phase: AppPhase,
@@ -146,6 +161,7 @@ pub struct App {
     pub create_default_accounts: bool,        // User confirmed, create the accounts
     pub pending_bank_import_result: Option<BankImportResult>, // Result from bank import modal
     pub last_import_check: std::time::Instant, // Last time we checked for new imports
+    background_task: Option<BackgroundTask>,
 }
 
 impl App {
@@ -199,6 +215,7 @@ impl App {
             create_default_accounts: false,
             pending_bank_import_result: None,
             last_import_check: std::time::Instant::now(),
+            background_task: None,
         }
     }
 
@@ -216,6 +233,25 @@ impl App {
                 ActiveView::Plaid => HelpContext::Plaid,
             },
         }
+    }
+
+    /// Whether a background task is currently running
+    fn has_background_task(&self) -> bool {
+        self.background_task.is_some()
+    }
+
+    /// Check if the background task has completed. Returns the result if done.
+    fn poll_background_task(&mut self) -> Option<BackgroundResult> {
+        let done = self
+            .background_task
+            .as_ref()
+            .and_then(|t| t.receiver.try_recv().ok());
+        if done.is_some() {
+            self.background_task = None;
+        } else if let Some(ref mut task) = self.background_task {
+            task.tick = task.tick.wrapping_add(1);
+        }
+        done
     }
 
     /// Close the current database and return to startup menu
@@ -1330,6 +1366,11 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
         AppPhase::Main => draw_main(frame, app),
     }
 
+    // Draw loading modal on top of everything when a background task is running
+    if let Some(ref task) = app.background_task {
+        draw_loading_modal(frame, &app.theme, &task.label, task.tick);
+    }
+
     // Draw quit confirmation dialog on top of everything
     if app.show_quit_confirm {
         draw_quit_confirm(frame, &app.theme);
@@ -1339,6 +1380,50 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     if app.pending_default_accounts {
         draw_default_accounts_confirm(frame, &app.theme);
     }
+}
+
+fn draw_loading_modal(frame: &mut Frame, theme: &Theme, label: &str, tick: u8) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spinner = spinner_chars[(tick as usize / 2) % spinner_chars.len()];
+
+    let dialog_width = (label.len() as u16 + 8)
+        .max(20)
+        .min(area.width.saturating_sub(4));
+    let dialog_height = 3;
+    let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
+    let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = ratatui::layout::Rect {
+        x: dialog_x,
+        y: dialog_y,
+        width: dialog_width,
+        height: dialog_height,
+    };
+
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.header));
+
+    frame.render_widget(block, dialog_area);
+
+    let inner = ratatui::layout::Rect {
+        x: dialog_area.x + 2,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(4),
+        height: 1,
+    };
+
+    let text = Line::from(vec![
+        Span::styled(format!("{} ", spinner), theme.header_style()),
+        Span::raw(label),
+    ]);
+
+    frame.render_widget(Paragraph::new(text), inner);
 }
 
 fn draw_quit_confirm(frame: &mut Frame, theme: &Theme) {
@@ -1493,6 +1578,26 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
     // Main loop
     let result = loop {
         terminal.draw(|f| draw_ui(f, &mut app))?;
+
+        // Check for background task completion
+        if let Some(result) = app.poll_background_task() {
+            if let Some(ref mut s) = store {
+                handle_background_result(&mut app, s, result);
+            }
+        }
+
+        // While a background task is running, only handle quit — skip all other actions
+        if app.has_background_task() {
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
+                        // Allow quit even during background work
+                        app.show_quit_confirm = true;
+                    }
+                }
+            }
+            continue;
+        }
 
         // Check if startup action was taken
         if app.phase == AppPhase::Startup && app.startup.has_action() {
@@ -1695,16 +1800,22 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
 
         // Handle CSV import
         if let Some(config) = app.csv_import.get_import_config() {
-            if let Some(ref mut s) = store {
-                match perform_csv_import(s, &config, &app.accounts.accounts) {
-                    Ok(count) => {
-                        app.status_message = Some(format!("Imported {} transactions", count));
-                        app.load_data(s);
-                    }
-                    Err(e) => {
-                        app.status_message = Some(format!("Import failed: {}", e));
-                    }
-                }
+            if let Some(db_path) = app.database_path.clone() {
+                let accounts = app.accounts.accounts.clone();
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| {
+                        let mut bg_store = EventStore::open(&db_path).map_err(|e| e.to_string())?;
+                        init_schema(bg_store.connection()).map_err(|e| e.to_string())?;
+                        perform_csv_import(&mut bg_store, &config, &accounts)
+                    })();
+                    let _ = tx.send(BackgroundResult::Csv(result));
+                });
+                app.background_task = Some(BackgroundTask {
+                    label: "Importing CSV...".to_string(),
+                    receiver: rx,
+                    tick: 0,
+                });
             }
             app.csv_import.hide();
         }
@@ -1731,24 +1842,32 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
                         save_mapping,
                         transactions,
                     } => {
-                        // Perform the import
-                        match perform_bank_import(
-                            s,
-                            import_id,
-                            &account_id,
-                            save_mapping,
-                            &transactions,
-                            &app.accounts.accounts,
-                        ) {
-                            Ok(count) => {
-                                app.status_message =
-                                    Some(format!("Imported {} transactions", count));
-                                app.bank_import.hide();
-                                app.load_data(s);
-                            }
-                            Err(e) => {
-                                app.status_message = Some(format!("Import failed: {}", e));
-                            }
+                        if let Some(db_path) = app.database_path.clone() {
+                            let accounts = app.accounts.accounts.clone();
+                            let (tx, rx) = mpsc::channel();
+                            let count = transactions.iter().filter(|t| t.selected).count();
+                            std::thread::spawn(move || {
+                                let result = (|| {
+                                    let mut bg_store =
+                                        EventStore::open(&db_path).map_err(|e| e.to_string())?;
+                                    init_schema(bg_store.connection())
+                                        .map_err(|e| e.to_string())?;
+                                    perform_bank_import(
+                                        &mut bg_store,
+                                        import_id,
+                                        &account_id,
+                                        save_mapping,
+                                        &transactions,
+                                        &accounts,
+                                    )
+                                })();
+                                let _ = tx.send(BackgroundResult::Bank(result));
+                            });
+                            app.background_task = Some(BackgroundTask {
+                                label: format!("Importing {} transactions...", count),
+                                receiver: rx,
+                                tick: 0,
+                            });
                         }
                     }
                     BankImportResult::None => {}
@@ -2197,6 +2316,23 @@ pub fn run_app_with_database(
     loop {
         terminal.draw(|f| draw_ui(f, &mut app))?;
 
+        // Check for background task completion
+        if let Some(result) = app.poll_background_task() {
+            handle_background_result(&mut app, &mut store, result);
+        }
+
+        // While a background task is running, only handle quit — skip all other actions
+        if app.has_background_task() {
+            if event::poll(Duration::from_millis(50))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('q') {
+                        app.show_quit_confirm = true;
+                    }
+                }
+            }
+            continue;
+        }
+
         // Handle default accounts creation
         if app.create_default_accounts {
             app.create_default_accounts = false;
@@ -2304,15 +2440,22 @@ pub fn run_app_with_database(
 
         // Handle CSV import
         if let Some(config) = app.csv_import.get_import_config() {
-            match perform_csv_import(&mut store, &config, &app.accounts.accounts) {
-                Ok(count) => {
-                    app.status_message = Some(format!("Imported {} transactions", count));
-                    app.load_data(&store);
-                }
-                Err(e) => {
-                    app.status_message = Some(format!("Import failed: {}", e));
-                }
-            }
+            let db_path = app.database_path.clone().unwrap();
+            let accounts = app.accounts.accounts.clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let result = (|| {
+                    let mut bg_store = EventStore::open(&db_path).map_err(|e| e.to_string())?;
+                    init_schema(bg_store.connection()).map_err(|e| e.to_string())?;
+                    perform_csv_import(&mut bg_store, &config, &accounts)
+                })();
+                let _ = tx.send(BackgroundResult::Csv(result));
+            });
+            app.background_task = Some(BackgroundTask {
+                label: "Importing CSV...".to_string(),
+                receiver: rx,
+                tick: 0,
+            });
             app.csv_import.hide();
         }
 
@@ -2337,24 +2480,31 @@ pub fn run_app_with_database(
                     save_mapping,
                     transactions,
                 } => {
-                    // Perform the import
-                    match perform_bank_import(
-                        &mut store,
-                        import_id,
-                        &account_id,
-                        save_mapping,
-                        &transactions,
-                        &app.accounts.accounts,
-                    ) {
-                        Ok(count) => {
-                            app.status_message = Some(format!("Imported {} transactions", count));
-                            app.bank_import.hide();
-                            app.load_data(&store);
-                        }
-                        Err(e) => {
-                            app.status_message = Some(format!("Import failed: {}", e));
-                        }
-                    }
+                    let db_path = app.database_path.clone().unwrap();
+                    let accounts = app.accounts.accounts.clone();
+                    let (tx, rx) = mpsc::channel();
+                    let count = transactions.iter().filter(|t| t.selected).count();
+                    std::thread::spawn(move || {
+                        let result = (|| {
+                            let mut bg_store =
+                                EventStore::open(&db_path).map_err(|e| e.to_string())?;
+                            init_schema(bg_store.connection()).map_err(|e| e.to_string())?;
+                            perform_bank_import(
+                                &mut bg_store,
+                                import_id,
+                                &account_id,
+                                save_mapping,
+                                &transactions,
+                                &accounts,
+                            )
+                        })();
+                        let _ = tx.send(BackgroundResult::Bank(result));
+                    });
+                    app.background_task = Some(BackgroundTask {
+                        label: format!("Importing {} transactions...", count),
+                        receiver: rx,
+                        tick: 0,
+                    });
                 }
                 BankImportResult::None => {}
             }
@@ -2863,6 +3013,36 @@ fn handle_plaid_action(app: &mut App, store: &mut EventStore, action: PlaidActio
     }
 }
 
+fn handle_background_result(app: &mut App, store: &mut EventStore, result: BackgroundResult) {
+    match result {
+        BackgroundResult::Staged { message, all_done } => {
+            if all_done {
+                app.plaid_staged.hide();
+                app.status_message = Some(message);
+            } else {
+                app.plaid_staged.status_message = Some(message);
+            }
+            app.load_plaid_staged(store.connection());
+            app.load_data(store);
+        }
+        BackgroundResult::Csv(Ok(count)) => {
+            app.status_message = Some(format!("Imported {} transactions", count));
+            app.load_data(store);
+        }
+        BackgroundResult::Csv(Err(e)) => {
+            app.status_message = Some(format!("Import failed: {}", e));
+        }
+        BackgroundResult::Bank(Ok(count)) => {
+            app.status_message = Some(format!("Imported {} transactions", count));
+            app.bank_import.hide();
+            app.load_data(store);
+        }
+        BackgroundResult::Bank(Err(e)) => {
+            app.status_message = Some(format!("Import failed: {}", e));
+        }
+    }
+}
+
 fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAction) {
     match action {
         StagedAction::Back => {
@@ -2907,24 +3087,44 @@ fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAct
                 .iter()
                 .map(|c| c.candidate_id.clone())
                 .collect();
-            let mut imported = 0u32;
-            let mut errors = 0u32;
-            for cid in candidate_ids {
-                let mut commands = crate::commands::plaid_commands::PlaidCommands::new(
-                    store,
-                    "tui-user".to_string(),
-                );
-                match commands.import_transfer(&cid) {
-                    Ok(_) => imported += 1,
-                    Err(_) => errors += 1,
-                }
+            if let Some(db_path) = app.database_path.clone() {
+                let (tx, rx) = mpsc::channel();
+                let count = candidate_ids.len();
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<(u32, u32), String> {
+                        let mut bg_store = EventStore::open(&db_path).map_err(|e| e.to_string())?;
+                        init_schema(bg_store.connection()).map_err(|e| e.to_string())?;
+                        let mut imported = 0u32;
+                        let mut errors = 0u32;
+                        for cid in candidate_ids {
+                            let mut commands = crate::commands::plaid_commands::PlaidCommands::new(
+                                &mut bg_store,
+                                "tui-user".to_string(),
+                            );
+                            match commands.import_transfer(&cid) {
+                                Ok(_) => imported += 1,
+                                Err(_) => errors += 1,
+                            }
+                        }
+                        Ok((imported, errors))
+                    })();
+                    let message = match result {
+                        Ok((imported, errors)) => {
+                            format!("Confirmed {} transfers, {} errors", imported, errors)
+                        }
+                        Err(e) => format!("Import failed: {}", e),
+                    };
+                    let _ = tx.send(BackgroundResult::Staged {
+                        message,
+                        all_done: false,
+                    });
+                });
+                app.background_task = Some(BackgroundTask {
+                    label: format!("Importing {} transfers...", count),
+                    receiver: rx,
+                    tick: 0,
+                });
             }
-            app.plaid_staged.status_message = Some(format!(
-                "Confirmed {} transfers, {} errors",
-                imported, errors
-            ));
-            app.load_plaid_staged(store.connection());
-            app.load_data(store);
         }
         StagedAction::ImportUnmatched(staged_id) => {
             let mut commands =
@@ -2941,24 +3141,33 @@ fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAct
             }
         }
         StagedAction::ImportAll => {
-            let mut commands =
-                crate::commands::plaid_commands::PlaidCommands::new(store, "tui-user".to_string());
-            match commands.import_all_staged() {
-                Ok((transfers, unmatched)) => {
-                    app.plaid_staged.status_message = Some(format!(
-                        "Imported {} transfers, {} unmatched",
-                        transfers, unmatched
-                    ));
-                    app.load_plaid_staged(store.connection());
-                    app.load_data(store);
-                    if app.plaid_staged.total_pending() == 0 {
-                        app.plaid_staged.hide();
-                        app.status_message = Some("All staged transactions imported".to_string());
-                    }
-                }
-                Err(e) => {
-                    app.plaid_staged.status_message = Some(format!("Import failed: {}", e));
-                }
+            if let Some(db_path) = app.database_path.clone() {
+                let total = app.plaid_staged.total_pending();
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = (|| -> Result<(u32, u32), String> {
+                        let mut bg_store = EventStore::open(&db_path).map_err(|e| e.to_string())?;
+                        init_schema(bg_store.connection()).map_err(|e| e.to_string())?;
+                        let mut commands = crate::commands::plaid_commands::PlaidCommands::new(
+                            &mut bg_store,
+                            "tui-user".to_string(),
+                        );
+                        commands.import_all_staged().map_err(|e| e.to_string())
+                    })();
+                    let (message, all_done) = match result {
+                        Ok((transfers, unmatched)) => (
+                            format!("Imported {} transfers, {} unmatched", transfers, unmatched),
+                            transfers + unmatched > 0,
+                        ),
+                        Err(e) => (format!("Import failed: {}", e), false),
+                    };
+                    let _ = tx.send(BackgroundResult::Staged { message, all_done });
+                });
+                app.background_task = Some(BackgroundTask {
+                    label: format!("Importing {} transactions...", total),
+                    receiver: rx,
+                    tick: 0,
+                });
             }
         }
         StagedAction::None => {}
