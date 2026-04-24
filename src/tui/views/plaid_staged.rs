@@ -56,6 +56,7 @@ pub enum StagedAction {
     ConfirmAllTransfers,
     ImportUnmatched(String),
     ImportAll,
+    ImportAllSkipBalanceCheck,
     Back,
 }
 

@@ -56,6 +56,7 @@ use super::views::{
     reports::ReportsView,
     settings::{SettingsModal, SettingsResult},
     startup::{StartupAction, StartupView},
+    subscriptions::SubscriptionsModal,
     welcome::{should_show_welcome, WelcomeView},
 };
 
@@ -112,6 +113,7 @@ enum BackgroundResult {
     Staged { message: String, all_done: bool },
     Csv(Result<usize, String>),
     Bank(Result<usize, String>),
+    OpeningBalances(Vec<OpeningBalanceProposal>),
 }
 
 /// A background task running in a separate thread
@@ -145,6 +147,7 @@ pub struct App {
     pub plaid_link: PlaidLinkModal,
     pub plaid_config: PlaidConfigModal,
     pub settings: SettingsModal,
+    pub subscriptions: SubscriptionsModal,
     pub theme: Theme,
     pub pending_plaid_link: Option<String>, // local_account_id to show plaid link modal for
     pub pending_plaid_action: Option<PlaidAction>, // Action from PlaidView to process
@@ -161,7 +164,20 @@ pub struct App {
     pub create_default_accounts: bool,        // User confirmed, create the accounts
     pub pending_bank_import_result: Option<BankImportResult>, // Result from bank import modal
     pub last_import_check: std::time::Instant, // Last time we checked for new imports
+    pub pending_find_subscriptions: bool,
+    pub pending_opening_balances: Option<Vec<OpeningBalanceProposal>>,
+    pub confirm_opening_balances: bool,
     background_task: Option<BackgroundTask>,
+}
+
+/// Proposed opening balance for a Plaid-connected account
+pub struct OpeningBalanceProposal {
+    pub local_account_id: String,
+    pub account_name: String,
+    pub plaid_balance_cents: i64,
+    pub staged_total_cents: i64,
+    pub opening_balance_cents: i64,
+    pub earliest_year: i32,
 }
 
 impl App {
@@ -199,6 +215,7 @@ impl App {
             plaid_link: PlaidLinkModal::new(),
             plaid_config: PlaidConfigModal::new(),
             settings: SettingsModal::new(),
+            subscriptions: SubscriptionsModal::new(),
             theme,
             pending_plaid_link: None,
             pending_plaid_action: None,
@@ -215,6 +232,9 @@ impl App {
             create_default_accounts: false,
             pending_bank_import_result: None,
             last_import_check: std::time::Instant::now(),
+            pending_find_subscriptions: false,
+            pending_opening_balances: None,
+            confirm_opening_balances: false,
             background_task: None,
         }
     }
@@ -417,19 +437,52 @@ impl App {
             .map(|(id, institution_name, status, last_synced_at)| {
                 let accounts: Vec<PlaidAccountDisplay> = conn
                     .prepare(
-                        "SELECT pa.plaid_account_id, pa.name, pa.account_type, pa.mask, pa.local_account_id, a.name
+                        "SELECT pa.plaid_account_id, pa.name, pa.account_type, pa.mask,
+                                pa.local_account_id, a.name, pa.plaid_balance_cents
                          FROM plaid_local_accounts pa
                          LEFT JOIN accounts a ON pa.local_account_id = a.id
                          WHERE pa.item_id = ?1",
                     )
                     .and_then(|mut stmt| {
                         stmt.query_map([&id], |row| {
+                            let local_account_id: Option<String> = row.get(4)?;
+                            let plaid_balance_cents: Option<i64> = row.get(6)?;
+                            let account_type: String = row.get(2)?;
+
+                            // Compute ledger balance for mapped accounts
+                            let ledger_balance_cents = local_account_id.as_ref().and_then(|aid| {
+                                conn.query_row(
+                                    "SELECT COALESCE(SUM(jl.amount), 0)
+                                     FROM journal_lines jl
+                                     JOIN journal_entries je ON jl.entry_id = je.id
+                                     WHERE jl.account_id = ?1 AND je.is_void = 0",
+                                    [aid],
+                                    |r| r.get::<_, i64>(0),
+                                )
+                                .ok()
+                            });
+
+                            // Convert Plaid balance to our sign convention for comparison
+                            // Plaid: positive = money in account (depository) or amount owed (credit)
+                            // Ours: positive = debit balance, negative = credit balance
+                            // Assets: Plaid positive = our positive (debit)
+                            // Credit/liability: Plaid positive (owed) = our negative (credit)
+                            let plaid_in_our_convention = plaid_balance_cents.map(|pb| {
+                                if account_type == "credit" {
+                                    -pb
+                                } else {
+                                    pb
+                                }
+                            });
+
                             Ok(PlaidAccountDisplay {
                                 plaid_account_id: row.get(0)?,
                                 name: row.get(1)?,
-                                account_type: row.get(2)?,
+                                account_type,
                                 mask: row.get(3)?,
                                 local_account_name: row.get(5)?,
+                                plaid_balance_cents: plaid_in_our_convention,
+                                ledger_balance_cents,
                             })
                         })
                         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -732,6 +785,29 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Handle opening balance confirmation dialog
+        if self.pending_opening_balances.is_some() {
+            match key {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_opening_balances = true;
+                    self.pending_opening_balances = None;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.pending_opening_balances = None;
+                    // Skip balances, go straight to import
+                    self.pending_staged_action = Some(StagedAction::ImportAllSkipBalanceCheck);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Handle subscriptions modal - it captures all input when visible
+        if self.subscriptions.visible {
+            self.subscriptions.handle_key(key);
             return;
         }
 
@@ -1175,6 +1251,8 @@ impl App {
                 // Modal states are handled above, so we're in normal mode here
                 if key == KeyCode::Char('e') {
                     self.open_entry_form();
+                } else if key == KeyCode::Char('f') {
+                    self.pending_find_subscriptions = true;
                 } else if key == KeyCode::Char('i') {
                     self.open_csv_import();
                 } else if key == KeyCode::Enter {
@@ -1350,6 +1428,9 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
     // Draw entry detail modal on top if visible
     app.entry_detail.draw(frame, size, theme);
 
+    // Draw subscriptions modal on top if visible
+    app.subscriptions.render(frame, size, theme);
+
     // Draw CSV import modal on top if visible
     app.csv_import.draw(frame, size, theme);
 
@@ -1376,6 +1457,11 @@ fn draw_ui(frame: &mut Frame, app: &mut App) {
     // Draw loading modal on top of everything when a background task is running
     if let Some(ref task) = app.background_task {
         draw_loading_modal(frame, &app.theme, &task.label, task.tick);
+    }
+
+    // Draw opening balance confirmation dialog
+    if let Some(ref proposals) = app.pending_opening_balances {
+        draw_opening_balance_confirm(frame, &app.theme, proposals);
     }
 
     // Draw quit confirmation dialog on top of everything
@@ -1431,6 +1517,84 @@ fn draw_loading_modal(frame: &mut Frame, theme: &Theme, label: &str, tick: u8) {
     ]);
 
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn draw_opening_balance_confirm(
+    frame: &mut Frame,
+    theme: &Theme,
+    proposals: &[OpeningBalanceProposal],
+) {
+    use ratatui::widgets::Clear;
+
+    let area = frame.area();
+    let dialog_height = (proposals.len() as u16 + 7).min(area.height.saturating_sub(4));
+    let dialog_width = 70u16.min(area.width.saturating_sub(4));
+    let dialog_x = (area.width.saturating_sub(dialog_width)) / 2;
+    let dialog_y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = ratatui::layout::Rect {
+        x: dialog_x,
+        y: dialog_y,
+        width: dialog_width,
+        height: dialog_height,
+    };
+
+    frame.render_widget(Clear, dialog_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.header))
+        .title(" Opening Balance Required ")
+        .title_style(theme.modal_title_style());
+
+    frame.render_widget(block, dialog_area);
+
+    let inner = ratatui::layout::Rect {
+        x: dialog_area.x + 2,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(4),
+        height: dialog_area.height.saturating_sub(2),
+    };
+
+    let mut lines = vec![
+        Line::from("The following accounts have no prior transactions."),
+        Line::from("Opening balance entries will be created:"),
+        Line::from(""),
+    ];
+
+    for p in proposals {
+        let amount = p.opening_balance_cents.abs();
+        let sign = if p.opening_balance_cents >= 0 {
+            "debit"
+        } else {
+            "credit"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}", p.account_name),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  ${}.{:02} {} (Jan 1, {})",
+                amount / 100,
+                (amount % 100) as u64,
+                sign,
+                p.earliest_year
+            )),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("Press "),
+        Span::styled("y", theme.success_style()),
+        Span::raw(" to confirm, "),
+        Span::styled("n", theme.error_style()),
+        Span::raw(" to skip and import without opening balances"),
+    ]));
+
+    let paragraph = Paragraph::new(lines);
+    frame.render_widget(paragraph, inner);
 }
 
 fn draw_quit_confirm(frame: &mut Frame, theme: &Theme) {
@@ -2034,6 +2198,26 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
                 if let Some(detail) = app.load_entry_detail(s, &entry_id) {
                     app.entry_detail.show(detail);
                 }
+            }
+        }
+
+        // Handle find subscriptions
+        if app.pending_find_subscriptions {
+            app.pending_find_subscriptions = false;
+            if let Some(ref s) = store {
+                let subs = crate::queries::subscriptions::detect_subscriptions(s.connection());
+                app.subscriptions.show(subs);
+            }
+        }
+
+        // Handle confirmed opening balances — create entries then import
+        if app.confirm_opening_balances {
+            app.confirm_opening_balances = false;
+            if let Some(ref mut s) = store {
+                if let Some(proposals) = app.pending_opening_balances.take() {
+                    create_opening_balance_entries(s, &proposals);
+                }
+                app.pending_staged_action = Some(StagedAction::ImportAllSkipBalanceCheck);
             }
         }
 
@@ -2652,6 +2836,22 @@ pub fn run_app_with_database(
             }
         }
 
+        // Handle find subscriptions
+        if app.pending_find_subscriptions {
+            app.pending_find_subscriptions = false;
+            let subs = crate::queries::subscriptions::detect_subscriptions(store.connection());
+            app.subscriptions.show(subs);
+        }
+
+        // Handle confirmed opening balances — create entries then import
+        if app.confirm_opening_balances {
+            app.confirm_opening_balances = false;
+            if let Some(proposals) = app.pending_opening_balances.take() {
+                create_opening_balance_entries(&mut store, &proposals);
+            }
+            app.pending_staged_action = Some(StagedAction::ImportAllSkipBalanceCheck);
+        }
+
         // Handle pending reassignment (load lines and show picker)
         if let Some(entry_id) = app.pending_reassign.take() {
             let lines: Vec<(String, String, String)> = {
@@ -3047,6 +3247,14 @@ fn handle_background_result(app: &mut App, store: &mut EventStore, result: Backg
         BackgroundResult::Bank(Err(e)) => {
             app.status_message = Some(format!("Import failed: {}", e));
         }
+        BackgroundResult::OpeningBalances(proposals) => {
+            if proposals.is_empty() {
+                // No opening balances needed, proceed directly with import
+                app.pending_staged_action = Some(StagedAction::ImportAllSkipBalanceCheck);
+            } else {
+                app.pending_opening_balances = Some(proposals);
+            }
+        }
     }
 }
 
@@ -3148,6 +3356,21 @@ fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAct
             }
         }
         StagedAction::ImportAll => {
+            // First check if any accounts need opening balances
+            if let Some(db_path) = app.database_path.clone() {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let proposals = compute_opening_balance_proposals(&db_path);
+                    let _ = tx.send(BackgroundResult::OpeningBalances(proposals));
+                });
+                app.background_task = Some(BackgroundTask {
+                    label: "Checking account balances...".to_string(),
+                    receiver: rx,
+                    tick: 0,
+                });
+            }
+        }
+        StagedAction::ImportAllSkipBalanceCheck => {
             if let Some(db_path) = app.database_path.clone() {
                 let total = app.plaid_staged.total_pending();
                 let (tx, rx) = mpsc::channel();
@@ -3179,6 +3402,249 @@ fn handle_staged_action(app: &mut App, store: &mut EventStore, action: StagedAct
         }
         StagedAction::None => {}
     }
+}
+
+/// Create opening balance journal entries for the given proposals.
+fn create_opening_balance_entries(store: &mut EventStore, proposals: &[OpeningBalanceProposal]) {
+    use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
+
+    // Find or create an "Opening Balances" equity account
+    let equity_account_id: String = store
+        .connection()
+        .query_row(
+            "SELECT id FROM accounts WHERE LOWER(name) = 'opening balances' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| {
+            let mut acct_commands = crate::commands::account_commands::AccountCommands::new(
+                store,
+                "tui-user".to_string(),
+            );
+            match acct_commands.create_account(
+                crate::commands::account_commands::CreateAccountCommand {
+                    account_type: crate::domain::AccountType::Equity,
+                    account_number: "3000".to_string(),
+                    name: "Opening Balances".to_string(),
+                    parent_id: None,
+                    currency: None,
+                    description: Some("Equity account for opening balance entries".to_string()),
+                },
+            ) {
+                Ok(stored) => {
+                    // Extract account_id from the stored event
+                    if let crate::events::types::Event::AccountCreated { account_id, .. } =
+                        &stored.event
+                    {
+                        account_id.clone()
+                    } else {
+                        uuid::Uuid::new_v4().to_string()
+                    }
+                }
+                Err(_) => uuid::Uuid::new_v4().to_string(),
+            }
+        });
+
+    let mut commands = EntryCommands::new(store, "tui-user".to_string());
+
+    for proposal in proposals {
+        let date = chrono::NaiveDate::from_ymd_opt(proposal.earliest_year, 1, 1)
+            .unwrap_or_else(|| chrono::Utc::now().date_naive());
+
+        let lines = vec![
+            EntryLine {
+                account_id: proposal.local_account_id.clone(),
+                amount: proposal.opening_balance_cents,
+                currency: "USD".to_string(),
+                exchange_rate: None,
+                memo: None,
+            },
+            EntryLine {
+                account_id: equity_account_id.clone(),
+                amount: -proposal.opening_balance_cents,
+                currency: "USD".to_string(),
+                exchange_rate: None,
+                memo: None,
+            },
+        ];
+
+        let _ = commands.post_entry(PostEntryCommand {
+            date,
+            memo: format!("Opening balance: {}", proposal.account_name),
+            lines,
+            reference: Some("opening-balance".to_string()),
+            source: Some(JournalEntrySource::System),
+        });
+    }
+}
+
+/// Check which mapped Plaid accounts need opening balances and compute proposals.
+/// Runs in a background thread.
+fn compute_opening_balance_proposals(db_path: &std::path::Path) -> Vec<OpeningBalanceProposal> {
+    let store = match EventStore::open(db_path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let _ = init_schema(store.connection());
+    let conn = store.connection();
+
+    // Find all mapped Plaid accounts
+    struct MappedAccount {
+        item_id: String,
+        plaid_account_id: String,
+        local_account_id: String,
+        account_name: String,
+        account_type: String,
+    }
+
+    let mapped: Vec<MappedAccount> = conn
+        .prepare(
+            "SELECT pla.item_id, pla.plaid_account_id, pla.local_account_id, a.name,
+                    pla.account_type
+             FROM plaid_local_accounts pla
+             JOIN accounts a ON pla.local_account_id = a.id
+             WHERE pla.local_account_id IS NOT NULL",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |row| {
+                Ok(MappedAccount {
+                    item_id: row.get(0)?,
+                    plaid_account_id: row.get(1)?,
+                    local_account_id: row.get(2)?,
+                    account_name: row.get(3)?,
+                    account_type: row.get(4)?,
+                })
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
+    // Filter to accounts that have no existing journal entries (new accounts)
+    let new_accounts: Vec<&MappedAccount> = mapped
+        .iter()
+        .filter(|m| {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM journal_lines jl
+                     JOIN journal_entries je ON jl.entry_id = je.id
+                     WHERE jl.account_id = ?1 AND je.is_void = 0",
+                    [&m.local_account_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            count == 0
+        })
+        .collect();
+
+    if new_accounts.is_empty() {
+        return Vec::new();
+    }
+
+    // For each new account, compute the sum of staged transactions and get Plaid balance
+    // Get unique item_ids to fetch balances
+    let item_ids: Vec<String> = new_accounts
+        .iter()
+        .map(|a| a.item_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Fetch balances from local server
+    let client = reqwest::blocking::Client::new();
+    let mut balance_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+
+    for item_id in &item_ids {
+        if let Ok(resp) = client
+            .post("http://localhost:9876/plaid/balances")
+            .json(&serde_json::json!({ "item_id": item_id }))
+            .send()
+        {
+            if let Ok(body) = resp.json::<serde_json::Value>() {
+                if let Some(accounts) = body["accounts"].as_array() {
+                    for acct in accounts {
+                        if let (Some(id), Some(current)) =
+                            (acct["plaid_account_id"].as_str(), acct["current"].as_f64())
+                        {
+                            balance_map.insert(id.to_string(), current);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut proposals = Vec::new();
+
+    for acct in &new_accounts {
+        let plaid_balance = match balance_map.get(&acct.plaid_account_id) {
+            Some(&b) => b,
+            None => continue,
+        };
+
+        // Plaid balance sign convention:
+        // - For depository (checking/savings): positive = money in account
+        // - For credit: positive = amount owed (the balance you need to pay)
+        // Convert to our internal convention (positive = debit, negative = credit)
+        let is_credit_type = acct.account_type == "credit";
+        let plaid_balance_cents = (plaid_balance * 100.0).round() as i64;
+
+        // Sum of staged transactions for this account (in Plaid's sign convention)
+        // Plaid: positive = money leaving, negative = money arriving
+        let staged_total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(amount_cents), 0) FROM plaid_staged_transactions
+                 WHERE plaid_account_id = ?1 AND status IN ('pending', 'matched')",
+                [&acct.plaid_account_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // When we import, each transaction's amount is negated for the local account line.
+        // So the net effect on the local account = -staged_total (sum of -amount_cents lines)
+        let import_effect = -staged_total;
+
+        // The opening balance should make: opening_balance + import_effect = current_balance
+        // For assets: current_balance = plaid_balance_cents (positive = debit = asset increase)
+        // For credit: current_balance = -plaid_balance_cents (Plaid shows positive for amount owed,
+        //             but in accounting credit card liability is a credit/negative balance)
+        let target_balance = if is_credit_type {
+            -plaid_balance_cents
+        } else {
+            plaid_balance_cents
+        };
+
+        let opening_balance_cents = target_balance - import_effect;
+
+        if opening_balance_cents == 0 {
+            continue;
+        }
+
+        // Find earliest year from staged transactions
+        let earliest_date: String = conn
+            .query_row(
+                "SELECT MIN(date) FROM plaid_staged_transactions
+                 WHERE plaid_account_id = ?1 AND status IN ('pending', 'matched')",
+                [&acct.plaid_account_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "2024-01-01".to_string());
+        let earliest_year = earliest_date
+            .split('-')
+            .next()
+            .and_then(|y| y.parse().ok())
+            .unwrap_or(2024);
+
+        proposals.push(OpeningBalanceProposal {
+            local_account_id: acct.local_account_id.clone(),
+            account_name: acct.account_name.clone(),
+            plaid_balance_cents,
+            staged_total_cents: staged_total,
+            opening_balance_cents,
+            earliest_year,
+        });
+    }
+
+    proposals
 }
 
 fn open_plaid_link_modal(app: &mut App, conn: &rusqlite::Connection, local_account_id: &str) {

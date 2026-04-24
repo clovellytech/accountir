@@ -545,6 +545,7 @@ pub async fn start_server_task() -> Option<ServerDb> {
         .route("/plaid/link-token", post(plaid_link_token))
         .route("/plaid/exchange-token", post(plaid_exchange_token))
         .route("/plaid/sync", post(plaid_sync))
+        .route("/plaid/balances", post(plaid_balances))
         .route("/plaid/staged", get(plaid_staged_list))
         .route("/plaid/staged/import-transfer", post(plaid_import_transfer))
         .route("/plaid/staged/reject-transfer", post(plaid_reject_transfer))
@@ -862,18 +863,19 @@ async fn plaid_sync(
         serde_json::from_value(sync_body["added"].clone()).unwrap_or_default();
 
     // Stage transactions instead of directly importing
-    let guard = state.db.lock().unwrap();
-    let active = guard.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
-            success: false,
-            error: "No database open".to_string(),
-        }),
-    ))?;
-    let conn = active.store.connection();
+    let (staged, skipped, transfer_candidates) = {
+        let guard = state.db.lock().unwrap();
+        let active = guard.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                success: false,
+                error: "No database open".to_string(),
+            }),
+        ))?;
+        let conn = active.store.connection();
 
-    // Load account mappings for this item
-    let mappings: std::collections::HashMap<String, Option<String>> = conn
+        // Load account mappings for this item
+        let mappings: std::collections::HashMap<String, Option<String>> = conn
         .prepare(
             "SELECT plaid_account_id, local_account_id FROM plaid_local_accounts WHERE item_id = ?1",
         )
@@ -885,95 +887,224 @@ async fn plaid_sync(
         })
         .unwrap_or_default();
 
-    let mut staged = 0u32;
-    let mut skipped = 0u32;
+        let mut staged = 0u32;
+        let mut skipped = 0u32;
 
-    for txn in &added_txns {
-        if txn.pending {
-            skipped += 1;
-            continue;
-        }
+        for txn in &added_txns {
+            if txn.pending {
+                skipped += 1;
+                continue;
+            }
 
-        // Skip if account is not mapped to a local account
-        let local_account_id = mappings.get(&txn.account_id).and_then(|o| o.clone());
-        if local_account_id.is_none() {
-            skipped += 1;
-            continue;
-        }
+            // Skip if account is not mapped to a local account
+            let local_account_id = mappings.get(&txn.account_id).and_then(|o| o.clone());
+            if local_account_id.is_none() {
+                skipped += 1;
+                continue;
+            }
 
-        // Skip if already staged or already imported
-        let already_exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM plaid_staged_transactions WHERE plaid_transaction_id = ?1
+            // Skip if already staged or already imported
+            let already_exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM plaid_staged_transactions WHERE plaid_transaction_id = ?1
                  UNION ALL
                  SELECT 1 FROM plaid_imported_transactions WHERE plaid_transaction_id = ?1
                  LIMIT 1",
-                [&txn.transaction_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+                    [&txn.transaction_id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
 
-        if already_exists {
-            skipped += 1;
-            continue;
-        }
+            if already_exists {
+                skipped += 1;
+                continue;
+            }
 
-        let amount_cents = (txn.amount * 100.0).round() as i64;
-        let currency = txn.iso_currency_code.as_deref().unwrap_or("USD");
-        let id = uuid::Uuid::new_v4().to_string();
-        let payment_meta_json = txn
-            .payment_meta
-            .as_ref()
-            .filter(|pm| !pm.is_empty())
-            .and_then(|pm| serde_json::to_string(pm).ok());
+            let amount_cents = (txn.amount * 100.0).round() as i64;
+            let currency = txn.iso_currency_code.as_deref().unwrap_or("USD");
+            let id = uuid::Uuid::new_v4().to_string();
+            let payment_meta_json = txn
+                .payment_meta
+                .as_ref()
+                .filter(|pm| !pm.is_empty())
+                .and_then(|pm| serde_json::to_string(pm).ok());
 
-        conn.execute(
-            "INSERT INTO plaid_staged_transactions
+            conn.execute(
+                "INSERT INTO plaid_staged_transactions
              (id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
               amount_cents, date, name, merchant_name, currency, status, payment_meta)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
-            rusqlite::params![
-                id,
-                req.item_id,
-                txn.transaction_id,
-                txn.account_id,
-                local_account_id,
-                amount_cents,
-                txn.date,
-                txn.name,
-                txn.merchant_name,
-                currency,
-                payment_meta_json
-            ],
-        )
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    success: false,
-                    error: format!("DB error: {}", e),
-                }),
+                rusqlite::params![
+                    id,
+                    req.item_id,
+                    txn.transaction_id,
+                    txn.account_id,
+                    local_account_id,
+                    amount_cents,
+                    txn.date,
+                    txn.name,
+                    txn.merchant_name,
+                    currency,
+                    payment_meta_json
+                ],
             )
-        })?;
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        success: false,
+                        error: format!("DB error: {}", e),
+                    }),
+                )
+            })?;
 
-        staged += 1;
+            staged += 1;
+        }
+
+        // Update last_synced_at
+        let now = chrono::Utc::now().to_rfc3339();
+        let _ = conn.execute(
+            "UPDATE plaid_items SET last_synced_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, req.item_id],
+        );
+
+        // Run transfer detection
+        let transfer_candidates =
+            crate::commands::plaid_commands::detect_transfers(conn).unwrap_or(0);
+
+        (staged, skipped, transfer_candidates)
+    }; // guard dropped here
+
+    // Fetch and store current Plaid balances for reconciliation
+    let mut balance_req = state
+        .http_client
+        .post(format!("{}/plaid/balances", plaid_cfg.proxy_url));
+    if let Some(ref key) = plaid_cfg.api_key {
+        balance_req = balance_req.bearer_auth(key);
     }
-
-    // Update last_synced_at
-    let now = chrono::Utc::now().to_rfc3339();
-    let _ = conn.execute(
-        "UPDATE plaid_items SET last_synced_at = ?1 WHERE id = ?2",
-        rusqlite::params![now, req.item_id],
-    );
-
-    // Run transfer detection
-    let transfer_candidates = crate::commands::plaid_commands::detect_transfers(conn).unwrap_or(0);
+    if let Ok(balance_resp) = balance_req
+        .json(&serde_json::json!({ "item_id": proxy_item_id }))
+        .send()
+        .await
+    {
+        if let Ok(body) = balance_resp.json::<serde_json::Value>().await {
+            if let Some(accounts) = body["accounts"].as_array() {
+                let guard = state.db.lock().unwrap();
+                if let Some(ref active) = *guard {
+                    let conn = active.store.connection();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    for acct in accounts {
+                        if let (Some(plaid_id), Some(current)) =
+                            (acct["account_id"].as_str(), acct["current"].as_f64())
+                        {
+                            let balance_cents = (current * 100.0).round() as i64;
+                            let _ = conn.execute(
+                                "UPDATE plaid_local_accounts SET plaid_balance_cents = ?1, balance_updated_at = ?2
+                                 WHERE item_id = ?3 AND plaid_account_id = ?4",
+                                rusqlite::params![balance_cents, now, req.item_id, plaid_id],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     Ok(Json(PlaidSyncResponse {
         staged,
         skipped,
         transfer_candidates,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Plaid balances endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct PlaidBalanceEntry {
+    plaid_account_id: String,
+    name: String,
+    current: Option<f64>,
+    available: Option<f64>,
+    iso_currency_code: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PlaidBalancesResponse {
+    accounts: Vec<PlaidBalanceEntry>,
+}
+
+async fn plaid_balances(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<PlaidSyncRequest>,
+) -> Result<Json<PlaidBalancesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let plaid_cfg = get_plaid_config(&state)?;
+
+    let proxy_item_id: String = {
+        let guard = state.db.lock().unwrap();
+        let active = guard.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                success: false,
+                error: "No database open".to_string(),
+            }),
+        ))?;
+        active
+            .store
+            .connection()
+            .query_row(
+                "SELECT proxy_item_id FROM plaid_items WHERE id = ?1",
+                [&req.item_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        success: false,
+                        error: "Item not found".to_string(),
+                    }),
+                )
+            })?
+    };
+
+    let mut req_builder = state
+        .http_client
+        .post(format!("{}/plaid/balances", plaid_cfg.proxy_url));
+    if let Some(ref key) = plaid_cfg.api_key {
+        req_builder = req_builder.bearer_auth(key);
+    }
+    let resp = req_builder
+        .json(&serde_json::json!({ "item_id": proxy_item_id }))
+        .send()
+        .await
+        .map_err(|e| proxy_error(format!("Failed to contact proxy: {}", e)))?;
+
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(proxy_error(format!("Proxy balance error: {}", text)));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| proxy_error(format!("Parse error: {}", e)))?;
+
+    let accounts: Vec<PlaidBalanceEntry> = body["accounts"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|a| PlaidBalanceEntry {
+            plaid_account_id: a["account_id"].as_str().unwrap_or("").to_string(),
+            name: a["name"].as_str().unwrap_or("").to_string(),
+            current: a["current"].as_f64(),
+            available: a["available"].as_f64(),
+            iso_currency_code: a["iso_currency_code"].as_str().map(String::from),
+        })
+        .collect();
+
+    Ok(Json(PlaidBalancesResponse { accounts }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,6 +1672,12 @@ struct PlaidLocalAccountInfo {
     mask: Option<String>,
     local_account_id: Option<String>,
     local_account_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plaid_balance_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ledger_balance_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    balance_updated_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1571,7 +1708,8 @@ async fn plaid_items(
     for (id, institution_name, status, last_synced_at) in items {
         let mut acct_stmt = conn
             .prepare(
-                "SELECT pa.plaid_account_id, pa.name, pa.account_type, pa.mask, pa.local_account_id, a.name
+                "SELECT pa.plaid_account_id, pa.name, pa.account_type, pa.mask,
+                        pa.local_account_id, a.name, pa.plaid_balance_cents, pa.balance_updated_at
                  FROM plaid_local_accounts pa
                  LEFT JOIN accounts a ON pa.local_account_id = a.id
                  WHERE pa.item_id = ?1",
@@ -1580,13 +1718,36 @@ async fn plaid_items(
 
         let accounts: Vec<PlaidLocalAccountInfo> = acct_stmt
             .query_map([&id], |row| {
+                let local_account_id: Option<String> = row.get(4)?;
+                let account_type: String = row.get(2)?;
+                let plaid_balance_raw: Option<i64> = row.get(6)?;
+
+                // Convert Plaid balance to our sign convention
+                let plaid_balance_cents =
+                    plaid_balance_raw.map(|pb| if account_type == "credit" { -pb } else { pb });
+
+                let ledger_balance_cents = local_account_id.as_ref().and_then(|aid| {
+                    conn.query_row(
+                        "SELECT COALESCE(SUM(jl.amount), 0)
+                         FROM journal_lines jl
+                         JOIN journal_entries je ON jl.entry_id = je.id
+                         WHERE jl.account_id = ?1 AND je.is_void = 0",
+                        [aid],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .ok()
+                });
+
                 Ok(PlaidLocalAccountInfo {
                     plaid_account_id: row.get(0)?,
                     name: row.get(1)?,
-                    account_type: row.get(2)?,
+                    account_type,
                     mask: row.get(3)?,
-                    local_account_id: row.get(4)?,
+                    local_account_id,
                     local_account_name: row.get(5)?,
+                    plaid_balance_cents,
+                    ledger_balance_cents,
+                    balance_updated_at: row.get(7)?,
                 })
             })
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

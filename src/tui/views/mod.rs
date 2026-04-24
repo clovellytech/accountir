@@ -15,4 +15,5 @@ pub mod plaid_staged;
 pub mod reports;
 pub mod settings;
 pub mod startup;
+pub mod subscriptions;
 pub mod welcome;

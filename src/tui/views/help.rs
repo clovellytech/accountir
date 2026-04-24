@@ -176,6 +176,7 @@ impl HelpModal {
             Self::key_line("  Enter", "View transaction details", theme),
             Self::key_line("  e", "Create new journal entry", theme),
             Self::key_line("  i", "Import transactions from CSV", theme),
+            Self::key_line("  f", "Find subscriptions in Uncategorized", theme),
             Self::key_line("  a", "Reassign transaction to different account", theme),
             Self::key_line("  g", "Go to other account's ledger (ledger only)", theme),
             Self::key_line("  x", "Void selected entry", theme),

@@ -36,7 +36,14 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
         (3, include_str!("../../migrations/003_bank_imports.sql")),
         (4, include_str!("../../migrations/004_plaid.sql")),
         (5, include_str!("../../migrations/005_plaid_staging.sql")),
-        (6, include_str!("../../migrations/006_plaid_payment_meta.sql")),
+        (
+            6,
+            include_str!("../../migrations/006_plaid_payment_meta.sql"),
+        ),
+        (
+            7,
+            include_str!("../../migrations/007_plaid_balance_snapshot.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -240,6 +247,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             account_type TEXT NOT NULL,
             mask TEXT,
             local_account_id TEXT REFERENCES accounts(id),
+            plaid_balance_cents INTEGER,
+            balance_updated_at TEXT,
             PRIMARY KEY (item_id, plaid_account_id)
         );
 

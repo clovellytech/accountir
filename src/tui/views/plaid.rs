@@ -31,6 +31,8 @@ pub struct PlaidAccountDisplay {
     pub account_type: String,
     pub mask: Option<String>,
     pub local_account_name: Option<String>,
+    pub plaid_balance_cents: Option<i64>,
+    pub ledger_balance_cents: Option<i64>,
 }
 
 pub enum PlaidAction {
@@ -184,7 +186,20 @@ impl PlaidView {
                             " [unmapped]"
                         };
                         let mask = a.mask.as_deref().unwrap_or("");
-                        format!("{}({}){}", a.name, mask, mapped)
+                        let balance_info = match (a.plaid_balance_cents, a.ledger_balance_cents) {
+                            (Some(plaid), Some(ledger)) => {
+                                let diff = plaid - ledger;
+                                if diff == 0 {
+                                    " [balanced]".to_string()
+                                } else {
+                                    let abs = diff.unsigned_abs() as i64;
+                                    let sign = if diff > 0 { "+" } else { "-" };
+                                    format!(" [off by {}${}.{:02}]", sign, abs / 100, abs % 100)
+                                }
+                            }
+                            _ => String::new(),
+                        };
+                        format!("{}({}){}{}", a.name, mask, mapped, balance_info)
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
