@@ -9,6 +9,7 @@ use ratatui::{
 
 use crate::domain::{Account, AccountType};
 use crate::tui::theme::Theme;
+use crate::tui::widgets::{self, TextField};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccountFormResult {
@@ -599,22 +600,16 @@ impl AccountForm {
         }
 
         // Account Number field
-        self.draw_text_field(
+        widgets::draw_text_field(
             frame,
-            chunks[1],
-            "Account Number",
-            &self.account_number,
-            self.active_field == FormField::AccountNumber,
+            &TextField::new(chunks[1], "Account Number", &self.account_number, self.active_field == FormField::AccountNumber),
             theme,
         );
 
         // Name field
-        self.draw_text_field(
+        widgets::draw_text_field(
             frame,
-            chunks[2],
-            "Name",
-            &self.name,
-            self.active_field == FormField::Name,
+            &TextField::new(chunks[2], "Name", &self.name, self.active_field == FormField::Name),
             theme,
         );
 
@@ -651,12 +646,9 @@ impl AccountForm {
         }
 
         // Description field
-        self.draw_text_field(
+        widgets::draw_text_field(
             frame,
-            chunks[4],
-            "Description",
-            &self.description,
-            self.active_field == FormField::Description,
+            &TextField::new(chunks[4], "Description", &self.description, self.active_field == FormField::Description),
             theme,
         );
 
@@ -683,43 +675,6 @@ impl AccountForm {
         if self.show_parent_dropdown {
             self.draw_parent_dropdown(frame, chunks[3], theme);
         }
-    }
-
-    fn draw_text_field(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        label: &str,
-        value: &str,
-        is_active: bool,
-        theme: &Theme,
-    ) {
-        let style = if is_active {
-            Style::default().fg(theme.input_active_fg)
-        } else {
-            Style::default().fg(theme.input_inactive_fg)
-        };
-
-        let border_style = if is_active {
-            Style::default().fg(theme.input_active_border)
-        } else {
-            Style::default().fg(theme.input_inactive_border)
-        };
-
-        let display = if is_active {
-            format!("{}█", value)
-        } else {
-            value.to_string()
-        };
-
-        let paragraph = Paragraph::new(display).style(style).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(format!(" {} ", label)),
-        );
-
-        frame.render_widget(paragraph, area);
     }
 
     fn draw_readonly_field(

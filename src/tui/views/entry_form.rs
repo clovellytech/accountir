@@ -9,6 +9,7 @@ use ratatui::{
 
 use crate::domain::Account;
 use crate::tui::theme::Theme;
+use crate::tui::widgets::{self, TextField};
 use chrono::NaiveDate;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,32 +563,23 @@ impl EntryForm {
             .split(inner);
 
         // Date field
-        self.draw_text_field(
+        widgets::draw_text_field(
             frame,
-            chunks[0],
-            "Date (YYYY-MM-DD)",
-            &self.date_str,
-            self.active_field == FormField::Date,
+            &TextField::new(chunks[0], "Date (YYYY-MM-DD)", &self.date_str, self.active_field == FormField::Date).cursor('|'),
             theme,
         );
 
         // Memo field
-        self.draw_text_field(
+        widgets::draw_text_field(
             frame,
-            chunks[1],
-            "Memo (optional)",
-            &self.memo,
-            self.active_field == FormField::Memo,
+            &TextField::new(chunks[1], "Memo (optional)", &self.memo, self.active_field == FormField::Memo).cursor('|'),
             theme,
         );
 
         // Reference field
-        self.draw_text_field(
+        widgets::draw_text_field(
             frame,
-            chunks[2],
-            "Reference (optional)",
-            &self.reference,
-            self.active_field == FormField::Reference,
+            &TextField::new(chunks[2], "Reference (optional)", &self.reference, self.active_field == FormField::Reference).cursor('|'),
             theme,
         );
 
@@ -638,43 +630,6 @@ impl EntryForm {
         if self.line_edit_mode == LineEditMode::SelectAccount {
             self.draw_account_dropdown(frame, chunks[3], theme);
         }
-    }
-
-    fn draw_text_field(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        label: &str,
-        value: &str,
-        is_active: bool,
-        theme: &Theme,
-    ) {
-        let style = if is_active {
-            Style::default().fg(theme.input_active_fg)
-        } else {
-            Style::default().fg(theme.input_inactive_fg)
-        };
-
-        let border_style = if is_active {
-            Style::default().fg(theme.input_active_border)
-        } else {
-            Style::default().fg(theme.input_inactive_border)
-        };
-
-        let display = if is_active {
-            format!("{}|", value)
-        } else {
-            value.to_string()
-        };
-
-        let paragraph = Paragraph::new(display).style(style).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(format!(" {} ", label)),
-        );
-
-        frame.render_widget(paragraph, area);
     }
 
     fn draw_lines_table(&self, frame: &mut Frame, area: Rect, theme: &Theme) {

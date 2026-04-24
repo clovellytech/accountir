@@ -9,6 +9,7 @@ use ratatui::{
 
 use crate::config::AppConfig;
 use crate::tui::theme::Theme;
+use crate::tui::widgets::{self, TextField};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaidConfigResult {
@@ -291,13 +292,9 @@ impl PlaidConfigModal {
                 ])
                 .split(inner);
 
-            self.draw_text_field(
+            widgets::draw_text_field(
                 frame,
-                chunks[0],
-                "Proxy URL",
-                &self.proxy_url,
-                false,
-                true,
+                &TextField::new(chunks[0], "Proxy URL", &self.proxy_url, true),
                 theme,
             );
 
@@ -327,31 +324,19 @@ impl PlaidConfigModal {
                 AuthMode::Login => "Email",
             };
 
-            self.draw_text_field(
+            widgets::draw_text_field(
                 frame,
-                chunks[0],
-                "Proxy URL",
-                &self.proxy_url,
-                false,
-                self.active_field == ConfigField::ProxyUrl,
+                &TextField::new(chunks[0], "Proxy URL", &self.proxy_url, self.active_field == ConfigField::ProxyUrl),
                 theme,
             );
-            self.draw_text_field(
+            widgets::draw_text_field(
                 frame,
-                chunks[1],
-                mode_label,
-                &self.email,
-                false,
-                self.active_field == ConfigField::Email,
+                &TextField::new(chunks[1], mode_label, &self.email, self.active_field == ConfigField::Email),
                 theme,
             );
-            self.draw_text_field(
+            widgets::draw_text_field(
                 frame,
-                chunks[2],
-                "Password",
-                &self.password,
-                true,
-                self.active_field == ConfigField::Password,
+                &TextField::new(chunks[2], "Password", &self.password, self.active_field == ConfigField::Password).secret(),
                 theme,
             );
 
@@ -375,49 +360,6 @@ impl PlaidConfigModal {
         frame.render_widget(Paragraph::new(message), area);
     }
 
-    fn draw_text_field(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        label: &str,
-        value: &str,
-        is_secret: bool,
-        is_active: bool,
-        theme: &Theme,
-    ) {
-        let style = if is_active {
-            Style::default().fg(theme.input_active_fg)
-        } else {
-            Style::default().fg(theme.input_inactive_fg)
-        };
-
-        let border_style = if is_active {
-            Style::default().fg(theme.input_active_border)
-        } else {
-            Style::default().fg(theme.input_inactive_border)
-        };
-
-        let displayed_value = if is_secret {
-            "*".repeat(value.len())
-        } else {
-            value.to_string()
-        };
-
-        let display = if is_active {
-            format!("{}█", displayed_value)
-        } else {
-            displayed_value
-        };
-
-        let paragraph = Paragraph::new(display).style(style).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(format!(" {} ", label)),
-        );
-
-        frame.render_widget(paragraph, area);
-    }
 }
 
 impl Default for PlaidConfigModal {
