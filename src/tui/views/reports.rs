@@ -431,6 +431,7 @@ impl ReportsView {
                 bs.as_of_date, depth_hint
             )
         };
+        let asset_rows: Vec<Row> = asset_rows.into_iter().skip(self.scroll_offset).collect();
         let assets_table = Table::new(
             asset_rows,
             [
@@ -491,6 +492,7 @@ impl ReportsView {
         );
         push_double_rule(&mut le_rows);
 
+        let le_rows: Vec<Row> = le_rows.into_iter().skip(self.scroll_offset).collect();
         let le_table = Table::new(
             le_rows,
             [
@@ -586,6 +588,7 @@ impl ReportsView {
                 is.start_date, is.end_date, depth_hint
             )
         };
+        let rows: Vec<Row> = rows.into_iter().skip(self.scroll_offset).collect();
         let table = Table::new(
             rows,
             [
