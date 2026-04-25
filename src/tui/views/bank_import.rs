@@ -809,7 +809,10 @@ impl BankImportModal {
 
                 if let Some(idx) = self.date_column {
                     let val = first_row.get(idx).map(|s| s.as_str()).unwrap_or("N/A");
-                    sample_lines.push(Line::from(format!("  Date: {}", widgets::truncate(val, 40))));
+                    sample_lines.push(Line::from(format!(
+                        "  Date: {}",
+                        widgets::truncate(val, 40)
+                    )));
                 }
                 if let Some(idx) = self.description_column {
                     let val = first_row.get(idx).map(|s| s.as_str()).unwrap_or("N/A");
@@ -951,4 +954,3 @@ impl BankImportModal {
         frame.render_widget(msg, inner);
     }
 }
-

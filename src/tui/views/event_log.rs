@@ -224,7 +224,11 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             format!("Added user '{}' as {:?}", username, role)
         }
         Event::UserModified { user_id, field, .. } => {
-            format!("Modified {} for user {}", field, widgets::truncate(user_id, 8))
+            format!(
+                "Modified {} for user {}",
+                field,
+                widgets::truncate(user_id, 8)
+            )
         }
         Event::UserRemoved { user_id } => {
             format!("Removed user {}", widgets::truncate(user_id, 8))
@@ -268,7 +272,11 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 .filter(|l| l.amount > 0)
                 .map(|l| l.amount)
                 .sum::<i64>();
-            format!("{} (${:.2})", widgets::truncate(memo, 40), amount as f64 / 100.0)
+            format!(
+                "{} (${:.2})",
+                widgets::truncate(memo, 40),
+                amount as f64 / 100.0
+            )
         }
         Event::JournalEntryVoided { entry_id, reason } => {
             format!(
@@ -424,4 +432,3 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         }
     }
 }
-

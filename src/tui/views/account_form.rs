@@ -602,14 +602,24 @@ impl AccountForm {
         // Account Number field
         widgets::draw_text_field(
             frame,
-            &TextField::new(chunks[1], "Account Number", &self.account_number, self.active_field == FormField::AccountNumber),
+            &TextField::new(
+                chunks[1],
+                "Account Number",
+                &self.account_number,
+                self.active_field == FormField::AccountNumber,
+            ),
             theme,
         );
 
         // Name field
         widgets::draw_text_field(
             frame,
-            &TextField::new(chunks[2], "Name", &self.name, self.active_field == FormField::Name),
+            &TextField::new(
+                chunks[2],
+                "Name",
+                &self.name,
+                self.active_field == FormField::Name,
+            ),
             theme,
         );
 
@@ -648,7 +658,12 @@ impl AccountForm {
         // Description field
         widgets::draw_text_field(
             frame,
-            &TextField::new(chunks[4], "Description", &self.description, self.active_field == FormField::Description),
+            &TextField::new(
+                chunks[4],
+                "Description",
+                &self.description,
+                self.active_field == FormField::Description,
+            ),
             theme,
         );
 
@@ -854,4 +869,3 @@ impl Default for AccountForm {
         Self::new()
     }
 }
-

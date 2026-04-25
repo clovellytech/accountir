@@ -169,4 +169,3 @@ impl Default for SettingsModal {
         Self::new()
     }
 }
-

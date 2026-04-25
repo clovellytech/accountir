@@ -233,4 +233,3 @@ fn format_amount(cents: i64) -> String {
     let remainder = (cents % 100).unsigned_abs();
     format!("${}.{:02}", dollars, remainder)
 }
-

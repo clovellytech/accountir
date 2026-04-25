@@ -228,4 +228,3 @@ impl Default for EntryDetailModal {
         Self::new()
     }
 }
-

@@ -1118,4 +1118,3 @@ impl Default for JournalView {
         Self::new()
     }
 }
-

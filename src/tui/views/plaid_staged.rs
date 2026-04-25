@@ -473,4 +473,3 @@ fn format_amount(cents: i64) -> String {
         format!("{}.{:02}", dollars, remainder)
     }
 }
-

@@ -450,7 +450,11 @@ impl ReportsView {
 
         let liab_tree =
             build_report_rows(&bs_to_inputs(&bs.liabilities.lines), self.collapse_depth);
-        render_report_rows(&liab_tree, |b| widgets::format_currency(b.abs()), &mut le_rows);
+        render_report_rows(
+            &liab_tree,
+            |b| widgets::format_currency(b.abs()),
+            &mut le_rows,
+        );
 
         push_single_rule(&mut le_rows);
         le_rows.push(
@@ -467,7 +471,11 @@ impl ReportsView {
         le_rows.push(Row::new(vec!["", "", ""]));
 
         let equity_tree = build_report_rows(&bs_to_inputs(&bs.equity.lines), self.collapse_depth);
-        render_report_rows(&equity_tree, |b| widgets::format_currency(b.abs()), &mut le_rows);
+        render_report_rows(
+            &equity_tree,
+            |b| widgets::format_currency(b.abs()),
+            &mut le_rows,
+        );
 
         push_single_rule(&mut le_rows);
         le_rows.push(
@@ -607,7 +615,6 @@ impl Default for ReportsView {
         Self::new()
     }
 }
-
 
 const SINGLE_LINE: &str = "───────────────";
 const DOUBLE_LINE: &str = "═══════════════";

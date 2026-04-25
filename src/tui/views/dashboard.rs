@@ -217,4 +217,3 @@ impl Default for DashboardView {
         Self::new()
     }
 }
-

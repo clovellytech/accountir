@@ -326,17 +326,33 @@ impl PlaidConfigModal {
 
             widgets::draw_text_field(
                 frame,
-                &TextField::new(chunks[0], "Proxy URL", &self.proxy_url, self.active_field == ConfigField::ProxyUrl),
+                &TextField::new(
+                    chunks[0],
+                    "Proxy URL",
+                    &self.proxy_url,
+                    self.active_field == ConfigField::ProxyUrl,
+                ),
                 theme,
             );
             widgets::draw_text_field(
                 frame,
-                &TextField::new(chunks[1], mode_label, &self.email, self.active_field == ConfigField::Email),
+                &TextField::new(
+                    chunks[1],
+                    mode_label,
+                    &self.email,
+                    self.active_field == ConfigField::Email,
+                ),
                 theme,
             );
             widgets::draw_text_field(
                 frame,
-                &TextField::new(chunks[2], "Password", &self.password, self.active_field == ConfigField::Password).secret(),
+                &TextField::new(
+                    chunks[2],
+                    "Password",
+                    &self.password,
+                    self.active_field == ConfigField::Password,
+                )
+                .secret(),
                 theme,
             );
 
@@ -359,7 +375,6 @@ impl PlaidConfigModal {
         };
         frame.render_widget(Paragraph::new(message), area);
     }
-
 }
 
 impl Default for PlaidConfigModal {
@@ -367,4 +382,3 @@ impl Default for PlaidConfigModal {
         Self::new()
     }
 }
-

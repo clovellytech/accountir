@@ -299,4 +299,3 @@ pub enum HelpContext {
     EventLog,
     Plaid,
 }
-

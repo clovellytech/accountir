@@ -565,21 +565,39 @@ impl EntryForm {
         // Date field
         widgets::draw_text_field(
             frame,
-            &TextField::new(chunks[0], "Date (YYYY-MM-DD)", &self.date_str, self.active_field == FormField::Date).cursor('|'),
+            &TextField::new(
+                chunks[0],
+                "Date (YYYY-MM-DD)",
+                &self.date_str,
+                self.active_field == FormField::Date,
+            )
+            .cursor('|'),
             theme,
         );
 
         // Memo field
         widgets::draw_text_field(
             frame,
-            &TextField::new(chunks[1], "Memo (optional)", &self.memo, self.active_field == FormField::Memo).cursor('|'),
+            &TextField::new(
+                chunks[1],
+                "Memo (optional)",
+                &self.memo,
+                self.active_field == FormField::Memo,
+            )
+            .cursor('|'),
             theme,
         );
 
         // Reference field
         widgets::draw_text_field(
             frame,
-            &TextField::new(chunks[2], "Reference (optional)", &self.reference, self.active_field == FormField::Reference).cursor('|'),
+            &TextField::new(
+                chunks[2],
+                "Reference (optional)",
+                &self.reference,
+                self.active_field == FormField::Reference,
+            )
+            .cursor('|'),
             theme,
         );
 
@@ -788,7 +806,6 @@ impl Default for EntryForm {
         Self::new()
     }
 }
-
 
 fn format_cents(cents: i64) -> String {
     let dollars = cents.abs() as f64 / 100.0;

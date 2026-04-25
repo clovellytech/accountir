@@ -348,4 +348,3 @@ impl Default for AccountsView {
         Self::new()
     }
 }
-
