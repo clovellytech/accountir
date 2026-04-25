@@ -54,19 +54,15 @@ impl SubscriptionsModal {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.hide();
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if !self.subscriptions.is_empty() {
-                    self.selected = (self.selected + 1).min(self.subscriptions.len() - 1);
-                }
+            KeyCode::Down | KeyCode::Char('j') if !self.subscriptions.is_empty() => {
+                self.selected = (self.selected + 1).min(self.subscriptions.len() - 1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
             }
             KeyCode::Home => self.selected = 0,
-            KeyCode::End => {
-                if !self.subscriptions.is_empty() {
-                    self.selected = self.subscriptions.len() - 1;
-                }
+            KeyCode::End if !self.subscriptions.is_empty() => {
+                self.selected = self.subscriptions.len() - 1;
             }
             _ => {}
         }

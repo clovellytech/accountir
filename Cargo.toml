@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "accountir"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Local-first, event-sourced double-entry accounting"
 license = "AGPL-3.0-or-later"

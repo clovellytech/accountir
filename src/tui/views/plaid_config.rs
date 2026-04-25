@@ -99,15 +99,11 @@ impl PlaidConfigModal {
             KeyCode::Esc => {
                 self.result = PlaidConfigResult::Cancel;
             }
-            KeyCode::Tab | KeyCode::Down => {
-                if !self.already_registered {
-                    self.active_field = self.active_field.next();
-                }
+            KeyCode::Tab | KeyCode::Down if !self.already_registered => {
+                self.active_field = self.active_field.next();
             }
-            KeyCode::BackTab | KeyCode::Up => {
-                if !self.already_registered {
-                    self.active_field = self.active_field.prev();
-                }
+            KeyCode::BackTab | KeyCode::Up if !self.already_registered => {
+                self.active_field = self.active_field.prev();
             }
             KeyCode::Enter => {
                 self.submit();

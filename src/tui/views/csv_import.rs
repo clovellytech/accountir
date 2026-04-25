@@ -229,35 +229,31 @@ impl CsvImportModal {
                     self.update_suggestions();
                 }
             }
-            KeyCode::Up => {
-                if !self.file_suggestions.is_empty() {
-                    let i = match self.suggestion_state.selected() {
-                        Some(i) => {
-                            if i == 0 {
-                                self.file_suggestions.len() - 1
-                            } else {
-                                i - 1
-                            }
+            KeyCode::Up if !self.file_suggestions.is_empty() => {
+                let i = match self.suggestion_state.selected() {
+                    Some(i) => {
+                        if i == 0 {
+                            self.file_suggestions.len() - 1
+                        } else {
+                            i - 1
                         }
-                        None => self.file_suggestions.len() - 1,
-                    };
-                    self.suggestion_state.select(Some(i));
-                }
+                    }
+                    None => self.file_suggestions.len() - 1,
+                };
+                self.suggestion_state.select(Some(i));
             }
-            KeyCode::Down => {
-                if !self.file_suggestions.is_empty() {
-                    let i = match self.suggestion_state.selected() {
-                        Some(i) => {
-                            if i >= self.file_suggestions.len() - 1 {
-                                0
-                            } else {
-                                i + 1
-                            }
+            KeyCode::Down if !self.file_suggestions.is_empty() => {
+                let i = match self.suggestion_state.selected() {
+                    Some(i) => {
+                        if i >= self.file_suggestions.len() - 1 {
+                            0
+                        } else {
+                            i + 1
                         }
-                        None => 0,
-                    };
-                    self.suggestion_state.select(Some(i));
-                }
+                    }
+                    None => 0,
+                };
+                self.suggestion_state.select(Some(i));
             }
             KeyCode::Backspace => {
                 self.file_path.pop();
@@ -293,23 +289,19 @@ impl CsvImportModal {
                     }
                 }
             }
-            KeyCode::Up => {
-                if num_accounts > 0 {
-                    let i = match self.account_state.selected() {
-                        Some(i) if i > 0 => i - 1,
-                        _ => num_accounts.saturating_sub(1),
-                    };
-                    self.account_state.select(Some(i));
-                }
+            KeyCode::Up if num_accounts > 0 => {
+                let i = match self.account_state.selected() {
+                    Some(i) if i > 0 => i - 1,
+                    _ => num_accounts.saturating_sub(1),
+                };
+                self.account_state.select(Some(i));
             }
-            KeyCode::Down => {
-                if num_accounts > 0 {
-                    let i = match self.account_state.selected() {
-                        Some(i) if i < num_accounts - 1 => i + 1,
-                        _ => 0,
-                    };
-                    self.account_state.select(Some(i));
-                }
+            KeyCode::Down if num_accounts > 0 => {
+                let i = match self.account_state.selected() {
+                    Some(i) if i < num_accounts - 1 => i + 1,
+                    _ => 0,
+                };
+                self.account_state.select(Some(i));
             }
             KeyCode::Backspace => {
                 self.account_filter.pop();
@@ -418,15 +410,14 @@ impl CsvImportModal {
                 self.step = ImportStep::MapColumns;
                 self.confirm_summary = None;
             }
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y')
                 if self
                     .confirm_summary
                     .as_ref()
                     .map(|s| !s.parsed.is_empty())
-                    .unwrap_or(false)
-                {
-                    self.ready_to_import = true;
-                }
+                    .unwrap_or(false) =>
+            {
+                self.ready_to_import = true;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.confirm_scroll = self.confirm_scroll.saturating_sub(1);
@@ -729,12 +720,10 @@ impl CsvImportModal {
                 self.step = ImportStep::SelectFile;
                 self.error_message = None;
             }
-            KeyCode::Enter => {
-                if self.preview.is_some() {
-                    self.step = ImportStep::SelectAccount;
-                    self.account_state.select(Some(0));
-                    self.error_message = None;
-                }
+            KeyCode::Enter if self.preview.is_some() => {
+                self.step = ImportStep::SelectAccount;
+                self.account_state.select(Some(0));
+                self.error_message = None;
             }
             KeyCode::Tab | KeyCode::Down => {
                 self.active_parse_field = match self.active_parse_field {

@@ -119,18 +119,14 @@ impl PlaidLinkModal {
             KeyCode::Esc => {
                 self.result = PlaidLinkResult::Cancel;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.available_accounts.is_empty() {
-                    self.selected = (self.selected + 1) % self.available_accounts.len();
-                }
+            KeyCode::Char('j') | KeyCode::Down if !self.available_accounts.is_empty() => {
+                self.selected = (self.selected + 1) % self.available_accounts.len();
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if !self.available_accounts.is_empty() {
-                    self.selected = self
-                        .selected
-                        .checked_sub(1)
-                        .unwrap_or(self.available_accounts.len() - 1);
-                }
+            KeyCode::Char('k') | KeyCode::Up if !self.available_accounts.is_empty() => {
+                self.selected = self
+                    .selected
+                    .checked_sub(1)
+                    .unwrap_or(self.available_accounts.len() - 1);
             }
             KeyCode::Enter => {
                 // Link selected Plaid account

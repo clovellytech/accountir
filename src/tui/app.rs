@@ -1207,13 +1207,12 @@ impl App {
                 self.active_view = ActiveView::Plaid;
                 return;
             }
-            KeyCode::Char('b') => {
+            KeyCode::Char('b')
                 // Open bank import modal if there are pending imports
-                if self.pending_import_count > 0 {
+                if self.pending_import_count > 0 => {
                     self.bank_import.show();
                     return;
                 }
-            }
             KeyCode::Char(',') => {
                 self.settings.show();
                 return;

@@ -532,12 +532,11 @@ impl JournalView {
             KeyCode::Char('h') => self.toggle_show_void(),
             KeyCode::Char('c') => self.toggle_id_column(),
             KeyCode::Char('a') => return true, // Signal to app.rs to start (bulk) reassignment
-            KeyCode::Char('g') => {
+            KeyCode::Char('g')
                 // Jump to other account's ledger (only in ledger view)
-                if is_ledger {
+                if is_ledger => {
                     self.request_goto_other_account();
                 }
-            }
             KeyCode::Esc | KeyCode::Backspace => {
                 if self.has_selections() {
                     // First Esc clears the selection set; the filter stays.
@@ -641,23 +640,19 @@ impl JournalView {
                     }
                 }
             }
-            KeyCode::Up => {
-                if num_accounts > 0 {
-                    let i = match self.reassign_state.selected() {
-                        Some(i) if i > 0 => i - 1,
-                        _ => num_accounts.saturating_sub(1),
-                    };
-                    self.reassign_state.select(Some(i));
-                }
+            KeyCode::Up if num_accounts > 0 => {
+                let i = match self.reassign_state.selected() {
+                    Some(i) if i > 0 => i - 1,
+                    _ => num_accounts.saturating_sub(1),
+                };
+                self.reassign_state.select(Some(i));
             }
-            KeyCode::Down => {
-                if num_accounts > 0 {
-                    let i = match self.reassign_state.selected() {
-                        Some(i) if i < num_accounts - 1 => i + 1,
-                        _ => 0,
-                    };
-                    self.reassign_state.select(Some(i));
-                }
+            KeyCode::Down if num_accounts > 0 => {
+                let i = match self.reassign_state.selected() {
+                    Some(i) if i < num_accounts - 1 => i + 1,
+                    _ => 0,
+                };
+                self.reassign_state.select(Some(i));
             }
             KeyCode::Backspace => {
                 self.reassign_filter.pop();
