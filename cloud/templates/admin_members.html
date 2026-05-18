@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Members · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Members</h1><div class="subtitle">Members of <strong>{{ active_company_name }}</strong></div></div>
+</div>
+
+<div class="grid grid-2 stack">
+  <div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Member</th><th style="width:140px">Role</th><th style="width:80px"></th></tr></thead>
+      <tbody>
+      {% for m in members %}
+        <tr>
+          <td>{{ m.email }}{% if m.name.is_some() %}<div class="muted" style="font-size: 11px;">{{ m.name.as_deref().unwrap_or("") }}</div>{% endif %}</td>
+          <td>
+            {% if can_admin %}
+            <form method="post" action="/app/admin/members/{{ m.user_id }}/role" style="margin:0;">
+              <select name="role" onchange="this.form.submit()" style="font-size:12px; padding:3px 6px;">
+                <option value="viewer" {% if m.role == "viewer" %}selected{% endif %}>Viewer</option>
+                <option value="accountant" {% if m.role == "accountant" %}selected{% endif %}>Accountant</option>
+                <option value="admin" {% if m.role == "admin" %}selected{% endif %}>Admin</option>
+                <option value="owner" {% if m.role == "owner" %}selected{% endif %}>Owner</option>
+              </select>
+            </form>
+            {% else %}
+            <span class="badge">{{ m.role }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if can_admin %}
+            <form method="post" action="/app/admin/members/{{ m.user_id }}/remove" style="margin:0;" onsubmit="return confirm('Remove this member?')">
+              <button class="btn btn-danger" style="padding:2px 8px; font-size:11px;">Remove</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+  <div>
+    <div class="card stack-sm" style="margin-bottom: var(--gap);">
+      <div class="section-title">Invite by email <span class="muted">(existing user only)</span></div>
+      {% if can_admin %}
+      <form method="post" action="/app/admin/members" class="stack-sm">
+        <label class="field"><span class="label-text">Email</span><input type="email" name="email" required></label>
+        <label class="field"><span class="label-text">Role</span>
+          <select name="role">
+            <option value="viewer">Viewer</option>
+            <option value="accountant">Accountant</option>
+            <option value="admin">Admin</option>
+            <option value="owner">Owner</option>
+          </select>
+        </label>
+        <button type="submit" class="btn btn-secondary">Add member</button>
+      </form>
+      {% else %}
+      <p class="muted">Owner/admin only.</p>
+      {% endif %}
+    </div>
+
+    <div class="card stack-sm">
+      <div class="section-title">Invitation links</div>
+      {% if can_admin %}
+      <form method="post" action="/app/admin/invitations" class="stack-sm">
+        <label class="field"><span class="label-text">Role for invitee</span>
+          <select name="role">
+            <option value="viewer">Viewer</option>
+            <option value="accountant">Accountant</option>
+            <option value="admin">Admin</option>
+          </select>
+        </label>
+        <button type="submit" class="btn btn-primary">Generate invite link</button>
+      </form>
+      <p class="muted" style="font-size:11px; margin: 4px 0 0;">Anyone with the link can join with the chosen role. Expires in 14 days.</p>
+      {% endif %}
+      {% if !invitations.is_empty() %}
+      <div style="margin-top: 12px;">
+        {% for inv in invitations %}
+        <div style="font-size:12px; padding: 6px 0; border-top: 1px solid var(--border);">
+          <span class="badge">{{ inv.role }}</span>
+          <span class="muted">expires {{ inv.expires_at.format("%Y-%m-%d").to_string() }}</span>
+          {% if inv.accepted_at.is_some() %}<span class="badge ok">used</span>{% endif %}
+          <div style="font-family: var(--mono); font-size:11px; word-break: break-all; margin-top:3px;">
+            {{ invite_url_base }}/accept-invite/{{ inv.token }}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endblock %}

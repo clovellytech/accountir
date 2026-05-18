@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Trial balance · Maven{% endblock %}
+{% block body %}
+<div class="print-header">
+  <span class="meta">Generated {{ generated_on }}</span>
+  <div class="company">{{ company_name }}</div>
+  <div>Trial balance · all-time</div>
+</div>
+<div class="page-header">
+  <div><h1>Trial balance</h1><div class="subtitle">All-time, by account</div></div>
+  <div class="actions">
+    <button type="button" class="btn btn-primary" onclick="window.print()">PDF</button>
+  </div>
+</div>
+
+{% if rows.is_empty() %}
+<div class="empty"><h3>No journal activity yet</h3><p>Post your first entry to populate the trial balance.</p>
+<a href="/app/entries/new" class="btn btn-primary">+ New entry</a></div>
+{% else %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:80px">Number</th><th>Account</th><th style="width:120px">Type</th><th class="num" style="width:140px">Debit</th><th class="num" style="width:140px">Credit</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td class="num" style="text-align: left;">{{ r.account_number }}</td>
+      <td>{{ r.name }}</td>
+      <td><span class="badge">{{ r.account_type }}</span></td>
+      <td class="num">{{ r.debit_display() }}</td>
+      <td class="num">{{ r.credit_display() }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+  <tfoot>
+    <tr>
+      <td colspan="3">Totals</td>
+      <td class="num">{{ total_debit_display }}</td>
+      <td class="num">{{ total_credit_display }}</td>
+    </tr>
+    <tr>
+      <td colspan="3" class="muted" style="font-weight: 400;">Balance check</td>
+      <td colspan="2" class="num"><span class="badge {{ balance_class }}">{{ balance_msg }}</span></td>
+    </tr>
+  </tfoot>
+</table>
+</div>
+{% endif %}
+{% endblock %}

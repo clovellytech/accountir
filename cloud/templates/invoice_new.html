@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}New invoice · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>New invoice</h1><div class="subtitle">Draft — issue when ready to post</div></div>
+</div>
+
+{% if customers.is_empty() %}
+<div class="empty">
+  <h3>Add a customer first</h3>
+  <p>You need at least one customer to create an invoice.</p>
+  <a href="/app/customers/new" class="btn btn-primary">+ New customer</a>
+</div>
+{% else if revenue_accounts.is_empty() %}
+<div class="empty">
+  <h3>Create a revenue account first</h3>
+  <p>You need a revenue account (e.g. 4000 Services Revenue) to assign invoice income to.</p>
+  <a href="/app/accounts/new" class="btn btn-primary">+ New account</a>
+</div>
+{% else %}
+<form method="post" action="/app/invoices" class="card" style="max-width: 920px;" id="invoice-form">
+  <div class="form-row">
+    <label class="field"><span class="label-text">Customer *</span>
+      <select name="customer_id" required>
+        <option value="">— Select —</option>
+        {% for c in customers %}
+        <option value="{{ c.id }}"{% if preselect_customer.as_deref() == Some(c.id.to_string().as_str()) %} selected{% endif %}>{{ c.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field"><span class="label-text">Issue date</span>
+      <input type="date" name="issue_date" value="{{ today_iso }}" required>
+    </label>
+    <label class="field"><span class="label-text">Terms</span>
+      <select name="terms">
+        <option value="due_on_receipt">Due on receipt</option>
+        <option value="net_15">Net 15</option>
+        <option value="net_30" selected>Net 30</option>
+        <option value="net_45">Net 45</option>
+        <option value="net_60">Net 60</option>
+      </select>
+    </label>
+  </div>
+
+  <h3 style="margin: 8px 0 4px;">Line items</h3>
+  <div id="lines">
+    <div class="inv-line">
+      <input type="text" name="desc[]" placeholder="Description" required style="flex:3;">
+      <input type="number" name="qty[]" placeholder="Qty" value="1" step="0.01" min="0" required style="width:80px; text-align:right;" oninput="recalc()">
+      <input type="number" name="unit_dollars[]" placeholder="Unit $" step="0.01" min="0" required style="width:110px; text-align:right;" oninput="recalc()">
+      <input type="number" name="tax_pct[]" placeholder="Tax %" value="0" step="0.001" min="0" max="100" style="width:80px; text-align:right;" oninput="recalc()">
+      <select name="revenue_account_id[]" required style="flex:2;">
+        {% for a in revenue_accounts %}<option value="{{ a.id }}">{{ a.display }}</option>{% endfor %}
+      </select>
+      <span class="inv-line-total muted" style="width:90px; text-align:right; font-variant-numeric:tabular-nums;">$0.00</span>
+      <button type="button" class="row-remove" onclick="removeLine(this)">×</button>
+    </div>
+  </div>
+  <button type="button" class="btn btn-ghost" onclick="addLine()" style="margin-top:8px;">+ Add line</button>
+
+  <div style="display: flex; justify-content: flex-end; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border);">
+    <table style="width: 260px;">
+      <tr><td class="muted">Subtotal</td><td class="num" id="sum-subtotal">$0.00</td></tr>
+      <tr><td class="muted">Tax</td><td class="num" id="sum-tax">$0.00</td></tr>
+      <tr style="font-weight:600;"><td>Total</td><td class="num" id="sum-total">$0.00</td></tr>
+    </table>
+  </div>
+
+  <label class="field" style="margin-top: 12px;"><span class="label-text">Memo (internal)</span>
+    <input type="text" name="memo">
+  </label>
+  <label class="field"><span class="label-text">Notes for customer (printed on invoice)</span>
+    <textarea name="customer_notes" rows="2" placeholder="Thank you for your business!"></textarea>
+  </label>
+
+  <div class="form-actions">
+    <button type="submit" class="btn btn-primary">Save draft</button>
+    <a href="/app/invoices" class="btn btn-ghost">Cancel</a>
+  </div>
+</form>
+
+<style>
+.inv-line {
+  display: flex; gap: 8px; align-items: center;
+  padding: 6px 0; border-top: 1px solid var(--border);
+}
+.inv-line:first-child { border-top: 0; }
+.inv-line input, .inv-line select { padding: 6px 8px; font-size: 13px; }
+</style>
+
+<script>
+const REV_OPTIONS = `{% for a in revenue_accounts %}<option value="{{ a.id }}">{{ a.display }}</option>{% endfor %}`;
+function addLine() {
+  const wrap = document.getElementById('lines');
+  const row = document.createElement('div');
+  row.className = 'inv-line';
+  row.innerHTML = `
+    <input type="text" name="desc[]" placeholder="Description" required style="flex:3;">
+    <input type="number" name="qty[]" placeholder="Qty" value="1" step="0.01" min="0" required style="width:80px; text-align:right;" oninput="recalc()">
+    <input type="number" name="unit_dollars[]" placeholder="Unit $" step="0.01" min="0" required style="width:110px; text-align:right;" oninput="recalc()">
+    <input type="number" name="tax_pct[]" placeholder="Tax %" value="0" step="0.001" min="0" max="100" style="width:80px; text-align:right;" oninput="recalc()">
+    <select name="revenue_account_id[]" required style="flex:2;">${REV_OPTIONS}</select>
+    <span class="inv-line-total muted" style="width:90px; text-align:right; font-variant-numeric:tabular-nums;">$0.00</span>
+    <button type="button" class="row-remove" onclick="removeLine(this)">×</button>`;
+  wrap.appendChild(row);
+}
+function removeLine(btn) {
+  const lines = document.querySelectorAll('.inv-line');
+  if (lines.length > 1) { btn.closest('.inv-line').remove(); recalc(); }
+}
+function fmt(n) { return '$' + n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function recalc() {
+  let subtotal = 0, tax = 0;
+  document.querySelectorAll('.inv-line').forEach(row => {
+    const q = parseFloat(row.querySelector('input[name="qty[]"]').value) || 0;
+    const u = parseFloat(row.querySelector('input[name="unit_dollars[]"]').value) || 0;
+    const t = parseFloat(row.querySelector('input[name="tax_pct[]"]').value) || 0;
+    const line = q * u;
+    const linetax = line * (t / 100);
+    subtotal += line;
+    tax += linetax;
+    row.querySelector('.inv-line-total').textContent = fmt(line + linetax);
+  });
+  document.getElementById('sum-subtotal').textContent = fmt(subtotal);
+  document.getElementById('sum-tax').textContent = fmt(tax);
+  document.getElementById('sum-total').textContent = fmt(subtotal + tax);
+}
+</script>
+{% endif %}
+{% endblock %}

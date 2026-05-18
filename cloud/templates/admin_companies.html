@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Companies · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Companies</h1><div class="subtitle">{{ companies.len() }} companies you belong to · active: <strong>{{ active_company_name }}</strong></div></div>
+</div>
+
+<div class="grid grid-2 stack">
+  <div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Company</th><th style="width:120px">Role</th><th style="width:140px"></th></tr></thead>
+      <tbody>
+      {% for c in companies %}
+        <tr>
+          <td>
+            {{ c.name }}
+            {% if c.id == active_company_id %}<span class="badge ok" style="margin-left: 6px;">active</span>{% endif %}
+            <div class="muted" style="font-size:11px;">{{ c.slug }}</div>
+          </td>
+          <td><span class="badge">{{ c.role }}</span></td>
+          <td>
+            {% if c.id != active_company_id %}
+            <form method="post" action="/app/admin/companies/{{ c.id }}/switch" style="margin:0;">
+              <button class="btn btn-secondary" style="padding: 3px 10px; font-size:12px;">Switch to</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+  <div class="card">
+    <div class="section-title">New company</div>
+    <form method="post" action="/app/admin/companies" class="stack-sm">
+      <label class="field"><span class="label-text">Name</span><input type="text" name="name" placeholder="Acme Inc." required></label>
+      <button type="submit" class="btn btn-primary">Create company</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Link a bank · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Link a bank</h1><div class="subtitle">You'll authenticate with Plaid Link. Credentials never touch this server.</div></div>
+</div>
+
+<div class="card" style="max-width: 520px;">
+  <div id="status" style="font-size: 13px; color: var(--text-2);">Initializing…</div>
+  <div style="margin-top: 16px;"><a href="/app/banks" class="btn btn-ghost">← Back to banks</a></div>
+</div>
+
+<script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+<script>
+  const statusEl = document.getElementById('status');
+  function setStatus(html, kind) {
+    statusEl.innerHTML = html;
+    statusEl.className = kind === 'err' ? 'flash err' : (kind === 'ok' ? 'flash ok' : '');
+    statusEl.style = '';
+  }
+
+  async function init() {
+    let linkToken;
+    try {
+      const r = await fetch('/plaid/create-link-token', { method: 'POST' });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        setStatus('Failed to get link token: ' + (j.message || j.error || r.status), 'err');
+        return;
+      }
+      linkToken = (await r.json()).link_token;
+    } catch (e) {
+      setStatus('Network error getting link token: ' + e.message, 'err');
+      return;
+    }
+
+    const handler = Plaid.create({
+      token: linkToken,
+      onSuccess: async (publicToken, metadata) => {
+        setStatus('Saving connection…', '');
+        try {
+          const r = await fetch('/plaid/exchange-token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              public_token: publicToken,
+              institution: {
+                institution_id: (metadata.institution && metadata.institution.institution_id) || '',
+                name: (metadata.institution && metadata.institution.name) || 'Unknown',
+              },
+              accounts: (metadata.accounts || []).map(a => ({
+                account_id: a.id, name: a.name,
+                official_name: a.official_name || null,
+                type: a.type || a.subtype || 'depository',
+                mask: a.mask || null,
+              })),
+            }),
+          });
+          if (!r.ok) {
+            const j = await r.json().catch(() => ({}));
+            setStatus('Failed to save: ' + (j.message || j.error || r.status), 'err');
+            return;
+          }
+          setStatus('Bank linked. Redirecting…', 'ok');
+          setTimeout(() => { window.location = '/app/banks'; }, 800);
+        } catch (e) { setStatus('Error saving: ' + e.message, 'err'); }
+      },
+      onExit: (err) => {
+        if (err) {
+          setStatus('Plaid Link exited: ' + (err.display_message || err.error_message || 'cancelled'), 'err');
+        } else {
+          setStatus('Cancelled. <a href="/app/banks/link">Try again</a>', '');
+        }
+      },
+    });
+    setStatus('Opening Plaid…', '');
+    handler.open();
+  }
+  init();
+</script>
+{% endblock %}

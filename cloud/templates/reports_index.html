@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Reports · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Reports</h1><div class="subtitle">Standard accounting reports</div></div>
+</div>
+
+<div class="grid grid-2 stack">
+  <a href="/app/reports/income-statement" class="card" style="text-decoration: none;">
+    <div class="card-title">Income statement</div>
+    <div class="card-value" style="font-size: 16px;">Profit &amp; loss</div>
+    <div class="card-sub">Revenue minus expenses over a date range</div>
+  </a>
+  <a href="/app/reports/balance-sheet" class="card" style="text-decoration: none;">
+    <div class="card-title">Balance sheet</div>
+    <div class="card-value" style="font-size: 16px;">Assets, liabilities, equity</div>
+    <div class="card-sub">Position at a specific date</div>
+  </a>
+  <a href="/app/reports/cash-flow" class="card" style="text-decoration: none;">
+    <div class="card-title">Cash flow</div>
+    <div class="card-value" style="font-size: 16px;">Movement summary</div>
+    <div class="card-sub">Change in cash with counterpart breakdown (v1)</div>
+  </a>
+  <a href="/app/reports/trial-balance" class="card" style="text-decoration: none;">
+    <div class="card-title">Trial balance</div>
+    <div class="card-value" style="font-size: 16px;">All accounts</div>
+    <div class="card-sub">Sums of debits and credits per account</div>
+  </a>
+</div>
+{% endblock %}

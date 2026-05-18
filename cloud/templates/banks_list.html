@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Banks · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Banks</h1><div class="subtitle">{{ items.len() }} institutions linked via Plaid</div></div>
+  <div class="actions"><a href="/app/banks/link" class="btn btn-primary">+ Link bank</a></div>
+</div>
+
+{% if items.is_empty() %}
+<div class="empty">
+  <h3>No banks linked</h3>
+  <p>Connect your bank via Plaid to auto-import transactions.</p>
+  <a href="/app/banks/link" class="btn btn-primary">+ Link bank</a>
+</div>
+{% else %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Institution</th><th style="width:100px">Status</th><th style="width:200px">Last synced</th><th style="width:100px"></th></tr></thead>
+  <tbody>
+  {% for item in items %}
+    <tr>
+      <td>{{ item.institution_name }}</td>
+      <td><span class="badge {% if item.status == "active" %}ok{% else %}err{% endif %}">{{ item.status }}</span></td>
+      <td class="muted">{{ item.last_synced_display() }}</td>
+      <td style="display: flex; gap: 4px;">
+        {% if item.status == "active" %}
+        <form method="post" action="/app/banks/{{ item.id }}/sync" style="margin:0;">
+          <button class="btn btn-secondary" style="padding:3px 10px; font-size:12px;">Sync</button>
+        </form>
+        {% endif %}
+        <form method="post" action="/app/banks/{{ item.id }}/unlink" style="margin:0;" onsubmit="return confirm('Unlink this bank? Already-imported transactions stay in your books.')">
+          <button class="btn btn-danger" style="padding:3px 8px; font-size:12px;">Unlink</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block title %}Cash flow · Maven{% endblock %}
+{% block body %}
+<div class="print-header">
+  <span class="meta">Generated {{ generated_on }}</span>
+  <div class="company">{{ company_name }}</div>
+  <div>Cash flow · {{ report.start }} → {{ report.end }}</div>
+</div>
+<div class="page-header">
+  <div><h1>Cash flow</h1>
+    <div class="subtitle">{{ report.start }} → {{ report.end }} <span class="muted">· simplified v1</span></div>
+  </div>
+  <div style="display: flex; gap: 8px; align-items: end;">
+    <form method="get" action="/app/reports/cash-flow" class="actions">
+      <input type="date" name="start" value="{{ report.start }}" style="width: 140px;">
+      <input type="date" name="end" value="{{ report.end }}" style="width: 140px;">
+      <button type="submit" class="btn btn-secondary">Update</button>
+    </form>
+    <button type="button" class="btn btn-primary" onclick="window.print()">PDF</button>
+  </div>
+</div>
+
+<div class="grid grid-3 stack">
+  <div class="card">
+    <div class="card-title">Opening cash</div>
+    <div class="card-value">{{ report.opening_display() }}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Closing cash</div>
+    <div class="card-value">{{ report.closing_display() }}</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Net change</div>
+    <div class="card-value {{ report.change_class() }}">{{ report.change_display() }}</div>
+  </div>
+</div>
+
+<h2 style="margin-top: 28px;">Counterpart breakdown</h2>
+<p class="muted" style="font-size: 12px; margin: -4px 0 12px;">Movement on accounts other than cash, for entries that touched a cash account in the period. Positive = inflow to cash.</p>
+{% if report.by_other_account.is_empty() %}
+<div class="empty">
+  <h3>No cash movement</h3>
+  <p>No entries in the period touched a cash/bank/checking/savings account.</p>
+</div>
+{% else %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Counterpart account</th><th class="num" style="width:160px">Effect on cash</th></tr></thead>
+  <tbody>
+  {% for r in report.by_other_account %}
+    <tr><td>{{ r.account_number }} &nbsp; {{ r.name }}</td><td class="num">{{ r.amount_display() }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

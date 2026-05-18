@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Customers · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div>
+    <h1>Customers</h1>
+    <div class="subtitle">People and businesses you invoice</div>
+  </div>
+  <div class="actions">
+    <a href="/app/customers/new" class="btn btn-primary">+ New customer</a>
+  </div>
+</div>
+
+{% if customers.is_empty() %}
+<div class="empty">
+  <h3>No customers yet</h3>
+  <p>Add your first customer to start invoicing.</p>
+  <a href="/app/customers/new" class="btn btn-primary">+ Add customer</a>
+</div>
+{% else %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Name</th><th>Email</th><th>Phone</th><th>City</th><th>Terms</th><th></th></tr></thead>
+  <tbody>
+  {% for c in customers %}
+    <tr>
+      <td><strong>{{ c.name }}</strong></td>
+      <td class="muted">{{ c.email.as_deref().unwrap_or("—") }}</td>
+      <td class="muted">{{ c.phone.as_deref().unwrap_or("—") }}</td>
+      <td class="muted">{% if c.city.is_some() %}{{ c.city.as_deref().unwrap_or("") }}{% if c.state.is_some() %}, {{ c.state.as_deref().unwrap_or("") }}{% endif %}{% else %}—{% endif %}</td>
+      <td><span class="badge">{{ c.default_terms }}</span></td>
+      <td><a href="/app/invoices/new?customer_id={{ c.id }}">New invoice →</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

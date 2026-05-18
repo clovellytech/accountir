@@ -1,5 +1,6 @@
 [workspace]
-members = ["."]
+members = [".", "core"]
+exclude = ["cloud"]
 resolver = "2"
 
 [package]
@@ -11,6 +12,9 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/zakvdm/accountir"
 
 [dependencies]
+# Shared domain + event types (no DB deps)
+accountir-core = { path = "core" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

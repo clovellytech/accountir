@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Transactions · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Transactions</h1><div class="subtitle">{{ rows.len() }} lines · all journal-line activity</div></div>
+</div>
+
+<form method="get" action="/app/transactions" class="card" style="margin-bottom: var(--gap);">
+  <div class="form-row" style="grid-template-columns: 1fr 1fr 2fr 1fr 2fr auto;">
+    <label class="field"><span class="label-text">From</span><input type="date" name="start" value="{{ start_str }}"></label>
+    <label class="field"><span class="label-text">To</span><input type="date" name="end" value="{{ end_str }}"></label>
+    <label class="field"><span class="label-text">Account</span>
+      <select name="account_id">
+        <option value="">All accounts</option>
+        {% for a in accounts %}
+        <option value="{{ a.id }}" {% if selected_account_id.as_deref() == Some(a.id.to_string().as_str()) %}selected{% endif %}>{{ a.account_number }} — {{ a.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field"><span class="label-text">Source</span>
+      <select name="source">
+        <option value="">All</option>
+        {% for s in sources %}
+        <option value="{{ s }}" {% if selected_source.as_deref() == Some(s) %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field"><span class="label-text">Search memo</span><input type="text" name="search" value="{{ search.as_deref().unwrap_or("") }}" placeholder="text in memo"></label>
+    <div style="display: flex; gap: 6px; align-items: end; padding-bottom: 12px;">
+      <button type="submit" class="btn btn-secondary">Apply</button>
+      <a href="/app/transactions" class="btn btn-ghost">Clear</a>
+    </div>
+  </div>
+</form>
+
+{% if rows.is_empty() %}
+<div class="empty">
+  <h3>No matching transactions</h3>
+  <p>Try a wider date range or different filters.</p>
+</div>
+{% else %}
+<div class="table-wrap">
+<form method="post" action="/app/transactions/bulk-reclassify">
+  <table>
+    <thead><tr>
+      <th style="width:32px;"><input type="checkbox" id="select-all"></th>
+      <th style="width:100px">Date</th>
+      <th>Memo</th>
+      <th style="width:240px">Account</th>
+      <th class="num" style="width:110px">Debit</th>
+      <th class="num" style="width:110px">Credit</th>
+      <th style="width:80px">Source</th>
+      <th style="width:90px"></th>
+    </tr></thead>
+    <tbody>
+    {% for t in rows %}
+      <tr {% if t.is_void %}style="opacity: 0.45; text-decoration: line-through;"{% endif %}>
+        <td><input type="checkbox" name="line_ids" value="{{ t.line_id }}" class="bulk-check"></td>
+        <td class="num" style="text-align:left;">{{ t.date }}</td>
+        <td>{{ t.memo }}{% if t.reference.is_some() %} <span class="muted" style="font-size:11px;">[{{ t.reference.as_deref().unwrap_or("") }}]</span>{% endif %}</td>
+        <td>
+          <form method="post" action="/app/transactions/{{ t.line_id }}/reclassify" style="display:inline;">
+            <select name="new_account_id" onchange="this.form.submit()" {% if t.is_void %}disabled{% endif %} style="font-size:12px; padding:4px 6px;">
+              {% for a in accounts %}
+              <option value="{{ a.id }}" {% if a.id == t.account_id %}selected{% endif %}>{{ a.account_number }} — {{ a.name }}</option>
+              {% endfor %}
+            </select>
+          </form>
+        </td>
+        <td class="num">{{ t.debit_display() }}</td>
+        <td class="num">{{ t.credit_display() }}</td>
+        <td><span class="badge">{{ t.source_label() }}</span></td>
+        <td>
+          {% if t.is_void %}
+          <form method="post" action="/app/entries/{{ t.entry_id }}/unvoid" style="display:inline;">
+            <button class="btn btn-ghost" style="padding:2px 8px; font-size:11px;">Unvoid</button>
+          </form>
+          {% else %}
+          <form method="post" action="/app/entries/{{ t.entry_id }}/void" style="display:inline;" onsubmit="return confirm('Void this entry?')">
+            <button class="btn btn-danger" style="padding:2px 8px; font-size:11px;">Void</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <div id="bulk-bar" style="display:none; padding:10px 14px; border-top:1px solid var(--border-strong); background:#fbfbfb; align-items:center; gap:12px;">
+    <span class="muted" id="bulk-count">0 selected</span>
+    <select name="new_account_id" required style="width:280px;">
+      <option value="">Reclassify selected to…</option>
+      {% for a in accounts %}
+      <option value="{{ a.id }}">{{ a.account_number }} — {{ a.name }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn btn-primary">Apply</button>
+  </div>
+</form>
+</div>
+
+<script>
+  (function() {
+    const all = document.getElementById('select-all');
+    const checks = document.querySelectorAll('.bulk-check');
+    const bar = document.getElementById('bulk-bar');
+    const cnt = document.getElementById('bulk-count');
+    function refresh() {
+      const n = Array.from(checks).filter(c => c.checked).length;
+      bar.style.display = n > 0 ? 'flex' : 'none';
+      cnt.textContent = n + ' selected';
+    }
+    all.addEventListener('change', () => { checks.forEach(c => c.checked = all.checked); refresh(); });
+    checks.forEach(c => c.addEventListener('change', refresh));
+  })();
+</script>
+{% endif %}
+{% endblock %}

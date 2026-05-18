@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Chart of accounts · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div>
+    <h1>Chart of accounts</h1>
+    <div class="subtitle">{{ accounts.len() }} active accounts</div>
+  </div>
+  <div class="actions">
+    <a href="/app/accounts/new" class="btn btn-primary">+ New account</a>
+  </div>
+</div>
+
+{% if accounts.is_empty() %}
+<div class="empty">
+  <h3>No accounts yet</h3>
+  <p>Start by adding the basics: a Cash account (1000, asset) and a Sales account (4000, revenue).</p>
+  <a href="/app/accounts/new" class="btn btn-primary">+ New account</a>
+</div>
+{% else %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:80px">Number</th><th>Name</th><th style="width:120px">Type</th><th style="width:80px">Currency</th></tr></thead>
+  <tbody>
+  {% for a in accounts %}
+    <tr>
+      <td class="num" style="text-align: left;">{{ a.account_number }}</td>
+      <td>{{ a.name }}</td>
+      <td><span class="badge">{{ a.account_type }}</span></td>
+      <td class="muted">{{ a.currency.as_deref().unwrap_or("—") }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

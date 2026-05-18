@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Invoice {{ invoice.invoice_number }} · {{ company_name }}</title>
+  <style>
+    :root { --text: #0f0f10; --muted: #5b5b62; --line: #e3e3e6; --accent: #0f0f10; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: #fafafa; color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 14px; -webkit-font-smoothing: antialiased;
+    }
+    .wrap { max-width: 760px; margin: 32px auto; background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 56px 64px; }
+    @media (max-width: 700px) { .wrap { padding: 32px 24px; margin: 0; border-radius: 0; border: 0; } }
+    .top { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 36px; }
+    .company { font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
+    .doc-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; }
+    .doc-num { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; }
+    .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin: 20px 0 40px; }
+    .meta-grid h4 { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 0 0 6px; font-weight: 600; }
+    .meta-grid .v { font-size: 13px; line-height: 1.5; }
+    .meta-grid strong { font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 8px 4px; border-bottom: 1px solid var(--line); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+    td { padding: 12px 4px; border-bottom: 1px solid #f2f2f4; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .tot { margin-top: 24px; display: flex; justify-content: flex-end; }
+    .tot table { width: 280px; }
+    .tot td { border: 0; padding: 4px 0; font-size: 13px; }
+    .tot tr.total td { font-weight: 700; font-size: 15px; padding-top: 10px; border-top: 1px solid var(--text); }
+    .tot tr.balance td { font-weight: 600; padding-top: 10px; border-top: 1px solid var(--line); }
+    .notes { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.6; }
+    .pay-btn { margin-top: 24px; padding: 10px 18px; background: var(--accent); color: #fff; border-radius: 4px; text-decoration: none; font-weight: 500; display: inline-block; font-size: 13px; }
+    .print-btn { background: transparent; border: 1px solid var(--line); color: var(--text); padding: 6px 14px; font-size: 12px; border-radius: 4px; cursor: pointer; font-family: inherit; }
+    .status-pill { display: inline-block; padding: 3px 10px; font-size: 11px; font-weight: 600; border-radius: 999px; letter-spacing: 0.04em; text-transform: uppercase; }
+    .status-paid { background: #e7f5ec; color: #0e7c3a; }
+    .status-void { background: #fdecec; color: #b42318; }
+    .status-due  { background: #fdf2e3; color: #b54708; }
+    @media print {
+      body { background: #fff; }
+      .wrap { border: 0; padding: 0; max-width: none; margin: 0; }
+      .no-print { display: none !important; }
+      @page { size: letter; margin: 0.55in 0.6in 0.7in; }
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <div class="company">{{ company_name }}</div>
+      <div style="color: var(--muted); font-size: 12px;">{{ company_subtitle }}</div>
+    </div>
+    <div style="text-align: right;">
+      <div class="doc-label">Invoice</div>
+      <div class="doc-num">{{ invoice.invoice_number }}</div>
+      {% if invoice.is_paid() %}<div class="status-pill status-paid" style="margin-top:6px;">Paid</div>
+      {% else if invoice.is_void() %}<div class="status-pill status-void" style="margin-top:6px;">Void</div>
+      {% else %}<div class="status-pill status-due" style="margin-top:6px;">Due {{ invoice.due_us() }}</div>{% endif %}
+    </div>
+  </div>
+
+  <div class="meta-grid">
+    <div>
+      <h4>Bill to</h4>
+      <div class="v">
+        <strong>{{ invoice.customer.name }}</strong><br>
+        {% if invoice.customer.address_line1.is_some() %}{{ invoice.customer.address_line1.as_deref().unwrap_or("") }}<br>{% endif %}
+        {% if invoice.customer.address_line2.is_some() %}{{ invoice.customer.address_line2.as_deref().unwrap_or("") }}<br>{% endif %}
+        {% if invoice.customer.city.is_some() %}{{ invoice.customer.city.as_deref().unwrap_or("") }}{% if invoice.customer.state.is_some() %}, {{ invoice.customer.state.as_deref().unwrap_or("") }}{% endif %} {{ invoice.customer.postal_code.as_deref().unwrap_or("") }}{% endif %}
+        {% if invoice.customer.email.is_some() %}<br>{{ invoice.customer.email.as_deref().unwrap_or("") }}{% endif %}
+      </div>
+    </div>
+    <div>
+      <h4>Details</h4>
+      <div class="v">
+        <div>Issued: <strong>{{ invoice.issue_us() }}</strong></div>
+        <div>Due: <strong>{{ invoice.due_us() }}</strong></div>
+        <div>Terms: <strong>{{ invoice.terms }}</strong></div>
+      </div>
+    </div>
+  </div>
+
+  <table>
+    <thead><tr><th>Description</th><th class="num" style="width:60px;">Qty</th><th class="num" style="width:90px;">Unit</th><th class="num" style="width:90px;">Amount</th></tr></thead>
+    <tbody>
+    {% for l in invoice.lines %}
+      <tr>
+        <td>{{ l.description }}</td>
+        <td class="num">{{ l.quantity_display() }}</td>
+        <td class="num">{{ l.unit_price_display() }}</td>
+        <td class="num">{{ l.amount_display() }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="tot">
+    <table>
+      <tr><td>Subtotal</td><td class="num">{{ invoice.subtotal_display() }}</td></tr>
+      {% if invoice.tax_cents > 0 %}<tr><td>Sales tax</td><td class="num">{{ invoice.tax_display() }}</td></tr>{% endif %}
+      <tr class="total"><td>Total</td><td class="num">{{ invoice.total_display() }}</td></tr>
+      {% if invoice.paid_cents > 0 %}
+      <tr><td style="color: var(--muted);">Paid to date</td><td class="num">−{{ invoice.paid_display() }}</td></tr>
+      <tr class="balance"><td>Balance due</td><td class="num">{{ invoice.balance_display() }}</td></tr>
+      {% endif %}
+    </table>
+  </div>
+
+  {% if invoice.customer_notes.is_some() %}
+  <div class="notes">{{ invoice.customer_notes.as_deref().unwrap_or("") }}</div>
+  {% endif %}
+
+  <div class="no-print" style="margin-top: 28px; display: flex; gap: 8px; justify-content: flex-end;">
+    <button class="print-btn" onclick="window.print()">Print / Save PDF</button>
+  </div>
+</div>
+</body>
+</html>

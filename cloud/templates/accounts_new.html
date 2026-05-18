@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}New account · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>New account</h1><div class="subtitle">Add an account to the chart</div></div>
+</div>
+<div class="card form-narrow">
+<form method="post" action="/app/accounts" class="stack-sm">
+  <label class="field"><span class="label-text">Account number</span>
+    <input type="text" name="account_number" placeholder="e.g. 1000" required></label>
+  <label class="field"><span class="label-text">Name</span>
+    <input type="text" name="name" placeholder="e.g. Cash" required></label>
+  <label class="field"><span class="label-text">Type</span>
+    <select name="account_type" required>
+      <option value="asset">Asset</option>
+      <option value="liability">Liability</option>
+      <option value="equity">Equity</option>
+      <option value="revenue">Revenue</option>
+      <option value="expense">Expense</option>
+    </select></label>
+  <label class="field"><span class="label-text">Currency</span>
+    <input type="text" name="currency" value="USD" maxlength="3"></label>
+  <label class="field"><span class="label-text">Description <span class="muted">(optional)</span></span>
+    <input type="text" name="description"></label>
+  <div class="form-actions">
+    <button type="submit" class="btn btn-primary">Create account</button>
+    <a href="/app/accounts" class="btn btn-ghost">Cancel</a>
+  </div>
+</form>
+</div>
+{% endblock %}

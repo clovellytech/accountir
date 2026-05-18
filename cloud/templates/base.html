@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Maven{% endblock %}</title>
+  <style>
+    :root {
+      --bg: #fafafa;
+      --surface: #ffffff;
+      --border: #ececec;
+      --border-strong: #d4d4d4;
+      --text: #0f0f10;
+      --text-2: #5b5b62;
+      --text-3: #93939c;
+      --accent: #0f0f10;
+      --accent-fg: #ffffff;
+      --pos: #0e7c3a;
+      --neg: #b42318;
+      --warn: #b54708;
+      --row-hover: #f6f6f7;
+      --radius: 6px;
+      --radius-sm: 4px;
+      --gap: 16px;
+      --pad: 14px;
+      --font: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: var(--font);
+      font-size: 14px;
+      color: var(--text);
+      background: var(--bg);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+    a { color: var(--text); text-decoration: none; }
+    a:hover { color: #000; text-decoration: underline; text-underline-offset: 3px; text-decoration-thickness: 1px; }
+
+    /* ----- top nav ----- */
+    .topbar {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 24px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; z-index: 10;
+    }
+    .topbar .brand { font-weight: 600; letter-spacing: -0.01em; font-size: 15px; }
+    .topbar .brand a { color: var(--text); }
+    .topbar nav { display: flex; gap: 4px; }
+    .topbar nav a {
+      padding: 6px 12px;
+      border-radius: var(--radius-sm);
+      color: var(--text-2);
+      font-weight: 500;
+      transition: background .12s;
+    }
+    .topbar nav a:hover { background: var(--row-hover); color: var(--text); text-decoration: none; }
+    .topbar nav a.active { background: var(--row-hover); color: var(--text); }
+    .topbar .meta { display: flex; align-items: center; gap: 12px; color: var(--text-3); font-size: 13px; }
+    .topbar .meta form { margin: 0; }
+    .topbar .meta button {
+      background: transparent; border: 1px solid var(--border); color: var(--text-2);
+      font-size: 13px; padding: 4px 10px; border-radius: var(--radius-sm); cursor: pointer; font-family: inherit;
+    }
+    .topbar .meta button:hover { border-color: var(--border-strong); color: var(--text); }
+
+    /* ----- layout ----- */
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 32px 24px 80px;
+    }
+    .page-header {
+      display: flex; align-items: flex-end; justify-content: space-between;
+      margin-bottom: 24px; gap: 16px; flex-wrap: wrap;
+    }
+    .page-header h1 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 600;
+      letter-spacing: -0.015em;
+    }
+    .page-header .subtitle { color: var(--text-2); font-size: 13px; margin-top: 4px; }
+    .actions { display: flex; gap: 8px; align-items: center; }
+
+    /* ----- cards ----- */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: var(--pad) 18px;
+    }
+    .card-title {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-3);
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .card-value {
+      font-size: 24px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      font-variant-numeric: tabular-nums;
+    }
+    .card-sub {
+      margin-top: 4px; font-size: 12px; color: var(--text-2);
+      font-variant-numeric: tabular-nums;
+    }
+    .grid { display: grid; gap: var(--gap); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    @media (max-width: 880px) {
+      .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-3, .grid-2 { grid-template-columns: 1fr; }
+    }
+
+    /* ----- buttons ----- */
+    .btn {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 7px 14px;
+      font-size: 13px; font-weight: 500; font-family: inherit;
+      border-radius: var(--radius-sm);
+      border: 1px solid transparent;
+      cursor: pointer;
+      text-decoration: none;
+      transition: background .12s, border-color .12s;
+    }
+    .btn-primary { background: var(--accent); color: var(--accent-fg); }
+    .btn-primary:hover { background: #25252a; color: var(--accent-fg); text-decoration: none; }
+    .btn-secondary { background: var(--surface); color: var(--text); border-color: var(--border-strong); }
+    .btn-secondary:hover { background: var(--row-hover); color: var(--text); text-decoration: none; }
+    .btn-ghost { background: transparent; color: var(--text-2); }
+    .btn-ghost:hover { background: var(--row-hover); color: var(--text); text-decoration: none; }
+    .btn-danger { background: transparent; color: var(--neg); border-color: #f4cccc; }
+    .btn-danger:hover { background: #fdecec; color: var(--neg); text-decoration: none; }
+
+    /* ----- forms ----- */
+    form { margin: 0; }
+    label.field { display: block; margin-bottom: 12px; font-size: 13px; color: var(--text-2); }
+    label.field > span.label-text { display: block; margin-bottom: 5px; font-weight: 500; color: var(--text); }
+    input[type="text"], input[type="email"], input[type="password"], input[type="number"],
+    input[type="date"], select, textarea {
+      width: 100%;
+      padding: 7px 10px;
+      font-size: 14px; font-family: inherit; color: var(--text);
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      outline: none;
+      transition: border-color .12s, box-shadow .12s;
+    }
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--text);
+      box-shadow: 0 0 0 3px rgba(15,15,16,0.08);
+    }
+    input[type="number"], input[type="date"] { font-variant-numeric: tabular-nums; }
+
+    .form-narrow { max-width: 420px; }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+    .form-actions { display: flex; gap: 8px; margin-top: 16px; }
+
+    /* ----- tables ----- */
+    .table-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 14px; text-align: left; font-size: 13px; }
+    thead th {
+      font-weight: 500; color: var(--text-3); font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.04em;
+      background: #fbfbfb; border-bottom: 1px solid var(--border);
+    }
+    tbody tr { border-top: 1px solid var(--border); }
+    tbody tr:first-child { border-top: 0; }
+    tbody tr:hover { background: var(--row-hover); }
+    .num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
+    tfoot td { background: #fbfbfb; border-top: 1px solid var(--border-strong); font-weight: 600; }
+    tfoot td.num { font-family: var(--mono); }
+
+    /* ----- badges ----- */
+    .badge {
+      display: inline-block;
+      padding: 2px 8px; font-size: 11px; font-weight: 500;
+      border-radius: 999px; line-height: 18px;
+      background: #f0f0f1; color: var(--text-2);
+    }
+    .badge.ok { background: #e7f5ec; color: var(--pos); }
+    .badge.err { background: #fdecec; color: var(--neg); }
+    .badge.warn { background: #fdf2e3; color: var(--warn); }
+
+    /* ----- dynamic line rows for journal entry ----- */
+    .row-line {
+      display: grid;
+      grid-template-columns: 32px 2fr 1fr 80px 32px;
+      gap: 8px;
+      align-items: center;
+      padding: 8px 0;
+      border-top: 1px solid var(--border);
+    }
+    .row-line:first-of-type { border-top: 0; }
+    .row-line .row-num { color: var(--text-3); font-size: 12px; text-align: center; font-variant-numeric: tabular-nums; }
+    .row-line .row-remove { background: transparent; border: 0; color: var(--text-3); cursor: pointer; font-size: 16px; padding: 4px; }
+    .row-line .row-remove:hover { color: var(--neg); }
+
+    /* ----- flash ----- */
+    .flash {
+      padding: 10px 14px; border-radius: var(--radius-sm); margin-bottom: 16px;
+      font-size: 13px; border: 1px solid transparent;
+    }
+    .flash.err { background: #fdecec; color: var(--neg); border-color: #f4cccc; }
+    .flash.ok  { background: #e7f5ec; color: var(--pos); border-color: #c7e8d2; }
+
+    /* ----- empty state ----- */
+    .empty {
+      text-align: center; padding: 56px 24px; color: var(--text-2);
+      background: var(--surface); border: 1px dashed var(--border-strong); border-radius: var(--radius);
+    }
+    .empty h3 { margin: 0 0 6px; font-weight: 600; color: var(--text); font-size: 15px; }
+    .empty p { margin: 0 0 16px; font-size: 13px; }
+
+    /* ----- auth pages ----- */
+    .auth-shell {
+      max-width: 360px; margin: 80px auto;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 28px;
+    }
+    .auth-shell h2 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+    .auth-shell .subtitle { margin: 0 0 20px; color: var(--text-2); font-size: 13px; }
+
+    /* ----- text helpers ----- */
+    .muted { color: var(--text-2); }
+    .pos { color: var(--pos); }
+    .neg { color: var(--neg); }
+    .stack-sm > * + * { margin-top: 8px; }
+    .stack > * + * { margin-top: var(--gap); }
+    h2 { font-size: 16px; font-weight: 600; margin: 24px 0 12px; letter-spacing: -0.01em; }
+    h3 { font-size: 14px; font-weight: 600; margin: 18px 0 8px; }
+    .section-title {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-3); font-weight: 600; margin: 0 0 8px;
+    }
+
+    /* ----- company switcher dropdown ----- */
+    .co-switcher { position: relative; }
+    .co-switcher > summary {
+      list-style: none; cursor: pointer;
+      padding: 5px 12px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+      font-size: 13px; font-weight: 500; color: var(--text);
+      background: var(--surface);
+    }
+    .co-switcher > summary::-webkit-details-marker { display: none; }
+    .co-switcher > summary:hover { background: var(--row-hover); }
+    .co-switcher .caret { color: var(--text-3); margin-left: 4px; }
+    .co-menu {
+      position: absolute; right: 0; top: calc(100% + 4px);
+      min-width: 240px;
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+      z-index: 20;
+      padding: 6px;
+    }
+    .co-menu-section { padding: 6px 0; }
+    .co-menu-section + .co-menu-section { border-top: 1px solid var(--border); }
+    .co-menu-label {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+      color: var(--text-3); font-weight: 600; padding: 4px 10px 6px;
+    }
+    .co-menu-item, .co-menu form button.co-menu-item {
+      display: block; width: 100%; text-align: left;
+      padding: 6px 10px; border-radius: var(--radius-sm);
+      font-size: 13px; color: var(--text); background: transparent; border: 0;
+      cursor: pointer; font-family: inherit;
+    }
+    .co-menu-item:hover { background: var(--row-hover); text-decoration: none; }
+    .co-menu-item.active { font-weight: 600; cursor: default; }
+
+    /* Print-only header inside report pages */
+    .print-header { display: none; }
+
+    /* ----- Print: clean PDF output via browser "Save as PDF" ----- */
+    @media print {
+      @page { size: letter; margin: 0.55in 0.6in 0.7in; }
+      :root { --bg: #ffffff; --surface: #ffffff; --row-hover: transparent; }
+      body { background: #fff; color: #000; font-size: 11pt; }
+      .topbar, .actions, .empty .btn, .btn, form, button, .row-line .row-remove, script { display: none !important; }
+      main { padding: 0; max-width: none; margin: 0; }
+      .page-header { margin-bottom: 12pt; }
+      .page-header h1 { font-size: 18pt; font-weight: 700; }
+      .page-header .subtitle { color: #444; }
+      .card { border: 1px solid #ccc; box-shadow: none; padding: 10pt 12pt; break-inside: avoid; }
+      .card-title { color: #555; }
+      .card-value { font-size: 16pt; }
+      .table-wrap { border: 1px solid #ccc; border-radius: 0; overflow: visible; break-inside: auto; }
+      table { font-size: 10.5pt; }
+      thead { display: table-header-group; }
+      tr { break-inside: avoid; }
+      th { background: #f3f3f3; color: #333; }
+      tfoot td { background: #f7f7f7; }
+      .badge { background: transparent !important; color: inherit !important; padding: 0; font-weight: 600; }
+      .badge.ok::before { content: "✓ "; }
+      .badge.err::before { content: "⚠ "; }
+      .grid-4 { grid-template-columns: repeat(4, 1fr); }
+      .grid-3 { grid-template-columns: repeat(3, 1fr); }
+      .grid-2 { grid-template-columns: repeat(2, 1fr); }
+      a { color: #000; text-decoration: none; }
+      .print-header {
+        display: block;
+        border-bottom: 1px solid #999;
+        padding-bottom: 8pt;
+        margin-bottom: 12pt;
+        font-size: 10pt;
+        color: #333;
+      }
+      .print-header .company { font-weight: 700; font-size: 12pt; color: #000; }
+      .print-header .meta { float: right; }
+    }
+  </style>
+</head>
+<body>
+  {% if user_email.is_some() %}
+  <header class="topbar">
+    <div class="brand"><a href="/app/dashboard">Maven</a></div>
+    <nav>
+      <a href="/app/dashboard">Dashboard</a>
+      <a href="/app/invoices">Sales</a>
+      <a href="/app/transactions">Transactions</a>
+      <a href="/app/entries">Journal</a>
+      <a href="/app/accounts">Accounts</a>
+      <a href="/app/banks">Banks</a>
+      <a href="/app/reports">Reports</a>
+      <a href="/app/chat">AI</a>
+    </nav>
+    <div class="meta">
+      {% if nav.all_companies.len() > 0 %}
+      <details class="co-switcher">
+        <summary>{{ nav.active_company_name }} <span class="caret">▾</span></summary>
+        <div class="co-menu">
+          <div class="co-menu-section">
+            <div class="co-menu-label">Switch company</div>
+            {% for c in nav.all_companies %}
+              {% if c.id.to_string() == nav.active_company_id %}
+                <div class="co-menu-item active">{{ c.name }} <span class="badge ok" style="margin-left:6px;">active</span></div>
+              {% else %}
+                <form method="post" action="/app/admin/companies/{{ c.id }}/switch" style="margin:0;">
+                  <button type="submit" class="co-menu-item">{{ c.name }} <span class="muted" style="font-size:11px;">{{ c.role }}</span></button>
+                </form>
+              {% endif %}
+            {% endfor %}
+          </div>
+          <div class="co-menu-section">
+            <a href="/app/admin/companies" class="co-menu-item">Manage companies</a>
+            <a href="/app/admin/members" class="co-menu-item">Members</a>
+            <a href="/app/admin/settings" class="co-menu-item">Settings</a>
+          </div>
+        </div>
+      </details>
+      {% endif %}
+      <span style="font-size:13px; color: var(--text-3);">{{ user_email.as_deref().unwrap_or("") }}</span>
+      <form method="post" action="/logout"><button type="submit">Log out</button></form>
+    </div>
+  </header>
+  {% endif %}
+  <main>
+    {% if flash.is_some() %}
+    <div class="flash {{ flash_kind.as_deref().unwrap_or("err") }}">{{ flash.as_deref().unwrap_or("") }}</div>
+    {% endif %}
+    {% block body %}{% endblock %}
+  </main>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+</body>
+</html>

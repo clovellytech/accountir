@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Accept invitation · Maven{% endblock %}
+{% block body %}
+<div class="auth-shell">
+  <h2>Join {{ company_name }}</h2>
+  <p class="subtitle">Invited as <strong>{{ role }}</strong></p>
+  {% if logged_in %}
+    <form method="post" action="/accept-invite/{{ token }}">
+      <button type="submit" class="btn btn-primary" style="width:100%; justify-content:center;">Accept invitation</button>
+    </form>
+    <p class="muted" style="margin-top:12px; font-size:12px;">You'll be added to {{ company_name }} as {{ role }}.</p>
+  {% else %}
+    <p>You need to log in or sign up first.</p>
+    <div style="display:flex; gap:8px; margin-top:12px;">
+      <a href="/login?invite={{ token }}" class="btn btn-primary" style="flex:1; justify-content:center;">Log in</a>
+      <a href="/signup?invite={{ token }}" class="btn btn-secondary" style="flex:1; justify-content:center;">Sign up</a>
+    </div>
+  {% endif %}
+</div>
+{% endblock %}

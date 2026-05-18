@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Income statement · Maven{% endblock %}
+{% block body %}
+<div class="print-header">
+  <span class="meta">Generated {{ generated_on }}</span>
+  <div class="company">{{ company_name }}</div>
+  <div>Income statement · {{ report.start }} → {{ report.end }}</div>
+</div>
+<div class="page-header">
+  <div><h1>Income statement</h1><div class="subtitle">{{ report.start }} → {{ report.end }}</div></div>
+  <div style="display: flex; gap: 8px; align-items: end;">
+    <form method="get" action="/app/reports/income-statement" class="actions">
+      <input type="date" name="start" value="{{ report.start }}" style="width: 140px;">
+      <input type="date" name="end" value="{{ report.end }}" style="width: 140px;">
+      <button type="submit" class="btn btn-secondary">Update</button>
+    </form>
+    <button type="button" class="btn btn-primary" onclick="window.print()">PDF</button>
+  </div>
+</div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Account</th><th class="num" style="width:160px">Amount</th></tr></thead>
+  <tbody>
+    <tr><td colspan="2"><strong>Revenue</strong></td></tr>
+    {% if report.revenues.is_empty() %}
+      <tr><td colspan="2" class="muted">No revenue in period</td></tr>
+    {% else %}
+      {% for r in report.revenues %}
+        <tr><td>{{ r.account_number }} &nbsp; {{ r.name }}</td><td class="num">{{ r.amount_display() }}</td></tr>
+      {% endfor %}
+    {% endif %}
+    <tr><td><strong>Total revenue</strong></td><td class="num"><strong>{{ report.total_revenue_display() }}</strong></td></tr>
+
+    <tr><td colspan="2" style="padding-top: 18px;"><strong>Expenses</strong></td></tr>
+    {% if report.expenses.is_empty() %}
+      <tr><td colspan="2" class="muted">No expenses in period</td></tr>
+    {% else %}
+      {% for e in report.expenses %}
+        <tr><td>{{ e.account_number }} &nbsp; {{ e.name }}</td><td class="num">{{ e.amount_display() }}</td></tr>
+      {% endfor %}
+    {% endif %}
+    <tr><td><strong>Total expenses</strong></td><td class="num"><strong>{{ report.total_expense_display() }}</strong></td></tr>
+  </tbody>
+  <tfoot>
+    <tr>
+      <td>Net income</td>
+      <td class="num {{ report.net_class() }}">{{ report.net_income_display() }}</td>
+    </tr>
+  </tfoot>
+</table>
+</div>
+{% endblock %}

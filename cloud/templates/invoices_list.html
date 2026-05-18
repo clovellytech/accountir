@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Invoices · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div>
+    <h1>Invoices</h1>
+    <div class="subtitle">{{ summary_subtitle }}</div>
+  </div>
+  <div class="actions">
+    <a href="/app/customers" class="btn btn-ghost">Customers</a>
+    <a href="/app/invoices/new" class="btn btn-primary">+ New invoice</a>
+  </div>
+</div>
+
+<div class="grid grid-4" style="margin-bottom: var(--gap);">
+  <div class="card"><div class="card-title">Outstanding</div><div class="card-value">{{ outstanding_display }}</div><div class="card-sub muted">{{ outstanding_count }} invoices</div></div>
+  <div class="card"><div class="card-title">Overdue</div><div class="card-value">{{ overdue_display }}</div><div class="card-sub muted">{{ overdue_count }} invoices</div></div>
+  <div class="card"><div class="card-title">Paid (30d)</div><div class="card-value">{{ paid_30d_display }}</div></div>
+  <div class="card"><div class="card-title">Drafts</div><div class="card-value">{{ draft_count }}</div></div>
+</div>
+
+<div style="margin-bottom: 12px;">
+  <a href="/app/invoices" class="btn {% if filter.is_none() %}btn-secondary{% else %}btn-ghost{% endif %}" style="padding:4px 10px; font-size:12px;">All</a>
+  <a href="/app/invoices?status=draft" class="btn {% if filter.as_deref() == Some("draft") %}btn-secondary{% else %}btn-ghost{% endif %}" style="padding:4px 10px; font-size:12px;">Draft</a>
+  <a href="/app/invoices?status=sent" class="btn {% if filter.as_deref() == Some("sent") %}btn-secondary{% else %}btn-ghost{% endif %}" style="padding:4px 10px; font-size:12px;">Sent</a>
+  <a href="/app/invoices?status=partial" class="btn {% if filter.as_deref() == Some("partial") %}btn-secondary{% else %}btn-ghost{% endif %}" style="padding:4px 10px; font-size:12px;">Partial</a>
+  <a href="/app/invoices?status=paid" class="btn {% if filter.as_deref() == Some("paid") %}btn-secondary{% else %}btn-ghost{% endif %}" style="padding:4px 10px; font-size:12px;">Paid</a>
+  <a href="/app/invoices?status=void" class="btn {% if filter.as_deref() == Some("void") %}btn-secondary{% else %}btn-ghost{% endif %}" style="padding:4px 10px; font-size:12px;">Void</a>
+</div>
+
+{% if invoices.is_empty() %}
+<div class="empty">
+  <h3>No invoices</h3>
+  <p>Create your first invoice to bill a customer.</p>
+  <a href="/app/invoices/new" class="btn btn-primary">+ New invoice</a>
+</div>
+{% else %}
+<div class="table-wrap">
+<table>
+  <thead><tr>
+    <th>Number</th><th>Customer</th><th>Issue</th><th>Due</th>
+    <th>Status</th><th class="num">Total</th><th class="num">Balance</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for i in invoices %}
+    <tr>
+      <td><a href="/app/invoices/{{ i.id }}"><strong>{{ i.invoice_number }}</strong></a></td>
+      <td>{{ i.customer_name }}</td>
+      <td class="muted">{{ i.issue_us() }}</td>
+      <td class="muted">{{ i.due_us() }}</td>
+      <td><span class="badge {{ i.status_badge() }}">{{ i.status }}</span></td>
+      <td class="num">{{ i.total_display() }}</td>
+      <td class="num">{{ i.balance_display() }}</td>
+      <td><a href="/app/invoices/{{ i.id }}">Open →</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

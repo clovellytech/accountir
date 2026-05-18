@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Log in · Maven{% endblock %}
+{% block body %}
+<div class="auth-shell">
+  <h2>Log in</h2>
+  <p class="subtitle">or <a href="/signup">create an account</a></p>
+  <form method="post" action="/login" class="stack-sm">
+    <label class="field"><span class="label-text">Email</span><input type="email" name="email" autofocus required></label>
+    <label class="field"><span class="label-text">Password</span><input type="password" name="password" required minlength="8"></label>
+    <button type="submit" class="btn btn-primary" style="width: 100%; justify-content: center;">Log in</button>
+  </form>
+</div>
+{% endblock %}

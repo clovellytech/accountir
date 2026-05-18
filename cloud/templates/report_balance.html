@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Balance sheet · Maven{% endblock %}
+{% block body %}
+<div class="print-header">
+  <span class="meta">Generated {{ generated_on }}</span>
+  <div class="company">{{ company_name }}</div>
+  <div>Balance sheet · As of {{ report.as_of }}</div>
+</div>
+<div class="page-header">
+  <div><h1>Balance sheet</h1><div class="subtitle">As of {{ report.as_of }}</div></div>
+  <div style="display: flex; gap: 8px; align-items: end;">
+    <form method="get" action="/app/reports/balance-sheet" class="actions">
+      <input type="date" name="as_of" value="{{ report.as_of }}" style="width: 140px;">
+      <button type="submit" class="btn btn-secondary">Update</button>
+    </form>
+    <button type="button" class="btn btn-primary" onclick="window.print()">PDF</button>
+  </div>
+</div>
+
+<div class="grid grid-2">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Assets</th><th class="num" style="width: 140px">Amount</th></tr></thead>
+    <tbody>
+      {% if report.assets.is_empty() %}
+        <tr><td colspan="2" class="muted">No asset balances</td></tr>
+      {% else %}
+        {% for r in report.assets %}
+        <tr><td>{{ r.account_number }} &nbsp; {{ r.name }}</td><td class="num">{{ r.amount_display() }}</td></tr>
+        {% endfor %}
+      {% endif %}
+    </tbody>
+    <tfoot><tr><td><strong>Total assets</strong></td><td class="num"><strong>{{ report.total_assets_display() }}</strong></td></tr></tfoot>
+  </table>
+  </div>
+
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Liabilities &amp; Equity</th><th class="num" style="width: 140px">Amount</th></tr></thead>
+    <tbody>
+      <tr><td colspan="2"><strong>Liabilities</strong></td></tr>
+      {% if report.liabilities.is_empty() %}
+        <tr><td colspan="2" class="muted">No liabilities</td></tr>
+      {% else %}
+        {% for r in report.liabilities %}
+        <tr><td>{{ r.account_number }} &nbsp; {{ r.name }}</td><td class="num">{{ r.amount_display() }}</td></tr>
+        {% endfor %}
+      {% endif %}
+      <tr><td>Total liabilities</td><td class="num">{{ report.total_liab_display() }}</td></tr>
+
+      <tr><td colspan="2" style="padding-top: 12px;"><strong>Equity</strong></td></tr>
+      {% if report.equity.is_empty() %}
+        <tr><td colspan="2" class="muted">No equity accounts</td></tr>
+      {% else %}
+        {% for r in report.equity %}
+        <tr><td>{{ r.account_number }} &nbsp; {{ r.name }}</td><td class="num">{{ r.amount_display() }}</td></tr>
+        {% endfor %}
+      {% endif %}
+      <tr><td>Current year net income</td><td class="num">{{ report.net_income_display() }}</td></tr>
+      <tr><td>Total equity</td><td class="num">{{ report.total_equity_display() }}</td></tr>
+    </tbody>
+    <tfoot><tr><td><strong>Total liab. + equity</strong></td><td class="num"><strong>{{ report.liab_plus_equity_display() }}</strong></td></tr></tfoot>
+  </table>
+  </div>
+</div>
+
+<div class="card" style="margin-top: var(--gap); display: flex; align-items: center; gap: 12px;">
+  <span class="muted" style="font-weight: 500;">Balance check:</span>
+  <span class="badge {{ report.balance_class() }}">{{ report.balance_msg() }}</span>
+</div>
+{% endblock %}

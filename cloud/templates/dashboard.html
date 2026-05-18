@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Dashboard · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Dashboard</h1><div class="subtitle">Snapshot of {{ company_name }} as of today</div></div>
+</div>
+
+<div class="grid grid-4 stack">
+  <div class="card">
+    <div class="card-title">Total assets</div>
+    <div class="card-value">{{ kpis.assets_display() }}</div>
+    <div class="card-sub">All asset accounts</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Total liabilities</div>
+    <div class="card-value">{{ kpis.liabilities_display() }}</div>
+    <div class="card-sub">All liability accounts</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Equity</div>
+    <div class="card-value">{{ kpis.equity_display() }}</div>
+    <div class="card-sub">Excludes current-year net income</div>
+  </div>
+  <div class="card">
+    <div class="card-title">Net income (YTD)</div>
+    <div class="card-value {{ kpis.net_ytd_class() }}">{{ kpis.net_income_ytd_display() }}</div>
+    <div class="card-sub">MTD: {{ kpis.net_income_mtd_display() }}</div>
+  </div>
+</div>
+
+<div class="grid grid-2" style="margin-top: var(--gap);">
+  <div class="card">
+    <div class="card-title">Recent journal entries</div>
+    {% if kpis.recent_entries.is_empty() %}
+    <p class="muted" style="margin: 8px 0 0;">No entries yet. <a href="/app/entries/new">Post one →</a></p>
+    {% else %}
+    <table style="margin-top: 4px;">
+      <tbody>
+      {% for e in kpis.recent_entries %}
+        <tr>
+          <td class="num muted" style="text-align: left; width: 90px;">{{ e.date }}</td>
+          <td>{{ e.memo }}</td>
+          <td class="num">{{ e.total_display() }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div style="margin-top: 12px;"><a href="/app/entries" class="btn btn-ghost">View all →</a></div>
+    {% endif %}
+  </div>
+  <div class="card">
+    <div class="card-title">Connections</div>
+    <div style="display: flex; gap: 24px; margin-top: 4px;">
+      <div>
+        <div class="card-value" style="font-size: 18px;">{{ kpis.bank_count }}</div>
+        <div class="card-sub">Banks linked</div>
+      </div>
+    </div>
+    <div style="margin-top: 16px;">
+      <a href="/app/banks" class="btn btn-secondary">Manage banks</a>
+      <a href="/app/reports" class="btn btn-ghost">Reports →</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

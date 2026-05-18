@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}AI assistant · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>AI assistant</h1>
+    <div class="subtitle">Ask Claude to read your books, classify, or post entries. Tool calls run against your data.</div>
+  </div>
+  <div class="actions">
+    <form method="post" action="/app/chat/clear" onsubmit="return confirm('Clear conversation history?')" style="margin:0;">
+      <button class="btn btn-ghost" type="submit">Clear chat</button>
+    </form>
+  </div>
+</div>
+
+{% if !api_key_set %}
+<div class="flash err">
+  <strong>Chat unavailable.</strong> Set <code>ANTHROPIC_API_KEY</code> in <code>cloud/.env</code> and restart the server.
+  Get a key at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.
+</div>
+{% endif %}
+
+<div class="card" style="padding: 0;">
+  <div id="messages" style="padding: 14px 18px; max-height: 56vh; overflow-y: auto;">
+    {% for m in messages %}
+      {% for line in m.lines %}
+      <div style="margin-bottom: 14px;">
+        <div class="muted" style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px;">{{ line.role }}</div>
+        <div style="white-space: pre-wrap; font-size: 14px;">{{ line.body }}</div>
+      </div>
+      {% endfor %}
+    {% endfor %}
+    {% if messages.is_empty() %}
+    <div class="muted" style="font-size: 13px;">
+      Try:
+      <ul style="margin: 8px 0 0 16px; padding: 0;">
+        <li>"Show me my chart of accounts"</li>
+        <li>"What's the balance on account 1000?"</li>
+        <li>"Create a new expense account 5100 called Software"</li>
+        <li>"Post a $50 entry: debit 5100 Software, credit 1000 Cash, today, memo 'GitHub Copilot'"</li>
+      </ul>
+    </div>
+    {% endif %}
+  </div>
+  <form method="post" action="/app/chat/messages" style="border-top: 1px solid var(--border); padding: 12px 14px; display: flex; gap: 8px;">
+    <input type="text" name="message" placeholder="Ask anything…" required autofocus style="flex: 1;" {% if !api_key_set %}disabled{% endif %}>
+    <button type="submit" class="btn btn-primary" {% if !api_key_set %}disabled{% endif %}>Send</button>
+  </form>
+</div>
+{% endblock %}

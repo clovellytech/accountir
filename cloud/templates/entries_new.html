@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}New entry · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Post journal entry</h1>
+    <div class="subtitle">Positive amounts are debits, negative are credits. Sum must equal zero.</div>
+  </div>
+</div>
+
+<div class="card">
+<form method="post" action="/app/entries" class="stack">
+  <div class="form-row">
+    <label class="field"><span class="label-text">Date</span><input type="date" name="date" value="{{ today }}" required></label>
+    <label class="field"><span class="label-text">Memo</span><input type="text" name="memo" required></label>
+    <label class="field"><span class="label-text">Reference <span class="muted">(optional)</span></span><input type="text" name="reference"></label>
+  </div>
+
+  <div>
+    <div class="section-title">Lines</div>
+    <div id="lines">
+      <div class="row-line">
+        <div class="row-num">1</div>
+        <select name="account_id" required>
+          <option value="">— select account —</option>
+          {% for a in accounts %}
+          <option value="{{ a.id }}">{{ a.account_number }} — {{ a.name }}</option>
+          {% endfor %}
+        </select>
+        <input type="number" step="0.01" name="amount" placeholder="0.00" required>
+        <input type="text" name="currency" value="USD" maxlength="3" required>
+        <span></span>
+      </div>
+      <div class="row-line">
+        <div class="row-num">2</div>
+        <select name="account_id" required>
+          <option value="">— select account —</option>
+          {% for a in accounts %}
+          <option value="{{ a.id }}">{{ a.account_number }} — {{ a.name }}</option>
+          {% endfor %}
+        </select>
+        <input type="number" step="0.01" name="amount" placeholder="0.00" required>
+        <input type="text" name="currency" value="USD" maxlength="3" required>
+        <span></span>
+      </div>
+    </div>
+    <button type="button" class="btn btn-ghost" style="margin-top: 8px;"
+            hx-get="/app/entries/lines/new" hx-target="#lines" hx-swap="beforeend">+ Add line</button>
+  </div>
+
+  <div class="form-actions">
+    <button type="submit" class="btn btn-primary">Post entry</button>
+    <a href="/app/entries" class="btn btn-ghost">Cancel</a>
+  </div>
+</form>
+</div>
+{% endblock %}

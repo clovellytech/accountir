@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}{{ invoice.invoice_number }} · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div>
+    <h1>{{ invoice.invoice_number }} <span class="badge {{ invoice.status_badge() }}" style="vertical-align: middle; margin-left: 6px;">{{ invoice.status }}</span></h1>
+    <div class="subtitle">{{ invoice.customer.name }} · Issued {{ invoice.issue_us() }} · Due {{ invoice.due_us() }}</div>
+  </div>
+  <div class="actions">
+    <a href="/invoice/{{ invoice.public_token }}" target="_blank" class="btn btn-ghost">View public</a>
+    <a href="/invoice/{{ invoice.public_token }}" target="_blank" class="btn btn-secondary">Print / PDF</a>
+    {% if invoice.is_draft() %}
+    <form method="post" action="/app/invoices/{{ invoice.id }}/issue" style="display:inline;">
+      <button class="btn btn-primary">Issue & post</button>
+    </form>
+    {% endif %}
+    {% if !invoice.is_draft() && !invoice.is_void() %}
+    <form method="post" action="/app/invoices/{{ invoice.id }}/send" style="display:inline;">
+      <button class="btn btn-primary">{% if invoice.sent_at.is_some() %}Resend email{% else %}Send email{% endif %}</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="grid grid-2 stack">
+<div>
+  <div class="card stack-sm" style="margin-bottom: var(--gap);">
+    <div class="section-title">Line items</div>
+    <div class="table-wrap" style="border: 0;">
+    <table>
+      <thead><tr><th>Description</th><th>Account</th><th class="num">Qty</th><th class="num">Unit</th><th class="num">Tax %</th><th class="num">Amount</th></tr></thead>
+      <tbody>
+      {% for l in invoice.lines %}
+        <tr>
+          <td>{{ l.description }}</td>
+          <td class="muted" style="font-size: 12px;">{{ l.revenue_account_name }}</td>
+          <td class="num">{{ l.quantity_display() }}</td>
+          <td class="num">{{ l.unit_price_display() }}</td>
+          <td class="num">{{ l.tax_rate_pct }}</td>
+          <td class="num">{{ l.amount_display() }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+      <tfoot>
+        <tr><td colspan="5" class="num muted">Subtotal</td><td class="num">{{ invoice.subtotal_display() }}</td></tr>
+        {% if invoice.tax_cents > 0 %}
+        <tr><td colspan="5" class="num muted">Tax</td><td class="num">{{ invoice.tax_display() }}</td></tr>
+        {% endif %}
+        <tr><td colspan="5" class="num">Total</td><td class="num">{{ invoice.total_display() }}</td></tr>
+        {% if invoice.paid_cents > 0 %}
+        <tr><td colspan="5" class="num muted">Paid</td><td class="num pos">−{{ invoice.paid_display() }}</td></tr>
+        <tr><td colspan="5" class="num">Balance due</td><td class="num">{{ invoice.balance_display() }}</td></tr>
+        {% endif %}
+      </tfoot>
+    </table>
+    </div>
+  </div>
+
+  {% if !invoice.payments.is_empty() %}
+  <div class="card">
+    <div class="section-title">Payments</div>
+    <table>
+      <thead><tr><th>Date</th><th>Method</th><th>Ref</th><th>Deposited to</th><th class="num">Amount</th></tr></thead>
+      <tbody>
+      {% for p in invoice.payments %}
+        <tr>
+          <td>{{ p.date_us() }}</td>
+          <td><span class="badge">{{ p.method }}</span></td>
+          <td class="muted">{{ p.reference.as_deref().unwrap_or("—") }}</td>
+          <td class="muted">{{ p.deposit_account_name }}</td>
+          <td class="num">{{ p.amount_display() }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+</div>
+
+<div>
+  <div class="card stack-sm" style="margin-bottom: var(--gap);">
+    <div class="section-title">Customer</div>
+    <div><strong>{{ invoice.customer.name }}</strong></div>
+    {% if invoice.customer.email.is_some() %}<div class="muted">{{ invoice.customer.email.as_deref().unwrap_or("") }}</div>{% endif %}
+    {% if invoice.customer.address_line1.is_some() %}
+    <div class="muted" style="font-size: 12px; line-height: 1.5;">
+      {{ invoice.customer.address_line1.as_deref().unwrap_or("") }}<br>
+      {% if invoice.customer.address_line2.is_some() %}{{ invoice.customer.address_line2.as_deref().unwrap_or("") }}<br>{% endif %}
+      {% if invoice.customer.city.is_some() %}{{ invoice.customer.city.as_deref().unwrap_or("") }}{% if invoice.customer.state.is_some() %}, {{ invoice.customer.state.as_deref().unwrap_or("") }}{% endif %} {{ invoice.customer.postal_code.as_deref().unwrap_or("") }}{% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  {% if !invoice.is_draft() && !invoice.is_void() && !invoice.is_paid() %}
+  <div class="card stack-sm" style="margin-bottom: var(--gap);">
+    <div class="section-title">Record payment</div>
+    {% if deposit_accounts.is_empty() %}
+    <p class="muted" style="font-size: 12px;">Create a Cash or Bank account (asset type, not 1200 A/R) first to record payments.</p>
+    <a href="/app/accounts/new" class="btn btn-secondary">+ Add bank/cash account</a>
+    {% else %}
+    <form method="post" action="/app/invoices/{{ invoice.id }}/payment" class="stack-sm">
+      <div class="form-row">
+        <label class="field"><span class="label-text">Date</span><input type="date" name="payment_date" value="{{ today_iso }}" required></label>
+        <label class="field"><span class="label-text">Amount $</span><input type="number" name="amount_dollars" step="0.01" min="0.01" value="{{ balance_dollars }}" required></label>
+      </div>
+      <label class="field"><span class="label-text">Method</span>
+        <select name="method">
+          <option value="check">Check</option><option value="ach">ACH</option><option value="wire">Wire</option>
+          <option value="card">Card</option><option value="cash">Cash</option><option value="other">Other</option>
+        </select>
+      </label>
+      <label class="field"><span class="label-text">Deposit to</span>
+        <select name="deposit_account_id" required>
+          {% for a in deposit_accounts %}<option value="{{ a.id }}">{{ a.display }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="field"><span class="label-text">Reference / Check #</span><input type="text" name="reference"></label>
+      <button type="submit" class="btn btn-primary">Record payment</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <div class="card stack-sm" style="margin-bottom: var(--gap);">
+    <div class="section-title">Public link</div>
+    <input type="text" readonly value="{{ public_url }}" onclick="this.select()" style="font-family: var(--mono); font-size: 11px;">
+    <div class="muted" style="font-size: 11px;">Anyone with the link can view + print this invoice.</div>
+  </div>
+
+  {% if !invoice.is_void() %}
+  <div class="card stack-sm">
+    <div class="section-title">Danger zone</div>
+    <form method="post" action="/app/invoices/{{ invoice.id }}/void" onsubmit="return confirm('Void this invoice? The journal entry will be reversed.')">
+      <input type="text" name="reason" placeholder="Reason" required>
+      <button type="submit" class="btn btn-danger" style="margin-top:8px;">Void invoice</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
+</div>
+{% endblock %}

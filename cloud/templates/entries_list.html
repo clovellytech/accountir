@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Journal · Maven{% endblock %}
+{% block body %}
+<div class="page-header">
+  <div><h1>Journal</h1><div class="subtitle">{{ entries.len() }} entries</div></div>
+  <div class="actions"><a href="/app/entries/new" class="btn btn-primary">+ New entry</a></div>
+</div>
+
+{% if entries.is_empty() %}
+<div class="empty">
+  <h3>No journal entries yet</h3>
+  <p>Post a balanced entry to start the ledger.</p>
+  <a href="/app/entries/new" class="btn btn-primary">+ New entry</a>
+</div>
+{% else %}
+<div class="table-wrap">
+<table>
+  <thead><tr><th style="width:110px">Date</th><th>Memo</th><th style="width:140px">Reference</th><th class="num" style="width:140px">Amount</th></tr></thead>
+  <tbody>
+  {% for e in entries %}
+    <tr>
+      <td class="num" style="text-align: left;">{{ e.date }}</td>
+      <td>{{ e.memo }}</td>
+      <td class="muted">{{ e.reference.as_deref().unwrap_or("") }}</td>
+      <td class="num">{{ e.total_display() }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}
