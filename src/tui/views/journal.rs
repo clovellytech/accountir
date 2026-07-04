@@ -116,6 +116,13 @@ pub struct JournalView {
     visible_height: usize,
     /// Pending jump to other account's ledger (other_account_id, entry_id)
     pub pending_goto_account: Option<(String, String)>,
+    /// Splits view: show one row per journal line in the filtered account
+    /// (rather than one row per entry). Only meaningful in ledger view.
+    /// Selection and reassignment then operate on individual splits.
+    pub splits_mode: bool,
+    /// Set when a state change (e.g. toggling splits view) requires the app to
+    /// reload journal data from the store. Consumed via `take_reload_request`.
+    reload_requested: bool,
 }
 
 impl JournalView {
@@ -143,6 +150,8 @@ impl JournalView {
             bulk_void_confirmed: None,
             visible_height: 20, // Default, will be updated during draw
             pending_goto_account: None,
+            splits_mode: false,
+            reload_requested: false,
         }
     }
 
@@ -231,6 +240,44 @@ impl JournalView {
         self.selected_entry_ids.clear();
     }
 
+    /// The identifier used to track selection for a row. In splits view rows are
+    /// individual journal lines (keyed by `line_id`); otherwise rows are whole
+    /// entries (keyed by `entry_id`).
+    fn row_key(&self, entry: &EntrySearchResult) -> String {
+        if self.splits_mode {
+            entry
+                .line_id
+                .clone()
+                .unwrap_or_else(|| entry.entry_id.clone())
+        } else {
+            entry.entry_id.clone()
+        }
+    }
+
+    /// The `line_id` of the currently selected split (splits view only).
+    pub fn current_line_id(&self) -> Option<String> {
+        self.selected_entry().and_then(|e| e.line_id.clone())
+    }
+
+    /// Toggle splits view (one row per journal line in the filtered account).
+    /// Only available in ledger view. Requests a data reload since the row set
+    /// changes, and drops any existing selection (keys differ between modes).
+    pub fn toggle_splits_mode(&mut self) {
+        if self.filter_account.is_none() {
+            return;
+        }
+        self.splits_mode = !self.splits_mode;
+        self.clear_selections();
+        self.state.select(Some(0));
+        *self.state.offset_mut() = 0;
+        self.reload_requested = true;
+    }
+
+    /// Take a pending reload request (set when the visible row set changes).
+    pub fn take_reload_request(&mut self) -> bool {
+        std::mem::take(&mut self.reload_requested)
+    }
+
     /// Whether any entries are currently selected for bulk operations.
     pub fn has_selections(&self) -> bool {
         !self.selected_entry_ids.is_empty()
@@ -245,11 +292,11 @@ impl JournalView {
             if entry.is_void {
                 return; // Can't select voided entries
             }
-            let entry_id = entry.entry_id.clone();
-            if self.selected_entry_ids.contains(&entry_id) {
-                self.selected_entry_ids.remove(&entry_id);
+            let key = self.row_key(entry);
+            if self.selected_entry_ids.contains(&key) {
+                self.selected_entry_ids.remove(&key);
             } else {
-                self.selected_entry_ids.insert(entry_id);
+                self.selected_entry_ids.insert(key);
             }
         }
     }
@@ -261,7 +308,8 @@ impl JournalView {
         }
         if let Some(entry) = self.selected_entry() {
             if !entry.is_void {
-                self.selected_entry_ids.insert(entry.entry_id.clone());
+                let key = self.row_key(entry);
+                self.selected_entry_ids.insert(key);
             }
         }
     }
@@ -385,11 +433,13 @@ impl JournalView {
 
     pub fn set_filter(&mut self, account: Account) {
         self.filter_account = Some(account);
+        self.splits_mode = false; // Start each ledger in entry view
         self.state.select(Some(0));
     }
 
     pub fn clear_filter(&mut self) {
         self.filter_account = None;
+        self.splits_mode = false;
         self.clear_selections(); // Drop bulk selections when leaving ledger view
     }
 
@@ -521,7 +571,9 @@ impl JournalView {
             }
             KeyCode::Char('s') => self.next_sort_field(),
             KeyCode::Char('r') => self.toggle_sort_direction(),
-            KeyCode::Char('x') => {
+            KeyCode::Char('x') if !self.splits_mode => {
+                // Voiding operates on whole entries; it is not offered in splits
+                // view, where rows are individual lines.
                 if self.has_selections() {
                     // Bulk void confirmation
                     self.bulk_void_pending = true;
@@ -531,6 +583,7 @@ impl JournalView {
             }
             KeyCode::Char('h') => self.toggle_show_void(),
             KeyCode::Char('c') => self.toggle_id_column(),
+            KeyCode::Char('l') if is_ledger => self.toggle_splits_mode(),
             KeyCode::Char('a') => return true, // Signal to app.rs to start (bulk) reassignment
             KeyCode::Char('g')
                 // Jump to other account's ledger (only in ledger view)
@@ -833,18 +886,38 @@ impl JournalView {
             self.sort_direction.symbol()
         );
         let void_info = if self.show_void { "" } else { " [hiding void]" };
+        let splits_info = if self.splits_mode { " [splits]" } else { "" };
 
         if let Some(ref account) = self.filter_account {
             if self.has_selections() {
                 let count = self.selected_entry_ids.len();
+                // Void acts on whole entries, so it is only offered outside splits view.
+                let (noun, actions) = if self.splits_mode {
+                    (
+                        "splits",
+                        "Space: toggle, Shift+↑↓: extend, a: assign, Esc: clear",
+                    )
+                } else {
+                    (
+                        "selected",
+                        "Space: toggle, Shift+↑↓: extend, a: assign, x: void, Esc: clear",
+                    )
+                };
                 format!(
-                    " Ledger: {} - {} {}{}  •  {} selected (Space: toggle, Shift+↑↓: extend, a: assign, x: void, Esc: clear) ",
-                    account.account_number, account.name, sort_info, void_info, count
+                    " Ledger: {} - {} {}{}{}  •  {} {} ({}) ",
+                    account.account_number,
+                    account.name,
+                    sort_info,
+                    void_info,
+                    splits_info,
+                    count,
+                    noun,
+                    actions
                 )
             } else {
                 format!(
-                    " Ledger: {} - {} {}{} ",
-                    account.account_number, account.name, sort_info, void_info
+                    " Ledger: {} - {} {}{}{} ",
+                    account.account_number, account.name, sort_info, void_info, splits_info
                 )
             }
         } else {
@@ -870,7 +943,7 @@ impl JournalView {
         let rows: Vec<Row> = visible
             .iter()
             .map(|(original_idx, entry)| {
-                let is_selected = self.selected_entry_ids.contains(&entry.entry_id);
+                let is_selected = self.selected_entry_ids.contains(&self.row_key(entry));
                 let status = if entry.is_void {
                     "VOID"
                 } else if is_selected {

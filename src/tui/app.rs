@@ -733,9 +733,15 @@ impl App {
         let search = crate::queries::search::Search::new(conn);
 
         let entries = if let Some(ref account) = self.journal.filter_account {
-            search
-                .search_entries(None, None, None, Some(&account.id), true)
-                .unwrap_or_default()
+            if self.journal.splits_mode {
+                search
+                    .search_account_splits(&account.id, true)
+                    .unwrap_or_default()
+            } else {
+                search
+                    .search_entries(None, None, None, Some(&account.id), true)
+                    .unwrap_or_default()
+            }
         } else {
             search.recent_entries(100).unwrap_or_default()
         };
@@ -1037,11 +1043,27 @@ impl App {
         }
 
         // Find the line to reassign:
+        // - In splits view: the selected split's own line (in the filtered account)
         // - In ledger view: the line that's NOT the current account (or first line if all same)
         // - In journal view: use the first line
-        let (line_id, other_account_id, current_account_name) = if let Some(ref filter_account) =
-            self.journal.filter_account
-        {
+        let splits_line = if self.journal.splits_mode {
+            self.journal
+                .current_line_id()
+                .filter(|lid| lines.iter().any(|(l, _, _)| l == lid))
+        } else {
+            None
+        };
+        let (line_id, other_account_id, current_account_name) = if let Some(forced) = splits_line {
+            // Splits view: reassign this exact line (the split in the filtered
+            // account). Start the picker unbiased so the user chooses a category.
+            let current_name = self
+                .journal
+                .filter_account
+                .as_ref()
+                .map(|a| a.name.clone())
+                .unwrap_or_default();
+            (forced, None, current_name)
+        } else if let Some(ref filter_account) = self.journal.filter_account {
             // Find the line that's not the filter account
             match lines
                 .iter()
@@ -1132,6 +1154,9 @@ impl App {
                     } else {
                         self.pending_reassign = self.request_reassign();
                     }
+                }
+                if self.journal.take_reload_request() {
+                    self.journal_needs_reload = true;
                 }
                 return;
             }
@@ -1271,6 +1296,9 @@ impl App {
                         } else {
                             self.pending_reassign = self.request_reassign();
                         }
+                    }
+                    if self.journal.take_reload_request() {
+                        self.journal_needs_reload = true;
                     }
                 }
             }
@@ -2361,28 +2389,40 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
         }
 
         // Handle confirmed bulk reassignment
-        if let Some((entry_ids, new_account_id)) = app.journal.take_bulk_reassign_confirmed() {
+        if let Some((ids, new_account_id)) = app.journal.take_bulk_reassign_confirmed() {
             if let Some(ref mut s) = store {
+                let splits_mode = app.journal.splits_mode;
                 let filter_account_id = app.journal.filter_account.as_ref().map(|a| a.id.clone());
                 let mut success_count = 0;
                 let mut error_count = 0;
 
-                for entry_id in entry_ids {
-                    // Find the line to reassign (the one that's NOT the filter account)
-                    let line_id: Option<String> = {
-                        let mut stmt = match s.connection().prepare(
-                            "SELECT jl.id FROM journal_lines jl WHERE jl.entry_id = ?1 AND jl.account_id != ?2 LIMIT 1",
-                        ) {
-                            Ok(s) => s,
-                            Err(_) => continue,
-                        };
-
-                        let filter_id = filter_account_id.clone().unwrap_or_default();
-                        stmt.query_row([&entry_id, &filter_id], |row| row.get(0))
+                for id in ids {
+                    // Resolve the (entry_id, line_id) pair to reassign.
+                    // - Splits view: `id` is the line_id; reassign that exact split.
+                    // - Ledger view: `id` is the entry_id; reassign the line that
+                    //   is NOT the filter account.
+                    let pair: Option<(String, String)> = if splits_mode {
+                        s.connection()
+                            .query_row(
+                                "SELECT entry_id FROM journal_lines WHERE id = ?1",
+                                [&id],
+                                |row| row.get::<_, String>(0),
+                            )
                             .ok()
+                            .map(|entry_id| (entry_id, id.clone()))
+                    } else {
+                        let filter_id = filter_account_id.clone().unwrap_or_default();
+                        s.connection()
+                            .query_row(
+                                "SELECT jl.id FROM journal_lines jl WHERE jl.entry_id = ?1 AND jl.account_id != ?2 LIMIT 1",
+                                [&id, &filter_id],
+                                |row| row.get::<_, String>(0),
+                            )
+                            .ok()
+                            .map(|line_id| (id.clone(), line_id))
                     };
 
-                    if let Some(line_id) = line_id {
+                    if let Some((entry_id, line_id)) = pair {
                         let mut commands = EntryCommands::new(s, "tui-user".to_string());
                         match commands.reassign_line(ReassignLineCommand {
                             entry_id,
@@ -2395,8 +2435,13 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
                     }
                 }
 
+                let noun = if splits_mode {
+                    "splits"
+                } else {
+                    "transactions"
+                };
                 if error_count == 0 {
-                    app.status_message = Some(format!("{} transactions reassigned", success_count));
+                    app.status_message = Some(format!("{} {} reassigned", success_count, noun));
                 } else {
                     app.status_message = Some(format!(
                         "{} reassigned, {} failed",
@@ -2984,27 +3029,41 @@ pub fn run_app_with_database(
         }
 
         // Handle confirmed bulk reassignment
-        if let Some((entry_ids, new_account_id)) = app.journal.take_bulk_reassign_confirmed() {
+        if let Some((ids, new_account_id)) = app.journal.take_bulk_reassign_confirmed() {
+            let splits_mode = app.journal.splits_mode;
             let filter_account_id = app.journal.filter_account.as_ref().map(|a| a.id.clone());
             let mut success_count = 0;
             let mut error_count = 0;
 
-            for entry_id in entry_ids {
-                // Find the line to reassign (the one that's NOT the filter account)
-                let line_id: Option<String> = {
-                    let mut stmt = match store.connection().prepare(
-                        "SELECT jl.id FROM journal_lines jl WHERE jl.entry_id = ?1 AND jl.account_id != ?2 LIMIT 1",
-                    ) {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    let filter_id = filter_account_id.clone().unwrap_or_default();
-                    stmt.query_row([&entry_id, &filter_id], |row| row.get(0))
+            for id in ids {
+                // Resolve the (entry_id, line_id) pair to reassign.
+                // - Splits view: `id` is the line_id; reassign that exact split.
+                // - Ledger view: `id` is the entry_id; reassign the line that
+                //   is NOT the filter account.
+                let pair: Option<(String, String)> = if splits_mode {
+                    store
+                        .connection()
+                        .query_row(
+                            "SELECT entry_id FROM journal_lines WHERE id = ?1",
+                            [&id],
+                            |row| row.get::<_, String>(0),
+                        )
                         .ok()
+                        .map(|entry_id| (entry_id, id.clone()))
+                } else {
+                    let filter_id = filter_account_id.clone().unwrap_or_default();
+                    store
+                        .connection()
+                        .query_row(
+                            "SELECT jl.id FROM journal_lines jl WHERE jl.entry_id = ?1 AND jl.account_id != ?2 LIMIT 1",
+                            [&id, &filter_id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok()
+                        .map(|line_id| (id.clone(), line_id))
                 };
 
-                if let Some(line_id) = line_id {
+                if let Some((entry_id, line_id)) = pair {
                     let mut commands = EntryCommands::new(&mut store, "tui-user".to_string());
                     match commands.reassign_line(ReassignLineCommand {
                         entry_id,
@@ -3017,8 +3076,13 @@ pub fn run_app_with_database(
                 }
             }
 
+            let noun = if splits_mode {
+                "splits"
+            } else {
+                "transactions"
+            };
             if error_count == 0 {
-                app.status_message = Some(format!("{} transactions reassigned", success_count));
+                app.status_message = Some(format!("{} {} reassigned", success_count, noun));
             } else {
                 app.status_message = Some(format!(
                     "{} reassigned, {} failed",

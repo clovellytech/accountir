@@ -37,6 +37,9 @@ pub struct EntrySearchResult {
     /// The ID of the other account (for jumping to that account's ledger)
     /// None if there are multiple other accounts
     pub other_account_id: Option<String>,
+    /// The specific journal line this row represents (splits view only).
+    /// None when the row represents a whole entry rather than a single split.
+    pub line_id: Option<String>,
 }
 
 /// Search functionality for accounts and entries
@@ -205,6 +208,94 @@ impl<'a> Search<'a> {
                     account_amount: row.get(7)?,
                     other_account: row.get(8)?,
                     other_account_id: row.get(9)?,
+                    line_id: None,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Search the individual splits (journal lines) posting to a single account.
+    ///
+    /// Unlike [`Self::search_entries`], this returns one row per journal line in
+    /// the account, so an entry with several splits into the same account yields
+    /// several rows — each carrying its own `line_id`. Used by the ledger's
+    /// "splits view" to select and reassign individual splits in bulk.
+    pub fn search_account_splits(
+        &self,
+        account_id: &str,
+        include_void: bool,
+    ) -> Result<Vec<EntrySearchResult>, SearchError> {
+        // Other-account name/id are computed across the whole entry (the split's
+        // offsetting side), mirroring the ledger view's columns.
+        let other_account = format!(
+            "(SELECT CASE
+                WHEN COUNT(DISTINCT jl3.account_id) = 0 THEN
+                    (SELECT a.name FROM accounts a WHERE a.id = '{0}')
+                WHEN COUNT(DISTINCT jl3.account_id) = 1 THEN
+                    (SELECT a.name FROM accounts a
+                     JOIN journal_lines jl4 ON a.id = jl4.account_id
+                     WHERE jl4.entry_id = je.id AND jl4.account_id != '{0}'
+                     LIMIT 1)
+                ELSE 'Multiple'
+                END
+                FROM journal_lines jl3
+                WHERE jl3.entry_id = je.id AND jl3.account_id != '{0}')",
+            account_id
+        );
+        let other_account_id = format!(
+            "(SELECT CASE
+                WHEN COUNT(DISTINCT jl5.account_id) = 1 THEN
+                    (SELECT jl6.account_id
+                     FROM journal_lines jl6
+                     WHERE jl6.entry_id = je.id AND jl6.account_id != '{0}'
+                     LIMIT 1)
+                ELSE NULL
+                END
+                FROM journal_lines jl5
+                WHERE jl5.entry_id = je.id AND jl5.account_id != '{0}')",
+            account_id
+        );
+
+        let mut sql = format!(
+            "SELECT je.id, je.date,
+                    COALESCE(NULLIF(jl.memo, ''), je.memo),
+                    je.reference,
+                    (SELECT SUM(ABS(jl2.amount)) / 2 FROM journal_lines jl2 WHERE jl2.entry_id = je.id),
+                    je.is_void, je.source, jl.amount, {}, {}, jl.id
+             FROM journal_entries je
+             JOIN journal_lines jl ON je.id = jl.entry_id
+             WHERE jl.account_id = ?1",
+            other_account, other_account_id
+        );
+
+        if !include_void {
+            sql.push_str(" AND je.is_void = 0");
+        }
+        sql.push_str(" ORDER BY je.date DESC, je.id DESC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        let results = stmt
+            .query_map([account_id], |row| {
+                let date_str: String = row.get(1)?;
+                let date = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d")
+                    .unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+
+                Ok(EntrySearchResult {
+                    entry_id: row.get(0)?,
+                    date,
+                    memo: row.get(2)?,
+                    reference: row.get(3)?,
+                    total_amount: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                    is_void: row.get::<_, i32>(5)? == 1,
+                    source: row.get(6)?,
+                    account_amount: row.get(7)?,
+                    other_account: row.get(8)?,
+                    other_account_id: row.get(9)?,
+                    line_id: Some(row.get(10)?),
                 })
             })?
             .filter_map(|r| r.ok())
@@ -244,6 +335,7 @@ impl<'a> Search<'a> {
                     account_amount: None,
                     other_account: None,
                     other_account_id: None,
+                    line_id: None,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -280,6 +372,7 @@ impl<'a> Search<'a> {
                     account_amount: None,
                     other_account: None,
                     other_account_id: None,
+                    line_id: None,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -317,6 +410,7 @@ impl<'a> Search<'a> {
                     account_amount: None,
                     other_account: None,
                     other_account_id: None,
+                    line_id: None,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -359,6 +453,7 @@ impl<'a> Search<'a> {
                         account_amount: None,
                         other_account: None,
                         other_account_id: None,
+                        line_id: None,
                     })
                 },
             )?
@@ -545,6 +640,74 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].entry_id, "entry-002");
+    }
+
+    #[test]
+    fn test_search_account_splits_one_row_per_line() {
+        let mut store = setup();
+        create_test_data(&mut store);
+
+        // An entry with two separate lines into the same expense account
+        // (e.g. two line items of one order both left Uncategorized).
+        let split_entry = Event::JournalEntryPosted {
+            entry_id: "entry-split".to_string(),
+            date: NaiveDate::from_ymd_opt(2024, 2, 1).unwrap(),
+            memo: "Order with two items".to_string(),
+            lines: vec![
+                JournalLineData {
+                    line_id: "ls-1".to_string(),
+                    account_id: "expense".to_string(),
+                    amount: 3000,
+                    currency: "USD".to_string(),
+                    exchange_rate: None,
+                    memo: Some("Widget".to_string()),
+                },
+                JournalLineData {
+                    line_id: "ls-2".to_string(),
+                    account_id: "expense".to_string(),
+                    amount: 2000,
+                    currency: "USD".to_string(),
+                    exchange_rate: None,
+                    memo: Some("Gadget".to_string()),
+                },
+                JournalLineData {
+                    line_id: "ls-3".to_string(),
+                    account_id: "cash".to_string(),
+                    amount: -5000,
+                    currency: "USD".to_string(),
+                    exchange_rate: None,
+                    memo: None,
+                },
+            ],
+            reference: None,
+            source: None,
+        };
+        append_and_project(&mut store, split_entry, "user");
+
+        let search = Search::new(store.connection());
+        let splits = search.search_account_splits("expense", true).unwrap();
+
+        // Two pre-existing single-line entries + two split lines from the new entry.
+        let split_rows: Vec<_> = splits
+            .iter()
+            .filter(|r| r.entry_id == "entry-split")
+            .collect();
+        assert_eq!(split_rows.len(), 2, "each split should be its own row");
+
+        let line_ids: Vec<&str> = split_rows
+            .iter()
+            .filter_map(|r| r.line_id.as_deref())
+            .collect();
+        assert!(line_ids.contains(&"ls-1"));
+        assert!(line_ids.contains(&"ls-2"));
+
+        // The per-line amount and memo are carried on each row.
+        let widget = split_rows
+            .iter()
+            .find(|r| r.line_id.as_deref() == Some("ls-1"))
+            .unwrap();
+        assert_eq!(widget.account_amount, Some(3000));
+        assert_eq!(widget.memo, "Widget");
     }
 
     #[test]
