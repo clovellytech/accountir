@@ -33,29 +33,63 @@ pub struct ServerDb {
 }
 
 impl ServerDb {
-    /// Open a database and make it available to the sync server.
-    pub fn set(&self, path: &std::path::Path) {
+    /// Open a database and make it available to the sync server. Returns the
+    /// canonical path on success. Errors are returned to the caller and also
+    /// logged to stderr so they're visible in `tauri dev` output.
+    pub fn set(&self, path: &std::path::Path) -> Result<std::path::PathBuf, String> {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         match EventStore::open(&canonical) {
             Ok(store) => {
                 // Run migrations to ensure schema is up to date
-                let _ = crate::store::migrations::run_migrations(store.connection());
+                if let Err(e) = crate::store::migrations::run_migrations(store.connection()) {
+                    let msg = format!(
+                        "sync-server: migrations failed for {}: {}",
+                        canonical.display(),
+                        e
+                    );
+                    eprintln!("{}", msg);
+                    return Err(msg);
+                }
                 let mut guard = self.inner.db.lock().unwrap();
                 *guard = Some(ActiveDb {
                     store,
-                    db_path: canonical,
+                    db_path: canonical.clone(),
                 });
+                eprintln!("sync-server: db set to {}", canonical.display());
+                Ok(canonical)
             }
-            Err(_) => {
-                // Silently ignore — the TUI has its own store; this is best-effort.
+            Err(e) => {
+                let msg = format!(
+                    "sync-server: failed to open {}: {}",
+                    canonical.display(),
+                    e
+                );
+                eprintln!("{}", msg);
+                Err(msg)
             }
         }
     }
 
-    /// Close the server's database connection (e.g. when the TUI closes a file).
+    /// Close the server's database connection.
     pub fn clear(&self) {
         let mut guard = self.inner.db.lock().unwrap();
         *guard = None;
+        eprintln!("sync-server: db cleared");
+    }
+
+    /// Path of the currently-open database, if any. Useful for diagnostics.
+    pub fn current_path(&self) -> Option<std::path::PathBuf> {
+        self.inner
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|a| a.db_path.clone())
+    }
+
+    /// Whether the server currently has a database open.
+    pub fn is_open(&self) -> bool {
+        self.inner.db.lock().unwrap().is_some()
     }
 }
 
@@ -542,6 +576,8 @@ pub async fn start_server_task() -> Option<ServerDb> {
         .route("/accounts/link-bank", post(bg_link_bank))
         .route("/import/bank-csv", post(bg_import_bank_csv))
         .route("/import/bank-file", post(bg_import_bank_file))
+        .route("/import/square-sales-file", post(bg_import_square_sales))
+        .route("/import/square-payroll-file", post(bg_import_square_payroll))
         // Plaid integration routes
         .route("/plaid/config", get(plaid_config))
         .route("/plaid/link-token", post(plaid_link_token))
@@ -554,15 +590,35 @@ pub async fn start_server_task() -> Option<ServerDb> {
         .route("/plaid/staged/import-all", post(plaid_import_all))
         .route("/plaid/items", get(plaid_items))
         .route("/plaid/link", get(plaid_link_page))
+        // Ingest API routes
+        .route("/api/ingest/mappings", get(bg_ingest_get_mappings).put(bg_ingest_set_mappings))
+        .route("/api/ingest/sale", post(bg_ingest_sale))
+        .route("/api/ingest/purchase-order", post(bg_ingest_purchase_order))
+        .route("/api/ingest/inventory-adjustment", post(bg_ingest_inventory_adjustment))
         .layer(cors)
         .with_state(shared.clone());
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 9876));
 
-    let listener = tokio::net::TcpListener::bind(addr).await.ok()?;
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "sync-server: failed to bind to {}: {} — another accountir \
+                 process is probably already running. Plaid sync from this \
+                 process will not work.",
+                addr, e
+            );
+            return None;
+        }
+    };
+
+    eprintln!("sync-server: listening on http://{}", addr);
 
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("sync-server: axum serve loop exited: {}", e);
+        }
     });
 
     Some(ServerDb { inner: shared })
@@ -1555,6 +1611,477 @@ fn sha2_hash(input: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Ingest API (POS, inventory, purchase orders)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct IngestMappingEntry {
+    key: String,
+    account_id: String,
+    account_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IngestMappingsResponse {
+    mappings: Vec<IngestMappingEntry>,
+}
+
+#[derive(Deserialize)]
+struct SetIngestMappingsRequest {
+    mappings: Vec<SetMappingEntry>,
+}
+
+#[derive(Deserialize)]
+struct SetMappingEntry {
+    key: String,
+    account_id: String,
+}
+
+#[derive(Serialize)]
+struct SetIngestMappingsResponse {
+    success: bool,
+    updated: usize,
+}
+
+#[derive(Deserialize)]
+struct IngestSaleRequest {
+    date: String,
+    reference: Option<String>,
+    memo: Option<String>,
+    items: Vec<SaleItem>,
+    payment_method: PaymentMethod,
+    tax_collected_cents: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct SaleItem {
+    name: String,
+    qty: u32,
+    unit_price_cents: i64,
+    unit_cost_cents: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PaymentMethod {
+    Cash,
+    Square,
+}
+
+#[derive(Serialize)]
+struct IngestSaleResponse {
+    success: bool,
+    entry_id: String,
+    total_revenue_cents: i64,
+    total_cogs_cents: i64,
+}
+
+#[derive(Deserialize)]
+struct IngestPurchaseOrderRequest {
+    date: String,
+    reference: Option<String>,
+    memo: Option<String>,
+    supplier: Option<String>,
+    items: Vec<PurchaseItem>,
+    payment: PurchasePayment,
+}
+
+#[derive(Deserialize)]
+struct PurchaseItem {
+    name: String,
+    qty: u32,
+    unit_cost_cents: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PurchasePayment {
+    Cash,
+    OnCredit,
+}
+
+#[derive(Serialize)]
+struct IngestPurchaseOrderResponse {
+    success: bool,
+    entry_id: String,
+    total_cost_cents: i64,
+}
+
+#[derive(Deserialize)]
+struct IngestInventoryAdjustmentRequest {
+    date: String,
+    reference: Option<String>,
+    memo: Option<String>,
+    items: Vec<AdjustmentItem>,
+}
+
+#[derive(Deserialize)]
+struct AdjustmentItem {
+    name: String,
+    qty_delta: i32,
+    unit_cost_cents: i64,
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct IngestInventoryAdjustmentResponse {
+    success: bool,
+    entry_id: String,
+    net_adjustment_cents: i64,
+}
+
+fn ingest_err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        status,
+        Json(ErrorResponse {
+            success: false,
+            error: msg.into(),
+        }),
+    )
+}
+
+fn ingest_no_db() -> (StatusCode, Json<ErrorResponse>) {
+    ingest_err(StatusCode::SERVICE_UNAVAILABLE, "No database open")
+}
+
+
+async fn bg_ingest_get_mappings(
+    State(state): State<Arc<SharedState>>,
+) -> Result<Json<IngestMappingsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let guard = state.db.lock().unwrap();
+    let active = guard.as_ref().ok_or_else(ingest_no_db)?;
+    let conn = active.store.connection();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.key, m.account_id, a.name
+             FROM ingest_account_mappings m
+             LEFT JOIN accounts a ON m.account_id = a.id
+             ORDER BY m.key",
+        )
+        .map_err(|e| ingest_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mappings: Vec<IngestMappingEntry> = stmt
+        .query_map([], |row| {
+            Ok(IngestMappingEntry {
+                key: row.get(0)?,
+                account_id: row.get(1)?,
+                account_name: row.get(2)?,
+            })
+        })
+        .map_err(|e| ingest_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(Json(IngestMappingsResponse { mappings }))
+}
+
+async fn bg_ingest_set_mappings(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<SetIngestMappingsRequest>,
+) -> Result<Json<SetIngestMappingsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let guard = state.db.lock().unwrap();
+    let active = guard.as_ref().ok_or_else(ingest_no_db)?;
+    let conn = active.store.connection();
+
+    let valid_keys = crate::commands::ingest_commands::mapping_keys();
+    for entry in &req.mappings {
+        if !valid_keys.contains(&entry.key.as_str()) {
+            return Err(ingest_err(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Unknown mapping key '{}'. Valid keys: {}",
+                    entry.key,
+                    valid_keys.join(", ")
+                ),
+            ));
+        }
+
+        let active_account: bool = conn
+            .query_row(
+                "SELECT is_active = 1 FROM accounts WHERE id = ?1",
+                [&entry.account_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                ingest_err(
+                    StatusCode::BAD_REQUEST,
+                    format!("Account not found: {}", entry.account_id),
+                )
+            })?;
+
+        if !active_account {
+            return Err(ingest_err(
+                StatusCode::BAD_REQUEST,
+                format!("Account is inactive: {}", entry.account_id),
+            ));
+        }
+    }
+
+    let mut updated = 0;
+    for entry in &req.mappings {
+        conn.execute(
+            "INSERT INTO ingest_account_mappings (key, account_id, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET account_id = ?2, updated_at = datetime('now')",
+            rusqlite::params![entry.key, entry.account_id],
+        )
+        .map_err(|e| ingest_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        updated += 1;
+    }
+
+    Ok(Json(SetIngestMappingsResponse {
+        success: true,
+        updated,
+    }))
+}
+
+async fn bg_ingest_sale(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<IngestSaleRequest>,
+) -> Result<Json<IngestSaleResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or_else(ingest_no_db)?;
+
+    let total_revenue: i64 = req.items.iter().map(|i| i.qty as i64 * i.unit_price_cents).sum();
+    let total_cogs: i64 = req.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
+
+    let data = crate::commands::ingest_commands::IngestSaleData {
+        date: req.date,
+        reference: req.reference,
+        memo: req.memo,
+        items: req.items.into_iter().map(|i| crate::commands::ingest_commands::IngestSaleItem {
+            name: i.name, qty: i.qty, unit_price_cents: i.unit_price_cents, unit_cost_cents: i.unit_cost_cents,
+        }).collect(),
+        payments: Vec::new(),
+        payment_method: Some(match req.payment_method {
+            PaymentMethod::Cash => crate::commands::ingest_commands::IngestPaymentMethod::Cash,
+            PaymentMethod::Square => crate::commands::ingest_commands::IngestPaymentMethod::Square,
+        }),
+        tax_collected_cents: req.tax_collected_cents,
+    };
+
+    let result = crate::commands::ingest_commands::ingest_sale(
+        &mut active.store,
+        "ingest-api",
+        data,
+        crate::events::types::JournalEntrySource::Pos,
+    ).map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+    Ok(Json(IngestSaleResponse {
+        success: true,
+        entry_id: result.entry_id,
+        total_revenue_cents: total_revenue,
+        total_cogs_cents: total_cogs,
+    }))
+}
+
+async fn bg_ingest_purchase_order(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<IngestPurchaseOrderRequest>,
+) -> Result<Json<IngestPurchaseOrderResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or_else(ingest_no_db)?;
+
+    let total_cost: i64 = req.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
+
+    let data = crate::commands::ingest_commands::IngestPurchaseOrderData {
+        date: req.date,
+        reference: req.reference,
+        memo: req.memo,
+        supplier: req.supplier,
+        items: req.items.into_iter().map(|i| crate::commands::ingest_commands::IngestPurchaseItem {
+            name: i.name, qty: i.qty, unit_cost_cents: i.unit_cost_cents,
+        }).collect(),
+        payment: Some(match req.payment {
+            PurchasePayment::Cash => crate::commands::ingest_commands::IngestPurchasePayment::Cash,
+            PurchasePayment::OnCredit => crate::commands::ingest_commands::IngestPurchasePayment::OnCredit,
+        }),
+    };
+
+    let result = crate::commands::ingest_commands::ingest_purchase_order(
+        &mut active.store,
+        "ingest-api",
+        data,
+        crate::events::types::JournalEntrySource::PurchaseOrder,
+    ).map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+    Ok(Json(IngestPurchaseOrderResponse {
+        success: true,
+        entry_id: result.entry_id,
+        total_cost_cents: total_cost,
+    }))
+}
+
+async fn bg_ingest_inventory_adjustment(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<IngestInventoryAdjustmentRequest>,
+) -> Result<Json<IngestInventoryAdjustmentResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or_else(ingest_no_db)?;
+
+    let net: i64 = req.items.iter().map(|i| i.qty_delta as i64 * i.unit_cost_cents).sum();
+
+    let data = crate::commands::ingest_commands::IngestInventoryAdjustmentData {
+        date: req.date,
+        reference: req.reference,
+        memo: req.memo,
+        items: req.items.into_iter().map(|i| crate::commands::ingest_commands::IngestAdjustmentItem {
+            name: i.name, qty_delta: i.qty_delta, unit_cost_cents: i.unit_cost_cents, reason: i.reason,
+        }).collect(),
+    };
+
+    let result = crate::commands::ingest_commands::ingest_inventory_adjustment(
+        &mut active.store,
+        "ingest-api",
+        data,
+        crate::events::types::JournalEntrySource::InventoryAdjustment,
+    ).map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+    Ok(Json(IngestInventoryAdjustmentResponse {
+        success: true,
+        entry_id: result.entry_id,
+        net_adjustment_cents: net,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Square CSV import (sales activity + pay-period payroll)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImportSquareFileRequest {
+    #[serde(default)]
+    company_id: String,
+    #[serde(default)]
+    source_name: Option<String>,
+    file_path: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    downloaded_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ImportSquareResponse {
+    success: bool,
+    entries_posted: usize,
+    skipped_duplicates: usize,
+    rows_parsed: usize,
+}
+
+/// Read a file the extension already downloaded to disk.
+async fn read_import_file(file_path: &str) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    let path = std::path::PathBuf::from(file_path);
+    let file_path = file_path.to_string();
+    tokio::task::spawn_blocking(move || std::fs::read_to_string(&path))
+        .await
+        .map_err(|e| ingest_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {}", e)))?
+        .map_err(|e| {
+            ingest_err(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read file '{}': {}", file_path, e),
+            )
+        })
+}
+
+/// The name we hand to the Square sales parser to recover the export period.
+/// Square names the download `sales-summary-<start>-<end>.csv`, so the basename
+/// carries the dates; we append the source name as a fallback hint.
+fn import_file_name(file_path: &str, source_name: Option<&str>) -> String {
+    let base = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_path);
+    match source_name {
+        Some(name) => format!("{} {}", base, name),
+        None => base.to_string(),
+    }
+}
+
+/// Guard that the posted file belongs to the company this server is serving.
+fn validate_company(
+    conn: &rusqlite::Connection,
+    company_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let db_company: Option<(String, String)> = conn
+        .query_row(
+            "SELECT company_id, name FROM company WHERE id = 'default'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    match db_company {
+        Some((db_id, db_name)) => {
+            if !company_id.is_empty() && company_id != db_id {
+                return Err(ingest_err(
+                    StatusCode::FORBIDDEN,
+                    format!(
+                        "File is for company '{}' but this server is serving '{}'",
+                        company_id, db_name
+                    ),
+                ));
+            }
+            Ok(())
+        }
+        None => Err(ingest_err(
+            StatusCode::BAD_REQUEST,
+            "No company configured in this database".to_string(),
+        )),
+    }
+}
+
+async fn bg_import_square_sales(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<ImportSquareFileRequest>,
+) -> Result<Json<ImportSquareResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let content = read_import_file(&req.file_path).await?;
+    let file_name = import_file_name(&req.file_path, req.source_name.as_deref());
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or_else(ingest_no_db)?;
+    validate_company(active.store.connection(), &req.company_id)?;
+
+    let summary = crate::commands::square_commands::ingest_square_sales(
+        &mut active.store,
+        "square-sync",
+        &content,
+        &file_name,
+    )
+    .map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+    Ok(Json(ImportSquareResponse {
+        success: true,
+        entries_posted: summary.entries_posted,
+        skipped_duplicates: summary.skipped_duplicates,
+        rows_parsed: summary.rows_parsed,
+    }))
+}
+
+async fn bg_import_square_payroll(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<ImportSquareFileRequest>,
+) -> Result<Json<ImportSquareResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // The payroll "Company Totals" report is a binary .xlsx; the parser opens
+    // the file directly from disk rather than reading it as text.
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or_else(ingest_no_db)?;
+    validate_company(active.store.connection(), &req.company_id)?;
+
+    let summary = crate::commands::square_commands::ingest_square_payroll(
+        &mut active.store,
+        "square-sync",
+        &req.file_path,
+    )
+    .map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+
+    Ok(Json(ImportSquareResponse {
+        success: true,
+        entries_posted: summary.entries_posted,
+        skipped_duplicates: summary.skipped_duplicates,
+        rows_parsed: summary.rows_parsed,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Standalone `serve` command (keeps the old interface)
 // ---------------------------------------------------------------------------
 
@@ -1893,6 +2420,49 @@ async fn import_bank_file(
     }))
 }
 
+async fn import_square_sales(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ImportSquareFileRequest>,
+) -> Result<Json<ImportSquareResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let content = read_import_file(&req.file_path).await?;
+    let file_name = import_file_name(&req.file_path, req.source_name.as_deref());
+    let mut store = state.store.lock().unwrap();
+    validate_company(store.connection(), &req.company_id)?;
+    let summary = crate::commands::square_commands::ingest_square_sales(
+        &mut store,
+        "square-sync",
+        &content,
+        &file_name,
+    )
+    .map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    Ok(Json(ImportSquareResponse {
+        success: true,
+        entries_posted: summary.entries_posted,
+        skipped_duplicates: summary.skipped_duplicates,
+        rows_parsed: summary.rows_parsed,
+    }))
+}
+
+async fn import_square_payroll(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ImportSquareFileRequest>,
+) -> Result<Json<ImportSquareResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let mut store = state.store.lock().unwrap();
+    validate_company(store.connection(), &req.company_id)?;
+    let summary = crate::commands::square_commands::ingest_square_payroll(
+        &mut store,
+        "square-sync",
+        &req.file_path,
+    )
+    .map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    Ok(Json(ImportSquareResponse {
+        success: true,
+        entries_posted: summary.entries_posted,
+        skipped_duplicates: summary.skipped_duplicates,
+        rows_parsed: summary.rows_parsed,
+    }))
+}
+
 /// Start the HTTP sync server on localhost:9876 (standalone mode).
 pub async fn run_server(store: EventStore, db_path: PathBuf) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
@@ -1908,6 +2478,8 @@ pub async fn run_server(store: EventStore, db_path: PathBuf) -> anyhow::Result<(
         .route("/accounts/link-bank", post(link_bank))
         .route("/import/bank-csv", post(import_bank_csv))
         .route("/import/bank-file", post(import_bank_file))
+        .route("/import/square-sales-file", post(import_square_sales))
+        .route("/import/square-payroll-file", post(import_square_payroll))
         .layer(cors)
         .with_state(state);
 

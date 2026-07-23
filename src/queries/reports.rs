@@ -19,6 +19,7 @@ pub enum ReportError {
 /// A line in the trial balance
 #[derive(Debug, Clone)]
 pub struct TrialBalanceLine {
+    pub account_id: String,
     pub account_number: String,
     pub account_name: String,
     pub account_type: AccountType,
@@ -143,6 +144,7 @@ impl<'a> Reports<'a> {
             };
 
             lines.push(TrialBalanceLine {
+                account_id: balance.account_id,
                 account_number: balance.account_number,
                 account_name: balance.account_name,
                 account_type: balance.account_type,
@@ -277,12 +279,22 @@ impl<'a> Reports<'a> {
                 continue;
             }
 
+            // Orient to the account's normal side (revenue is credit-normal,
+            // expense debit-normal) rather than taking the magnitude. This keeps
+            // contra activity signed correctly — e.g. a refunds account inside
+            // Revenue carries a debit balance and must *subtract* from revenue,
+            // not add to it.
+            let balance = match account.account_type {
+                AccountType::Revenue => -period_change,
+                _ => period_change, // Expense
+            };
+
             let line = IncomeStatementLine {
                 account_id: account.id.clone(),
                 account_number: account.account_number,
                 account_name: account.name,
                 parent_id: account.parent_id,
-                balance: period_change.abs(),
+                balance,
             };
 
             match account.account_type {
@@ -497,7 +509,7 @@ mod tests {
     };
     use crate::store::event_store::EventStore;
     use crate::store::migrations::init_schema;
-    use crate::store::projections::Projector;
+    use crate::store::projections::ProjectionStore;
 
     fn setup() -> EventStore {
         let store = EventStore::in_memory().unwrap();
@@ -510,8 +522,7 @@ mod tests {
             .append(EventEnvelope::new(event, user_id.to_string()))
             .unwrap();
         {
-            let projector = Projector::new(store.connection());
-            projector.apply(&stored).unwrap();
+            store.apply_projection(&stored).unwrap();
         }
         stored
     }
@@ -673,6 +684,79 @@ mod tests {
         assert_eq!(pl.revenue.total, 50000); // $500 revenue
         assert_eq!(pl.expenses.total, 20000); // $200 expense
         assert_eq!(pl.net_income, 30000); // $300 net income
+    }
+
+    #[test]
+    fn income_statement_nets_contra_revenue() {
+        let mut store = setup();
+        for (id, ty, num, name) in [
+            ("cash", EventAccountType::Asset, "1000", "Cash"),
+            ("sales", EventAccountType::Revenue, "4000", "Sales"),
+            ("refunds", EventAccountType::Revenue, "4900", "Refunds"),
+        ] {
+            append_and_project(
+                &mut store,
+                Event::AccountCreated {
+                    account_id: id.to_string(),
+                    account_type: ty,
+                    account_number: num.to_string(),
+                    name: name.to_string(),
+                    parent_id: None,
+                    currency: Some("USD".to_string()),
+                    description: None,
+                },
+                "user",
+            );
+        }
+
+        // $15,000 of sales: Cash DR / Sales CR.
+        append_and_project(
+            &mut store,
+            Event::JournalEntryPosted {
+                entry_id: "s1".to_string(),
+                date: NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
+                memo: "sales".to_string(),
+                lines: vec![
+                    JournalLineData { line_id: "s1a".to_string(), account_id: "cash".to_string(), amount: 1_500_000, currency: "USD".to_string(), exchange_rate: None, memo: None },
+                    JournalLineData { line_id: "s1b".to_string(), account_id: "sales".to_string(), amount: -1_500_000, currency: "USD".to_string(), exchange_rate: None, memo: None },
+                ],
+                reference: None,
+                source: None,
+            },
+            "user",
+        );
+
+        // $4,000 of refunds: Refunds DR (contra-revenue) / Cash CR.
+        append_and_project(
+            &mut store,
+            Event::JournalEntryPosted {
+                entry_id: "r1".to_string(),
+                date: NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
+                memo: "refund".to_string(),
+                lines: vec![
+                    JournalLineData { line_id: "r1a".to_string(), account_id: "refunds".to_string(), amount: 400_000, currency: "USD".to_string(), exchange_rate: None, memo: None },
+                    JournalLineData { line_id: "r1b".to_string(), account_id: "cash".to_string(), amount: -400_000, currency: "USD".to_string(), exchange_rate: None, memo: None },
+                ],
+                reference: None,
+                source: None,
+            },
+            "user",
+        );
+
+        let reports = Reports::new(store.connection());
+        let pl = reports
+            .income_statement(
+                NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2024, 1, 31).unwrap(),
+            )
+            .unwrap();
+
+        // $15,000 − $4,000 = $11,000 net revenue — NOT $19,000.
+        assert_eq!(pl.revenue.total, 1_100_000);
+        assert_eq!(pl.net_income, 1_100_000);
+        // The refunds line itself reads negative (contra-revenue).
+        let refunds = pl.revenue.lines.iter().find(|l| l.account_id == "refunds").unwrap();
+        assert_eq!(refunds.balance, -400_000);
     }
 
     #[test]

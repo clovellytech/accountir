@@ -1,8 +1,10 @@
+use crate::commands::entry_commands::{check_entry_invariants_in_txn, check_reference_free_in_txn};
+use rusqlite::OptionalExtension;
 use crate::events::types::{
     Event, EventEnvelope, JournalEntrySource, JournalLineData, PlaidAccountInfo, StoredEvent,
 };
-use crate::store::event_store::{EventStore, EventStoreError};
-use crate::store::projections::{ProjectionError, Projector};
+use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
+use crate::store::projections::{ProjectionError, ProjectionStore, Projector};
 use chrono::{NaiveDate, Utc};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
@@ -18,10 +20,16 @@ pub enum PlaidCommandError {
     ItemNotFound(String),
     #[error("Account not mapped: {0}")]
     AccountNotMapped(String),
+    #[error("Invalid transfer: {0}")]
+    InvalidTransfer(String),
+    #[error("Transaction already imported: {0}")]
+    AlreadyImported(String),
     #[error("Database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
     #[error("Account error: {0}")]
     AccountError(#[from] crate::commands::account_commands::AccountCommandError),
+    #[error("Entry invariant: {0}")]
+    EntryError(#[from] crate::commands::entry_commands::EntryCommandError),
 }
 
 pub struct PlaidCommands<'a> {
@@ -52,8 +60,7 @@ impl<'a> PlaidCommands<'a> {
 
         let envelope = EventEnvelope::new(event, self.user_id.clone());
         let stored = self.store.append(envelope)?;
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
+        self.store.apply_projection(&stored)?;
         Ok(stored)
     }
 
@@ -85,8 +92,7 @@ impl<'a> PlaidCommands<'a> {
 
         let envelope = EventEnvelope::new(event, self.user_id.clone());
         let stored = self.store.append(envelope)?;
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
+        self.store.apply_projection(&stored)?;
         Ok(stored)
     }
 
@@ -123,8 +129,7 @@ impl<'a> PlaidCommands<'a> {
 
         let envelope = EventEnvelope::new(event, self.user_id.clone());
         let stored = self.store.append(envelope)?;
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
+        self.store.apply_projection(&stored)?;
         Ok(stored)
     }
 
@@ -194,54 +199,109 @@ impl<'a> PlaidCommands<'a> {
                 .unwrap_or_else(|_| Utc::now().date_naive());
 
             let amount_cents = (txn.amount * 100.0).round() as i64;
+            let currency = txn.currency.clone().unwrap_or_else(|| "USD".to_string());
+            let memo = txn.merchant_name.as_deref().unwrap_or(&txn.name).to_string();
+            let user_id = self.user_id.clone();
+            let uncat = uncategorized_id.clone();
+            let txn_ref = txn.transaction_id.clone();
+            let item = item_id.to_string();
 
-            let entry_id = Uuid::new_v4().to_string();
-            let memo = txn
-                .merchant_name
-                .as_deref()
-                .unwrap_or(&txn.name)
-                .to_string();
-
-            let lines = vec![
-                JournalLineData {
-                    line_id: format!("{}-line-1", entry_id),
-                    account_id: local_account_id.clone(),
-                    amount: -amount_cents,
-                    currency: txn.currency.clone().unwrap_or_else(|| "USD".to_string()),
-                    exchange_rate: None,
-                    memo: None,
-                },
-                JournalLineData {
-                    line_id: format!("{}-line-2", entry_id),
-                    account_id: uncategorized_id.clone(),
-                    amount: amount_cents,
-                    currency: txn.currency.clone().unwrap_or_else(|| "USD".to_string()),
-                    exchange_rate: None,
-                    memo: None,
-                },
-            ];
-
-            let event = Event::JournalEntryPosted {
-                entry_id: entry_id.clone(),
-                date,
-                memo,
-                lines,
-                reference: Some(txn.transaction_id.clone()),
-                source: Some(JournalEntrySource::Plaid),
+            // Post the entry, fold in its projection, and record the dedup row —
+            // all in one append_checked transaction (retry on a head move). The
+            // reference dedup and the fences (account active, period open) run
+            // under the write lock. A duplicate reference (a concurrent import
+            // that won the race) or a fence violation is counted as skipped
+            // rather than posted.
+            let posted = loop {
+                let head = self.store.latest_id()?.unwrap_or(0);
+                let outcome = self.store.append_checked(
+                    head,
+                    |tx| {
+                        // Already imported under this bare txn id — including when
+                        // it was consumed by a transfer (whose journal reference is
+                        // `transfer:from:to`, so the reference check below won't see
+                        // it). Checked in-txn so a concurrent transfer that won the
+                        // race is caught, not double-posted.
+                        if tx
+                            .query_row(
+                                "SELECT 1 FROM plaid_imported_transactions WHERE plaid_transaction_id = ?1",
+                                [&txn_ref],
+                                |_| Ok(true),
+                            )
+                            .optional()?
+                            .unwrap_or(false)
+                        {
+                            return Ok(Verdict::Reject(PlaidCommandError::AlreadyImported(
+                                txn_ref.clone(),
+                            )));
+                        }
+                        if check_reference_free_in_txn(tx, &txn_ref)?.is_some() {
+                            return Ok(Verdict::Reject(PlaidCommandError::AlreadyImported(
+                                txn_ref.clone(),
+                            )));
+                        }
+                        if let Some(e) = check_entry_invariants_in_txn(
+                            tx,
+                            &[local_account_id.as_str(), uncat.as_str()],
+                            date,
+                        )? {
+                            return Ok(Verdict::Reject(PlaidCommandError::from(e)));
+                        }
+                        let entry_id = Uuid::new_v4().to_string();
+                        let lines = vec![
+                            JournalLineData {
+                                line_id: format!("{}-line-1", entry_id),
+                                account_id: local_account_id.clone(),
+                                amount: -amount_cents,
+                                currency: currency.clone(),
+                                exchange_rate: None,
+                                memo: None,
+                            },
+                            JournalLineData {
+                                line_id: format!("{}-line-2", entry_id),
+                                account_id: uncat.clone(),
+                                amount: amount_cents,
+                                currency: currency.clone(),
+                                exchange_rate: None,
+                                memo: None,
+                            },
+                        ];
+                        let event = Event::JournalEntryPosted {
+                            entry_id,
+                            date,
+                            memo: memo.clone(),
+                            lines,
+                            reference: Some(txn_ref.clone()),
+                            source: Some(JournalEntrySource::Plaid),
+                        };
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    },
+                    |tx, stored| {
+                        Projector::new(tx)
+                            .apply(stored)
+                            .map_err(|e| EventStoreError::Projection(e.to_string()))?;
+                        let entry_id = match &stored.event {
+                            Event::JournalEntryPosted { entry_id, .. } => entry_id.as_str(),
+                            _ => "",
+                        };
+                        tx.execute(
+                            "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
+                            rusqlite::params![txn_ref, item, entry_id],
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                match outcome {
+                    CheckedOutcome::Appended(_) => break true,
+                    CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                    CheckedOutcome::Rejected(_) => break false, // duplicate or fence → skip
+                }
             };
-
-            let envelope = EventEnvelope::new(event, self.user_id.clone());
-            let stored = self.store.append(envelope)?;
-            let projector = Projector::new(self.store.connection());
-            projector.apply(&stored)?;
-
-            // Record for dedup
-            self.store.connection().execute(
-                "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-                rusqlite::params![txn.transaction_id, item_id, entry_id],
-            )?;
-
-            added += 1;
+            if posted {
+                added += 1;
+            } else {
+                skipped += 1;
+            }
         }
 
         // Record sync event
@@ -254,8 +314,7 @@ impl<'a> PlaidCommands<'a> {
         };
         let envelope = EventEnvelope::new(sync_event, self.user_id.clone());
         let stored = self.store.append(envelope)?;
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
+        self.store.apply_projection(&stored)?;
 
         Ok((added, skipped))
     }
@@ -358,8 +417,7 @@ impl<'a> PlaidCommands<'a> {
         };
         let envelope = EventEnvelope::new(sync_event, self.user_id.clone());
         let stored = self.store.append(envelope)?;
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
+        self.store.apply_projection(&stored)?;
 
         // Run transfer detection after staging
         detect_transfers(self.store.connection())?;
@@ -377,89 +435,147 @@ impl<'a> PlaidCommands<'a> {
             load_transfer_pair(conn, candidate_id)?
         };
 
-        // Plaid amounts are positive when money leaves the account, negative when it arrives.
-        // The positive-amount side is the "from" account (money leaving), negative is "to".
-        let (from_txn, to_txn) = if txn1.amount_cents > 0 {
-            (&txn1, &txn2)
+        // Pick the source ("from", money leaving) and destination ("to") legs.
+        //
+        // Asset↔asset transfers (e.g. checking→savings) arrive equal-and-opposite:
+        // Plaid amounts are positive when money leaves an account, so the positive
+        // leg is the source.
+        //
+        // Asset↔liability transfers (e.g. a credit-card payment) arrive with the
+        // SAME sign — both legs positive — so sign alone can't tell direction. In
+        // that case the asset account is the source (cash leaving) and the
+        // liability is paid down. Either way the journal below posts -abs to the
+        // source and +abs to the destination, which nets to zero and moves both
+        // balances correctly (the liability, carried negative, moves toward zero).
+        let (from_txn, to_txn) = if txn1.amount_cents == -txn2.amount_cents {
+            if txn1.amount_cents > 0 {
+                (&txn1, &txn2)
+            } else {
+                (&txn2, &txn1)
+            }
         } else {
-            (&txn2, &txn1)
+            let txn1_is_asset = account_type_of(self.store.connection(), txn1.local_account_id.as_deref())
+                .as_deref()
+                == Some("asset");
+            if txn1_is_asset {
+                (&txn1, &txn2)
+            } else {
+                (&txn2, &txn1)
+            }
         };
 
         let date = NaiveDate::parse_from_str(&from_txn.date, "%Y-%m-%d")
             .unwrap_or_else(|_| Utc::now().date_naive());
         let abs_amount = from_txn.amount_cents.unsigned_abs() as i64;
-        let entry_id = Uuid::new_v4().to_string();
         let memo = format!(
             "Transfer: {}",
             from_txn.merchant_name.as_deref().unwrap_or(&from_txn.name)
         );
 
-        let from_account = from_txn.local_account_id.as_ref().ok_or_else(|| {
+        let from_account = from_txn.local_account_id.clone().ok_or_else(|| {
             PlaidCommandError::AccountNotMapped(from_txn.plaid_account_id.clone())
         })?;
         let to_account = to_txn
             .local_account_id
-            .as_ref()
+            .clone()
             .ok_or_else(|| PlaidCommandError::AccountNotMapped(to_txn.plaid_account_id.clone()))?;
 
-        let lines = vec![
-            JournalLineData {
-                line_id: format!("{}-line-1", entry_id),
-                account_id: from_account.clone(),
-                amount: -abs_amount,
-                currency: from_txn.currency.clone(),
-                exchange_rate: None,
-                memo: None,
-            },
-            JournalLineData {
-                line_id: format!("{}-line-2", entry_id),
-                account_id: to_account.clone(),
-                amount: abs_amount,
-                currency: to_txn.currency.clone(),
-                exchange_rate: None,
-                memo: None,
-            },
-        ];
+        let from_currency = from_txn.currency.clone();
+        let to_currency = to_txn.currency.clone();
+        let from_ref = from_txn.plaid_transaction_id.clone();
+        let from_item = from_txn.item_id.clone();
+        let to_ref = to_txn.plaid_transaction_id.clone();
+        let to_item = to_txn.item_id.clone();
+        let reference = format!("transfer:{}:{}", from_ref, to_ref);
+        let staged1 = txn1.id.clone();
+        let staged2 = txn2.id.clone();
+        let cand = candidate_id.to_string();
+        let user_id = self.user_id.clone();
 
-        let event = Event::JournalEntryPosted {
-            entry_id: entry_id.clone(),
-            date,
-            memo,
-            lines,
-            reference: Some(format!(
-                "transfer:{}:{}",
-                from_txn.plaid_transaction_id, to_txn.plaid_transaction_id
-            )),
-            source: Some(JournalEntrySource::Plaid),
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        // Record both in plaid_imported_transactions for dedup
-        let conn = self.store.connection();
-        conn.execute(
-            "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-            rusqlite::params![from_txn.plaid_transaction_id, from_txn.item_id, entry_id],
-        )?;
-        conn.execute(
-            "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-            rusqlite::params![to_txn.plaid_transaction_id, to_txn.item_id, entry_id],
-        )?;
-
-        // Update statuses
-        conn.execute(
-            "UPDATE plaid_staged_transactions SET status = 'imported' WHERE id IN (?1, ?2)",
-            rusqlite::params![txn1.id, txn2.id],
-        )?;
-        conn.execute(
-            "UPDATE plaid_transfer_candidates SET status = 'confirmed' WHERE id = ?1",
-            [candidate_id],
-        )?;
-
-        Ok(stored)
+        // Post the transfer entry, its projection, both dedup rows, and the
+        // staged/candidate status updates in one append_checked transaction
+        // (retry on a head move). The reference dedup and the fences (both
+        // accounts active, period open) run under the write lock; a duplicate or
+        // fence violation is a terminal error.
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| {
+                    if check_reference_free_in_txn(tx, &reference)?.is_some() {
+                        return Ok(Verdict::Reject(PlaidCommandError::AlreadyImported(
+                            reference.clone(),
+                        )));
+                    }
+                    if let Some(e) = check_entry_invariants_in_txn(
+                        tx,
+                        &[from_account.as_str(), to_account.as_str()],
+                        date,
+                    )? {
+                        return Ok(Verdict::Reject(PlaidCommandError::from(e)));
+                    }
+                    let entry_id = Uuid::new_v4().to_string();
+                    let lines = vec![
+                        JournalLineData {
+                            line_id: format!("{}-line-1", entry_id),
+                            account_id: from_account.clone(),
+                            amount: -abs_amount,
+                            currency: from_currency.clone(),
+                            exchange_rate: None,
+                            memo: None,
+                        },
+                        JournalLineData {
+                            line_id: format!("{}-line-2", entry_id),
+                            account_id: to_account.clone(),
+                            amount: abs_amount,
+                            currency: to_currency.clone(),
+                            exchange_rate: None,
+                            memo: None,
+                        },
+                    ];
+                    let event = Event::JournalEntryPosted {
+                        entry_id,
+                        date,
+                        memo: memo.clone(),
+                        lines,
+                        reference: Some(reference.clone()),
+                        source: Some(JournalEntrySource::Plaid),
+                    };
+                    Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))?;
+                    let entry_id = match &stored.event {
+                        Event::JournalEntryPosted { entry_id, .. } => entry_id.as_str(),
+                        _ => "",
+                    };
+                    tx.execute(
+                        "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![from_ref, from_item, entry_id],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![to_ref, to_item, entry_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE plaid_staged_transactions SET status = 'imported' WHERE id IN (?1, ?2)",
+                        rusqlite::params![staged1, staged2],
+                    )?;
+                    tx.execute(
+                        "UPDATE plaid_transfer_candidates SET status = 'confirmed' WHERE id = ?1",
+                        [cand.as_str()],
+                    )?;
+                    Ok(())
+                },
+            )?;
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
+        }
     }
 
     /// Import a single unmatched staged transaction with Uncategorized counterpart.
@@ -482,57 +598,110 @@ impl<'a> PlaidCommands<'a> {
 
         let date = NaiveDate::parse_from_str(&txn.date, "%Y-%m-%d")
             .unwrap_or_else(|_| Utc::now().date_naive());
-        let entry_id = Uuid::new_v4().to_string();
         let memo = txn
             .merchant_name
             .as_deref()
             .unwrap_or(&txn.name)
             .to_string();
+        let currency = txn.currency.clone();
+        let amount_cents = txn.amount_cents;
+        let txn_ref = txn.plaid_transaction_id.clone();
+        let item = txn.item_id.clone();
+        let user_id = self.user_id.clone();
+        let staged_id = staged_txn_id.to_string();
 
-        let lines = vec![
-            JournalLineData {
-                line_id: format!("{}-line-1", entry_id),
-                account_id: local_account_id,
-                amount: -txn.amount_cents,
-                currency: txn.currency.clone(),
-                exchange_rate: None,
-                memo: None,
-            },
-            JournalLineData {
-                line_id: format!("{}-line-2", entry_id),
-                account_id: uncategorized_id,
-                amount: txn.amount_cents,
-                currency: txn.currency.clone(),
-                exchange_rate: None,
-                memo: None,
-            },
-        ];
-
-        let event = Event::JournalEntryPosted {
-            entry_id: entry_id.clone(),
-            date,
-            memo,
-            lines,
-            reference: Some(txn.plaid_transaction_id.clone()),
-            source: Some(JournalEntrySource::Plaid),
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        let conn = self.store.connection();
-        conn.execute(
-            "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
-            rusqlite::params![txn.plaid_transaction_id, txn.item_id, entry_id],
-        )?;
-        conn.execute(
-            "UPDATE plaid_staged_transactions SET status = 'imported' WHERE id = ?1",
-            [staged_txn_id],
-        )?;
-
-        Ok(stored)
+        // Post the entry, its projection, the dedup row, and the staged-status
+        // update in one append_checked transaction (retry on a head move). The
+        // reference dedup and the fences (account active, period open) run under
+        // the write lock; a duplicate or fence violation is a terminal error.
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| {
+                    // Already imported under this bare txn id — including when it
+                    // was consumed by a transfer (whose journal reference is
+                    // `transfer:from:to`, so the reference check below won't see
+                    // it). Checked in-txn so a concurrent import is caught.
+                    if tx
+                        .query_row(
+                            "SELECT 1 FROM plaid_imported_transactions WHERE plaid_transaction_id = ?1",
+                            [&txn_ref],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false)
+                    {
+                        return Ok(Verdict::Reject(PlaidCommandError::AlreadyImported(
+                            txn_ref.clone(),
+                        )));
+                    }
+                    if check_reference_free_in_txn(tx, &txn_ref)?.is_some() {
+                        return Ok(Verdict::Reject(PlaidCommandError::AlreadyImported(
+                            txn_ref.clone(),
+                        )));
+                    }
+                    if let Some(e) = check_entry_invariants_in_txn(
+                        tx,
+                        &[local_account_id.as_str(), uncategorized_id.as_str()],
+                        date,
+                    )? {
+                        return Ok(Verdict::Reject(PlaidCommandError::from(e)));
+                    }
+                    let entry_id = Uuid::new_v4().to_string();
+                    let lines = vec![
+                        JournalLineData {
+                            line_id: format!("{}-line-1", entry_id),
+                            account_id: local_account_id.clone(),
+                            amount: -amount_cents,
+                            currency: currency.clone(),
+                            exchange_rate: None,
+                            memo: None,
+                        },
+                        JournalLineData {
+                            line_id: format!("{}-line-2", entry_id),
+                            account_id: uncategorized_id.clone(),
+                            amount: amount_cents,
+                            currency: currency.clone(),
+                            exchange_rate: None,
+                            memo: None,
+                        },
+                    ];
+                    let event = Event::JournalEntryPosted {
+                        entry_id,
+                        date,
+                        memo: memo.clone(),
+                        lines,
+                        reference: Some(txn_ref.clone()),
+                        source: Some(JournalEntrySource::Plaid),
+                    };
+                    Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))?;
+                    let entry_id = match &stored.event {
+                        Event::JournalEntryPosted { entry_id, .. } => entry_id.as_str(),
+                        _ => "",
+                    };
+                    tx.execute(
+                        "INSERT INTO plaid_imported_transactions (plaid_transaction_id, item_id, entry_id) VALUES (?1, ?2, ?3)",
+                        rusqlite::params![txn_ref, item, entry_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE plaid_staged_transactions SET status = 'imported' WHERE id = ?1",
+                        [staged_id.as_str()],
+                    )?;
+                    Ok(())
+                },
+            )?;
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
+        }
     }
 
     /// Import all: confirm all pending transfer candidates, then import remaining unmatched.
@@ -542,7 +711,7 @@ impl<'a> PlaidCommands<'a> {
         let candidate_ids: Vec<String> = {
             let conn = self.store.connection();
             let mut stmt =
-                conn.prepare("SELECT id FROM plaid_transfer_candidates WHERE status = 'pending'")?;
+                conn.prepare("SELECT id FROM plaid_transfer_candidates WHERE status IN ('pending', 'manual')")?;
             let ids: Vec<String> = stmt
                 .query_map([], |row| row.get(0))?
                 .filter_map(|r| r.ok())
@@ -602,8 +771,7 @@ impl<'a> PlaidCommands<'a> {
 
         let envelope = EventEnvelope::new(event, self.user_id.clone());
         let stored = self.store.append(envelope)?;
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
+        self.store.apply_projection(&stored)?;
         Ok(stored)
     }
 }
@@ -678,35 +846,61 @@ pub struct TransferCandidate {
 }
 
 /// Detect transfer pairs among pending staged transactions.
-/// Matches transactions with equal-and-opposite amounts, within 3 days,
-/// from different local accounts.
+///
+/// Matches transactions of equal magnitude within 5 days, across two different
+/// mapped accounts, in either of two shapes:
+///   * equal-and-opposite amounts — an asset↔asset transfer (checking→savings),
+///     where Plaid reports the two legs with opposite signs; or
+///   * equal-and-SAME-sign amounts across an asset and a liability account — a
+///     credit-card payment, whose two legs Plaid reports with the same sign.
+///
+/// 5 days covers weekend lag on cross-bank payments (e.g. Thu checking debit →
+/// Mon card post). Candidates always require user confirmation before import.
+///
+/// Manually-marked candidates (status `'manual'`) and their legs are preserved
+/// across re-runs; only auto-generated (`'pending'`) candidates are recomputed.
 pub fn detect_transfers(conn: &rusqlite::Connection) -> Result<u32, PlaidCommandError> {
-    // Clear previous unconfirmed candidates
+    // Clear previous auto-generated candidates (leave 'manual'/'confirmed' alone)
     conn.execute(
         "DELETE FROM plaid_transfer_candidates WHERE status = 'pending'",
         [],
     )?;
 
-    // Reset previously matched-but-not-confirmed staged txns back to pending
+    // Reset previously matched staged txns back to pending, except those still
+    // held by a surviving manual candidate.
     conn.execute(
-        "UPDATE plaid_staged_transactions SET status = 'pending' WHERE status = 'matched'",
+        "UPDATE plaid_staged_transactions SET status = 'pending'
+         WHERE status = 'matched'
+           AND id NOT IN (
+               SELECT staged_txn_id_1 FROM plaid_transfer_candidates WHERE status = 'manual'
+               UNION
+               SELECT staged_txn_id_2 FROM plaid_transfer_candidates WHERE status = 'manual'
+           )",
         [],
     )?;
 
-    // Find pairs: equal-and-opposite amounts, within 3 days, different mapped accounts
+    // Find pairs: equal magnitude, within 5 days, different mapped accounts —
+    // either opposite-signed (asset↔asset) or same-signed across asset↔liability.
     let mut stmt = conn.prepare(
         "SELECT t1.id, t2.id,
                 ABS(julianday(t1.date) - julianday(t2.date)) as date_diff
          FROM plaid_staged_transactions t1
          JOIN plaid_staged_transactions t2
-           ON t1.amount_cents = -t2.amount_cents
+           ON ABS(t1.amount_cents) = ABS(t2.amount_cents)
            AND t1.amount_cents != 0
            AND t1.id < t2.id
            AND t1.local_account_id IS NOT NULL
            AND t2.local_account_id IS NOT NULL
            AND t1.local_account_id != t2.local_account_id
-           AND ABS(julianday(t1.date) - julianday(t2.date)) <= 3
+           AND ABS(julianday(t1.date) - julianday(t2.date)) <= 5
+         JOIN accounts a1 ON a1.id = t1.local_account_id
+         JOIN accounts a2 ON a2.id = t2.local_account_id
          WHERE t1.status = 'pending' AND t2.status = 'pending'
+           AND (
+                 t1.amount_cents = -t2.amount_cents
+              OR (a1.account_type = 'asset' AND a2.account_type = 'liability')
+              OR (a1.account_type = 'liability' AND a2.account_type = 'asset')
+               )
          ORDER BY date_diff ASC",
     )?;
 
@@ -723,8 +917,8 @@ pub fn detect_transfers(conn: &rusqlite::Connection) -> Result<u32, PlaidCommand
             continue;
         }
 
-        // Confidence: 1.0 for same day, decreasing for further apart
-        let confidence = 1.0 - (date_diff / 4.0);
+        // Confidence: 1.0 for same day, decreasing to ~0.17 at the 5-day edge.
+        let confidence = 1.0 - (date_diff / 6.0);
 
         let candidate_id = Uuid::new_v4().to_string();
         conn.execute(
@@ -744,6 +938,73 @@ pub fn detect_transfers(conn: &rusqlite::Connection) -> Result<u32, PlaidCommand
     }
 
     Ok(count)
+}
+
+/// Look up an account's type ("asset", "liability", …) from the projection.
+fn account_type_of(conn: &rusqlite::Connection, account_id: Option<&str>) -> Option<String> {
+    let id = account_id?;
+    conn.query_row(
+        "SELECT account_type FROM accounts WHERE id = ?1",
+        [id],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+}
+
+/// Manually pair two pending staged transactions as a transfer candidate.
+///
+/// Used when auto-detection misses a transfer — e.g. a credit-card payment whose
+/// legs differ in some way the matcher can't see. The pair is recorded with
+/// status `'manual'` so it survives re-syncs, and shows up as a candidate to
+/// confirm or reject like any auto-detected one.
+pub fn create_manual_transfer(
+    conn: &rusqlite::Connection,
+    staged_id_1: &str,
+    staged_id_2: &str,
+) -> Result<String, PlaidCommandError> {
+    if staged_id_1 == staged_id_2 {
+        return Err(PlaidCommandError::InvalidTransfer(
+            "cannot pair a transaction with itself".to_string(),
+        ));
+    }
+
+    let t1 = load_staged_transaction(conn, staged_id_1)?;
+    let t2 = load_staged_transaction(conn, staged_id_2)?;
+
+    if t1.local_account_id.is_none() || t2.local_account_id.is_none() {
+        return Err(PlaidCommandError::InvalidTransfer(
+            "both transactions must be linked to a local account first".to_string(),
+        ));
+    }
+    if t1.local_account_id == t2.local_account_id {
+        return Err(PlaidCommandError::InvalidTransfer(
+            "both legs are on the same account — a transfer moves between two accounts"
+                .to_string(),
+        ));
+    }
+    if t1.status != "pending" || t2.status != "pending" {
+        return Err(PlaidCommandError::InvalidTransfer(
+            "both transactions must be unmatched (pending)".to_string(),
+        ));
+    }
+    if t1.amount_cents.abs() != t2.amount_cents.abs() {
+        return Err(PlaidCommandError::InvalidTransfer(
+            "the two legs must be the same amount".to_string(),
+        ));
+    }
+
+    let candidate_id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO plaid_transfer_candidates (id, staged_txn_id_1, staged_txn_id_2, confidence, status)
+         VALUES (?1, ?2, ?3, 1.0, 'manual')",
+        rusqlite::params![candidate_id, staged_id_1, staged_id_2],
+    )?;
+    conn.execute(
+        "UPDATE plaid_staged_transactions SET status = 'matched' WHERE id = ?1 OR id = ?2",
+        rusqlite::params![staged_id_1, staged_id_2],
+    )?;
+
+    Ok(candidate_id)
 }
 
 /// Reject a transfer candidate, unlinking the pair back to pending.
@@ -823,7 +1084,7 @@ pub fn load_pending_transfers(
         "SELECT tc.id, tc.confidence, tc.status,
                 tc.staged_txn_id_1, tc.staged_txn_id_2
          FROM plaid_transfer_candidates tc
-         WHERE tc.status = 'pending'
+         WHERE tc.status IN ('pending', 'manual')
          ORDER BY tc.confidence DESC",
     )?;
 
@@ -899,9 +1160,162 @@ pub fn staged_counts(conn: &rusqlite::Connection) -> Result<(u32, u32), PlaidCom
         |row| row.get(0),
     )?;
     let transfers: u32 = conn.query_row(
-        "SELECT COUNT(*) FROM plaid_transfer_candidates WHERE status = 'pending'",
+        "SELECT COUNT(*) FROM plaid_transfer_candidates WHERE status IN ('pending', 'manual')",
         [],
         |row| row.get(0),
     )?;
     Ok((staged, transfers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::account_commands::{
+        AccountCommands, CreateAccountCommand, DeactivateAccountCommand,
+    };
+    use crate::domain::AccountType;
+    use crate::store::migrations::init_schema;
+
+    fn mk_account(store: &mut EventStore, num: &str, name: &str, ty: AccountType) -> String {
+        let stored = AccountCommands::new(store, "u".to_string())
+            .create_account(CreateAccountCommand {
+                account_type: ty,
+                account_number: num.to_string(),
+                name: name.to_string(),
+                parent_id: None,
+                currency: None,
+                description: None,
+            })
+            .unwrap();
+        match &stored.event {
+            Event::AccountCreated { account_id, .. } => account_id.clone(),
+            _ => panic!("expected AccountCreated"),
+        }
+    }
+
+    /// Store with a local asset account mapped to Plaid account 'pa1' on item
+    /// 'item1'. Returns (store, local_account_id).
+    fn setup() -> (EventStore, String) {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let local = mk_account(&mut store, "1000", "Checking", AccountType::Asset);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_items (id, proxy_item_id, institution_name) VALUES ('item1','p1','Bank')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_local_accounts (item_id, plaid_account_id, name, account_type, local_account_id)
+                 VALUES ('item1','pa1','Checking','depository',?1)",
+                [&local],
+            )
+            .unwrap();
+        (store, local)
+    }
+
+    fn txn(id: &str, date: &str, amount: f64) -> SyncedTransaction {
+        SyncedTransaction {
+            transaction_id: id.to_string(),
+            account_id: "pa1".to_string(),
+            amount,
+            date: date.to_string(),
+            name: "Coffee".to_string(),
+            merchant_name: None,
+            pending: false,
+            iso_currency_code: None,
+            currency: None,
+            payment_meta: None,
+        }
+    }
+
+    fn count(store: &EventStore, sql: &str) -> i64 {
+        store.connection().query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn import_transactions_posts_entry_and_records_dedup() {
+        let (mut store, _local) = setup();
+        let (added, skipped) = PlaidCommands::new(&mut store, "u".to_string())
+            .import_transactions("item1", &[txn("t1", "2026-03-04", 4.50)])
+            .unwrap();
+        assert_eq!((added, skipped), (1, 0));
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM journal_entries WHERE reference = 't1'"),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM plaid_imported_transactions WHERE plaid_transaction_id = 't1'"
+            ),
+            1,
+            "the dedup row must be recorded in the same commit"
+        );
+    }
+
+    #[test]
+    fn import_transactions_skips_already_imported() {
+        let (mut store, _local) = setup();
+        let t = [txn("t1", "2026-03-04", 4.50)];
+        PlaidCommands::new(&mut store, "u".to_string())
+            .import_transactions("item1", &t)
+            .unwrap();
+        let (added, skipped) = PlaidCommands::new(&mut store, "u".to_string())
+            .import_transactions("item1", &t)
+            .unwrap();
+        assert_eq!((added, skipped), (0, 1), "re-import is a no-op");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM journal_entries WHERE reference = 't1'"),
+            1,
+            "no double-post"
+        );
+    }
+
+    #[test]
+    fn import_transactions_skips_transaction_in_closed_period() {
+        let (mut store, _local) = setup();
+        // Seed a closed fiscal period covering the transaction date. (There is no
+        // command emitter for period-close yet, so seed the projection directly.)
+        store
+            .connection()
+            .execute(
+                "INSERT INTO fiscal_periods (year, period, start_date, end_date, status)
+                 VALUES (2026, 3, '2026-03-01', '2026-03-31', 'closed')",
+                [],
+            )
+            .unwrap();
+        let (added, skipped) = PlaidCommands::new(&mut store, "u".to_string())
+            .import_transactions("item1", &[txn("t1", "2026-03-04", 4.50)])
+            .unwrap();
+        assert_eq!((added, skipped), (0, 1), "closed-period txn is skipped");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM journal_entries"), 0);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM plaid_imported_transactions WHERE plaid_transaction_id = 't1'"
+            ),
+            0,
+            "a skipped txn is not marked imported"
+        );
+    }
+
+    #[test]
+    fn import_transactions_skips_transaction_to_inactive_account() {
+        let (mut store, local) = setup();
+        AccountCommands::new(&mut store, "u".to_string())
+            .deactivate_account(DeactivateAccountCommand {
+                account_id: local,
+                reason: None,
+            })
+            .unwrap();
+        let (added, skipped) = PlaidCommands::new(&mut store, "u".to_string())
+            .import_transactions("item1", &[txn("t1", "2026-03-04", 4.50)])
+            .unwrap();
+        assert_eq!((added, skipped), (0, 1), "inactive-account txn is skipped");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM journal_entries"), 0);
+    }
 }

@@ -1,14 +1,23 @@
 use accountir::commands::account_commands::{AccountCommands, CreateAccountCommand};
+use accountir::commands::bill_commands::{
+    ApplyBillPaymentCommand, BillCommands as BillCommandHandler, ReceiveBillCommand, VoidBillCommand,
+};
 use accountir::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
-use accountir::domain::AccountType;
+use accountir::commands::invoice_commands::{
+    InvoiceCommands as InvoiceCommandHandler, IssueInvoiceCommand, ReceiveInvoicePaymentCommand,
+    VoidInvoiceCommand,
+};
+use accountir::domain::{AccountType, PaymentTerms};
 use accountir::events::types::{Event, JournalEntrySource};
 use accountir::queries::account_queries::AccountQueries;
+use accountir::queries::ap_ar_queries::ApArQueries;
 use accountir::queries::reports::Reports;
 use accountir::store::event_store::EventStore;
 use accountir::store::merkle::MerkleTree;
 use accountir::store::migrations::init_schema;
+use accountir::store::projections::ProjectionStore;
+use accountir::tui::run_app;
 use accountir::tui::views::welcome::reset_welcome;
-use accountir::tui::{run_app, run_app_with_database};
 use anyhow::Result;
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
@@ -18,7 +27,7 @@ use std::path::PathBuf;
 #[command(name = "accountir")]
 #[command(about = "Event-sourced double-entry accounting system", long_about = None)]
 struct Cli {
-    /// Database file path
+    /// Database file for non-TUI subcommands (ignored by `tui` — that goes through the picker)
     #[arg(short, long, default_value = "accountir.db")]
     database: PathBuf,
 
@@ -67,6 +76,14 @@ enum Commands {
     #[command(subcommand)]
     Plaid(PlaidCommands_),
 
+    /// Accounts payable (bills)
+    #[command(subcommand)]
+    Bill(BillCliCommands),
+
+    /// Accounts receivable (invoices)
+    #[command(subcommand)]
+    Invoice(InvoiceCliCommands),
+
     /// Import a GnuCash file into a fresh database
     ImportGnucash {
         /// Path to the GnuCash file (gzip or plain XML)
@@ -74,6 +91,38 @@ enum Commands {
         /// Output database path (default: {input_stem}.db)
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+
+    /// Import a Square export file by hand (sales CSV or payroll xlsx)
+    #[command(subcommand)]
+    Square(SquareCliCommands),
+
+    /// Import an Amazon Business export by hand (order history CSV)
+    #[command(subcommand)]
+    Amazon(AmazonCliCommands),
+}
+
+#[derive(Subcommand)]
+enum AmazonCliCommands {
+    /// Import an Amazon Business "Order History Report" CSV. Posts one entry per
+    /// card charge, clearing the mapped `amazon_clearing` account. Idempotent.
+    Orders {
+        /// Path to the order history CSV, e.g. orders_from_20250529_to_20260629_*.csv
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum SquareCliCommands {
+    /// Import a Square sales-summary CSV (the date range is read from the filename)
+    Sales {
+        /// Path to the sales-summary CSV, e.g. sales-summary-2026-06-26-2026-06-26.csv
+        file: PathBuf,
+    },
+    /// Import a Square payroll "Company Totals" .xlsx (date range read from the filename)
+    Payroll {
+        /// Path to the Company Totals .xlsx, e.g. Company-Totals-2026-06-01-2026-06-30-.xlsx
+        file: PathBuf,
     },
 }
 
@@ -209,6 +258,130 @@ enum PlaidCommands_ {
     Status,
 }
 
+#[derive(Subcommand)]
+enum BillCliCommands {
+    /// Record a new bill from a vendor
+    Receive {
+        #[arg(long)]
+        vendor: String,
+        /// Amount in dollars (e.g. 500.00)
+        #[arg(long)]
+        amount: f64,
+        #[arg(long, default_value = "USD")]
+        currency: String,
+        /// Issue date (YYYY-MM-DD)
+        #[arg(long)]
+        date: String,
+        /// Payment terms (net30, net60, net90, due-on-receipt, or number of days)
+        #[arg(long, default_value = "net30")]
+        terms: String,
+        /// Expense account ID (debit side)
+        #[arg(long)]
+        expense_account: String,
+        /// Accounts Payable account ID (credit side)
+        #[arg(long)]
+        ap_account: String,
+        #[arg(long)]
+        memo: Option<String>,
+    },
+    /// Apply a payment to a bill
+    Pay {
+        #[arg(long)]
+        bill_id: String,
+        /// Amount in dollars
+        #[arg(long)]
+        amount: f64,
+        /// Payment date (YYYY-MM-DD)
+        #[arg(long)]
+        date: String,
+        /// Bank/cash account to pay from
+        #[arg(long)]
+        payment_account: String,
+        /// Accounts Payable account ID
+        #[arg(long)]
+        ap_account: String,
+        #[arg(long)]
+        memo: Option<String>,
+    },
+    /// List bills
+    List {
+        /// Filter by status (open, partial, paid, void)
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Void a bill (only if no payments applied)
+    Void {
+        #[arg(long)]
+        bill_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Show AP aging report
+    Aging,
+}
+
+#[derive(Subcommand)]
+enum InvoiceCliCommands {
+    /// Issue a new invoice to a customer
+    Issue {
+        #[arg(long)]
+        customer: String,
+        /// Amount in dollars (e.g. 1000.00)
+        #[arg(long)]
+        amount: f64,
+        #[arg(long, default_value = "USD")]
+        currency: String,
+        /// Issue date (YYYY-MM-DD)
+        #[arg(long)]
+        date: String,
+        /// Payment terms (net30, net60, net90, due-on-receipt, or number of days)
+        #[arg(long, default_value = "net30")]
+        terms: String,
+        /// Revenue account ID (credit side)
+        #[arg(long)]
+        revenue_account: String,
+        /// Accounts Receivable account ID (debit side)
+        #[arg(long)]
+        ar_account: String,
+        #[arg(long)]
+        memo: Option<String>,
+    },
+    /// Record a payment received on an invoice
+    ReceivePayment {
+        #[arg(long)]
+        invoice_id: String,
+        /// Amount in dollars
+        #[arg(long)]
+        amount: f64,
+        /// Payment date (YYYY-MM-DD)
+        #[arg(long)]
+        date: String,
+        /// Bank/cash account receiving the payment
+        #[arg(long)]
+        payment_account: String,
+        /// Accounts Receivable account ID
+        #[arg(long)]
+        ar_account: String,
+        #[arg(long)]
+        memo: Option<String>,
+    },
+    /// List invoices
+    List {
+        /// Filter by status (open, partial, paid, void)
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Void an invoice (only if no payments received)
+    Void {
+        #[arg(long)]
+        invoice_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Show AR aging report
+    Aging,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -245,8 +418,7 @@ async fn main() -> Result<()> {
                     "cli-user".to_string(),
                 );
                 let stored = store.append(envelope)?;
-                let projector = accountir::store::projections::Projector::new(store.connection());
-                projector.apply(&stored)?;
+                store.apply_projection(&stored)?;
             }
 
             println!("Database initialized at {:?}", cli.database);
@@ -255,14 +427,8 @@ async fn main() -> Result<()> {
         Commands::Tui => {
             // Start background sync server before entering the TUI
             let server_db = accountir::server::start_server_task().await;
-
-            // If a specific database was provided (not the default), open it directly
-            if cli.database != std::path::Path::new("accountir.db") {
-                run_app_with_database(&cli.database, server_db)?;
-            } else {
-                // Otherwise show the startup screen to select/create a database
-                run_app(server_db)?;
-            }
+            // Always go through the business picker.
+            run_app(server_db)?;
         }
 
         Commands::Account(cmd) => {
@@ -306,8 +472,94 @@ async fn main() -> Result<()> {
             handle_plaid_command(cmd).await?;
         }
 
+        Commands::Bill(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            handle_bill_command(&mut store, cmd)?;
+        }
+
+        Commands::Invoice(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            handle_invoice_command(&mut store, cmd)?;
+        }
+
         Commands::ImportGnucash { file, output } => {
             handle_import_gnucash(&file, output)?;
+        }
+
+        Commands::Square(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            accountir::store::migrations::run_migrations(store.connection())?;
+            handle_square_command(&mut store, cmd)?;
+        }
+
+        Commands::Amazon(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            accountir::store::migrations::run_migrations(store.connection())?;
+            handle_amazon_command(&mut store, cmd)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_amazon_command(store: &mut EventStore, cmd: AmazonCliCommands) -> Result<()> {
+    use accountir::commands::amazon_commands;
+
+    match cmd {
+        AmazonCliCommands::Orders { file } => {
+            let content = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("read {}: {}", file.display(), e))?;
+            let s = amazon_commands::ingest_amazon_orders(store, "cli", &content)?;
+            println!(
+                "Amazon orders: {} entr{} posted, {} skipped (already imported)",
+                s.entries_posted,
+                if s.entries_posted == 1 { "y" } else { "ies" },
+                s.skipped_duplicates
+            );
+            println!(
+                "  {} charges seen · {} cancelled order(s) skipped · {} pending order(s) skipped",
+                s.charges_seen, s.cancelled_orders, s.pending_orders
+            );
+            if s.reconciled_charges > 0 {
+                println!(
+                    "  ⚠ {} charge(s) had line items that didn't foot to the payment total — \
+                     review the 'reconciling difference' lines",
+                    s.reconciled_charges
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_square_command(store: &mut EventStore, cmd: SquareCliCommands) -> Result<()> {
+    use accountir::commands::square_commands;
+
+    let report = |summary: square_commands::SquareImportSummary, label: &str| {
+        println!(
+            "Square {}: {} entr{} posted, {} skipped (already imported)",
+            label,
+            summary.entries_posted,
+            if summary.entries_posted == 1 { "y" } else { "ies" },
+            summary.skipped_duplicates
+        );
+    };
+
+    match cmd {
+        SquareCliCommands::Sales { file } => {
+            let content = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("read {}: {}", file.display(), e))?;
+            let name = file.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+            let summary = square_commands::ingest_square_sales(store, "cli", &content, name)?;
+            report(summary, "sales");
+        }
+        SquareCliCommands::Payroll { file } => {
+            let path = file
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("non-UTF8 file path"))?;
+            let summary = square_commands::ingest_square_payroll(store, "cli", path)?;
+            report(summary, "payroll");
         }
     }
 
@@ -1014,4 +1266,260 @@ fn truncate(s: &str, max_len: usize) -> String {
     } else {
         format!("{}...", &s[..max_len - 3])
     }
+}
+
+fn handle_bill_command(store: &mut EventStore, cmd: BillCliCommands) -> Result<()> {
+    match cmd {
+        BillCliCommands::Receive {
+            vendor,
+            amount,
+            currency,
+            date,
+            terms,
+            expense_account,
+            ap_account,
+            memo,
+        } => {
+            let issue_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map_err(|_| anyhow::anyhow!("Invalid date format, use YYYY-MM-DD"))?;
+            let amount_cents = (amount * 100.0).round() as i64;
+            let payment_terms = PaymentTerms::parse(&terms);
+
+            let mut cmds = BillCommandHandler::new(store, "cli-user".to_string());
+            let stored = cmds.receive_bill(ReceiveBillCommand {
+                vendor: vendor.clone(),
+                amount: amount_cents,
+                currency,
+                issue_date,
+                terms: payment_terms.clone(),
+                memo,
+                expense_account_id: expense_account,
+                ap_account_id: ap_account,
+                reference: None,
+            })?;
+
+            if let Event::BillReceived {
+                bill_id, due_date, ..
+            } = &stored.event
+            {
+                println!(
+                    "Bill received: {} from {} for ${:.2} (due {})",
+                    &bill_id[..8],
+                    vendor,
+                    amount,
+                    due_date
+                );
+            }
+        }
+        BillCliCommands::Pay {
+            bill_id,
+            amount,
+            date,
+            payment_account,
+            ap_account,
+            memo,
+        } => {
+            let payment_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map_err(|_| anyhow::anyhow!("Invalid date format, use YYYY-MM-DD"))?;
+            let amount_cents = (amount * 100.0).round() as i64;
+
+            let mut cmds = BillCommandHandler::new(store, "cli-user".to_string());
+            cmds.apply_payment(ApplyBillPaymentCommand {
+                bill_id: bill_id.clone(),
+                payment_date,
+                amount_applied: amount_cents,
+                payment_account_id: payment_account,
+                ap_account_id: ap_account,
+                memo,
+            })?;
+
+            println!(
+                "Payment of ${:.2} applied to bill {}",
+                amount,
+                &bill_id[..8.min(bill_id.len())]
+            );
+        }
+        BillCliCommands::List { status } => {
+            let queries = ApArQueries::new(store.connection());
+            let bills = queries.list_bills(status.as_deref())?;
+
+            if bills.is_empty() {
+                println!("No bills found.");
+                return Ok(());
+            }
+
+            println!(
+                "{:<10} {:<20} {:>12} {:>12} {:>12} {:<8} {}",
+                "Due Date", "Vendor", "Amount", "Paid", "Balance", "Status", "ID"
+            );
+            println!("{}", "-".repeat(90));
+            for bill in &bills {
+                let balance = bill.amount - bill.amount_paid;
+                println!(
+                    "{:<10} {:<20} {:>12} {:>12} {:>12} {:<8} {}",
+                    bill.due_date,
+                    truncate(&bill.vendor, 20),
+                    format_amount(bill.amount),
+                    format_amount(bill.amount_paid),
+                    format_amount(balance),
+                    bill.status,
+                    &bill.id[..8.min(bill.id.len())],
+                );
+            }
+        }
+        BillCliCommands::Void { bill_id, reason } => {
+            let mut cmds = BillCommandHandler::new(store, "cli-user".to_string());
+            cmds.void_bill(VoidBillCommand {
+                bill_id: bill_id.clone(),
+                reason,
+            })?;
+            println!("Bill {} voided", &bill_id[..8.min(bill_id.len())]);
+        }
+        BillCliCommands::Aging => {
+            let queries = ApArQueries::new(store.connection());
+            let today = chrono::Local::now().date_naive();
+            let aging = queries.ap_aging(today)?;
+
+            println!("AP Aging Report (as of {})", today);
+            println!("{}", "-".repeat(60));
+            println!("  Current (not yet due): {}", format_amount(aging.current));
+            println!("  1-30 days overdue:     {}", format_amount(aging.days_1_30));
+            println!("  31-60 days overdue:    {}", format_amount(aging.days_31_60));
+            println!("  61-90 days overdue:    {}", format_amount(aging.days_61_90));
+            println!("  Over 90 days:          {}", format_amount(aging.days_over_90));
+            println!("{}", "-".repeat(60));
+            println!("  Total:                 {}", format_amount(aging.total));
+        }
+    }
+    Ok(())
+}
+
+fn handle_invoice_command(store: &mut EventStore, cmd: InvoiceCliCommands) -> Result<()> {
+    match cmd {
+        InvoiceCliCommands::Issue {
+            customer,
+            amount,
+            currency,
+            date,
+            terms,
+            revenue_account,
+            ar_account,
+            memo,
+        } => {
+            let issue_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map_err(|_| anyhow::anyhow!("Invalid date format, use YYYY-MM-DD"))?;
+            let amount_cents = (amount * 100.0).round() as i64;
+            let payment_terms = PaymentTerms::parse(&terms);
+
+            let mut cmds = InvoiceCommandHandler::new(store, "cli-user".to_string());
+            let stored = cmds.issue_invoice(IssueInvoiceCommand {
+                customer: customer.clone(),
+                amount: amount_cents,
+                currency,
+                issue_date,
+                terms: payment_terms,
+                memo,
+                revenue_account_id: revenue_account,
+                ar_account_id: ar_account,
+            })?;
+
+            if let Event::InvoiceIssued {
+                invoice_id,
+                due_date,
+                ..
+            } = &stored.event
+            {
+                println!(
+                    "Invoice issued: {} to {} for ${:.2} (due {})",
+                    &invoice_id[..8],
+                    customer,
+                    amount,
+                    due_date
+                );
+            }
+        }
+        InvoiceCliCommands::ReceivePayment {
+            invoice_id,
+            amount,
+            date,
+            payment_account,
+            ar_account,
+            memo,
+        } => {
+            let payment_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                .map_err(|_| anyhow::anyhow!("Invalid date format, use YYYY-MM-DD"))?;
+            let amount_cents = (amount * 100.0).round() as i64;
+
+            let mut cmds = InvoiceCommandHandler::new(store, "cli-user".to_string());
+            cmds.receive_payment(ReceiveInvoicePaymentCommand {
+                invoice_id: invoice_id.clone(),
+                payment_date,
+                amount_applied: amount_cents,
+                payment_account_id: payment_account,
+                ar_account_id: ar_account,
+                memo,
+            })?;
+
+            println!(
+                "Payment of ${:.2} received on invoice {}",
+                amount,
+                &invoice_id[..8.min(invoice_id.len())]
+            );
+        }
+        InvoiceCliCommands::List { status } => {
+            let queries = ApArQueries::new(store.connection());
+            let invoices = queries.list_invoices(status.as_deref())?;
+
+            if invoices.is_empty() {
+                println!("No invoices found.");
+                return Ok(());
+            }
+
+            println!(
+                "{:<10} {:<20} {:>12} {:>12} {:>12} {:<8} {}",
+                "Due Date", "Customer", "Amount", "Received", "Balance", "Status", "ID"
+            );
+            println!("{}", "-".repeat(90));
+            for inv in &invoices {
+                let balance = inv.amount - inv.amount_paid;
+                println!(
+                    "{:<10} {:<20} {:>12} {:>12} {:>12} {:<8} {}",
+                    inv.due_date,
+                    truncate(&inv.customer, 20),
+                    format_amount(inv.amount),
+                    format_amount(inv.amount_paid),
+                    format_amount(balance),
+                    inv.status,
+                    &inv.id[..8.min(inv.id.len())],
+                );
+            }
+        }
+        InvoiceCliCommands::Void { invoice_id, reason } => {
+            let mut cmds = InvoiceCommandHandler::new(store, "cli-user".to_string());
+            cmds.void_invoice(VoidInvoiceCommand {
+                invoice_id: invoice_id.clone(),
+                reason,
+            })?;
+            println!(
+                "Invoice {} voided",
+                &invoice_id[..8.min(invoice_id.len())]
+            );
+        }
+        InvoiceCliCommands::Aging => {
+            let queries = ApArQueries::new(store.connection());
+            let today = chrono::Local::now().date_naive();
+            let aging = queries.ar_aging(today)?;
+
+            println!("AR Aging Report (as of {})", today);
+            println!("{}", "-".repeat(60));
+            println!("  Current (not yet due): {}", format_amount(aging.current));
+            println!("  1-30 days overdue:     {}", format_amount(aging.days_1_30));
+            println!("  31-60 days overdue:    {}", format_amount(aging.days_31_60));
+            println!("  61-90 days overdue:    {}", format_amount(aging.days_61_90));
+            println!("  Over 90 days:          {}", format_amount(aging.days_over_90));
+            println!("{}", "-".repeat(60));
+            println!("  Total:                 {}", format_amount(aging.total));
+        }
+    }
+    Ok(())
 }

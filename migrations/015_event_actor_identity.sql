@@ -1,0 +1,24 @@
+-- Server identity on the event envelope (MULTITENANT-SPEC Phase 1).
+--
+-- The single-writer log stamps every event with a free-text `user_id` and a
+-- client `timestamp` (when the event occurred). The move to a server-authoritative
+-- multi-writer model adds two nullable columns:
+--
+--   * `actor_id`    — the authenticated user that produced the event. NULL for
+--                     legacy/solo single-writer streams (there was no
+--                     authenticated identity). `user_id` is retained unchanged
+--                     for audit and back-compat.
+--   * `received_at` — the server-stamped time the event was accepted. This
+--                     becomes canonical for ordering in the multi-writer model;
+--                     the client `timestamp` (occurred_at) is kept for audit.
+--                     NULL until a server stamps it, so solo/local-first events
+--                     never carry one.
+--
+-- Both are nullable with no default, so existing rows backfill as NULL
+-- automatically (actor_id = NULL / 'legacy', received_at = NULL). Neither column
+-- is a hash input (see `compute_event_hash`): they are server-stamped and may be
+-- absent, so hashing them would destabilize legacy hashes and make appends
+-- non-deterministic. Solo/local-first behavior is therefore byte-for-byte
+-- unchanged.
+ALTER TABLE events ADD COLUMN actor_id TEXT;
+ALTER TABLE events ADD COLUMN received_at TEXT;

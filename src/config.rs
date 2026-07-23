@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
+use crate::registry::Registry;
 use crate::tui::theme::ThemePreset;
 
+/// User-level application configuration. Persisted in the root registry
+/// (`~/.local/share/accountir/registry.db`) — this struct is just a convenience
+/// view over the `preferences` table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -24,28 +27,22 @@ impl PlaidConfig {
 }
 
 impl AppConfig {
+    /// Load from the registry. Falls back to defaults if the registry can't be
+    /// opened (e.g. no home directory in a sandboxed environment).
     pub fn load() -> Self {
-        let path = config_path();
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+        match Registry::open_default() {
+            Ok(reg) => AppConfig {
+                plaid: reg.get_plaid(),
+                theme: reg.get_theme(),
+            },
             Err(_) => AppConfig::default(),
         }
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = config_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&path, contents)?;
+        let reg = Registry::open_default()?;
+        reg.set_plaid(&self.plaid)?;
+        reg.set_theme(self.theme)?;
         Ok(())
     }
-}
-
-fn config_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("accountir")
-        .join("config.toml")
 }

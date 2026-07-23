@@ -145,6 +145,7 @@ impl EventLogView {
                     t if t.starts_with("account") => theme.header,
                     t if t.starts_with("company") => Color::Magenta,
                     t if t.starts_with("user") => Color::Blue,
+                    t if t.starts_with("bill") || t.starts_with("invoice") => Color::Cyan,
                     t if t.starts_with("reconciliation") || t.starts_with("transaction") => {
                         theme.accent
                     }
@@ -428,6 +429,91 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 "Synced {} transactions for {}",
                 transactions_added,
                 widgets::truncate(item_id, 8)
+            )
+        }
+        Event::EventServiceRegistered { name, root_url, .. } => {
+            format!("Registered service '{}' ({})", name, widgets::truncate(root_url, 30))
+        }
+        Event::EventServiceRemoved { service_id } => {
+            format!("Removed service {}", widgets::truncate(service_id, 8))
+        }
+        Event::EventServiceSynced {
+            service_id,
+            events_processed,
+            entries_created,
+            errors,
+        } => {
+            format!(
+                "Synced service {}: {} events, {} entries, {} errors",
+                widgets::truncate(service_id, 8),
+                events_processed,
+                entries_created,
+                errors
+            )
+        }
+        Event::BillReceived {
+            vendor,
+            amount,
+            due_date,
+            ..
+        } => {
+            format!(
+                "Bill from {} for ${:.2} due {}",
+                vendor,
+                *amount as f64 / 100.0,
+                due_date
+            )
+        }
+        Event::BillPaymentApplied {
+            bill_id,
+            amount_applied,
+            ..
+        } => {
+            format!(
+                "Payment ${:.2} applied to bill {}",
+                *amount_applied as f64 / 100.0,
+                widgets::truncate(bill_id, 8)
+            )
+        }
+        Event::BillVoided { bill_id, reason } => {
+            format!(
+                "Voided bill {} - {}",
+                widgets::truncate(bill_id, 8),
+                widgets::truncate(reason, 30)
+            )
+        }
+        Event::InvoiceIssued {
+            customer,
+            amount,
+            due_date,
+            ..
+        } => {
+            format!(
+                "Invoice to {} for ${:.2} due {}",
+                customer,
+                *amount as f64 / 100.0,
+                due_date
+            )
+        }
+        Event::InvoicePaymentReceived {
+            invoice_id,
+            amount_applied,
+            ..
+        } => {
+            format!(
+                "Payment ${:.2} received on invoice {}",
+                *amount_applied as f64 / 100.0,
+                widgets::truncate(invoice_id, 8)
+            )
+        }
+        Event::InvoiceVoided {
+            invoice_id,
+            reason,
+        } => {
+            format!(
+                "Voided invoice {} - {}",
+                widgets::truncate(invoice_id, 8),
+                widgets::truncate(reason, 30)
             )
         }
     }

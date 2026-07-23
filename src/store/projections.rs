@@ -149,6 +149,14 @@ impl<'a> Projector<'a> {
                     crate::events::types::JournalEntrySource::Recurring => "recurring",
                     crate::events::types::JournalEntrySource::System => "system",
                     crate::events::types::JournalEntrySource::Plaid => "plaid",
+                    crate::events::types::JournalEntrySource::Pos => "pos",
+                    crate::events::types::JournalEntrySource::PurchaseOrder => "purchase_order",
+                    crate::events::types::JournalEntrySource::InventoryAdjustment => "inventory_adjustment",
+                    crate::events::types::JournalEntrySource::EventService => "event_service",
+                    crate::events::types::JournalEntrySource::BillPayable => "bill_payable",
+                    crate::events::types::JournalEntrySource::InvoiceReceivable => "invoice_receivable",
+                    crate::events::types::JournalEntrySource::BillPayment => "bill_payment",
+                    crate::events::types::JournalEntrySource::InvoicePayment => "invoice_payment",
                 });
 
                 self.conn.execute(
@@ -371,6 +379,154 @@ impl<'a> Projector<'a> {
                     params![sync_timestamp, item_id],
                 )?;
             }
+            Event::EventServiceRegistered {
+                service_id,
+                name,
+                root_url,
+                api_key,
+            } => {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO event_services (id, name, root_url, api_key, status, connected_at_event)
+                     VALUES (?1, ?2, ?3, ?4, 'active', ?5)",
+                    params![service_id, name, root_url, api_key, stored_event.id],
+                )?;
+            }
+            Event::EventServiceRemoved { service_id } => {
+                self.conn.execute(
+                    "UPDATE event_services SET status = 'removed' WHERE id = ?1",
+                    params![service_id],
+                )?;
+            }
+            Event::EventServiceSynced {
+                service_id,
+                events_processed,
+                entries_created,
+                errors: _,
+            } => {
+                self.conn.execute(
+                    "UPDATE event_services SET last_synced_at = datetime('now'),
+                     events_processed = events_processed + ?1,
+                     entries_created = entries_created + ?2
+                     WHERE id = ?3",
+                    params![events_processed, entries_created, service_id],
+                )?;
+            }
+            Event::BillReceived {
+                bill_id,
+                vendor,
+                amount,
+                currency,
+                due_date,
+                terms,
+                memo,
+                entry_id,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO bills (id, vendor, amount, currency, amount_paid, status, due_date, terms, memo, entry_id, posted_at_event, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, 0, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
+                    params![
+                        bill_id,
+                        vendor,
+                        amount,
+                        currency,
+                        due_date.to_string(),
+                        terms,
+                        memo,
+                        entry_id,
+                        stored_event.id,
+                    ],
+                )?;
+            }
+            Event::BillPaymentApplied {
+                bill_id,
+                payment_entry_id,
+                amount_applied,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO bill_payments (bill_id, payment_entry_id, amount_applied, applied_at_event)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![bill_id, payment_entry_id, amount_applied, stored_event.id],
+                )?;
+                self.conn.execute(
+                    "UPDATE bills SET
+                         amount_paid = amount_paid + ?1,
+                         status = CASE
+                             WHEN amount_paid + ?1 >= amount THEN 'paid'
+                             WHEN amount_paid + ?1 > 0 THEN 'partial'
+                             ELSE 'open'
+                         END,
+                         updated_at_event = ?2
+                     WHERE id = ?3",
+                    params![amount_applied, stored_event.id, bill_id],
+                )?;
+            }
+            Event::BillVoided {
+                bill_id,
+                reason: _,
+            } => {
+                self.conn.execute(
+                    "UPDATE bills SET status = 'void', updated_at_event = ?1 WHERE id = ?2",
+                    params![stored_event.id, bill_id],
+                )?;
+            }
+            Event::InvoiceIssued {
+                invoice_id,
+                customer,
+                amount,
+                currency,
+                due_date,
+                terms,
+                memo,
+                entry_id,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO invoices (id, customer, amount, currency, amount_paid, status, due_date, terms, memo, entry_id, posted_at_event, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, 0, 'open', ?5, ?6, ?7, ?8, ?9, ?9)",
+                    params![
+                        invoice_id,
+                        customer,
+                        amount,
+                        currency,
+                        due_date.to_string(),
+                        terms,
+                        memo,
+                        entry_id,
+                        stored_event.id,
+                    ],
+                )?;
+            }
+            Event::InvoicePaymentReceived {
+                invoice_id,
+                payment_entry_id,
+                amount_applied,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO invoice_payments (invoice_id, payment_entry_id, amount_applied, applied_at_event)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![invoice_id, payment_entry_id, amount_applied, stored_event.id],
+                )?;
+                self.conn.execute(
+                    "UPDATE invoices SET
+                         amount_paid = amount_paid + ?1,
+                         status = CASE
+                             WHEN amount_paid + ?1 >= amount THEN 'paid'
+                             WHEN amount_paid + ?1 > 0 THEN 'partial'
+                             ELSE 'open'
+                         END,
+                         updated_at_event = ?2
+                     WHERE id = ?3",
+                    params![amount_applied, stored_event.id, invoice_id],
+                )?;
+            }
+            Event::InvoiceVoided {
+                invoice_id,
+                reason: _,
+            } => {
+                self.conn.execute(
+                    "UPDATE invoices SET status = 'void', updated_at_event = ?1 WHERE id = ?2",
+                    params![stored_event.id, invoice_id],
+                )?;
+            }
             Event::ReconciliationStarted {
                 reconciliation_id,
                 account_id,
@@ -454,7 +610,12 @@ impl<'a> Projector<'a> {
     pub fn rebuild(&self, events: &[StoredEvent]) -> Result<(), ProjectionError> {
         // Clear all projections
         self.conn.execute_batch(
-            "DELETE FROM plaid_imported_transactions;
+            "DELETE FROM bill_payments;
+             DELETE FROM invoice_payments;
+             DELETE FROM bills;
+             DELETE FROM invoices;
+             DELETE FROM event_services;
+             DELETE FROM plaid_imported_transactions;
              DELETE FROM plaid_local_accounts;
              DELETE FROM plaid_items;
              DELETE FROM cleared_transactions;
@@ -479,17 +640,47 @@ impl<'a> Projector<'a> {
     }
 }
 
+/// Backend-level projection application (SPEC §6.1 storage abstraction).
+///
+/// The event store folds events into its materialized projection tables
+/// (`accounts`, `journal_entries`, …). This trait is the backend-agnostic
+/// surface for that fold: callers say "apply this event to the projections"
+/// without reaching for a raw `rusqlite::Connection`, so the same command and
+/// import code runs against either the local SQLite store or the Postgres
+/// group-server backend (which will implement this trait with Postgres SQL).
+///
+/// The SQLite implementation below just drives the existing [`Projector`]. The
+/// methods take `&mut self` because a Postgres client requires a mutable
+/// borrow to execute; SQLite is happy either way.
+pub trait ProjectionStore {
+    /// Apply a single event to the projection tables.
+    fn apply_projection(&mut self, stored_event: &StoredEvent) -> Result<(), ProjectionError>;
+
+    /// Clear and replay `events` to rebuild every projection from scratch.
+    fn rebuild_projections(&mut self, events: &[StoredEvent]) -> Result<(), ProjectionError>;
+}
+
+impl ProjectionStore for crate::store::event_store::EventStore {
+    fn apply_projection(&mut self, stored_event: &StoredEvent) -> Result<(), ProjectionError> {
+        Projector::new(self.connection()).apply(stored_event)
+    }
+
+    fn rebuild_projections(&mut self, events: &[StoredEvent]) -> Result<(), ProjectionError> {
+        Projector::new(self.connection()).rebuild(events)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::events::types::{EventEnvelope, JournalLineData};
     use crate::store::event_store::EventStore;
-    use crate::store::migrations::init_schema;
+    use crate::store::migrations::SchemaStore;
     use chrono::NaiveDate;
 
     fn setup() -> EventStore {
-        let store = EventStore::in_memory().unwrap();
-        init_schema(store.connection()).unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        store.init_schema().unwrap();
         store
     }
 
@@ -497,10 +688,7 @@ mod tests {
         let stored = store
             .append(EventEnvelope::new(event, user_id.to_string()))
             .unwrap();
-        {
-            let projector = Projector::new(store.connection());
-            projector.apply(&stored).unwrap();
-        }
+        store.apply_projection(&stored).unwrap();
         stored
     }
 
@@ -740,10 +928,7 @@ mod tests {
         assert_eq!(count, 2);
 
         // Rebuild from scratch
-        {
-            let projector = Projector::new(store.connection());
-            projector.rebuild(&stored_events).unwrap();
-        }
+        store.rebuild_projections(&stored_events).unwrap();
 
         // Verify same state after rebuild
         let count_after: i32 = store

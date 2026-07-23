@@ -79,13 +79,21 @@ impl HelpModal {
 
         // Add context-specific help
         let context_lines = match context {
-            HelpContext::Startup => self.startup_help(theme),
+            HelpContext::BusinessPicker => self.business_picker_help(theme),
             HelpContext::Dashboard => self.dashboard_help(theme),
             HelpContext::Accounts => self.accounts_help(theme),
             HelpContext::Journal => self.journal_help(theme),
             HelpContext::Reports => self.reports_help(theme),
+            HelpContext::Payables | HelpContext::Receivables => {
+                vec![
+                    Self::section_header("AP/AR View", theme),
+                    Self::key_line("j/k", "Navigate up/down", theme),
+                    Self::key_line("r", "Refresh data", theme),
+                ]
+            }
             HelpContext::EventLog => self.event_log_help(theme),
             HelpContext::Plaid => self.plaid_help(theme),
+            HelpContext::Services => self.services_help(theme),
         };
 
         lines.extend(context_lines);
@@ -107,18 +115,23 @@ impl HelpModal {
         Line::from(Span::styled(label, Style::default().fg(theme.info)))
     }
 
-    fn startup_help(&self, theme: &Theme) -> Vec<Line<'static>> {
+    fn business_picker_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
-            Self::section_header("  Startup Screen", theme),
+            Self::section_header("  Choose a Business", theme),
             Line::from(""),
-            Self::key_line("  ↑/↓ or j/k", "Navigate menu", theme),
-            Self::key_line("  Enter", "Select option", theme),
-            Self::key_line("  Esc", "Cancel input", theme),
+            Self::key_line("  ↑/↓ or j/k", "Navigate businesses", theme),
+            Self::key_line("  Enter", "Open the selected business", theme),
+            Self::key_line("  + or n", "Add a business (new file or import existing)", theme),
+            Self::key_line("  a", "Archive the selected business", theme),
+            Self::key_line("  r", "Rename (set a custom display name)", theme),
+            Self::key_line("  v", "Toggle archived list", theme),
+            Self::key_line("  R", "Restore (only in archived list)", theme),
+            Self::key_line("  Esc / q", "Quit", theme),
             Line::from(""),
-            Self::section_label("  Options:", theme),
-            Line::from("  • Create New Database - Start a fresh accounting file"),
-            Line::from("  • Open Database - Open an existing .db file"),
-            Line::from("  • Recent Databases - Quick access to found .db files"),
+            Self::section_label("  About:", theme),
+            Line::from("  Each business is a separate accounting database (.db)."),
+            Line::from("  The registry at ~/.local/share/accountir/registry.db"),
+            Line::from("  tracks where each business's file lives and its name."),
         ]
     }
 
@@ -258,6 +271,28 @@ impl HelpModal {
         ]
     }
 
+    fn services_help(&self, theme: &Theme) -> Vec<Line<'static>> {
+        vec![
+            Self::section_header("  Event Services View", theme),
+            Line::from(""),
+            Self::key_line("  a", "Add a new event service", theme),
+            Self::key_line("  s", "Sync selected service", theme),
+            Self::key_line("  d", "Remove selected service", theme),
+            Self::key_line("  ↑/↓ or j/k", "Navigate services", theme),
+            Line::from(""),
+            Self::section_label("  About Event Services:", theme),
+            Line::from("  Register external apps that publish accounting"),
+            Line::from("  events via the accountir-events package."),
+            Line::from("  Accountir polls these services and converts"),
+            Line::from("  events into journal entries."),
+            Line::from(""),
+            Self::section_label("  Setup:", theme),
+            Line::from("  1. Press 'a' to register a service (name, URL, API key)"),
+            Line::from("  2. Configure ingest account mappings via the API"),
+            Line::from("  3. Press 's' to sync events from the service"),
+        ]
+    }
+
     fn event_log_help(&self, theme: &Theme) -> Vec<Line<'static>> {
         vec![
             Self::section_header("  Event Log View", theme),
@@ -291,11 +326,14 @@ impl Default for HelpModal {
 /// Context for which view the help is being shown
 #[derive(Debug, Clone, Copy)]
 pub enum HelpContext {
-    Startup,
+    BusinessPicker,
     Dashboard,
     Accounts,
     Journal,
     Reports,
+    Payables,
+    Receivables,
     EventLog,
     Plaid,
+    Services,
 }

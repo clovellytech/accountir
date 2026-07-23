@@ -3,7 +3,7 @@ use crate::events::types::{
 };
 use crate::gnucash::{fraction_to_cents, GncBook, GnuCashError};
 use crate::store::event_store::EventStore;
-use crate::store::projections::Projector;
+use crate::store::projections::ProjectionStore;
 use std::collections::{HashMap, HashSet, VecDeque};
 use uuid::Uuid;
 
@@ -404,9 +404,8 @@ fn import_inner(
         let stored = store
             .append(envelope)
             .map_err(|e| GnuCashError::EventStore(e.to_string()))?;
-        let projector = Projector::new(store.connection());
-        projector
-            .apply(&stored)
+                store
+            .apply_projection(&stored)
             .map_err(|e| GnuCashError::EventStore(e.to_string()))?;
 
         summary.transactions_imported += 1;
@@ -425,9 +424,8 @@ fn append_and_project(
     let stored = store
         .append(envelope)
         .map_err(|e| GnuCashError::EventStore(e.to_string()))?;
-    let projector = Projector::new(store.connection());
-    projector
-        .apply(&stored)
+        store
+        .apply_projection(&stored)
         .map_err(|e| GnuCashError::EventStore(e.to_string()))?;
     Ok(())
 }

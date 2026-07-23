@@ -44,6 +44,30 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             7,
             include_str!("../../migrations/007_plaid_balance_snapshot.sql"),
         ),
+        (8, include_str!("../../migrations/008_ingest_mappings.sql")),
+        (9, include_str!("../../migrations/009_event_services.sql")),
+        (10, include_str!("../../migrations/010_ap_ar.sql")),
+        (
+            11,
+            include_str!("../../migrations/011_staged_service_events.sql"),
+        ),
+        (12, include_str!("../../migrations/012_vendor_rules.sql")),
+        (
+            13,
+            include_str!("../../migrations/013_reconciliation_one_in_progress.sql"),
+        ),
+        (
+            14,
+            include_str!("../../migrations/014_journal_entry_reference_unique.sql"),
+        ),
+        (
+            15,
+            include_str!("../../migrations/015_event_actor_identity.sql"),
+        ),
+        (
+            16,
+            include_str!("../../migrations/016_event_service_root_url_unique.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -77,6 +101,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
     conn.execute_batch(
         r#"
         -- Core event store (append-only)
+        -- actor_id / received_at are the server-identity fields (migration 015).
+        -- Nullable: NULL = legacy/solo single-writer. Not hash inputs.
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY,
             event_type TEXT NOT NULL,
@@ -84,6 +110,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             hash BLOB NOT NULL,
             user_id TEXT NOT NULL,
             timestamp TEXT NOT NULL,
+            actor_id TEXT,
+            received_at TEXT,
             UNIQUE(hash)
         );
 
@@ -296,21 +324,159 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
 
         -- Indexes for common queries
         CREATE INDEX IF NOT EXISTS idx_journal_entries_date ON journal_entries(date);
+        -- At most one live journal entry per non-null reference (invariant audit:
+        -- ingest ref-dedup). DB backstop for the in-txn check in post_entry;
+        -- mirrors check_idempotent (non-null reference, not voided).
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_journal_entries_reference_unique
+            ON journal_entries(reference) WHERE reference IS NOT NULL AND is_void = 0;
         CREATE INDEX IF NOT EXISTS idx_journal_lines_account ON journal_lines(account_id);
         CREATE INDEX IF NOT EXISTS idx_journal_lines_entry ON journal_lines(entry_id);
         CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
         CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
         CREATE INDEX IF NOT EXISTS idx_accounts_number ON accounts(account_number);
         CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounts(account_type);
+
+        -- At most one in-progress reconciliation per account (invariant audit:
+        -- ReconciliationStarted). DB backstop for the in-txn check.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reconciliations_one_in_progress
+            ON reconciliations(account_id) WHERE status = 'in_progress';
+
+        -- Ingest account mappings (for POS/inventory integration)
+        CREATE TABLE IF NOT EXISTS ingest_account_mappings (
+            key TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Vendor → payable account rules (per-vendor AP matching)
+        CREATE TABLE IF NOT EXISTS vendor_account_rules (
+            id TEXT PRIMARY KEY,
+            pattern TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Accounts Payable / Accounts Receivable
+        CREATE TABLE IF NOT EXISTS bills (
+            id TEXT PRIMARY KEY,
+            vendor TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'USD',
+            amount_paid INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            due_date TEXT NOT NULL,
+            terms TEXT,
+            memo TEXT,
+            entry_id TEXT NOT NULL,
+            posted_at_event INTEGER REFERENCES events(id),
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS bill_payments (
+            bill_id TEXT NOT NULL REFERENCES bills(id),
+            payment_entry_id TEXT NOT NULL,
+            amount_applied INTEGER NOT NULL,
+            applied_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (bill_id, payment_entry_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS invoices (
+            id TEXT PRIMARY KEY,
+            customer TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            currency TEXT NOT NULL DEFAULT 'USD',
+            amount_paid INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            due_date TEXT NOT NULL,
+            terms TEXT,
+            memo TEXT,
+            entry_id TEXT NOT NULL,
+            posted_at_event INTEGER REFERENCES events(id),
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS invoice_payments (
+            invoice_id TEXT NOT NULL REFERENCES invoices(id),
+            payment_entry_id TEXT NOT NULL,
+            amount_applied INTEGER NOT NULL,
+            applied_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (invoice_id, payment_entry_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bills_status ON bills(status);
+        CREATE INDEX IF NOT EXISTS idx_bills_due_date ON bills(due_date);
+        CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
+        CREATE INDEX IF NOT EXISTS idx_invoices_due_date ON invoices(due_date);
+
+        -- Staged service events (fetched events awaiting user review)
+        CREATE TABLE IF NOT EXISTS staged_service_events (
+            id TEXT PRIMARY KEY,
+            service_id TEXT NOT NULL,
+            remote_event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            data TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            error_message TEXT,
+            staged_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(service_id, remote_event_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_staged_svc_events_status ON staged_service_events(status);
+
+        -- Event services (external apps publishing via accountir-events)
+        CREATE TABLE IF NOT EXISTS event_services (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            root_url TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            cursor TEXT,
+            last_synced_at TEXT,
+            events_processed INTEGER DEFAULT 0,
+            entries_created INTEGER DEFAULT 0,
+            connected_at_event INTEGER REFERENCES events(id)
+        );
+
+        -- At most one active event service per root_url. DB backstop for the
+        -- in-txn check in register_service.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_event_services_active_root_url
+            ON event_services(root_url) WHERE status = 'active';
         "#,
     )?;
 
     Ok(())
 }
 
+/// Backend-level schema management (SPEC §6.1 storage abstraction).
+///
+/// Schema creation and migration are inherently backend-specific (DDL dialect,
+/// autoincrement, index syntax). This trait lets callers initialize/migrate the
+/// store without naming a raw `rusqlite::Connection`, so a Postgres backend can
+/// provide its own DDL behind the same interface. The SQLite implementation
+/// delegates to the free functions above.
+pub trait SchemaStore {
+    /// Create all tables/indexes if they don't exist (idempotent).
+    fn init_schema(&mut self) -> Result<(), MigrationError>;
+
+    /// Apply any pending versioned migrations.
+    fn run_migrations(&mut self) -> Result<(), MigrationError>;
+}
+
+impl SchemaStore for crate::store::event_store::EventStore {
+    fn init_schema(&mut self) -> Result<(), MigrationError> {
+        init_schema(self.connection())
+    }
+
+    fn run_migrations(&mut self) -> Result<(), MigrationError> {
+        run_migrations(self.connection())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
 
     #[test]
     fn test_init_schema() {
@@ -330,5 +496,178 @@ mod tests {
         assert!(tables.contains(&"accounts".to_string()));
         assert!(tables.contains(&"journal_entries".to_string()));
         assert!(tables.contains(&"journal_lines".to_string()));
+    }
+
+    fn has_reference_unique_index(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index'
+             AND name='idx_journal_entries_reference_unique'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    /// Insert two live entries sharing a reference; the second must violate the
+    /// unique index. This is the DB-level backstop for ingest ref-dedup.
+    fn assert_duplicate_reference_rejected(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO journal_entries (id, date, reference, is_void) VALUES ('e1','2026-01-01','R',0)",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO journal_entries (id, date, reference, is_void) VALUES ('e2','2026-01-01','R',0)",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate live reference must be rejected");
+        // Voiding the first frees the reference (mirrors check_idempotent).
+        conn.execute("UPDATE journal_entries SET is_void = 1 WHERE id = 'e1'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO journal_entries (id, date, reference, is_void) VALUES ('e3','2026-01-01','R',0)",
+            [],
+        )
+        .expect("a voided entry frees its reference for re-use");
+    }
+
+    #[test]
+    fn init_schema_has_reference_unique_index_and_enforces_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(has_reference_unique_index(&conn));
+        assert_duplicate_reference_rejected(&conn);
+    }
+
+    fn events_has_column(conn: &Connection, col: &str) -> bool {
+        conn.prepare("SELECT name FROM pragma_table_info('events')")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|c| c == col)
+    }
+
+    #[test]
+    fn init_schema_has_event_actor_identity_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(events_has_column(&conn, "actor_id"));
+        assert!(events_has_column(&conn, "received_at"));
+    }
+
+    #[test]
+    fn migration_015_adds_identity_columns_to_legacy_events_table() {
+        // Simulate a pre-existing DB whose events table predates the identity
+        // columns; applying migration 015 must add them and leave existing rows
+        // backfilled as NULL.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                hash BLOB NOT NULL,
+                user_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                UNIQUE(hash)
+            );
+            INSERT INTO events (event_type, payload, hash, user_id, timestamp)
+            VALUES ('x', '{}', X'00', 'u', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        assert!(!events_has_column(&conn, "actor_id"));
+
+        // Apply the actual migration 015 SQL (the ALTER path exercised by
+        // run_migrations for a DB whose events table predates the columns).
+        conn.execute_batch(include_str!("../../migrations/015_event_actor_identity.sql"))
+            .unwrap();
+
+        assert!(events_has_column(&conn, "actor_id"));
+        assert!(events_has_column(&conn, "received_at"));
+        // Existing row backfilled as NULL.
+        let (a, r): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT actor_id, received_at FROM events LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((a, r), (None, None));
+    }
+
+    #[test]
+    fn init_schema_then_run_migrations_is_idempotent_with_015() {
+        // Production flow: init_schema (creates events WITH the columns) then
+        // run_migrations (whose 015 ALTER would hit "duplicate column"). The
+        // migration runner tolerates that, so the full path must not error.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(events_has_column(&conn, "actor_id"));
+        assert!(events_has_column(&conn, "received_at"));
+    }
+
+    #[test]
+    fn run_migrations_adds_reference_unique_index() {
+        // The production path is init_schema THEN run_migrations; the migration
+        // must also (idempotently) leave the index in place.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(has_reference_unique_index(&conn));
+    }
+
+    fn has_event_service_url_index(conn: &Connection) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index'
+             AND name='idx_event_services_active_root_url'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    #[test]
+    fn init_schema_has_event_service_url_index_and_enforces_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(has_event_service_url_index(&conn));
+        // Two active services can't share a root_url; a disconnected one frees it.
+        conn.execute(
+            "INSERT INTO event_services (id, name, root_url, api_key, status)
+             VALUES ('s1','A','https://x','k','active')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO event_services (id, name, root_url, api_key, status)
+             VALUES ('s2','B','https://x','k','active')",
+            [],
+        );
+        assert!(dup.is_err(), "duplicate active root_url must be rejected");
+        conn.execute(
+            "UPDATE event_services SET status = 'disconnected' WHERE id = 's1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO event_services (id, name, root_url, api_key, status)
+             VALUES ('s3','C','https://x','k','active')",
+            [],
+        )
+        .expect("a disconnected service frees its root_url");
+    }
+
+    #[test]
+    fn run_migrations_adds_event_service_url_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+        assert!(has_event_service_url_index(&conn));
     }
 }

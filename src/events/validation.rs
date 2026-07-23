@@ -270,6 +270,96 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             validate_non_empty(item_id, "item_id")?;
             validate_non_empty(sync_timestamp, "sync_timestamp")?;
         }
+        Event::EventServiceRegistered {
+            service_id,
+            name,
+            root_url,
+            api_key,
+        } => {
+            validate_non_empty(service_id, "service_id")?;
+            validate_non_empty(name, "name")?;
+            validate_non_empty(root_url, "root_url")?;
+            validate_non_empty(api_key, "api_key")?;
+        }
+        Event::EventServiceRemoved { service_id } => {
+            validate_non_empty(service_id, "service_id")?;
+        }
+        Event::EventServiceSynced { service_id, .. } => {
+            validate_non_empty(service_id, "service_id")?;
+        }
+        Event::BillReceived {
+            bill_id,
+            vendor,
+            amount,
+            currency,
+            entry_id,
+            ..
+        } => {
+            validate_non_empty(bill_id, "bill_id")?;
+            validate_non_empty(vendor, "vendor")?;
+            validate_non_empty(entry_id, "entry_id")?;
+            validate_currency_code(currency)?;
+            if *amount <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "Bill amount must be positive".to_string(),
+                ));
+            }
+        }
+        Event::BillPaymentApplied {
+            bill_id,
+            payment_entry_id,
+            amount_applied,
+        } => {
+            validate_non_empty(bill_id, "bill_id")?;
+            validate_non_empty(payment_entry_id, "payment_entry_id")?;
+            if *amount_applied <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "Applied amount must be positive".to_string(),
+                ));
+            }
+        }
+        Event::BillVoided { bill_id, reason } => {
+            validate_non_empty(bill_id, "bill_id")?;
+            validate_non_empty(reason, "reason")?;
+        }
+        Event::InvoiceIssued {
+            invoice_id,
+            customer,
+            amount,
+            currency,
+            entry_id,
+            ..
+        } => {
+            validate_non_empty(invoice_id, "invoice_id")?;
+            validate_non_empty(customer, "customer")?;
+            validate_non_empty(entry_id, "entry_id")?;
+            validate_currency_code(currency)?;
+            if *amount <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "Invoice amount must be positive".to_string(),
+                ));
+            }
+        }
+        Event::InvoicePaymentReceived {
+            invoice_id,
+            payment_entry_id,
+            amount_applied,
+        } => {
+            validate_non_empty(invoice_id, "invoice_id")?;
+            validate_non_empty(payment_entry_id, "payment_entry_id")?;
+            if *amount_applied <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "Applied amount must be positive".to_string(),
+                ));
+            }
+        }
+        Event::InvoiceVoided {
+            invoice_id,
+            reason,
+        } => {
+            validate_non_empty(invoice_id, "invoice_id")?;
+            validate_non_empty(reason, "reason")?;
+        }
     }
     Ok(())
 }

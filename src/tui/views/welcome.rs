@@ -6,52 +6,26 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph},
     Frame,
 };
-use std::path::PathBuf;
 
+use crate::registry::Registry;
 use crate::tui::theme::Theme;
 
-/// Config file location for storing preferences
-fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("accountir").join("config.json"))
-}
-
-/// Check if welcome screen should be shown
+/// Check if welcome screen should be shown. Reads `show_welcome` from the
+/// registry; defaults to `true` if the registry can't be opened or the pref
+/// is unset.
 pub fn should_show_welcome() -> bool {
-    let Some(path) = config_path() else {
-        return true; // Show by default if can't determine config path
-    };
-
-    if !path.exists() {
-        return true; // Show by default if no config exists
-    }
-
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            // Parse JSON manually to avoid extra dependency
-            !content.contains("\"show_welcome\":false")
-        }
+    match Registry::open_default() {
+        Ok(reg) => reg.get_bool("show_welcome", true),
         Err(_) => true,
     }
 }
 
-/// Save the "don't show welcome" preference
+/// Save the "don't show welcome" preference. Silently no-ops if the registry
+/// can't be opened (matches the prior file-based behavior).
 pub fn set_show_welcome(show: bool) {
-    let Some(path) = config_path() else {
-        return;
-    };
-
-    // Ensure config directory exists
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Ok(reg) = Registry::open_default() {
+        let _ = reg.set_bool("show_welcome", show);
     }
-
-    let content = if show {
-        "{\"show_welcome\":true}\n"
-    } else {
-        "{\"show_welcome\":false}\n"
-    };
-
-    let _ = std::fs::write(&path, content);
 }
 
 /// Reset the welcome screen to show on next startup

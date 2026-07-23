@@ -15,7 +15,7 @@ repository = "https://github.com/zakvdm/accountir"
 tokio = { version = "1", features = ["full"] }
 
 # SQLite
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "backup"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -51,6 +51,9 @@ rust_decimal = { version = "1", features = ["serde"] }
 
 # Config directories
 dirs = "6"
+
+# Excel (.xlsx) reading — Square payroll "Company Totals" report
+calamine = "0.26"
 
 # Config file
 toml = { version = "1.0.7+spec-1.1.0", features = ["preserve_order"] }

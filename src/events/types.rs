@@ -23,6 +23,14 @@ pub enum JournalEntrySource {
     Recurring,
     System,
     Plaid,
+    Pos,
+    PurchaseOrder,
+    InventoryAdjustment,
+    EventService,
+    BillPayable,
+    InvoiceReceivable,
+    BillPayment,
+    InvoicePayment,
 }
 
 /// Info about a Plaid account, used in PlaidItemConnected events
@@ -227,6 +235,63 @@ pub enum Event {
         sync_timestamp: String,
     },
 
+    // Event Services (external apps publishing via accountir-events)
+    EventServiceRegistered {
+        service_id: String,
+        name: String,
+        root_url: String,
+        api_key: String,
+    },
+    EventServiceRemoved {
+        service_id: String,
+    },
+    EventServiceSynced {
+        service_id: String,
+        events_processed: u32,
+        entries_created: u32,
+        errors: u32,
+    },
+
+    // Accounts Payable / Accounts Receivable
+    BillReceived {
+        bill_id: String,
+        vendor: String,
+        amount: i64,
+        currency: String,
+        due_date: NaiveDate,
+        terms: String,
+        memo: Option<String>,
+        entry_id: String,
+    },
+    BillPaymentApplied {
+        bill_id: String,
+        payment_entry_id: String,
+        amount_applied: i64,
+    },
+    BillVoided {
+        bill_id: String,
+        reason: String,
+    },
+    InvoiceIssued {
+        invoice_id: String,
+        customer: String,
+        amount: i64,
+        currency: String,
+        due_date: NaiveDate,
+        terms: String,
+        memo: Option<String>,
+        entry_id: String,
+    },
+    InvoicePaymentReceived {
+        invoice_id: String,
+        payment_entry_id: String,
+        amount_applied: i64,
+    },
+    InvoiceVoided {
+        invoice_id: String,
+        reason: String,
+    },
+
     // Bank Reconciliation
     ReconciliationStarted {
         reconciliation_id: String,
@@ -283,6 +348,15 @@ impl Event {
             Event::PlaidAccountMapped { .. } => "plaid_account_mapped",
             Event::PlaidAccountUnmapped { .. } => "plaid_account_unmapped",
             Event::PlaidTransactionsSynced { .. } => "plaid_transactions_synced",
+            Event::EventServiceRegistered { .. } => "event_service_registered",
+            Event::EventServiceRemoved { .. } => "event_service_removed",
+            Event::EventServiceSynced { .. } => "event_service_synced",
+            Event::BillReceived { .. } => "bill_received",
+            Event::BillPaymentApplied { .. } => "bill_payment_applied",
+            Event::BillVoided { .. } => "bill_voided",
+            Event::InvoiceIssued { .. } => "invoice_issued",
+            Event::InvoicePaymentReceived { .. } => "invoice_payment_received",
+            Event::InvoiceVoided { .. } => "invoice_voided",
             Event::ReconciliationStarted { .. } => "reconciliation_started",
             Event::TransactionCleared { .. } => "transaction_cleared",
             Event::TransactionUncleared { .. } => "transaction_uncleared",
@@ -319,6 +393,15 @@ impl Event {
             Event::PlaidAccountMapped { item_id, .. } => Some(item_id),
             Event::PlaidAccountUnmapped { item_id, .. } => Some(item_id),
             Event::PlaidTransactionsSynced { item_id, .. } => Some(item_id),
+            Event::EventServiceRegistered { service_id, .. } => Some(service_id),
+            Event::EventServiceRemoved { service_id } => Some(service_id),
+            Event::EventServiceSynced { service_id, .. } => Some(service_id),
+            Event::BillReceived { bill_id, .. } => Some(bill_id),
+            Event::BillPaymentApplied { bill_id, .. } => Some(bill_id),
+            Event::BillVoided { bill_id, .. } => Some(bill_id),
+            Event::InvoiceIssued { invoice_id, .. } => Some(invoice_id),
+            Event::InvoicePaymentReceived { invoice_id, .. } => Some(invoice_id),
+            Event::InvoiceVoided { invoice_id, .. } => Some(invoice_id),
             Event::ReconciliationStarted {
                 reconciliation_id, ..
             } => Some(reconciliation_id),
@@ -342,12 +425,26 @@ pub struct StoredEvent {
     pub id: i64,
     pub event: Event,
     pub hash: Vec<u8>,
+    /// Free-text writer identity (legacy, always present). Retained for audit and
+    /// back-compat; `actor_id` is the authenticated identity when one exists.
     pub user_id: String,
+    /// Client-supplied wall-clock time the event occurred. Retained for audit;
+    /// `received_at` (server-stamped) is canonical for ordering when set.
     pub timestamp: DateTime<Utc>,
+    /// The authenticated user that produced this event. `None` for legacy/solo
+    /// single-writer streams (existing rows backfill as NULL).
+    pub actor_id: Option<String>,
+    /// Server-stamped receive time; canonical for ordering. `None` until a server
+    /// sets it (solo/local-first events never have one).
+    pub received_at: Option<DateTime<Utc>>,
 }
 
 impl StoredEvent {
-    /// Create a new stored event (hash will be computed by the event store)
+    /// Create a new stored event (hash will be computed by the event store).
+    ///
+    /// The server-identity fields (`actor_id`, `received_at`) default to `None`,
+    /// preserving the legacy/solo single-writer shape. Use
+    /// [`StoredEvent::with_identity`] to carry them through the store.
     pub fn new(
         id: i64,
         event: Event,
@@ -361,6 +458,31 @@ impl StoredEvent {
             hash,
             user_id,
             timestamp,
+            actor_id: None,
+            received_at: None,
+        }
+    }
+
+    /// Create a stored event carrying the server-identity fields — used by the
+    /// store when hydrating rows and when appending events that have an actor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_identity(
+        id: i64,
+        event: Event,
+        hash: Vec<u8>,
+        user_id: String,
+        timestamp: DateTime<Utc>,
+        actor_id: Option<String>,
+        received_at: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            id,
+            event,
+            hash,
+            user_id,
+            timestamp,
+            actor_id,
+            received_at,
         }
     }
 }
@@ -371,6 +493,12 @@ pub struct EventEnvelope {
     pub event: Event,
     pub user_id: String,
     pub timestamp: DateTime<Utc>,
+    /// The authenticated user producing this event. `None` = legacy/solo
+    /// single-writer (no server identity).
+    pub actor_id: Option<String>,
+    /// Server-stamped receive time. `None` until a server stamps it; solo
+    /// local-first appends leave it `None`.
+    pub received_at: Option<DateTime<Utc>>,
 }
 
 impl EventEnvelope {
@@ -379,6 +507,8 @@ impl EventEnvelope {
             event,
             user_id,
             timestamp: Utc::now(),
+            actor_id: None,
+            received_at: None,
         }
     }
 
@@ -387,7 +517,23 @@ impl EventEnvelope {
             event,
             user_id,
             timestamp,
+            actor_id: None,
+            received_at: None,
         }
+    }
+
+    /// Set the authenticated actor identity (builder-style). `None` keeps the
+    /// legacy/solo shape.
+    pub fn with_actor(mut self, actor_id: Option<String>) -> Self {
+        self.actor_id = actor_id;
+        self
+    }
+
+    /// Set the server-stamped receive time (builder-style). A server calls this
+    /// when it accepts the event; solo appends never do.
+    pub fn with_received_at(mut self, received_at: Option<DateTime<Utc>>) -> Self {
+        self.received_at = received_at;
+        self
     }
 }
 

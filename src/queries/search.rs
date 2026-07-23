@@ -84,6 +84,7 @@ impl<'a> Search<'a> {
         end_date: Option<NaiveDate>,
         account_id: Option<&str>,
         include_void: bool,
+        limit: Option<usize>,
     ) -> Result<Vec<EntrySearchResult>, SearchError> {
         // When filtering by account, include the account-specific amount and other account info
         let (select_account_amount, select_other_account, select_other_account_id) =
@@ -180,6 +181,11 @@ impl<'a> Search<'a> {
         }
 
         sql.push_str(" ORDER BY je.date DESC, je.id DESC");
+        // Bound the result set in SQL when a caller asks (avoids materializing the
+        // whole table then truncating). `limit` is a usize, so no injection.
+        if let Some(n) = limit {
+            sql.push_str(&format!(" LIMIT {n}"));
+        }
 
         let mut stmt = self.conn.prepare(&sql)?;
 
@@ -375,7 +381,7 @@ mod tests {
     use crate::events::types::{Event, EventAccountType, EventEnvelope, JournalLineData};
     use crate::store::event_store::EventStore;
     use crate::store::migrations::init_schema;
-    use crate::store::projections::Projector;
+    use crate::store::projections::ProjectionStore;
 
     fn setup() -> EventStore {
         let store = EventStore::in_memory().unwrap();
@@ -388,8 +394,7 @@ mod tests {
             .append(EventEnvelope::new(event, user_id.to_string()))
             .unwrap();
         {
-            let projector = Projector::new(store.connection());
-            projector.apply(&stored).unwrap();
+            store.apply_projection(&stored).unwrap();
         }
     }
 
@@ -505,7 +510,7 @@ mod tests {
 
         // Search by memo
         let results = search
-            .search_entries(Some("supplies"), None, None, None, false)
+            .search_entries(Some("supplies"), None, None, None, false, None)
             .unwrap();
         assert_eq!(results.len(), 2);
 
@@ -517,6 +522,7 @@ mod tests {
                 Some(NaiveDate::from_ymd_opt(2024, 1, 25).unwrap()),
                 None,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(results.len(), 1);

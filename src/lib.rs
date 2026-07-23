@@ -4,8 +4,10 @@ pub mod domain;
 pub mod events;
 pub mod gnucash;
 pub mod queries;
+pub mod registry;
 pub mod server;
 pub mod store;
+pub mod sync;
 pub mod tui;
 
 pub use domain::*;

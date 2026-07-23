@@ -1,7 +1,8 @@
 use crate::domain::AccountType;
 use crate::events::types::{Event, EventAccountType, EventEnvelope, StoredEvent};
-use crate::store::event_store::{EventStore, EventStoreError};
+use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::Projector;
+use rusqlite::OptionalExtension;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -104,6 +105,109 @@ pub struct ReactivateAccountCommand {
     pub account_id: String,
 }
 
+/// Outcome of an account command's in-txn validation: the invariants held (append
+/// this event) or a domain invariant was violated (reject). Mirrors
+/// [`crate::commands::entry_commands::PostEntryStep`]. The caller wraps the event
+/// in an envelope, stamping identity as appropriate (local `user_id` vs. the
+/// server-authenticated actor on the sync path).
+pub(crate) enum AccountStep {
+    /// All invariants hold under the write lock; append this event.
+    Append(Event),
+    /// A domain invariant was violated.
+    Reject(AccountCommandError),
+}
+
+/// Run `create_account`'s state-dependent invariant inside the append
+/// transaction — the account-number uniqueness check — and, if it holds, build
+/// the `AccountCreated` event. Shared by [`AccountCommands::create_account`] and
+/// the server-side sync submit path so both enforce the SAME uniqueness fence
+/// under the write lock (the read-then-append TOCTOU on the HIGH-risk
+/// `AccountCreated` variant, SPEC §6.2 / invariant audit #4).
+pub(crate) fn build_create_account_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &CreateAccountCommand,
+) -> Result<AccountStep, EventStoreError> {
+    // Uniqueness: no existing account already holds this number.
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM accounts WHERE account_number = ?1",
+            [&cmd.account_number],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if exists {
+        return Ok(AccountStep::Reject(AccountCommandError::AlreadyExists(
+            cmd.account_number.clone(),
+        )));
+    }
+
+    let event = Event::AccountCreated {
+        account_id: Uuid::new_v4().to_string(),
+        account_type: EventAccountType::from(cmd.account_type),
+        account_number: cmd.account_number.clone(),
+        name: cmd.name.clone(),
+        parent_id: cmd.parent_id.clone(),
+        currency: cmd.currency.clone(),
+        description: cmd.description.clone(),
+    };
+    Ok(AccountStep::Append(event))
+}
+
+/// Run `deactivate_account`'s state-dependent invariants inside the append
+/// transaction — the account is active AND has a zero net balance — and, if they
+/// hold, build the `AccountDeactivated` event. Shared by
+/// [`AccountCommands::deactivate_account`] and the server-side sync submit path
+/// so both enforce the SAME fences under the write lock (audit
+/// `AccountDeactivated`, HIGH — a concurrent posting must not sneak a nonzero
+/// balance in after the check).
+pub(crate) fn build_deactivate_account_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &DeactivateAccountCommand,
+) -> Result<AccountStep, EventStoreError> {
+    let is_active: Option<bool> = tx
+        .query_row(
+            "SELECT is_active = 1 FROM accounts WHERE id = ?1",
+            [&cmd.account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match is_active {
+        None => {
+            return Ok(AccountStep::Reject(AccountCommandError::NotFound(
+                cmd.account_id.clone(),
+            )))
+        }
+        Some(false) => {
+            return Ok(AccountStep::Reject(AccountCommandError::InvalidData(
+                "Account is already inactive".to_string(),
+            )))
+        }
+        Some(true) => {}
+    }
+
+    let balance: i64 = tx
+        .query_row(
+            "SELECT COALESCE(SUM(jl.amount), 0)
+             FROM journal_lines jl
+             JOIN journal_entries je ON jl.entry_id = je.id
+             WHERE jl.account_id = ?1 AND je.is_void = 0",
+            [&cmd.account_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if balance != 0 {
+        return Ok(AccountStep::Reject(AccountCommandError::HasBalance));
+    }
+
+    let event = Event::AccountDeactivated {
+        account_id: cmd.account_id.clone(),
+        reason: cmd.reason.clone(),
+    };
+    Ok(AccountStep::Append(event))
+}
+
 /// Account command handler
 pub struct AccountCommands<'a> {
     store: &'a mut EventStore,
@@ -115,300 +219,279 @@ impl<'a> AccountCommands<'a> {
         Self { store, user_id }
     }
 
-    /// Create a new account
+    /// Create a new account.
+    ///
+    /// The account-number uniqueness check runs *inside* the append transaction
+    /// via [`EventStore::append_checked`], so two concurrent creates can't both
+    /// pass the duplicate check and then both append the same number (the
+    /// read-then-append TOCTOU on the HIGH-risk `AccountCreated` variant, SPEC
+    /// §6.2 / invariant audit #4). On a head move we retry against fresh state.
     pub fn create_account(
         &mut self,
         cmd: CreateAccountCommand,
     ) -> Result<StoredEvent, AccountCommandError> {
-        // Check for duplicate account number
-        let exists: bool = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT 1 FROM accounts WHERE account_number = ?1",
-                [&cmd.account_number],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build_create_account_in_txn(tx, &cmd)? {
+                    AccountStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    AccountStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
 
-        if exists {
-            return Err(AccountCommandError::AlreadyExists(cmd.account_number));
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-
-        let account_id = Uuid::new_v4().to_string();
-        let account_type = EventAccountType::from(cmd.account_type);
-
-        let event = Event::AccountCreated {
-            account_id,
-            account_type,
-            account_number: cmd.account_number,
-            name: cmd.name,
-            parent_id: cmd.parent_id,
-            currency: cmd.currency,
-            description: cmd.description,
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-
-        // Apply projection
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        Ok(stored)
     }
 
-    /// Update an existing account
+    /// Update an existing account.
+    ///
+    /// Emits one `AccountUpdated` event per changed field (number, name, parent,
+    /// description) — a batch that must land atomically — via
+    /// [`EventStore::append_checked_many`]. The account-number rename uniqueness
+    /// check runs inside the append transaction (audit `AccountUpdated`), so a
+    /// concurrent create/rename can't collide the number. Retries on a head move.
+    /// Returns the events for the fields that actually changed (empty if none).
     pub fn update_account(
         &mut self,
         cmd: UpdateAccountCommand,
     ) -> Result<Vec<StoredEvent>, AccountCommandError> {
-        // Verify account exists
-        let exists: bool = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT 1 FROM accounts WHERE id = ?1",
-                [&cmd.account_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked_many(
+                head,
+                |tx| {
+                    let exists: bool = tx
+                        .query_row(
+                            "SELECT 1 FROM accounts WHERE id = ?1",
+                            [&cmd.account_id],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if !exists {
+                        return Ok(Verdict::Reject(AccountCommandError::NotFound(
+                            cmd.account_id.clone(),
+                        )));
+                    }
 
-        if !exists {
-            return Err(AccountCommandError::NotFound(cmd.account_id));
-        }
+                    let mut envelopes = Vec::new();
 
-        let mut events = Vec::new();
+                    // account_number — with rename-uniqueness check
+                    if let Some(new_number) = &cmd.account_number {
+                        let old_number: String = tx.query_row(
+                            "SELECT account_number FROM accounts WHERE id = ?1",
+                            [&cmd.account_id],
+                            |row| row.get(0),
+                        )?;
+                        if &old_number != new_number {
+                            let duplicate: bool = tx
+                                .query_row(
+                                    "SELECT 1 FROM accounts WHERE account_number = ?1 AND id != ?2",
+                                    [new_number, &cmd.account_id],
+                                    |_| Ok(true),
+                                )
+                                .optional()?
+                                .unwrap_or(false);
+                            if duplicate {
+                                return Ok(Verdict::Reject(AccountCommandError::AlreadyExists(
+                                    new_number.clone(),
+                                )));
+                            }
+                            envelopes.push(EventEnvelope::new(
+                                Event::AccountUpdated {
+                                    account_id: cmd.account_id.clone(),
+                                    field: "account_number".to_string(),
+                                    old_value: old_number,
+                                    new_value: new_number.clone(),
+                                },
+                                user_id.clone(),
+                            ));
+                        }
+                    }
 
-        // Update account_number
-        if let Some(new_number) = cmd.account_number {
-            let old_number: String = self
-                .store
-                .connection()
-                .query_row(
-                    "SELECT account_number FROM accounts WHERE id = ?1",
-                    [&cmd.account_id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| AccountCommandError::NotFound(cmd.account_id.clone()))?;
+                    // name
+                    if let Some(new_name) = &cmd.name {
+                        let old_name: String = tx.query_row(
+                            "SELECT name FROM accounts WHERE id = ?1",
+                            [&cmd.account_id],
+                            |row| row.get(0),
+                        )?;
+                        if &old_name != new_name {
+                            envelopes.push(EventEnvelope::new(
+                                Event::AccountUpdated {
+                                    account_id: cmd.account_id.clone(),
+                                    field: "name".to_string(),
+                                    old_value: old_name,
+                                    new_value: new_name.clone(),
+                                },
+                                user_id.clone(),
+                            ));
+                        }
+                    }
 
-            if old_number != new_number {
-                // Check for duplicate account number (excluding current account)
-                let duplicate: bool = self
-                    .store
-                    .connection()
-                    .query_row(
-                        "SELECT 1 FROM accounts WHERE account_number = ?1 AND id != ?2",
-                        [&new_number, &cmd.account_id],
-                        |_| Ok(true),
-                    )
-                    .unwrap_or(false);
+                    // parent_id (Option<Option<String>>: Some(x) => set to x)
+                    if let Some(new_parent) = &cmd.parent_id {
+                        let old_parent: Option<String> = tx.query_row(
+                            "SELECT parent_id FROM accounts WHERE id = ?1",
+                            [&cmd.account_id],
+                            |row| row.get(0),
+                        )?;
+                        let old_parent_str = old_parent.unwrap_or_default();
+                        let new_parent_str = new_parent.clone().unwrap_or_default();
+                        if old_parent_str != new_parent_str {
+                            envelopes.push(EventEnvelope::new(
+                                Event::AccountUpdated {
+                                    account_id: cmd.account_id.clone(),
+                                    field: "parent_id".to_string(),
+                                    old_value: old_parent_str,
+                                    new_value: new_parent_str,
+                                },
+                                user_id.clone(),
+                            ));
+                        }
+                    }
 
-                if duplicate {
-                    return Err(AccountCommandError::AlreadyExists(new_number));
-                }
+                    // description
+                    if let Some(new_desc) = &cmd.description {
+                        let old_desc: Option<String> = tx.query_row(
+                            "SELECT description FROM accounts WHERE id = ?1",
+                            [&cmd.account_id],
+                            |row| row.get(0),
+                        )?;
+                        let old_desc_str = old_desc.unwrap_or_default();
+                        if &old_desc_str != new_desc {
+                            envelopes.push(EventEnvelope::new(
+                                Event::AccountUpdated {
+                                    account_id: cmd.account_id.clone(),
+                                    field: "description".to_string(),
+                                    old_value: old_desc_str,
+                                    new_value: new_desc.clone(),
+                                },
+                                user_id.clone(),
+                            ));
+                        }
+                    }
 
-                let event = Event::AccountUpdated {
-                    account_id: cmd.account_id.clone(),
-                    field: "account_number".to_string(),
-                    old_value: old_number,
-                    new_value: new_number,
-                };
+                    Ok(Verdict::Append(envelopes))
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
 
-                let envelope = EventEnvelope::new(event, self.user_id.clone());
-                let stored = self.store.append(envelope)?;
-
-                let projector = Projector::new(self.store.connection());
-                projector.apply(&stored)?;
-
-                events.push(stored);
+            match outcome {
+                CheckedOutcome::Appended(events) => return Ok(events),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
             }
         }
-
-        // Update name
-        if let Some(new_name) = cmd.name {
-            let old_name: String = self
-                .store
-                .connection()
-                .query_row(
-                    "SELECT name FROM accounts WHERE id = ?1",
-                    [&cmd.account_id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| AccountCommandError::NotFound(cmd.account_id.clone()))?;
-
-            if old_name != new_name {
-                let event = Event::AccountUpdated {
-                    account_id: cmd.account_id.clone(),
-                    field: "name".to_string(),
-                    old_value: old_name,
-                    new_value: new_name,
-                };
-
-                let envelope = EventEnvelope::new(event, self.user_id.clone());
-                let stored = self.store.append(envelope)?;
-
-                let projector = Projector::new(self.store.connection());
-                projector.apply(&stored)?;
-
-                events.push(stored);
-            }
-        }
-
-        // Update parent_id
-        if let Some(new_parent) = cmd.parent_id {
-            let old_parent: Option<String> = self
-                .store
-                .connection()
-                .query_row(
-                    "SELECT parent_id FROM accounts WHERE id = ?1",
-                    [&cmd.account_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(None);
-
-            let old_parent_str = old_parent.unwrap_or_default();
-            let new_parent_str = new_parent.unwrap_or_default();
-
-            if old_parent_str != new_parent_str {
-                let event = Event::AccountUpdated {
-                    account_id: cmd.account_id.clone(),
-                    field: "parent_id".to_string(),
-                    old_value: old_parent_str,
-                    new_value: new_parent_str,
-                };
-
-                let envelope = EventEnvelope::new(event, self.user_id.clone());
-                let stored = self.store.append(envelope)?;
-
-                let projector = Projector::new(self.store.connection());
-                projector.apply(&stored)?;
-
-                events.push(stored);
-            }
-        }
-
-        // Update description
-        if let Some(new_desc) = cmd.description {
-            let old_desc: Option<String> = self
-                .store
-                .connection()
-                .query_row(
-                    "SELECT description FROM accounts WHERE id = ?1",
-                    [&cmd.account_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(None);
-
-            let old_desc_str = old_desc.unwrap_or_default();
-            if old_desc_str != new_desc {
-                let event = Event::AccountUpdated {
-                    account_id: cmd.account_id.clone(),
-                    field: "description".to_string(),
-                    old_value: old_desc_str,
-                    new_value: new_desc,
-                };
-
-                let envelope = EventEnvelope::new(event, self.user_id.clone());
-                let stored = self.store.append(envelope)?;
-
-                let projector = Projector::new(self.store.connection());
-                projector.apply(&stored)?;
-
-                events.push(stored);
-            }
-        }
-
-        Ok(events)
     }
 
-    /// Deactivate an account
+    /// Deactivate an account.
+    ///
+    /// Re-checks, inside the append transaction, that the account is active and
+    /// has a zero net balance (audit `AccountDeactivated`, HIGH — a concurrent
+    /// posting must not sneak a nonzero balance in after the check). Retries on a
+    /// head move.
     pub fn deactivate_account(
         &mut self,
         cmd: DeactivateAccountCommand,
     ) -> Result<StoredEvent, AccountCommandError> {
-        // Verify account exists and is active
-        let is_active: bool = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT is_active = 1 FROM accounts WHERE id = ?1",
-                [&cmd.account_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| AccountCommandError::NotFound(cmd.account_id.clone()))?;
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build_deactivate_account_in_txn(tx, &cmd)? {
+                    AccountStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    AccountStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
 
-        if !is_active {
-            return Err(AccountCommandError::InvalidData(
-                "Account is already inactive".to_string(),
-            ));
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-
-        // Check if account has balance
-        let balance: i64 = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT COALESCE(SUM(jl.amount), 0)
-                 FROM journal_lines jl
-                 JOIN journal_entries je ON jl.entry_id = je.id
-                 WHERE jl.account_id = ?1 AND je.is_void = 0",
-                [&cmd.account_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if balance != 0 {
-            return Err(AccountCommandError::HasBalance);
-        }
-
-        let event = Event::AccountDeactivated {
-            account_id: cmd.account_id,
-            reason: cmd.reason,
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        Ok(stored)
     }
 
-    /// Reactivate an account
+    /// Reactivate an account.
+    ///
+    /// Re-checks the "exists and is currently inactive" guard inside the append
+    /// transaction. Retries on a head move.
     pub fn reactivate_account(
         &mut self,
         cmd: ReactivateAccountCommand,
     ) -> Result<StoredEvent, AccountCommandError> {
-        // Verify account exists and is inactive
-        let is_active: bool = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT is_active = 1 FROM accounts WHERE id = ?1",
-                [&cmd.account_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| AccountCommandError::NotFound(cmd.account_id.clone()))?;
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| {
+                    let is_active: Option<bool> = tx
+                        .query_row(
+                            "SELECT is_active = 1 FROM accounts WHERE id = ?1",
+                            [&cmd.account_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    match is_active {
+                        None => {
+                            return Ok(Verdict::Reject(AccountCommandError::NotFound(
+                                cmd.account_id.clone(),
+                            )))
+                        }
+                        Some(true) => {
+                            return Ok(Verdict::Reject(AccountCommandError::InvalidData(
+                                "Account is already active".to_string(),
+                            )))
+                        }
+                        Some(false) => {}
+                    }
 
-        if is_active {
-            return Err(AccountCommandError::InvalidData(
-                "Account is already active".to_string(),
-            ));
+                    let event = Event::AccountReactivated {
+                        account_id: cmd.account_id.clone(),
+                    };
+                    Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
+
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-
-        let event = Event::AccountReactivated {
-            account_id: cmd.account_id,
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        Ok(stored)
     }
 }
 
@@ -426,7 +509,20 @@ pub fn has_no_accounts(store: &EventStore) -> bool {
 }
 
 /// Ensure a default company exists. Returns a status message if one was created.
+///
+/// The singleton invariant (at most one `company` row, keyed `id = 'default'`) is
+/// enforced *inside* the append transaction via [`EventStore::append_checked`]:
+/// the "does a company already exist" check runs under the write lock, so two
+/// concurrent bootstraps can't both pass the check and both append a
+/// `CompanyCreated` (the projection uses `INSERT OR REPLACE` and would otherwise
+/// silently clobber). If a concurrent writer wins the race the loser is rejected
+/// and this returns `None` (idempotent no-op), matching the pre-existing
+/// "already have a company" fast path. On a head move we retry against fresh
+/// state.
 pub fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Option<String> {
+    // Fast path: a company already exists ⇒ nothing to do. Correctness does not
+    // rely on this read (the in-txn check below is authoritative); it just skips
+    // the append loop in the common case.
     let has_company: bool = store
         .connection()
         .query_row(
@@ -435,7 +531,6 @@ pub fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Opti
             |row| row.get(0),
         )
         .unwrap_or(false);
-
     if has_company {
         return None;
     }
@@ -445,25 +540,56 @@ pub fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Opti
         .and_then(|s| s.to_str())
         .unwrap_or("My Company")
         .to_string();
-    let company_id = Uuid::new_v4().to_string();
-    let envelope = crate::events::types::EventEnvelope::new(
-        Event::CompanyCreated {
-            company_id,
-            name: company_name.clone(),
-            base_currency: "USD".to_string(),
-            fiscal_year_start: 1,
-        },
-        "system".to_string(),
-    );
-    match store.append(envelope) {
-        Ok(stored) => {
-            let projector = crate::store::projections::Projector::new(store.connection());
-            if let Err(e) = projector.apply(&stored) {
-                return Some(format!("Failed to project company: {}", e));
+
+    loop {
+        let head = match store.latest_id() {
+            Ok(h) => h.unwrap_or(0),
+            Err(e) => return Some(format!("Failed to create company: {}", e)),
+        };
+        let outcome = store.append_checked(
+            head,
+            |tx| {
+                // Singleton: a company row already exists ⇒ reject (treated as an
+                // idempotent no-op by the caller). Checked under the write lock so
+                // a concurrent bootstrap can't slip in between check and append.
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM company WHERE id = 'default'",
+                        [],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if exists {
+                    return Ok(Verdict::Reject(AccountCommandError::AlreadyExists(
+                        "company".to_string(),
+                    )));
+                }
+
+                let event = Event::CompanyCreated {
+                    company_id: Uuid::new_v4().to_string(),
+                    name: company_name.clone(),
+                    base_currency: "USD".to_string(),
+                    fiscal_year_start: 1,
+                };
+                Ok(Verdict::Append(EventEnvelope::new(event, "system".to_string())))
+            },
+            |tx, stored| {
+                Projector::new(tx)
+                    .apply(stored)
+                    .map_err(|e| EventStoreError::Projection(e.to_string()))
+            },
+        );
+
+        match outcome {
+            Ok(CheckedOutcome::Appended(_)) => {
+                return Some(format!("Company '{}' created for sync", company_name))
             }
-            Some(format!("Company '{}' created for sync", company_name))
+            Ok(CheckedOutcome::HeadMismatch { .. }) => continue, // refetch & retry
+            // A concurrent writer created the company first: idempotent no-op.
+            Ok(CheckedOutcome::Rejected(_)) => return None,
+            Err(e) => return Some(format!("Failed to create company: {}", e)),
         }
-        Err(e) => Some(format!("Failed to create company: {}", e)),
     }
 }
 
@@ -597,11 +723,15 @@ pub fn create_opening_balance_entries(
             },
         ];
 
+        // Per-account reference (not a shared "opening-balance" literal): each
+        // account gets exactly one opening-balance entry, so this doubles as an
+        // idempotency key and keeps the reference unique (idx_journal_entries_
+        // reference_unique). Re-running for the same account is a no-op.
         let _ = commands.post_entry(PostEntryCommand {
             date,
             memo: format!("Opening balance: {}", account_name),
             lines,
-            reference: Some("opening-balance".to_string()),
+            reference: Some(format!("opening-balance:{}", account_id)),
             source: Some(JournalEntrySource::System),
         });
     }
@@ -610,12 +740,85 @@ pub fn create_opening_balance_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::migrations::init_schema;
+    use crate::store::migrations::SchemaStore;
 
     fn setup() -> EventStore {
-        let store = EventStore::in_memory().unwrap();
-        init_schema(store.connection()).unwrap();
+        let mut store = EventStore::in_memory().unwrap();
+        store.init_schema().unwrap();
         store
+    }
+
+    #[test]
+    fn concurrent_create_same_number_only_one_wins() {
+        // The AccountCreated uniqueness TOCTOU (audit #4), exercised across TWO
+        // connections — the UI + in-process-sync-server topology the WAL setup is
+        // built for. Because the dup-check AND the projection now commit in one
+        // transaction (append_checked), exactly one create lands and the other
+        // observes the committed `accounts` row and is rejected AlreadyExists.
+        // Before projections were folded into the txn this raced (both could pass
+        // the check against a not-yet-projected log and append a duplicate).
+        let dir = std::env::temp_dir().join(format!("accountir-acct-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("log.db");
+        {
+            let mut store = EventStore::open(&db).unwrap();
+            store.init_schema().unwrap();
+        }
+
+        // A barrier lines both threads up at the create so they genuinely
+        // contend at the critical section (rather than one finishing first).
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker = |tag: &'static str,
+                      path: std::path::PathBuf,
+                      barrier: std::sync::Arc<std::sync::Barrier>| {
+            move || {
+                let mut store = EventStore::open(&path).unwrap();
+                let mut commands = AccountCommands::new(&mut store, tag.to_string());
+                barrier.wait();
+                commands.create_account(CreateAccountCommand {
+                    account_type: AccountType::Asset,
+                    account_number: "1000".to_string(),
+                    name: format!("Cash {tag}"),
+                    parent_id: None,
+                    currency: None,
+                    description: None,
+                })
+            }
+        };
+
+        let t1 = std::thread::spawn(worker("t1", db.clone(), barrier.clone()));
+        let t2 = std::thread::spawn(worker("t2", db.clone(), barrier.clone()));
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(oks, 1, "exactly one create must win (r1={r1:?}, r2={r2:?})");
+        for r in [&r1, &r2] {
+            if let Err(e) = r {
+                assert!(
+                    matches!(e, AccountCommandError::AlreadyExists(_)),
+                    "the loser must be rejected AlreadyExists, got {e:?}"
+                );
+            }
+        }
+
+        // Exactly one account row and one event landed — no duplicate.
+        let store = EventStore::open(&db).unwrap();
+        let rows: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE account_number = '1000'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "exactly one account with number 1000");
+        assert_eq!(
+            store.count().unwrap(),
+            1,
+            "exactly one AccountCreated event"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -775,5 +978,117 @@ mod tests {
             )
             .unwrap();
         assert_eq!(is_active, 0);
+    }
+
+    #[test]
+    fn deactivate_rejected_when_account_has_balance() {
+        use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
+        let mut store = setup();
+
+        let mk = |store: &mut EventStore, num: &str, ty: AccountType| {
+            let e = AccountCommands::new(store, "u".to_string())
+                .create_account(CreateAccountCommand {
+                    account_type: ty,
+                    account_number: num.to_string(),
+                    name: format!("A{num}"),
+                    parent_id: None,
+                    currency: None,
+                    description: None,
+                })
+                .unwrap();
+            match e.event {
+                Event::AccountCreated { account_id, .. } => account_id,
+                _ => panic!("expected AccountCreated"),
+            }
+        };
+        let cash = mk(&mut store, "1000", AccountType::Asset);
+        let equity = mk(&mut store, "3000", AccountType::Equity);
+
+        // Give cash a nonzero balance.
+        EntryCommands::new(&mut store, "u".to_string())
+            .post_entry(PostEntryCommand {
+                date: chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap(),
+                memo: "opening".to_string(),
+                lines: vec![
+                    EntryLine::debit(&cash, 5000, "USD"),
+                    EntryLine::credit(&equity, 5000, "USD"),
+                ],
+                reference: None,
+                source: None,
+            })
+            .unwrap();
+
+        let err = AccountCommands::new(&mut store, "u".to_string())
+            .deactivate_account(DeactivateAccountCommand {
+                account_id: cash,
+                reason: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, AccountCommandError::HasBalance));
+    }
+
+    #[test]
+    fn update_account_rename_to_existing_number_rejected() {
+        let mut store = setup();
+        let mk = |store: &mut EventStore, num: &str| {
+            let e = AccountCommands::new(store, "u".to_string())
+                .create_account(CreateAccountCommand {
+                    account_type: AccountType::Asset,
+                    account_number: num.to_string(),
+                    name: format!("A{num}"),
+                    parent_id: None,
+                    currency: None,
+                    description: None,
+                })
+                .unwrap();
+            match e.event {
+                Event::AccountCreated { account_id, .. } => account_id,
+                _ => panic!("expected AccountCreated"),
+            }
+        };
+        let _a = mk(&mut store, "1000");
+        let b = mk(&mut store, "2000");
+
+        // Renaming b to 1000 collides with a — rejected in-txn.
+        let err = AccountCommands::new(&mut store, "u".to_string())
+            .update_account(UpdateAccountCommand {
+                account_id: b,
+                account_number: Some("1000".to_string()),
+                name: None,
+                parent_id: None,
+                description: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, AccountCommandError::AlreadyExists(_)));
+    }
+
+    #[test]
+    fn ensure_company_creates_once_then_is_a_noop() {
+        let mut store = setup();
+        let path = std::path::Path::new("/tmp/Acme.db");
+
+        // First call creates the singleton company row.
+        let msg = ensure_company(&mut store, path);
+        assert!(msg.is_some(), "first ensure_company should create a company");
+        let rows: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM company", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+        let after_create = store.count().unwrap();
+
+        // Second call is an idempotent no-op: no message, no new event, still one row.
+        let msg2 = ensure_company(&mut store, path);
+        assert!(msg2.is_none(), "second ensure_company must be a no-op");
+        let rows2: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM company", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows2, 1, "still exactly one company row");
+        assert_eq!(
+            store.count().unwrap(),
+            after_create,
+            "a no-op ensure_company appends nothing"
+        );
     }
 }

@@ -1,9 +1,34 @@
 use crate::events::types::{Event, EventEnvelope, StoredEvent};
-use crate::store::event_store::{EventStore, EventStoreError};
+use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::Projector;
 use chrono::NaiveDate;
+use rusqlite::OptionalExtension;
 use thiserror::Error;
 use uuid::Uuid;
+
+/// In-txn guard that a reconciliation exists and is still in progress. Returns
+/// `Some(err)` (`NotFound` / `AlreadyCompleted` / `Abandoned`) or `None` if it is
+/// in progress and safe to mutate.
+fn recon_in_progress_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    reconciliation_id: &str,
+) -> Result<Option<ReconciliationCommandError>, EventStoreError> {
+    let status: Option<String> = tx
+        .query_row(
+            "SELECT status FROM reconciliations WHERE id = ?1",
+            [reconciliation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match status.as_deref() {
+        None => Ok(Some(ReconciliationCommandError::NotFound(
+            reconciliation_id.to_string(),
+        ))),
+        Some("completed") => Ok(Some(ReconciliationCommandError::AlreadyCompleted)),
+        Some("abandoned") => Ok(Some(ReconciliationCommandError::Abandoned)),
+        Some(_) => Ok(None),
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum ReconciliationCommandError {
@@ -15,6 +40,8 @@ pub enum ReconciliationCommandError {
     NotFound(String),
     #[error("Account not found: {0}")]
     AccountNotFound(String),
+    #[error("Account {0} already has a reconciliation in progress")]
+    AlreadyInProgress(String),
     #[error("Reconciliation already completed")]
     AlreadyCompleted,
     #[error("Reconciliation was abandoned")]
@@ -65,6 +92,249 @@ pub struct AbandonReconciliationCommand {
     pub reconciliation_id: String,
 }
 
+/// Outcome of a reconciliation command's in-txn validation: the invariants held
+/// (append this event) or a domain invariant was violated (reject). Mirrors
+/// [`crate::commands::account_commands::AccountStep`]. The caller wraps the event
+/// in an envelope, stamping identity as appropriate (local `user_id` vs. the
+/// server-authenticated actor on the sync path).
+pub(crate) enum ReconciliationStep {
+    /// All invariants hold under the write lock; append this event.
+    Append(Event),
+    /// A domain invariant was violated.
+    Reject(ReconciliationCommandError),
+}
+
+/// Run `start_reconciliation`'s state-dependent invariants inside the append
+/// transaction — the account exists AND has no other in-progress reconciliation —
+/// and, if they hold, build the `ReconciliationStarted` event. Shared by
+/// [`ReconciliationCommands::start_reconciliation`] and the server-side sync submit
+/// path so both enforce the SAME ≤1-in-progress-per-account fence under the write
+/// lock (audit `ReconciliationStarted`, HIGH).
+pub(crate) fn build_start_reconciliation_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &StartReconciliationCommand,
+) -> Result<ReconciliationStep, EventStoreError> {
+    let account_exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM accounts WHERE id = ?1",
+            [&cmd.account_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !account_exists {
+        return Ok(ReconciliationStep::Reject(
+            ReconciliationCommandError::AccountNotFound(cmd.account_id.clone()),
+        ));
+    }
+
+    // At most one in-progress reconciliation per account.
+    let in_progress: bool = tx
+        .query_row(
+            "SELECT 1 FROM reconciliations
+             WHERE account_id = ?1 AND status = 'in_progress'",
+            [&cmd.account_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if in_progress {
+        return Ok(ReconciliationStep::Reject(
+            ReconciliationCommandError::AlreadyInProgress(cmd.account_id.clone()),
+        ));
+    }
+
+    let event = Event::ReconciliationStarted {
+        reconciliation_id: Uuid::new_v4().to_string(),
+        account_id: cmd.account_id.clone(),
+        statement_date: cmd.statement_date,
+        statement_ending_balance: cmd.statement_ending_balance,
+    };
+    Ok(ReconciliationStep::Append(event))
+}
+
+/// Run `clear_transaction`'s state-dependent invariants inside the append
+/// transaction — the reconciliation is in progress, the line exists, and it is not
+/// already cleared — and, if they hold, build the `TransactionCleared` event.
+/// Shared by [`ReconciliationCommands::clear_transaction`] and the server-side sync
+/// submit path.
+pub(crate) fn build_clear_transaction_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &ClearTransactionCommand,
+) -> Result<ReconciliationStep, EventStoreError> {
+    if let Some(e) = recon_in_progress_in_txn(tx, &cmd.reconciliation_id)? {
+        return Ok(ReconciliationStep::Reject(e));
+    }
+
+    // The entry/line must exist.
+    let amount: Option<i64> = tx
+        .query_row(
+            "SELECT amount FROM journal_lines WHERE id = ?1 AND entry_id = ?2",
+            rusqlite::params![&cmd.line_id, &cmd.entry_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let amount = match amount {
+        Some(a) => a,
+        None => {
+            return Ok(ReconciliationStep::Reject(
+                ReconciliationCommandError::LineNotFound(cmd.line_id.clone()),
+            ))
+        }
+    };
+
+    // Not already cleared in this reconciliation.
+    let already_cleared: bool = tx
+        .query_row(
+            "SELECT 1 FROM cleared_transactions
+             WHERE reconciliation_id = ?1 AND entry_id = ?2 AND line_id = ?3",
+            rusqlite::params![&cmd.reconciliation_id, &cmd.entry_id, &cmd.line_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if already_cleared {
+        return Ok(ReconciliationStep::Reject(
+            ReconciliationCommandError::AlreadyCleared,
+        ));
+    }
+
+    let event = Event::TransactionCleared {
+        reconciliation_id: cmd.reconciliation_id.clone(),
+        entry_id: cmd.entry_id.clone(),
+        line_id: cmd.line_id.clone(),
+        cleared_amount: amount,
+    };
+    Ok(ReconciliationStep::Append(event))
+}
+
+/// Run `unclear_transaction`'s state-dependent invariants inside the append
+/// transaction — the reconciliation is in progress and the line is actually cleared
+/// — and, if they hold, build the `TransactionUncleared` event. Shared by
+/// [`ReconciliationCommands::unclear_transaction`] and the server-side sync submit
+/// path.
+pub(crate) fn build_unclear_transaction_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &UnclearTransactionCommand,
+) -> Result<ReconciliationStep, EventStoreError> {
+    if let Some(e) = recon_in_progress_in_txn(tx, &cmd.reconciliation_id)? {
+        return Ok(ReconciliationStep::Reject(e));
+    }
+
+    let is_cleared: bool = tx
+        .query_row(
+            "SELECT 1 FROM cleared_transactions
+             WHERE reconciliation_id = ?1 AND entry_id = ?2 AND line_id = ?3",
+            rusqlite::params![&cmd.reconciliation_id, &cmd.entry_id, &cmd.line_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !is_cleared {
+        return Ok(ReconciliationStep::Reject(
+            ReconciliationCommandError::NotCleared,
+        ));
+    }
+
+    let event = Event::TransactionUncleared {
+        reconciliation_id: cmd.reconciliation_id.clone(),
+        entry_id: cmd.entry_id.clone(),
+        line_id: cmd.line_id.clone(),
+    };
+    Ok(ReconciliationStep::Append(event))
+}
+
+/// Run `complete_reconciliation`'s state-dependent logic inside the append
+/// transaction — the reconciliation is in progress, and the `difference` snapshot
+/// is computed from the cleared set and beginning balance under the write lock —
+/// and, if it holds, build the `ReconciliationCompleted` event. Shared by
+/// [`ReconciliationCommands::complete_reconciliation`] and the server-side sync
+/// submit path so a concurrent `TransactionCleared`/`Uncleared` can't make the
+/// stored difference wrong (audit `ReconciliationCompleted`, HIGH).
+pub(crate) fn build_complete_reconciliation_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &CompleteReconciliationCommand,
+) -> Result<ReconciliationStep, EventStoreError> {
+    let recon: Option<(String, i64, String)> = tx
+        .query_row(
+            "SELECT status, statement_ending_balance, account_id
+             FROM reconciliations WHERE id = ?1",
+            [&cmd.reconciliation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (status, statement_balance, account_id) = match recon {
+        Some(r) => r,
+        None => {
+            return Ok(ReconciliationStep::Reject(
+                ReconciliationCommandError::NotFound(cmd.reconciliation_id.clone()),
+            ))
+        }
+    };
+    if status == "completed" {
+        return Ok(ReconciliationStep::Reject(
+            ReconciliationCommandError::AlreadyCompleted,
+        ));
+    }
+    if status == "abandoned" {
+        return Ok(ReconciliationStep::Reject(
+            ReconciliationCommandError::Abandoned,
+        ));
+    }
+
+    // Cleared balance for this reconciliation.
+    let cleared_total: i64 = tx
+        .query_row(
+            "SELECT COALESCE(SUM(cleared_amount), 0) FROM cleared_transactions
+             WHERE reconciliation_id = ?1",
+            [&cmd.reconciliation_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+
+    // Account's beginning balance (already-cleared lines from prior
+    // reconciliations).
+    let beginning_balance: i64 = tx
+        .query_row(
+            "SELECT COALESCE(SUM(jl.amount), 0)
+             FROM journal_lines jl
+             JOIN journal_entries je ON jl.entry_id = je.id
+             WHERE jl.account_id = ?1 AND jl.is_cleared = 1
+               AND jl.id NOT IN (SELECT line_id FROM cleared_transactions WHERE reconciliation_id = ?2)
+               AND je.is_void = 0",
+            rusqlite::params![&account_id, &cmd.reconciliation_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+
+    let difference = statement_balance - (beginning_balance + cleared_total);
+    let event = Event::ReconciliationCompleted {
+        reconciliation_id: cmd.reconciliation_id.clone(),
+        difference,
+    };
+    Ok(ReconciliationStep::Append(event))
+}
+
+/// Run `abandon_reconciliation`'s state-dependent invariant inside the append
+/// transaction — the reconciliation is in progress — and, if it holds, build the
+/// `ReconciliationAbandoned` event. Shared by
+/// [`ReconciliationCommands::abandon_reconciliation`] and the server-side sync
+/// submit path.
+pub(crate) fn build_abandon_reconciliation_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &AbandonReconciliationCommand,
+) -> Result<ReconciliationStep, EventStoreError> {
+    if let Some(e) = recon_in_progress_in_txn(tx, &cmd.reconciliation_id)? {
+        return Ok(ReconciliationStep::Reject(e));
+    }
+    let event = Event::ReconciliationAbandoned {
+        reconciliation_id: cmd.reconciliation_id.clone(),
+    };
+    Ok(ReconciliationStep::Append(event))
+}
+
 /// Reconciliation command handler
 pub struct ReconciliationCommands<'a> {
     store: &'a mut EventStore,
@@ -76,266 +346,180 @@ impl<'a> ReconciliationCommands<'a> {
         Self { store, user_id }
     }
 
-    /// Start a new reconciliation
+    /// Start a new reconciliation.
+    ///
+    /// Enforces, inside the append transaction, that the account exists and has
+    /// **no other in-progress reconciliation** (audit `ReconciliationStarted`,
+    /// HIGH — previously unenforced). A partial unique index
+    /// `reconciliations(account_id) WHERE status='in_progress'` is the DB-level
+    /// backstop. Retries on a head move.
     pub fn start_reconciliation(
         &mut self,
         cmd: StartReconciliationCommand,
     ) -> Result<StoredEvent, ReconciliationCommandError> {
-        // Verify account exists
-        let exists: bool = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT 1 FROM accounts WHERE id = ?1",
-                [&cmd.account_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build_start_reconciliation_in_txn(tx, &cmd)? {
+                    ReconciliationStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    ReconciliationStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
 
-        if !exists {
-            return Err(ReconciliationCommandError::AccountNotFound(cmd.account_id));
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-
-        let reconciliation_id = Uuid::new_v4().to_string();
-
-        let event = Event::ReconciliationStarted {
-            reconciliation_id,
-            account_id: cmd.account_id,
-            statement_date: cmd.statement_date,
-            statement_ending_balance: cmd.statement_ending_balance,
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        Ok(stored)
     }
 
-    /// Clear a transaction in a reconciliation
+    /// Clear a transaction in a reconciliation.
+    ///
+    /// Re-checks, in the append transaction, that the reconciliation is in
+    /// progress, the line exists, and it is not already cleared. Retries on a
+    /// head move.
     pub fn clear_transaction(
         &mut self,
         cmd: ClearTransactionCommand,
     ) -> Result<StoredEvent, ReconciliationCommandError> {
-        // Verify reconciliation exists and is in progress
-        let status: String = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT status FROM reconciliations WHERE id = ?1",
-                [&cmd.reconciliation_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| ReconciliationCommandError::NotFound(cmd.reconciliation_id.clone()))?;
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build_clear_transaction_in_txn(tx, &cmd)? {
+                    ReconciliationStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    ReconciliationStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
 
-        if status == "completed" {
-            return Err(ReconciliationCommandError::AlreadyCompleted);
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-        if status == "abandoned" {
-            return Err(ReconciliationCommandError::Abandoned);
-        }
-
-        // Verify entry and line exist
-        let amount: i64 = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT amount FROM journal_lines WHERE id = ?1 AND entry_id = ?2",
-                rusqlite::params![&cmd.line_id, &cmd.entry_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| ReconciliationCommandError::LineNotFound(cmd.line_id.clone()))?;
-
-        // Check if already cleared in this reconciliation
-        let already_cleared: bool = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT 1 FROM cleared_transactions
-                 WHERE reconciliation_id = ?1 AND entry_id = ?2 AND line_id = ?3",
-                rusqlite::params![&cmd.reconciliation_id, &cmd.entry_id, &cmd.line_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if already_cleared {
-            return Err(ReconciliationCommandError::AlreadyCleared);
-        }
-
-        let event = Event::TransactionCleared {
-            reconciliation_id: cmd.reconciliation_id,
-            entry_id: cmd.entry_id,
-            line_id: cmd.line_id,
-            cleared_amount: amount,
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        Ok(stored)
     }
 
-    /// Unclear a transaction in a reconciliation
+    /// Unclear a transaction in a reconciliation.
+    ///
+    /// Re-checks, in the append transaction, that the reconciliation is in
+    /// progress and the line is actually cleared. Retries on a head move.
     pub fn unclear_transaction(
         &mut self,
         cmd: UnclearTransactionCommand,
     ) -> Result<StoredEvent, ReconciliationCommandError> {
-        // Verify reconciliation exists and is in progress
-        let status: String = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT status FROM reconciliations WHERE id = ?1",
-                [&cmd.reconciliation_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| ReconciliationCommandError::NotFound(cmd.reconciliation_id.clone()))?;
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build_unclear_transaction_in_txn(tx, &cmd)? {
+                    ReconciliationStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    ReconciliationStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
 
-        if status == "completed" {
-            return Err(ReconciliationCommandError::AlreadyCompleted);
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-        if status == "abandoned" {
-            return Err(ReconciliationCommandError::Abandoned);
-        }
-
-        // Check if actually cleared
-        let is_cleared: bool = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT 1 FROM cleared_transactions
-                 WHERE reconciliation_id = ?1 AND entry_id = ?2 AND line_id = ?3",
-                rusqlite::params![&cmd.reconciliation_id, &cmd.entry_id, &cmd.line_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if !is_cleared {
-            return Err(ReconciliationCommandError::NotCleared);
-        }
-
-        let event = Event::TransactionUncleared {
-            reconciliation_id: cmd.reconciliation_id,
-            entry_id: cmd.entry_id,
-            line_id: cmd.line_id,
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        Ok(stored)
     }
 
-    /// Complete a reconciliation
+    /// Complete a reconciliation.
+    ///
+    /// The `difference` snapshot is computed from the cleared set and beginning
+    /// balance **inside** the append transaction (audit `ReconciliationCompleted`,
+    /// HIGH), so a concurrent `TransactionCleared`/`Uncleared` can't make the
+    /// stored difference wrong. Retries on a head move.
     pub fn complete_reconciliation(
         &mut self,
         cmd: CompleteReconciliationCommand,
     ) -> Result<StoredEvent, ReconciliationCommandError> {
-        // Verify reconciliation exists and is in progress
-        let (status, statement_balance, account_id): (String, i64, String) = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT status, statement_ending_balance, account_id FROM reconciliations WHERE id = ?1",
-                [&cmd.reconciliation_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .map_err(|_| ReconciliationCommandError::NotFound(cmd.reconciliation_id.clone()))?;
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build_complete_reconciliation_in_txn(tx, &cmd)? {
+                    ReconciliationStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    ReconciliationStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
 
-        if status == "completed" {
-            return Err(ReconciliationCommandError::AlreadyCompleted);
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-        if status == "abandoned" {
-            return Err(ReconciliationCommandError::Abandoned);
-        }
-
-        // Calculate cleared balance
-        let cleared_total: i64 = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT COALESCE(SUM(cleared_amount), 0) FROM cleared_transactions
-                 WHERE reconciliation_id = ?1",
-                [&cmd.reconciliation_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        // Get account's beginning balance (transactions before the reconciliation started)
-        let beginning_balance: i64 = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT COALESCE(SUM(jl.amount), 0)
-                 FROM journal_lines jl
-                 JOIN journal_entries je ON jl.entry_id = je.id
-                 WHERE jl.account_id = ?1 AND jl.is_cleared = 1
-                   AND jl.id NOT IN (SELECT line_id FROM cleared_transactions WHERE reconciliation_id = ?2)
-                   AND je.is_void = 0",
-                rusqlite::params![&account_id, &cmd.reconciliation_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        let book_balance = beginning_balance + cleared_total;
-        let difference = statement_balance - book_balance;
-
-        let event = Event::ReconciliationCompleted {
-            reconciliation_id: cmd.reconciliation_id,
-            difference,
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        Ok(stored)
     }
 
-    /// Abandon a reconciliation
+    /// Abandon a reconciliation.
+    ///
+    /// Re-checks in-progress status inside the append transaction, then frees the
+    /// account's in-progress slot. Retries on a head move.
     pub fn abandon_reconciliation(
         &mut self,
         cmd: AbandonReconciliationCommand,
     ) -> Result<StoredEvent, ReconciliationCommandError> {
-        // Verify reconciliation exists and is in progress
-        let status: String = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT status FROM reconciliations WHERE id = ?1",
-                [&cmd.reconciliation_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| ReconciliationCommandError::NotFound(cmd.reconciliation_id.clone()))?;
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build_abandon_reconciliation_in_txn(tx, &cmd)? {
+                    ReconciliationStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    ReconciliationStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
 
-        if status == "completed" {
-            return Err(ReconciliationCommandError::AlreadyCompleted);
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-        if status == "abandoned" {
-            return Err(ReconciliationCommandError::Abandoned);
-        }
-
-        let event = Event::ReconciliationAbandoned {
-            reconciliation_id: cmd.reconciliation_id,
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-
-        let projector = Projector::new(self.store.connection());
-        projector.apply(&stored)?;
-
-        Ok(stored)
     }
 
     /// Get reconciliation status
@@ -655,5 +839,163 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "abandoned");
+    }
+
+    #[test]
+    fn second_start_on_same_account_rejected_until_freed() {
+        let mut store = setup();
+        let (checking_id, _, _) = create_test_data(&mut store);
+
+        let first = ReconciliationCommands::new(&mut store, "user".to_string())
+            .start_reconciliation(StartReconciliationCommand {
+                account_id: checking_id.clone(),
+                statement_date: NaiveDate::from_ymd_opt(2024, 1, 31).unwrap(),
+                statement_ending_balance: 100000,
+            })
+            .unwrap();
+        let first_id = match first.event {
+            Event::ReconciliationStarted {
+                reconciliation_id, ..
+            } => reconciliation_id,
+            _ => panic!("expected ReconciliationStarted"),
+        };
+
+        // A second start while the first is in progress is rejected.
+        let err = ReconciliationCommands::new(&mut store, "user".to_string())
+            .start_reconciliation(StartReconciliationCommand {
+                account_id: checking_id.clone(),
+                statement_date: NaiveDate::from_ymd_opt(2024, 2, 28).unwrap(),
+                statement_ending_balance: 120000,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ReconciliationCommandError::AlreadyInProgress(_)
+        ));
+
+        // Abandoning the first frees the account's slot.
+        ReconciliationCommands::new(&mut store, "user".to_string())
+            .abandon_reconciliation(AbandonReconciliationCommand {
+                reconciliation_id: first_id,
+            })
+            .unwrap();
+        ReconciliationCommands::new(&mut store, "user".to_string())
+            .start_reconciliation(StartReconciliationCommand {
+                account_id: checking_id,
+                statement_date: NaiveDate::from_ymd_opt(2024, 2, 28).unwrap(),
+                statement_ending_balance: 120000,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn concurrent_starts_same_account_only_one_wins() {
+        // The ≤1-in-progress-per-account invariant (audit ReconciliationStarted,
+        // previously unenforced), across two connections. The in-txn check + the
+        // partial unique index let exactly one start land; the other is rejected
+        // AlreadyInProgress.
+        let dir = std::env::temp_dir().join(format!("accountir-recon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("log.db");
+        let checking_id = {
+            let mut store = EventStore::open(&db).unwrap();
+            init_schema(store.connection()).unwrap();
+            let (checking_id, _, _) = create_test_data(&mut store);
+            checking_id
+        };
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let spawn_start = |db: std::path::PathBuf,
+                           account_id: String,
+                           barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                let mut store = EventStore::open(&db).unwrap();
+                let mut cmds = ReconciliationCommands::new(&mut store, "user".to_string());
+                barrier.wait();
+                cmds.start_reconciliation(StartReconciliationCommand {
+                    account_id,
+                    statement_date: NaiveDate::from_ymd_opt(2024, 1, 31).unwrap(),
+                    statement_ending_balance: 100000,
+                })
+            })
+        };
+
+        let t1 = spawn_start(db.clone(), checking_id.clone(), barrier.clone());
+        let t2 = spawn_start(db.clone(), checking_id.clone(), barrier.clone());
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        assert_eq!(
+            oks, 1,
+            "only one reconciliation may start per account (r1={r1:?}, r2={r2:?})"
+        );
+        for r in [&r1, &r2] {
+            if let Err(e) = r {
+                assert!(
+                    matches!(e, ReconciliationCommandError::AlreadyInProgress(_)),
+                    "the loser must be rejected AlreadyInProgress, got {e:?}"
+                );
+            }
+        }
+
+        let store = EventStore::open(&db).unwrap();
+        let n: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM reconciliations
+                 WHERE account_id = ?1 AND status = 'in_progress'",
+                [&checking_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "exactly one in-progress reconciliation for the account"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migration_path_creates_enforcing_partial_index() {
+        // Production initializes with init_schema followed by run_migrations;
+        // confirm that sequence is clean (migration 013's IF NOT EXISTS index
+        // co-exists with init_schema's) and that the resulting partial unique
+        // index actually rejects a second in-progress reconciliation.
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        crate::store::migrations::run_migrations(store.connection()).unwrap();
+
+        let acc = AccountCommands::new(&mut store, "u".to_string())
+            .create_account(CreateAccountCommand {
+                account_type: AccountType::Asset,
+                account_number: "1010".to_string(),
+                name: "Checking".to_string(),
+                parent_id: None,
+                currency: None,
+                description: None,
+            })
+            .unwrap();
+        let account_id = match acc.event {
+            Event::AccountCreated { account_id, .. } => account_id,
+            _ => panic!("expected AccountCreated"),
+        };
+
+        let conn = store.connection();
+        conn.execute(
+            "INSERT INTO reconciliations (id, account_id, statement_date, statement_ending_balance, status)
+             VALUES ('r1', ?1, '2024-01-01', 0, 'in_progress')",
+            [&account_id],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO reconciliations (id, account_id, statement_date, statement_ending_balance, status)
+             VALUES ('r2', ?1, '2024-02-01', 0, 'in_progress')",
+            [&account_id],
+        );
+        assert!(
+            dup.is_err(),
+            "the partial unique index must reject a second in-progress reconciliation"
+        );
     }
 }

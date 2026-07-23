@@ -22,6 +22,7 @@ use ratatui::{
 
 use crate::queries::account_queries::AccountQueries;
 use crate::queries::reports::Reports;
+use crate::registry::{legacy_migration, Business, Registry};
 use crate::store::event_store::EventStore;
 use crate::store::migrations::init_schema;
 
@@ -46,15 +47,21 @@ use super::views::{
     event_log::EventLogView,
     help::{HelpContext, HelpModal},
     journal::JournalView,
+    payables::PayablesView,
     plaid::{PlaidAccountDisplay, PlaidAction, PlaidItemDisplay, PlaidView},
     plaid_config::{PlaidConfigModal, PlaidConfigResult},
     plaid_link::{PlaidLinkModal, PlaidLinkResult},
     plaid_staged::{
         PlaidStagedView, StagedAction, StagedTransactionDisplay, TransferCandidateDisplay,
     },
+    receivables::ReceivablesView,
     reports::ReportsView,
+    service_form::{ServiceFormModal, ServiceFormResult},
+    services::{ServiceAction, ServicesView},
     settings::{SettingsModal, SettingsResult},
-    startup::{StartupAction, StartupView},
+    staged_events::{ServiceStagedAction, StagedEventsView},
+    business_picker::{BusinessPickerView, PickerAction},
+    sync_results::SyncResultsModal,
     subscriptions::SubscriptionsModal,
     welcome::{should_show_welcome, WelcomeView},
 };
@@ -63,7 +70,7 @@ use super::views::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppPhase {
     Welcome,
-    Startup,
+    BusinessPicker,
     Main,
 }
 
@@ -74,8 +81,11 @@ pub enum ActiveView {
     Accounts,
     Journal,
     Reports,
+    Payables,
+    Receivables,
     EventLog,
     Plaid,
+    Services,
 }
 
 impl ActiveView {
@@ -85,8 +95,11 @@ impl ActiveView {
             ActiveView::Accounts => 1,
             ActiveView::Journal => 2,
             ActiveView::Reports => 3,
-            ActiveView::EventLog => 4,
-            ActiveView::Plaid => 5,
+            ActiveView::Payables => 4,
+            ActiveView::Receivables => 5,
+            ActiveView::EventLog => 6,
+            ActiveView::Plaid => 7,
+            ActiveView::Services => 8,
         }
     }
 
@@ -96,14 +109,17 @@ impl ActiveView {
             1 => ActiveView::Accounts,
             2 => ActiveView::Journal,
             3 => ActiveView::Reports,
-            4 => ActiveView::EventLog,
-            5 => ActiveView::Plaid,
+            4 => ActiveView::Payables,
+            5 => ActiveView::Receivables,
+            6 => ActiveView::EventLog,
+            7 => ActiveView::Plaid,
+            8 => ActiveView::Services,
             _ => ActiveView::Dashboard,
         }
     }
 
     fn count() -> usize {
-        6
+        9
     }
 }
 
@@ -128,14 +144,24 @@ pub struct App {
     pub active_view: ActiveView,
     pub should_quit: bool,
     pub database_path: Option<PathBuf>,
-    pub startup: StartupView,
+    pub current_business_id: Option<String>,
+    pub registry: Registry,
+    pub business_picker: BusinessPickerView,
     pub dashboard: DashboardView,
     pub accounts: AccountsView,
     pub journal: JournalView,
     pub reports: ReportsView,
     pub event_log: EventLogView,
+    pub payables: PayablesView,
+    pub receivables: ReceivablesView,
     pub plaid_view: PlaidView,
     pub plaid_staged: PlaidStagedView,
+    pub services_view: ServicesView,
+    pub service_form: ServiceFormModal,
+    pub sync_results: SyncResultsModal,
+    pub pending_service_action: Option<ServiceAction>,
+    pub staged_events_view: StagedEventsView,
+    pub pending_service_staged_action: Option<ServiceStagedAction>,
     pub help: HelpModal,
     pub welcome: WelcomeView,
     pub account_form: AccountForm,
@@ -181,29 +207,43 @@ pub struct OpeningBalanceProposal {
 
 impl App {
     pub fn new() -> Self {
-        // Start with Welcome phase if enabled, otherwise go to Startup
+        let registry = Registry::open_default()
+            .expect("failed to open registry at ~/.local/share/accountir/registry.db");
+        let _ = legacy_migration::migrate_legacy(&registry);
+
+        // Start with Welcome phase if enabled, otherwise go to BusinessPicker
         let initial_phase = if should_show_welcome() {
             AppPhase::Welcome
         } else {
-            AppPhase::Startup
+            AppPhase::BusinessPicker
         };
 
-        let config = crate::config::AppConfig::load();
-        let theme = Theme::from_preset(config.theme);
+        let theme = Theme::from_preset(registry.get_theme());
+        let business_picker = BusinessPickerView::new(&registry);
 
         Self {
             phase: initial_phase,
             active_view: ActiveView::Dashboard,
             should_quit: false,
             database_path: None,
-            startup: StartupView::new(),
+            current_business_id: None,
+            registry,
+            business_picker,
             dashboard: DashboardView::new(),
             accounts: AccountsView::new(),
             journal: JournalView::new(),
             reports: ReportsView::new(),
             event_log: EventLogView::new(),
+            payables: PayablesView::new(),
+            receivables: ReceivablesView::new(),
             plaid_view: PlaidView::new(),
             plaid_staged: PlaidStagedView::new(),
+            services_view: ServicesView::new(),
+            service_form: ServiceFormModal::new(),
+            sync_results: SyncResultsModal::new(),
+            pending_service_action: None,
+            staged_events_view: StagedEventsView::new(),
+            pending_service_staged_action: None,
             help: HelpModal::new(),
             welcome: WelcomeView::new(),
             account_form: AccountForm::new(),
@@ -241,15 +281,18 @@ impl App {
     /// Get the current help context based on app state
     fn help_context(&self) -> HelpContext {
         match self.phase {
-            AppPhase::Welcome => HelpContext::Startup, // Use Startup context for Welcome
-            AppPhase::Startup => HelpContext::Startup,
+            AppPhase::Welcome => HelpContext::BusinessPicker,
+            AppPhase::BusinessPicker => HelpContext::BusinessPicker,
             AppPhase::Main => match self.active_view {
                 ActiveView::Dashboard => HelpContext::Dashboard,
                 ActiveView::Accounts => HelpContext::Accounts,
                 ActiveView::Journal => HelpContext::Journal,
                 ActiveView::Reports => HelpContext::Reports,
+                ActiveView::Payables => HelpContext::Payables,
+                ActiveView::Receivables => HelpContext::Receivables,
                 ActiveView::EventLog => HelpContext::EventLog,
                 ActiveView::Plaid => HelpContext::Plaid,
+                ActiveView::Services => HelpContext::Services,
             },
         }
     }
@@ -273,10 +316,11 @@ impl App {
         done
     }
 
-    /// Close the current database and return to startup menu
+    /// Close the current database and return to the business picker
     pub fn close_database(&mut self) {
-        self.phase = AppPhase::Startup;
+        self.phase = AppPhase::BusinessPicker;
         self.database_path = None;
+        self.current_business_id = None;
         self.active_view = ActiveView::Dashboard;
 
         // Reset all views
@@ -285,7 +329,12 @@ impl App {
         self.journal = JournalView::new();
         self.reports = ReportsView::new();
         self.event_log = EventLogView::new();
+        self.payables = PayablesView::new();
+        self.receivables = ReceivablesView::new();
         self.plaid_view = PlaidView::new();
+        self.services_view = ServicesView::new();
+        self.staged_events_view = StagedEventsView::new();
+        self.pending_service_staged_action = None;
 
         // Reset forms and modals
         self.account_form = AccountForm::new();
@@ -295,6 +344,7 @@ impl App {
         self.bank_import = BankImportModal::new();
         self.plaid_link = PlaidLinkModal::new();
         self.plaid_config = PlaidConfigModal::new();
+        self.service_form = ServiceFormModal::new();
         self.settings = SettingsModal::new();
         self.welcome = WelcomeView::new();
         self.pending_import_count = 0;
@@ -302,6 +352,7 @@ impl App {
         // Reset pending actions
         self.pending_plaid_link = None;
         self.pending_plaid_action = None;
+        self.pending_service_action = None;
         self.pending_entry_detail = None;
         self.pending_reassign = None;
         self.pending_bulk_reassign = false;
@@ -313,8 +364,8 @@ impl App {
         // Reset sync server status (actual abort happens in the event loop)
         self.sync_server_running = false;
 
-        // Reset startup view
-        self.startup = StartupView::new();
+        // Refresh business picker from registry
+        self.business_picker = BusinessPickerView::new(&self.registry);
     }
 
     pub fn load_data(&mut self, store: &EventStore) {
@@ -354,6 +405,12 @@ impl App {
 
         // Load Plaid items for Plaid view
         self.load_plaid_items(conn);
+
+        // Load event services
+        self.load_event_services(conn);
+
+        // Load AP/AR data
+        self.load_ap_ar(conn);
 
         // Load pending bank imports
         self.load_pending_imports(conn);
@@ -507,6 +564,33 @@ impl App {
             self.plaid_view.staged_count = staged as usize;
             self.plaid_view.transfer_count = transfers as usize;
         }
+    }
+
+    fn load_event_services(&mut self, conn: &rusqlite::Connection) {
+        match crate::commands::event_service_commands::list_services(conn) {
+            Ok(services) => self.services_view.set_services(services),
+            Err(_) => self.services_view.set_services(Vec::new()),
+        }
+    }
+
+    fn load_ap_ar(&mut self, conn: &rusqlite::Connection) {
+        let queries = crate::queries::ap_ar_queries::ApArQueries::new(conn);
+        let today = chrono::Local::now().date_naive();
+        if let Ok(bills) = queries.open_bills() {
+            let aging = queries.ap_aging(today).unwrap_or_default();
+            self.payables.set_data(bills, aging);
+        }
+        if let Ok(invoices) = queries.open_invoices() {
+            let aging = queries.ar_aging(today).unwrap_or_default();
+            self.receivables.set_data(invoices, aging);
+        }
+    }
+
+    fn load_service_staged(&mut self, conn: &rusqlite::Connection, service_id: &str) {
+        let events =
+            crate::commands::event_service_commands::load_staged_events(conn, service_id)
+                .unwrap_or_default();
+        self.staged_events_view.set_events(events);
     }
 
     /// Load staged transaction data for the review view
@@ -734,7 +818,7 @@ impl App {
 
         let entries = if let Some(ref account) = self.journal.filter_account {
             search
-                .search_entries(None, None, None, Some(&account.id), true)
+                .search_entries(None, None, None, Some(&account.id), true, None)
                 .unwrap_or_default()
         } else {
             search.recent_entries(100).unwrap_or_default()
@@ -812,6 +896,12 @@ impl App {
             return;
         }
 
+        // Handle sync results modal
+        if self.sync_results.visible {
+            self.sync_results.handle_key(key);
+            return;
+        }
+
         // Handle entry detail modal first - it captures all input when visible
         if self.entry_detail.visible {
             self.entry_detail.handle_key(key);
@@ -839,6 +929,12 @@ impl App {
         // Handle plaid config modal - it captures all input when visible
         if self.plaid_config.visible {
             self.plaid_config.handle_key(key);
+            return;
+        }
+
+        // Handle service form modal - it captures all input when visible
+        if self.service_form.visible {
+            self.service_form.handle_key(key);
             return;
         }
 
@@ -906,7 +1002,7 @@ impl App {
 
         match self.phase {
             AppPhase::Welcome => self.handle_welcome_key(key),
-            AppPhase::Startup => self.handle_startup_key(key, modifiers),
+            AppPhase::BusinessPicker => self.handle_business_picker_key(key, modifiers),
             AppPhase::Main => self.handle_main_key(key, modifiers),
         }
     }
@@ -1085,27 +1181,27 @@ impl App {
     fn handle_welcome_key(&mut self, key: KeyCode) {
         self.welcome.handle_key(key);
         if self.welcome.should_continue() {
-            // If a database is already loaded (via CLI), go to Main, otherwise Startup
+            // If a database is already loaded (via CLI), go to Main, otherwise picker
             if self.database_path.is_some() {
                 self.phase = AppPhase::Main;
             } else {
-                self.phase = AppPhase::Startup;
+                self.phase = AppPhase::BusinessPicker;
             }
         }
     }
 
-    fn handle_startup_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+    fn handle_business_picker_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         // Global quit - Ctrl+C quits immediately, q/Esc shows confirmation
         if key == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return;
         }
-        if key == KeyCode::Char('q') || key == KeyCode::Esc {
+        if key == KeyCode::Char('q') {
             self.show_quit_confirm = true;
             return;
         }
 
-        self.startup.handle_key(key);
+        self.business_picker.handle_key(key, &self.registry);
     }
 
     fn handle_main_key(&mut self, key: KeyCode, modifiers: KeyModifiers) {
@@ -1148,6 +1244,19 @@ impl App {
         if key == KeyCode::Esc && self.active_view == ActiveView::Plaid && self.plaid_staged.visible
         {
             self.pending_staged_action = Some(StagedAction::Back);
+            return;
+        }
+
+        // In service staged view, capture all keys (not just Esc) to prevent
+        // global keys from interfering with the staged events view
+        if self.active_view == ActiveView::Services && self.staged_events_view.visible {
+            let action = self.staged_events_view.handle_key(key);
+            match action {
+                ServiceStagedAction::None => {}
+                other => {
+                    self.pending_service_staged_action = Some(other);
+                }
+            }
             return;
         }
 
@@ -1200,11 +1309,23 @@ impl App {
                 return;
             }
             KeyCode::Char('5') => {
-                self.active_view = ActiveView::EventLog;
+                self.active_view = ActiveView::Payables;
                 return;
             }
             KeyCode::Char('6') => {
+                self.active_view = ActiveView::Receivables;
+                return;
+            }
+            KeyCode::Char('7') => {
+                self.active_view = ActiveView::EventLog;
+                return;
+            }
+            KeyCode::Char('8') => {
                 self.active_view = ActiveView::Plaid;
+                return;
+            }
+            KeyCode::Char('9') => {
+                self.active_view = ActiveView::Services;
                 return;
             }
             KeyCode::Char('b')
@@ -1278,6 +1399,12 @@ impl App {
             ActiveView::EventLog => {
                 self.event_log.handle_key(key);
             }
+            ActiveView::Payables => {
+                self.payables.handle_key(key);
+            }
+            ActiveView::Receivables => {
+                self.receivables.handle_key(key);
+            }
             ActiveView::Plaid => {
                 if self.plaid_staged.visible {
                     let action = self.plaid_staged.handle_key(key);
@@ -1297,6 +1424,25 @@ impl App {
                     }
                 }
             }
+            ActiveView::Services => {
+                if self.staged_events_view.visible {
+                    let action = self.staged_events_view.handle_key(key);
+                    match action {
+                        ServiceStagedAction::None => {}
+                        other => {
+                            self.pending_service_staged_action = Some(other);
+                        }
+                    }
+                } else {
+                    let action = self.services_view.handle_key(key);
+                    match action {
+                        ServiceAction::None => {}
+                        other => {
+                            self.pending_service_action = Some(other);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -1312,9 +1458,9 @@ fn draw_welcome(frame: &mut Frame, app: &mut App) {
     app.welcome.draw(frame, size, &app.theme);
 }
 
-fn draw_startup(frame: &mut Frame, app: &mut App) {
+fn draw_business_picker(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
-    app.startup.draw(frame, size, &app.theme);
+    app.business_picker.draw(frame, size, &app.theme);
 
     // Draw help modal on top if visible
     app.help.draw(frame, size, app.help_context(), &app.theme);
@@ -1348,8 +1494,11 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
         "2:Accounts",
         "3:Journal",
         "4:Reports",
-        "5:Events",
-        "6:Plaid",
+        "5:Payables",
+        "6:Receivables",
+        "7:Events",
+        "8:Plaid",
+        "9:Services",
     ];
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -1365,11 +1514,20 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
         ActiveView::Journal => app.journal.draw(frame, chunks[1], theme),
         ActiveView::Reports => app.reports.draw(frame, chunks[1], theme),
         ActiveView::EventLog => app.event_log.draw(frame, chunks[1], theme),
+        ActiveView::Payables => app.payables.render(frame, chunks[1], theme),
+        ActiveView::Receivables => app.receivables.render(frame, chunks[1], theme),
         ActiveView::Plaid => {
             if app.plaid_staged.visible {
                 app.plaid_staged.render(frame, chunks[1], theme);
             } else {
                 app.plaid_view.render(frame, chunks[1], theme);
+            }
+        }
+        ActiveView::Services => {
+            if app.staged_events_view.visible {
+                app.staged_events_view.render(frame, chunks[1], theme);
+            } else {
+                app.services_view.render(frame, chunks[1], theme);
             }
         }
     }
@@ -1378,7 +1536,7 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
     let status_text = if let Some(ref msg) = app.status_message {
         msg.clone()
     } else {
-        "Tab: switch views | 1-6: jump to view | ,: settings | ?: help | Esc: close file | q: quit"
+        "Tab: switch views | 1-9: jump to view | ,: settings | ?: help | Esc: close file | q: quit"
             .to_string()
     };
 
@@ -1428,6 +1586,9 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
     // Draw entry detail modal on top if visible
     app.entry_detail.draw(frame, size, theme);
 
+    // Draw sync results modal on top if visible
+    app.sync_results.draw(frame, size, theme);
+
     // Draw subscriptions modal on top if visible
     app.subscriptions.render(frame, size, theme);
 
@@ -1443,6 +1604,9 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
     // Draw plaid config modal on top if visible
     app.plaid_config.draw(frame, size, theme);
 
+    // Draw service form modal on top if visible
+    app.service_form.draw(frame, size, theme);
+
     // Draw settings modal on top if visible
     app.settings.draw(frame, size, theme);
 }
@@ -1450,7 +1614,7 @@ fn draw_main(frame: &mut Frame, app: &mut App) {
 fn draw_ui(frame: &mut Frame, app: &mut App) {
     match app.phase {
         AppPhase::Welcome => draw_welcome(frame, app),
-        AppPhase::Startup => draw_startup(frame, app),
+        AppPhase::BusinessPicker => draw_business_picker(frame, app),
         AppPhase::Main => draw_main(frame, app),
     }
 
@@ -1770,89 +1934,71 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
             continue;
         }
 
-        // Check if startup action was taken
-        if app.phase == AppPhase::Startup && app.startup.has_action() {
-            // Clone the action to avoid borrow issues
-            let action = app.startup.action.clone();
+        // Check if the business picker requested an action
+        if app.phase == AppPhase::BusinessPicker && app.business_picker.has_action() {
+            let action = app.business_picker.action.clone();
+            app.business_picker.action = PickerAction::None;
             match action {
-                StartupAction::NewDatabase(path) => {
-                    // Create and initialize new database
-                    match EventStore::open(&path) {
-                        Ok(mut new_store) => {
-                            if let Err(e) = init_schema(new_store.connection()) {
-                                app.status_message = Some(format!("Failed to initialize: {}", e));
-                            } else {
-                                ensure_company(&mut new_store, &path);
-
-                                app.database_path = Some(path.clone());
-                                app.load_data(&new_store);
-
-                                // Check if accounts are empty
-                                if has_no_accounts(&new_store) {
-                                    app.pending_default_accounts = true;
-                                }
-
-                                store = Some(new_store);
-                                app.phase = AppPhase::Main;
-                                app.status_message = Some("New database created".to_string());
-
-                                // Notify sync server of the new database
-                                if let Some(ref sdb) = server_db {
-                                    sdb.set(&path);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            app.status_message = Some(format!("Failed to create database: {}", e));
-                            app.startup.action = StartupAction::None;
-                        }
-                    }
-                }
-                StartupAction::OpenDatabase(path) => {
-                    // Open existing database
-                    match EventStore::open(&path) {
-                        Ok(mut existing_store) => {
-                            let path_display = path.display().to_string();
-
-                            // Run migrations on existing databases
-                            if let Err(e) = crate::store::migrations::run_migrations(
-                                existing_store.connection(),
-                            ) {
-                                app.status_message = Some(format!("Migration failed: {}", e));
-                                app.startup.action = StartupAction::None;
-                                continue;
-                            }
-
-                            // Ensure company exists for sync server
-                            let company_msg = ensure_company(&mut existing_store, &path);
-
-                            app.database_path = Some(path.clone());
-                            app.load_data(&existing_store);
-
-                            // Check if accounts are empty
-                            if has_no_accounts(&existing_store) {
-                                app.pending_default_accounts = true;
-                            }
-
-                            store = Some(existing_store);
+                PickerAction::OpenBusiness(biz) => {
+                    match open_registered_business(&mut app, &biz, server_db.as_ref()) {
+                        Ok(opened) => {
+                            store = Some(opened);
                             app.phase = AppPhase::Main;
-                            app.status_message = Some(match company_msg {
-                                Some(msg) => format!("Opened {} ({})", path_display, msg),
-                                None => format!("Opened {}", path_display),
-                            });
-
-                            // Notify sync server of the opened database
-                            if let Some(ref sdb) = server_db {
-                                sdb.set(&path);
-                            }
                         }
                         Err(e) => {
-                            app.status_message = Some(format!("Failed to open database: {}", e));
-                            app.startup.action = StartupAction::None;
+                            app.business_picker
+                                .set_status(format!("Failed to open: {}", e));
                         }
                     }
                 }
-                StartupAction::None => {}
+                PickerAction::AddNew(path) => {
+                    match create_and_register(&mut app, &path, server_db.as_ref()) {
+                        Ok(opened) => {
+                            store = Some(opened);
+                            app.phase = AppPhase::Main;
+                        }
+                        Err(e) => {
+                            app.business_picker
+                                .set_status(format!("Failed to create: {}", e));
+                            app.business_picker.refresh(&app.registry);
+                        }
+                    }
+                }
+                PickerAction::AddExisting(path) => {
+                    match open_and_register(&mut app, &path, server_db.as_ref()) {
+                        Ok(opened) => {
+                            store = Some(opened);
+                            app.phase = AppPhase::Main;
+                        }
+                        Err(e) => {
+                            app.business_picker
+                                .set_status(format!("Failed to open: {}", e));
+                            app.business_picker.refresh(&app.registry);
+                        }
+                    }
+                }
+                PickerAction::ImportFound(paths) => {
+                    let mut imported = 0usize;
+                    let mut failed = 0usize;
+                    for p in &paths {
+                        if open_and_register_silent(&mut app, p).is_ok() {
+                            imported += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    app.business_picker.refresh(&app.registry);
+                    app.business_picker.set_status(format!(
+                        "Imported {} business(es){}",
+                        imported,
+                        if failed > 0 {
+                            format!(", {} failed", failed)
+                        } else {
+                            String::new()
+                        }
+                    ));
+                }
+                PickerAction::None => {}
             }
         }
 
@@ -2058,6 +2204,51 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
                 app.plaid_config.result = PlaidConfigResult::None;
             }
             PlaidConfigResult::None => {}
+        }
+
+        // Handle service form result
+        match app.service_form.result.clone() {
+            ServiceFormResult::Saved {
+                name,
+                root_url,
+                api_key,
+            } => {
+                app.service_form.hide();
+                app.service_form.result = ServiceFormResult::None;
+                if let Some(ref mut s) = store {
+                    match crate::commands::event_service_commands::register_service(
+                        s, "tui-user", &name, &root_url, &api_key,
+                    ) {
+                        Ok(_) => {
+                            app.load_event_services(s.connection());
+                            app.status_message =
+                                Some(format!("Registered service '{}'", name));
+                        }
+                        Err(e) => {
+                            app.status_message =
+                                Some(format!("Failed to register service: {}", e));
+                        }
+                    }
+                }
+            }
+            ServiceFormResult::Cancel => {
+                app.service_form.hide();
+                app.service_form.result = ServiceFormResult::None;
+            }
+            ServiceFormResult::None => {}
+        }
+
+        // Handle service view actions
+        if let Some(action) = app.pending_service_action.take() {
+            if let Some(ref mut s) = store {
+                handle_service_action(&mut app, s, action);
+            }
+        }
+
+        if let Some(action) = app.pending_service_staged_action.take() {
+            if let Some(ref mut s) = store {
+                handle_service_staged_action(&mut app, s, action);
+            }
         }
 
         // Handle Plaid view actions
@@ -2424,8 +2615,8 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
             app.check_for_new_imports(s.connection());
         }
 
-        // Close store and clear server DB when returning to startup
-        if app.phase == AppPhase::Startup && store.is_some() {
+        // Close store and clear server DB when returning to the picker
+        if app.phase == AppPhase::BusinessPicker && store.is_some() {
             if let Some(ref sdb) = server_db {
                 sdb.clear();
             }
@@ -2500,7 +2691,7 @@ pub fn run_app_with_database(
     // Notify sync server of the opened database
     app.sync_server_running = server_db.is_some();
     if let Some(ref sdb) = server_db {
-        sdb.set(db_path);
+        let _ = sdb.set(db_path);
     }
 
     // Main loop
@@ -2713,6 +2904,45 @@ pub fn run_app_with_database(
                 app.plaid_config.result = PlaidConfigResult::None;
             }
             PlaidConfigResult::None => {}
+        }
+
+        // Handle service form result
+        match app.service_form.result.clone() {
+            ServiceFormResult::Saved {
+                name,
+                root_url,
+                api_key,
+            } => {
+                app.service_form.hide();
+                app.service_form.result = ServiceFormResult::None;
+                match crate::commands::event_service_commands::register_service(
+                    &mut store, "tui-user", &name, &root_url, &api_key,
+                ) {
+                    Ok(_) => {
+                        app.load_event_services(store.connection());
+                        app.status_message =
+                            Some(format!("Registered service '{}'", name));
+                    }
+                    Err(e) => {
+                        app.status_message =
+                            Some(format!("Failed to register service: {}", e));
+                    }
+                }
+            }
+            ServiceFormResult::Cancel => {
+                app.service_form.hide();
+                app.service_form.result = ServiceFormResult::None;
+            }
+            ServiceFormResult::None => {}
+        }
+
+        // Handle service view actions
+        if let Some(action) = app.pending_service_action.take() {
+            handle_service_action(&mut app, &mut store, action);
+        }
+
+        if let Some(action) = app.pending_service_staged_action.take() {
+            handle_service_staged_action(&mut app, &mut store, action);
         }
 
         // Handle Plaid view actions
@@ -3043,8 +3273,8 @@ pub fn run_app_with_database(
         // Periodically check for new pending imports
         app.check_for_new_imports(store.connection());
 
-        // Check if returning to startup (database closed)
-        if app.phase == AppPhase::Startup {
+        // Check if returning to the picker (database closed)
+        if app.phase == AppPhase::BusinessPicker {
             // Clear sync server database
             if let Some(ref sdb) = server_db {
                 sdb.clear();
@@ -3087,6 +3317,247 @@ pub fn run_app_with_database(
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+fn handle_service_action(app: &mut App, store: &mut EventStore, action: ServiceAction) {
+    match action {
+        ServiceAction::None => {}
+        ServiceAction::Register => {
+            app.service_form.show();
+        }
+        ServiceAction::Review(service_id) => {
+            // Look up service name
+            let svc_name = match crate::commands::event_service_commands::get_service(
+                store.connection(),
+                &service_id,
+            ) {
+                Ok(s) => s.name,
+                Err(_) => service_id.clone(),
+            };
+            app.load_service_staged(store.connection(), &service_id);
+            if app.staged_events_view.events.is_empty() {
+                app.status_message = Some(format!("'{}': no staged events to review", svc_name));
+            } else {
+                app.staged_events_view.show(service_id, svc_name);
+            }
+        }
+        ServiceAction::Remove(service_id) => {
+            match crate::commands::event_service_commands::remove_service(
+                store,
+                "tui-user",
+                &service_id,
+            ) {
+                Ok(_) => {
+                    app.load_event_services(store.connection());
+                    app.status_message = Some("Service removed".to_string());
+                }
+                Err(e) => {
+                    app.status_message = Some(format!("Failed to remove service: {}", e));
+                }
+            }
+        }
+        ServiceAction::Sync(service_id) => {
+            // Load service info from DB
+            let service = match crate::commands::event_service_commands::get_service(
+                store.connection(),
+                &service_id,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    app.status_message = Some(format!("Service not found: {}", e));
+                    return;
+                }
+            };
+
+            let root_url = service.root_url.clone();
+            let api_key = service.api_key.clone();
+            let cursor = service.cursor.clone();
+            let svc_name = service.name.clone();
+
+            app.status_message = Some(format!("Syncing '{}'...", svc_name));
+
+            // Fetch events on a background thread (reqwest::blocking can't run on tokio runtime)
+            let fetch_result: Result<(Vec<crate::commands::event_service_commands::RemoteEvent>, Option<String>), String> =
+                std::thread::spawn(move || {
+                    crate::commands::event_service_commands::fetch_all_remote_events(
+                        &root_url,
+                        &api_key,
+                        cursor.as_deref(),
+                    )
+                })
+                .join()
+                .unwrap_or_else(|_| Err("Sync thread panicked".to_string()));
+
+            match fetch_result {
+                Ok((events, new_cursor)) => {
+                    if events.is_empty() {
+                        app.status_message = Some(format!("'{}': already up to date", svc_name));
+                        return;
+                    }
+
+                    // Stage events for review instead of processing immediately
+                    match crate::commands::event_service_commands::stage_events(
+                        store.connection(),
+                        &service_id,
+                        events,
+                    ) {
+                        Ok(staged_count) => {
+                            // Advance cursor — events are safe in staging table
+                            if let Some(ref c) = new_cursor {
+                                let _ = store.connection().execute(
+                                    "UPDATE event_services SET cursor = ?1 WHERE id = ?2",
+                                    rusqlite::params![c, service_id],
+                                );
+                            }
+                            app.load_service_staged(store.connection(), &service_id);
+                            app.staged_events_view
+                                .show(service_id.clone(), svc_name.clone());
+                            app.status_message = Some(format!(
+                                "'{}': {} events staged for review",
+                                svc_name, staged_count
+                            ));
+                        }
+                        Err(e) => {
+                            app.status_message =
+                                Some(format!("'{}' staging failed: {}", svc_name, e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    app.status_message = Some(format!("'{}' sync failed: {}", svc_name, e));
+                }
+            }
+        }
+    }
+}
+
+fn handle_service_staged_action(
+    app: &mut App,
+    store: &mut EventStore,
+    action: ServiceStagedAction,
+) {
+    match action {
+        ServiceStagedAction::None => {}
+        ServiceStagedAction::Back => {
+            app.staged_events_view.hide();
+        }
+        ServiceStagedAction::ImportSingle(staged_id) => {
+            let service_id = app.staged_events_view.service_id.clone();
+            let service_name = app.staged_events_view.service_name.clone();
+            match crate::commands::event_service_commands::import_staged_event(
+                store,
+                &staged_id,
+                &service_name,
+            ) {
+                Ok(_) => {
+                    app.staged_events_view.status_message =
+                        Some("Event imported successfully".to_string());
+                }
+                Err(e) => {
+                    app.staged_events_view.status_message =
+                        Some(format!("Import failed: {}", e));
+                }
+            }
+            app.load_service_staged(store.connection(), &service_id);
+            app.load_data(store);
+        }
+        ServiceStagedAction::ImportAll => {
+            let service_id = app.staged_events_view.service_id.clone();
+            let service_name = app.staged_events_view.service_name.clone();
+            let ready_ids: Vec<String> = app
+                .staged_events_view
+                .events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.readiness,
+                        crate::commands::event_service_commands::StagedEventReadiness::Ready
+                    )
+                })
+                .map(|e| e.id.clone())
+                .collect();
+
+            if ready_ids.is_empty() {
+                app.staged_events_view.status_message =
+                    Some("No events ready to import".to_string());
+                return;
+            }
+
+            let total = ready_ids.len();
+            let mut imported = 0;
+            let mut errors = 0;
+            for id in &ready_ids {
+                match crate::commands::event_service_commands::import_staged_event(
+                    store,
+                    id,
+                    &service_name,
+                ) {
+                    Ok(_) => imported += 1,
+                    Err(_) => errors += 1,
+                }
+            }
+            app.staged_events_view.status_message = Some(format!(
+                "Imported {}/{} events ({} errors)",
+                imported, total, errors
+            ));
+            app.load_service_staged(store.connection(), &service_id);
+            app.load_event_services(store.connection());
+            app.load_data(store);
+        }
+        ServiceStagedAction::OpenMappingEditor(staged_id) => {
+            let event = app
+                .staged_events_view
+                .events
+                .iter()
+                .find(|e| e.id == staged_id);
+            if let Some(event) = event {
+                let keys = match &event.readiness {
+                    crate::commands::event_service_commands::StagedEventReadiness::NeedsMapping(
+                        keys,
+                    ) => keys.clone(),
+                    crate::commands::event_service_commands::StagedEventReadiness::Ready => {
+                        // Show all required keys so user can re-assign
+                        crate::commands::event_service_commands::required_mapping_keys(
+                            &event.event_type,
+                            &event.data,
+                        )
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                    }
+                };
+                if keys.is_empty() {
+                    app.staged_events_view.status_message =
+                        Some("No mappings needed for this event type".to_string());
+                    return;
+                }
+                let accounts = app.accounts.accounts.clone();
+                app.staged_events_view
+                    .mapping_editor
+                    .open(keys, accounts);
+            }
+        }
+        ServiceStagedAction::SaveMapping { key, account_id } => {
+            let service_id = app.staged_events_view.service_id.clone();
+            match crate::commands::event_service_commands::save_ingest_mapping(
+                store.connection(),
+                &key,
+                &account_id,
+            ) {
+                Ok(_) => {
+                    app.staged_events_view.status_message =
+                        Some(format!("Mapping '{}' saved", key));
+                    app.staged_events_view.mapping_editor.advance_or_close();
+                }
+                Err(e) => {
+                    app.staged_events_view.status_message =
+                        Some(format!("Failed to save mapping: {}", e));
+                }
+            }
+            // Re-evaluate readiness
+            app.load_service_staged(store.connection(), &service_id);
+        }
+    }
 }
 
 /// Check if the database has a company configured; if not, create one.
@@ -3680,6 +4151,111 @@ fn open_plaid_link_modal(app: &mut App, conn: &rusqlite::Connection, local_accou
 
 fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Option<String> {
     crate::commands::account_commands::ensure_company(store, db_path)
+}
+
+/// Read company.name from the projected `company` table, falling back to the
+/// file stem if no row is found.
+fn read_company_name(store: &EventStore, db_path: &std::path::Path) -> String {
+    store
+        .connection()
+        .query_row(
+            "SELECT name FROM company WHERE id = 'default'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| {
+            db_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Business")
+                .to_string()
+        })
+}
+
+/// Open the .db file referenced by a registered Business, run migrations,
+/// refresh the registry's cached name and last_opened timestamp, and prepare
+/// app state for the Main phase.
+fn open_registered_business(
+    app: &mut App,
+    biz: &Business,
+    server_db: Option<&crate::server::ServerDb>,
+) -> Result<EventStore, String> {
+    let mut store = EventStore::open(&biz.db_path)
+        .map_err(|e| format!("opening {}: {}", biz.db_path.display(), e))?;
+    crate::store::migrations::run_migrations(store.connection())
+        .map_err(|e| format!("migration: {}", e))?;
+    let company_msg = ensure_company(&mut store, &biz.db_path);
+    let name = read_company_name(&store, &biz.db_path);
+    let _ = app.registry.update_name_cache(&biz.id, &name);
+    let _ = app.registry.touch_last_opened(&biz.id);
+
+    app.database_path = Some(biz.db_path.clone());
+    app.current_business_id = Some(biz.id.clone());
+    app.load_data(&store);
+    if has_no_accounts(&store) {
+        app.pending_default_accounts = true;
+    }
+    if let Some(sdb) = server_db {
+        let _ = sdb.set(&biz.db_path);
+    }
+    let label = biz.label().to_string();
+    app.status_message = Some(match company_msg {
+        Some(msg) => format!("Opened {} ({})", label, msg),
+        None => format!("Opened {}", label),
+    });
+    Ok(store)
+}
+
+/// Create a brand-new accountir database at `path`, register it in the
+/// registry, and prepare app state for Main.
+fn create_and_register(
+    app: &mut App,
+    path: &std::path::Path,
+    server_db: Option<&crate::server::ServerDb>,
+) -> Result<EventStore, String> {
+    let mut store = EventStore::open(path).map_err(|e| format!("creating: {}", e))?;
+    init_schema(store.connection()).map_err(|e| format!("init schema: {}", e))?;
+    ensure_company(&mut store, path);
+    let name = read_company_name(&store, path);
+    let biz = app
+        .registry
+        .add_business(&name, path)
+        .map_err(|e| format!("register: {}", e))?;
+    open_registered_business(app, &biz, server_db)
+}
+
+/// Open an existing .db file and register it (idempotent on path).
+fn open_and_register(
+    app: &mut App,
+    path: &std::path::Path,
+    server_db: Option<&crate::server::ServerDb>,
+) -> Result<EventStore, String> {
+    let mut store = EventStore::open(path).map_err(|e| format!("opening: {}", e))?;
+    crate::store::migrations::run_migrations(store.connection())
+        .map_err(|e| format!("migration: {}", e))?;
+    ensure_company(&mut store, path);
+    let name = read_company_name(&store, path);
+    let biz = app
+        .registry
+        .add_business(&name, path)
+        .map_err(|e| format!("register: {}", e))?;
+    drop(store);
+    open_registered_business(app, &biz, server_db)
+}
+
+/// Like `open_and_register` but doesn't transition app phase or notify the
+/// server — used during first-run bulk import where the user picks several
+/// candidates at once.
+fn open_and_register_silent(app: &mut App, path: &std::path::Path) -> Result<(), String> {
+    let mut store = EventStore::open(path).map_err(|e| format!("opening: {}", e))?;
+    crate::store::migrations::run_migrations(store.connection())
+        .map_err(|e| format!("migration: {}", e))?;
+    ensure_company(&mut store, path);
+    let name = read_company_name(&store, path);
+    app.registry
+        .add_business(&name, path)
+        .map_err(|e| format!("register: {}", e))?;
+    Ok(())
 }
 
 fn has_no_accounts(store: &EventStore) -> bool {

@@ -422,7 +422,7 @@ mod tests {
     use crate::events::types::{Event, EventAccountType, EventEnvelope, JournalLineData};
     use crate::store::event_store::EventStore;
     use crate::store::migrations::init_schema;
-    use crate::store::projections::Projector;
+    use crate::store::projections::ProjectionStore;
 
     fn setup() -> EventStore {
         let store = EventStore::in_memory().unwrap();
@@ -435,8 +435,7 @@ mod tests {
             .append(EventEnvelope::new(event, user_id.to_string()))
             .unwrap();
         {
-            let projector = Projector::new(store.connection());
-            projector.apply(&stored).unwrap();
+            store.apply_projection(&stored).unwrap();
         }
     }
 
