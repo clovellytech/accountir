@@ -5,3 +5,6 @@ imports
 
 node_modules/
 
+.claude
+*.db-shm
+*.db-wal
