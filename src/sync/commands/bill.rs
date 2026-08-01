@@ -9,6 +9,12 @@
 //! shared in-txn helpers (`build_receive_bill_in_txn` /
 //! `build_issue_invoice_in_txn`) return the raw events and this endpoint stamps
 //! the authenticated actor on each (the local handlers stamp their own user).
+//!
+//! The request DTOs derive `Serialize` as well as `Deserialize` so the client half
+//! ([`crate::sync::client::SyncClient`]) builds its bodies from the *same* structs
+//! the server parses. The failure that prevents: a hand-rolled `json!` body on the
+//! client drifting one field name away from the server's DTO, which serde answers
+//! with a silent default or a 422 nobody can explain from either side of the wire.
 
 use crate::commands::bill_commands::{
     build_receive_bill_in_txn, check_receive_bill_pure, BillStep, ReceiveBillCommand,
@@ -22,7 +28,7 @@ use crate::store::event_store::{CheckedOutcome, Verdict};
 use crate::sync::{project, stamp, ApiError, AuthedUser, SubmitResponse, SyncState};
 use axum::{extract::State, routing::post, Json, Router};
 use chrono::NaiveDate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<SyncState> {
     Router::new()
@@ -51,7 +57,7 @@ fn many_outcome_to_response<E: std::fmt::Display>(
 
 // --- receive-bill ---
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ReceiveBillRequest {
     pub expected_head_seq: i64,
     pub vendor: String,
@@ -111,7 +117,7 @@ async fn submit_receive_bill(
 
 // --- issue-invoice ---
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct IssueInvoiceRequest {
     pub expected_head_seq: i64,
     pub customer: String,

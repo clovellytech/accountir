@@ -68,6 +68,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             16,
             include_str!("../../migrations/016_event_service_root_url_unique.sql"),
         ),
+        (17, include_str!("../../migrations/017_group_binding.sql")),
     ];
 
     for (version, sql) in migrations {
@@ -442,6 +443,20 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         -- in-txn check in register_service.
         CREATE UNIQUE INDEX IF NOT EXISTS idx_event_services_active_root_url
             ON event_services(root_url) WHERE status = 'active';
+
+        -- Which group server this ledger is a replica of (migration 017).
+        -- Kept in step with the migration so a database built by `init_schema`
+        -- alone is complete; see 017_group_binding.sql for why the binding lives
+        -- in the ledger file rather than the machine's registry.
+        CREATE TABLE IF NOT EXISTS group_binding (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            group_id TEXT NOT NULL,
+            instance_url TEXT NOT NULL,
+            control_plane_url TEXT NOT NULL,
+            bound_at TEXT NOT NULL,
+            last_server_head INTEGER NOT NULL DEFAULT 0,
+            last_synced_at TEXT
+        );
         "#,
     )?;
 

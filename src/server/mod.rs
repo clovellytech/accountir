@@ -32,10 +32,44 @@ pub struct ServerDb {
     inner: Arc<SharedState>,
 }
 
+/// Whether this local server may serve the given ledger at all.
+///
+/// The failure this prevents: every write handler on this server appends a
+/// **locally authored** event through the ordinary path, and the server holds its
+/// own `EventStore` on the file, so none of it passes through whatever gate the
+/// caller uses to keep replicas read-only. On a group replica `events.id` *are*
+/// the group server's sequence numbers, so one `POST /api/ingest/sale` or one
+/// Plaid Link callback mints an id the group server is also about to mint, for a
+/// different event. The two logs then silently stop being the same log, and the
+/// first anyone notices is a trial balance nobody else can reproduce.
+///
+/// It is refused here rather than at each of the dozen write handlers, and rather
+/// than only in the caller, because this is the single place the file becomes
+/// reachable — and because this server is unauthenticated and CORS-permissive, so
+/// "no caller would do that" is not a property anyone can enforce.
+///
+/// Erring toward refusal: a binding we cannot read is treated as present. A
+/// wrongly refused local ledger costs an error message the user can act on; a
+/// wrongly accepted replica costs the ledger.
+fn attachable(store: &EventStore) -> Result<(), String> {
+    let bound = crate::sync::binding::get_for(store).map_or(true, |b| b.is_some());
+    if bound {
+        return Err(
+            "these books are a copy of a group server's — the group server keeps the \
+             authoritative copy, so imports and Plaid have to go through it rather than \
+             being written here"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 impl ServerDb {
     /// Open a database and make it available to the sync server. Returns the
     /// canonical path on success. Errors are returned to the caller and also
     /// logged to stderr so they're visible in `tauri dev` output.
+    ///
+    /// Refuses a group replica outright — see [`attachable`].
     pub fn set(&self, path: &std::path::Path) -> Result<std::path::PathBuf, String> {
         let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         match EventStore::open(&canonical) {
@@ -49,6 +83,14 @@ impl ServerDb {
                     );
                     eprintln!("{}", msg);
                     return Err(msg);
+                }
+                if let Err(why) = attachable(&store) {
+                    let msg = format!("sync-server: refusing {}: {}", canonical.display(), why);
+                    eprintln!("{}", msg);
+                    // Whatever was attached before is not this file, and leaving it
+                    // in place would silently write somewhere else.
+                    *self.inner.db.lock().unwrap() = None;
+                    return Err(why);
                 }
                 let mut guard = self.inner.db.lock().unwrap();
                 *guard = Some(ActiveDb {
@@ -2490,4 +2532,46 @@ pub async fn run_server(store: EventStore, db_path: PathBuf) -> anyhow::Result<(
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::migrations::SchemaStore;
+
+    fn ledger() -> EventStore {
+        let mut s = EventStore::in_memory().unwrap();
+        s.init_schema().unwrap();
+        s.run_migrations().unwrap();
+        s
+    }
+
+    /// The regression this guards: a group replica being served by this local,
+    /// unauthenticated, CORS-permissive HTTP server. Its write handlers append
+    /// locally authored events on its own connection to the file, so nothing the
+    /// caller does to keep a replica read-only can see them — and an event
+    /// authored at a seq the group server is also about to use forks the log
+    /// silently and permanently.
+    #[test]
+    fn a_group_replica_is_never_served_by_the_local_write_server() {
+        let local = ledger();
+        assert!(
+            attachable(&local).is_ok(),
+            "a plain local ledger is what this server exists for"
+        );
+
+        let replica = ledger();
+        crate::sync::binding::bind(
+            replica.connection(),
+            "acme",
+            "https://acme.app.accountir.com",
+            "https://app.accountir.com",
+        )
+        .unwrap();
+        let err = attachable(&replica).unwrap_err();
+        assert!(
+            err.contains("group server"),
+            "the refusal has to say where the writes belong instead: {err}"
+        );
+    }
 }

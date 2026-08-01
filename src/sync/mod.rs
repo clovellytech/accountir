@@ -26,7 +26,8 @@ use crate::commands::entry_commands::{
     build_post_entry_in_txn, check_entry_pure, EntryCommandError, EntryLine, PostEntryCommand,
     PostEntryStep,
 };
-use crate::events::types::{Event, EventEnvelope, JournalEntrySource};
+use crate::events::payload::hash_to_hex;
+use crate::events::types::{Event, EventEnvelope, JournalEntrySource, StoredEvent};
 use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::Projector;
 use axum::{
@@ -36,17 +37,21 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+pub mod binding;
 pub mod client;
 pub mod commands;
 pub mod reads;
+pub mod replica;
+pub use binding::GroupBinding;
 pub use client::{SyncClient, SyncClientError};
+pub use replica::{AppliedRange, ReplicaError};
 
 /// Resolves a bearer token to an authenticated `actor_id` (or `None` if invalid).
 /// This is the transport's auth seam: `accountir-app` ships the in-memory
@@ -166,25 +171,72 @@ async fn get_head(
 #[derive(Deserialize)]
 struct EventsQuery {
     since: Option<i64>,
+    /// Page size. A replica catching up from zero must not be handed the entire
+    /// log in one response — that is an unbounded allocation on both ends driven
+    /// by a client-chosen `since`. Clamped in [`EventsQuery::page_limit`].
+    limit: Option<u32>,
+}
+
+/// Default and maximum page sizes for `GET /sync/events`.
+///
+/// The default is what a catching-up replica gets when it doesn't ask; the
+/// maximum is the ceiling a client cannot talk the server past, because the
+/// response is materialized in memory before it is serialized.
+const EVENTS_DEFAULT_LIMIT: u32 = 500;
+const EVENTS_MAX_LIMIT: u32 = 1000;
+
+impl EventsQuery {
+    /// Clamp the requested page size into `1..=EVENTS_MAX_LIMIT`. A `0` or absent
+    /// limit means "use the default" rather than "return nothing": a client that
+    /// mis-serializes its limit should catch up slowly, not stall forever on an
+    /// empty page it reads as "already up to date".
+    fn page_limit(&self) -> usize {
+        self.limit
+            .filter(|l| *l > 0)
+            .unwrap_or(EVENTS_DEFAULT_LIMIT)
+            .min(EVENTS_MAX_LIMIT) as usize
+    }
 }
 
 /// A log entry as seen by a client catching up. `seq` is the canonical order.
-#[derive(Serialize, Deserialize)]
+///
+/// `timestamp` / `received_at` / `hash` are the fields a **replica** needs to
+/// mirror the row faithfully — without the timestamp and the hash a client
+/// cannot re-derive `compute_event_hash` and therefore cannot tell a genuine
+/// server log from a mangled one. They are `Option` + `#[serde(default)]` purely
+/// for wire compatibility with an older peer; the replica path fails closed when
+/// they are absent (see [`replica::apply_batch`]) rather than trusting a log it
+/// cannot verify.
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SyncEvent {
     pub seq: i64,
     pub actor_id: Option<String>,
     pub user_id: String,
     pub event: Event,
+    /// Client wall-clock time, RFC3339 on the wire. A hash input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<DateTime<Utc>>,
+    /// Server-stamped receive time. Not a hash input; mirrored for audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<DateTime<Utc>>,
+    /// Hex-encoded SHA-256 of the stored row, as the server holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EventsResponse {
     pub head: i64,
     pub events: Vec<SyncEvent>,
 }
 
-/// Fetch all events after `since` (default 0) plus the current head, so a client
-/// can rebuild its view before retrying a conflicted submit.
+/// Fetch events after `since` (default 0), up to `limit`, plus the current head,
+/// so a client can rebuild its view before retrying a conflicted submit or catch
+/// a replica up.
+///
+/// `head` is the *canonical* head, not the last seq in this page: that is what
+/// tells a paging replica whether to come back for more. Truncation is therefore
+/// visible to the client (`last seq < head`) rather than silent.
 async fn get_events(
     _user: AuthedUser,
     State(st): State<SyncState>,
@@ -192,19 +244,25 @@ async fn get_events(
 ) -> Result<Json<EventsResponse>, ApiError> {
     let store = st.store.lock().unwrap();
     let stored = store
-        .get_after(q.since.unwrap_or(0))
+        .get_after_limited(q.since.unwrap_or(0), q.page_limit())
         .map_err(ApiError::store)?;
     let head = store.latest_id().map_err(ApiError::store)?.unwrap_or(0);
-    let events = stored
-        .into_iter()
-        .map(|s| SyncEvent {
+    let events = stored.into_iter().map(SyncEvent::from).collect();
+    Ok(Json(EventsResponse { head, events }))
+}
+
+impl From<StoredEvent> for SyncEvent {
+    fn from(s: StoredEvent) -> Self {
+        SyncEvent {
             seq: s.id,
             actor_id: s.actor_id,
             user_id: s.user_id,
+            timestamp: Some(s.timestamp),
+            received_at: s.received_at,
+            hash: Some(hash_to_hex(&s.hash)),
             event: s.event,
-        })
-        .collect();
-    Ok(Json(EventsResponse { head, events }))
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -251,7 +309,7 @@ async fn submit(
 
 // --- Real command: post a journal entry, validated server-side ---
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PostEntryLine {
     pub account_id: String,
     /// Smallest currency unit. Positive = debit, negative = credit.
@@ -712,5 +770,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    // --- replica catch-up over the real transport ---
+
+    /// The whole point of the read path, end to end: a fresh empty ledger follows
+    /// a live server over HTTP and ends up holding the same log, byte for byte,
+    /// with the same ids. If this passes, `local_cursor` is a valid cursor.
+    #[tokio::test]
+    async fn a_replica_catches_up_to_the_server_over_http_and_matches_it_exactly() {
+        let mut server_store = {
+            let s = EventStore::in_memory().unwrap();
+            init_schema(s.connection()).unwrap();
+            s
+        };
+        mk_account(&mut server_store, "1000", AccountType::Asset);
+        mk_account(&mut server_store, "2000", AccountType::Liability);
+        mk_account(&mut server_store, "3000", AccountType::Equity);
+        let expected_hashes = server_store.get_all_hashes().unwrap();
+
+        let base = serve(SyncState::new(server_store, tokens())).await;
+
+        let mut replica_store = {
+            let s = EventStore::in_memory().unwrap();
+            init_schema(s.connection()).unwrap();
+            crate::store::migrations::run_migrations(s.connection()).unwrap();
+            binding::bind(s.connection(), "acme", &base, "https://cp").unwrap();
+            s
+        };
+
+        // Page deliberately smaller than the log so the paging loop is exercised.
+        let mut client = SyncClient::with_head(&base, TOKEN, 0);
+        loop {
+            let cursor = replica::local_cursor(&replica_store).unwrap();
+            let page = client.events_page(cursor, 2).await.unwrap();
+            if page.events.is_empty() {
+                assert_eq!(cursor, page.head, "an empty page means we are caught up");
+                break;
+            }
+            replica::apply_batch(&mut replica_store, &page.events).unwrap();
+        }
+
+        assert_eq!(replica_store.get_all_hashes().unwrap(), expected_hashes);
+        assert_eq!(replica::local_cursor(&replica_store).unwrap(), 3);
+        // The projections came with them — a replica is usable, not just archived.
+        let accounts: i64 = replica_store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accounts, 3);
+
+        // And the prefix check the desktop runs on every open agrees.
+        let at_head = client.events_page(2, 1).await.unwrap();
+        replica::verify_prefix(&replica_store, at_head.events.first()).unwrap();
+    }
+
+    /// A client must not be able to talk the server into materializing an
+    /// arbitrarily large response, and a `limit` of zero must not mean "no events"
+    /// — a replica reading an empty page as "caught up" would stall forever.
+    #[tokio::test]
+    async fn the_events_page_limit_is_clamped_and_head_still_reports_the_whole_log() {
+        let mut store = {
+            let s = EventStore::in_memory().unwrap();
+            init_schema(s.connection()).unwrap();
+            s
+        };
+        for i in 0..5 {
+            mk_account(&mut store, &format!("{}000", i + 1), AccountType::Asset);
+        }
+        let base = serve(SyncState::new(store, tokens())).await;
+        let http = reqwest::Client::new();
+
+        let page: EventsResponse = http
+            .get(format!("{base}/sync/events?since=0&limit=2"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page.events.len(), 2);
+        // Truncation has to be visible, or a replica stops one page short and
+        // believes it is up to date.
+        assert_eq!(page.head, 5);
+
+        for query in ["limit=0", "limit=100000", ""] {
+            let page: EventsResponse = http
+                .get(format!("{base}/sync/events?since=0&{query}"))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(page.events.len(), 5, "query {query:?}");
+        }
+    }
+
+    /// Old clients pin the shape they rely on; new fields must be additive.
+    #[test]
+    fn a_sync_event_still_deserializes_without_the_replica_fields() {
+        let json = serde_json::json!({
+            "seq": 1,
+            "actor_id": null,
+            "user_id": "u",
+            "event": Event::AccountCreated {
+                account_id: "a".into(),
+                account_number: "1000".into(),
+                name: "Cash".into(),
+                account_type: EventAccountType::Asset,
+                parent_id: None,
+                currency: Some("USD".into()),
+                description: None,
+            },
+        });
+        let e: SyncEvent = serde_json::from_value(json).unwrap();
+        assert!(e.timestamp.is_none() && e.hash.is_none());
     }
 }

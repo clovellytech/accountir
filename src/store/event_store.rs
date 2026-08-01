@@ -31,6 +31,40 @@ pub enum EventStoreError {
     DuplicateHash,
     #[error("IO error: {0}")]
     IoError(String),
+    /// A mirrored batch did not continue the local log exactly (see
+    /// [`EventStore::append_mirrored`]). Not recoverable by retrying the same
+    /// batch: either the client asked from the wrong cursor, or the local copy is
+    /// not a prefix of the server's log.
+    #[error("mirrored batch is not contiguous: expected seq {expected}, got {got}")]
+    MirrorGap { expected: i64, got: i64 },
+    /// A mirrored event's payload did not re-derive the hash the server sent.
+    /// Terminal: the log this client is being handed is not the one the server
+    /// signed for, so applying it would fork the ledger.
+    #[error("mirrored event {seq} does not match the hash the server sent")]
+    MirrorHashMismatch { seq: i64 },
+}
+
+/// One server-authored event to mirror into a replica's log, carrying the
+/// server's own sequence number and hash.
+///
+/// Distinct from [`EventEnvelope`] on purpose: an envelope is something this
+/// machine is *authoring* (the store assigns its id and computes its hash), while
+/// a `MirrorEvent` is something this machine is *copying* (the id and hash come
+/// from the server and are verified, never minted). Keeping the two types apart
+/// is what makes "a replica never authors an event" checkable by reading the
+/// signature instead of the call site.
+#[derive(Debug, Clone)]
+pub struct MirrorEvent {
+    /// The server's canonical sequence number; becomes this row's `id`.
+    pub seq: i64,
+    pub event: Event,
+    pub user_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub actor_id: Option<String>,
+    pub received_at: Option<DateTime<Utc>>,
+    /// The 32-byte hash as the server stored it. Compared against a local
+    /// recomputation; never written unverified.
+    pub hash: Vec<u8>,
 }
 
 /// The event store manages the append-only event log
@@ -521,6 +555,122 @@ impl EventStore {
         Ok(CheckedOutcome::Appended(stored_events))
     }
 
+    /// Mirror a contiguous batch of **server-authored** events into this log,
+    /// keeping the server's sequence numbers as the local row ids.
+    ///
+    /// This is the replica write path (SPEC §4.1: the group server is
+    /// authoritative and online-first). It is deliberately *not* `append`: an
+    /// append mints a fresh local id, and a replica whose ids drift from the
+    /// server's can no longer express "I have everything up to N" — which is the
+    /// only cursor this design has (see [`crate::sync::replica`]). So the id is
+    /// supplied, not generated, and the whole batch is refused unless it starts
+    /// exactly at `head + 1` and ascends by one.
+    ///
+    /// The failure this prevents is a client quietly accepting a log that is not a
+    /// prefix of the server's — a hole, a re-ordering, or a tampered payload — and
+    /// then reporting balances the rest of the group cannot reproduce. Concretely,
+    /// inside one `IMMEDIATE` transaction:
+    ///   1. re-read the head **under the write lock** (the head the caller checked
+    ///      before the request may be stale by now — another mirror batch or, on a
+    ///      misconfigured install, a local append);
+    ///   2. require `events[0].seq == head + 1` and strictly `+1` ascending,
+    ///      else [`EventStoreError::MirrorGap`];
+    ///   3. re-derive `compute_event_hash(event, timestamp.to_rfc3339(), user_id)`
+    ///      and compare it with the hash the server sent, else
+    ///      [`EventStoreError::MirrorHashMismatch`] — the client verifies rather
+    ///      than trusts, so a proxy or a bug that mutates a payload in flight is
+    ///      caught at the boundary instead of becoming permanent ledger state;
+    ///   4. insert with the **explicit** id and run `project` for each event in the
+    ///      same transaction, so the log can never lead the projections;
+    ///   5. commit — whole batch or nothing.
+    ///
+    /// `append`, `append_expecting` and `append_checked*` are untouched, so solo
+    /// local-first behaviour is byte-for-byte unchanged.
+    pub fn append_mirrored(
+        &mut self,
+        events: &[MirrorEvent],
+        project: impl Fn(&rusqlite::Transaction<'_>, &StoredEvent) -> Result<(), EventStoreError>,
+    ) -> Result<Vec<StoredEvent>, EventStoreError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let head: i64 = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+            row.get(0)
+        })?;
+
+        let mut stored_events = Vec::with_capacity(events.len());
+        for (expected, mirrored) in (head + 1..).zip(events.iter()) {
+            if mirrored.seq != expected {
+                // Dropping `tx` rolls back: no partial apply, ever.
+                return Err(EventStoreError::MirrorGap {
+                    expected,
+                    got: mirrored.seq,
+                });
+            }
+
+            // A mirrored event is still subject to this build's structural rules.
+            // Refusing here is the safe direction: an event we cannot validate is
+            // one whose projection we cannot trust either.
+            validate_event(&mirrored.event)?;
+
+            let payload = serialize_event(&mirrored.event)
+                .map_err(|e| EventStoreError::SerializationError(e.to_string()))?;
+            let timestamp_str = mirrored.timestamp.to_rfc3339();
+            let received_at_str = mirrored.received_at.map(|t| t.to_rfc3339());
+            // Recompute rather than store what we were given. See `append`:
+            // `actor_id`/`received_at` are not hash inputs, so the recomputation
+            // uses exactly the three fields the server hashed.
+            let hash = compute_event_hash(&mirrored.event, &timestamp_str, &mirrored.user_id)
+                .map_err(|e| EventStoreError::SerializationError(e.to_string()))?;
+            if hash.as_slice() != mirrored.hash.as_slice() {
+                return Err(EventStoreError::MirrorHashMismatch { seq: mirrored.seq });
+            }
+
+            match tx.execute(
+                "INSERT INTO events (id, event_type, payload, hash, user_id, timestamp, actor_id, received_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    mirrored.seq,
+                    mirrored.event.event_type(),
+                    payload,
+                    hash.as_slice(),
+                    mirrored.user_id,
+                    timestamp_str,
+                    mirrored.actor_id,
+                    received_at_str,
+                ],
+            ) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    return Err(EventStoreError::DuplicateHash)
+                }
+                Err(e) => return Err(EventStoreError::DatabaseError(e)),
+            }
+
+            let stored = StoredEvent::with_identity(
+                mirrored.seq,
+                mirrored.event.clone(),
+                hash.to_vec(),
+                mirrored.user_id.clone(),
+                mirrored.timestamp,
+                mirrored.actor_id.clone(),
+                mirrored.received_at,
+            );
+            project(&tx, &stored)?;
+            stored_events.push(stored);
+        }
+
+        tx.commit()?;
+        Ok(stored_events)
+    }
+
     /// Get an event by ID
     pub fn get(&self, id: i64) -> Result<StoredEvent, EventStoreError> {
         let row = self
@@ -600,6 +750,35 @@ impl EventStore {
 
         let events = stmt
             .query_map([after_id], row_to_stored_parts)?
+            .filter_map(|r| r.ok())
+            .filter_map(hydrate_stored_event)
+            .collect();
+
+        Ok(events)
+    }
+
+    /// Get at most `limit` events after `after_id`, in ascending id order.
+    ///
+    /// The paged form of [`get_after`], for the sync transport. It exists because
+    /// `get_after` materializes the *entire* remaining log: on a group server
+    /// polled every ten seconds by a dozen desktops, serving one page of a
+    /// year-old ledger would allocate the whole ledger a dozen times a minute. The
+    /// `LIMIT` belongs in SQL, not in a `.take()` after the rows are already
+    /// hydrated.
+    ///
+    /// [`get_after`]: EventStore::get_after
+    pub fn get_after_limited(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredEvent>, EventStoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, event_type, payload, hash, user_id, timestamp, actor_id, received_at
+             FROM events WHERE id > ?1 ORDER BY id ASC LIMIT ?2",
+        )?;
+
+        let events = stmt
+            .query_map(params![after_id, limit as i64], row_to_stored_parts)?
             .filter_map(|r| r.ok())
             .filter_map(hydrate_stored_event)
             .collect();

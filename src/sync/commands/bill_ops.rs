@@ -14,6 +14,12 @@
 //! (state-independent) pre-check — the guards all read live projections under the
 //! write lock — so there is no `check_*_pure` call here. A domain rejection is a
 //! `422`, a stale head a `409`.
+//!
+//! The request DTOs derive `Serialize` as well as `Deserialize` so the client half
+//! ([`crate::sync::client::SyncClient`]) builds its bodies from the *same* structs
+//! the server parses. The failure that prevents: a hand-rolled `json!` body on the
+//! client drifting one field name away from the server's DTO, which serde answers
+//! with a silent default or a 422 nobody can explain from either side of the wire.
 
 use crate::commands::bill_commands::{
     build_apply_payment_in_txn, build_void_bill_in_txn, ApplyBillPaymentCommand, BillStep,
@@ -28,7 +34,7 @@ use crate::store::event_store::{CheckedOutcome, Verdict};
 use crate::sync::{project, stamp, ApiError, AuthedUser, SubmitResponse, SyncState};
 use axum::{extract::State, routing::post, Json, Router};
 use chrono::NaiveDate;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<SyncState> {
     Router::new()
@@ -65,7 +71,7 @@ fn many_outcome_to_response<E: std::fmt::Display>(
 
 // --- apply-bill-payment ---
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ApplyBillPaymentRequest {
     pub expected_head_seq: i64,
     pub bill_id: String,
@@ -116,7 +122,7 @@ async fn submit_apply_bill_payment(
 
 // --- void-bill ---
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct VoidBillRequest {
     pub expected_head_seq: i64,
     pub bill_id: String,
@@ -156,7 +162,7 @@ async fn submit_void_bill(
 
 // --- receive-invoice-payment ---
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ReceiveInvoicePaymentRequest {
     pub expected_head_seq: i64,
     pub invoice_id: String,
@@ -207,7 +213,7 @@ async fn submit_receive_invoice_payment(
 
 // --- void-invoice ---
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct VoidInvoiceRequest {
     pub expected_head_seq: i64,
     pub invoice_id: String,
