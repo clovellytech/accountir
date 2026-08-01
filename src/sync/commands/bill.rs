@@ -104,9 +104,9 @@ async fn submit_receive_bill(
             req.expected_head_seq,
             move |tx| match build_receive_bill_in_txn(tx, &cmd)? {
                 // Sync path: stamp the authenticated actor on each event.
-                BillStep::Append(events) => {
-                    Ok(Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect()))
-                }
+                BillStep::Append(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
                 BillStep::Reject(e) => Ok(Verdict::Reject(e)),
             },
             project,
@@ -161,9 +161,9 @@ async fn submit_issue_invoice(
             req.expected_head_seq,
             move |tx| match build_issue_invoice_in_txn(tx, &cmd)? {
                 // Sync path: stamp the authenticated actor on each event.
-                InvoiceStep::Append(events) => {
-                    Ok(Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect()))
-                }
+                InvoiceStep::Append(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
                 InvoiceStep::Reject(e) => Ok(Verdict::Reject(e)),
             },
             project,
@@ -335,10 +335,7 @@ mod tests {
             .unwrap();
         // The server enforces the fence: inactive account → 422, not a blind append.
         assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["error"]
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("inactive"));
@@ -386,5 +383,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+    /// Same wiring regression as `bill_ops`: the desktop's only route to these two
+    /// commands is [`SyncClient`], and a path or field-name drift between the two
+    /// halves is invisible until a user reports a bill that "didn't save".
+    ///
+    /// [`SyncClient`]: crate::sync::client::SyncClient
+    #[tokio::test]
+    async fn the_client_reaches_receive_bill_and_issue_invoice() {
+        use crate::sync::client::SyncClient;
+
+        let (base, a) = serve_with_accounts().await;
+        let head = 4;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+        let date = NaiveDate::from_ymd_opt(2026, 7, 3).unwrap();
+
+        let after_bill = client
+            .receive_bill(
+                "V".to_string(),
+                10_000,
+                "USD".to_string(),
+                date,
+                PaymentTerms::Net { days: 30 },
+                None,
+                a.expense.clone(),
+                a.ap.clone(),
+                None,
+            )
+            .await
+            .expect("receive-bill");
+        assert_eq!(
+            after_bill,
+            head + 2,
+            "a bill appends its entry and the event"
+        );
+
+        let after_invoice = client
+            .issue_invoice(
+                "C".to_string(),
+                10_000,
+                "USD".to_string(),
+                date,
+                PaymentTerms::Net { days: 30 },
+                None,
+                a.revenue.clone(),
+                a.ar.clone(),
+            )
+            .await
+            .expect("issue-invoice");
+        assert_eq!(after_invoice, head + 4);
     }
 }

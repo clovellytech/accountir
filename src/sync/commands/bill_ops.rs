@@ -109,9 +109,9 @@ async fn submit_apply_bill_payment(
             req.expected_head_seq,
             move |tx| match build_apply_payment_in_txn(tx, &cmd)? {
                 // Sync path: stamp the authenticated actor on each event.
-                BillStep::Append(events) => {
-                    Ok(Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect()))
-                }
+                BillStep::Append(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
                 BillStep::Reject(e) => Ok(Verdict::Reject(e)),
             },
             project,
@@ -149,9 +149,9 @@ async fn submit_void_bill(
         .append_checked_many(
             req.expected_head_seq,
             move |tx| match build_void_bill_in_txn(tx, &cmd)? {
-                BillStep::Append(events) => {
-                    Ok(Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect()))
-                }
+                BillStep::Append(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
                 BillStep::Reject(e) => Ok(Verdict::Reject(e)),
             },
             project,
@@ -200,9 +200,9 @@ async fn submit_receive_invoice_payment(
         .append_checked_many(
             req.expected_head_seq,
             move |tx| match build_receive_payment_in_txn(tx, &cmd)? {
-                InvoiceStep::Append(events) => {
-                    Ok(Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect()))
-                }
+                InvoiceStep::Append(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
                 InvoiceStep::Reject(e) => Ok(Verdict::Reject(e)),
             },
             project,
@@ -240,9 +240,9 @@ async fn submit_void_invoice(
         .append_checked_many(
             req.expected_head_seq,
             move |tx| match build_void_invoice_in_txn(tx, &cmd)? {
-                InvoiceStep::Append(events) => {
-                    Ok(Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect()))
-                }
+                InvoiceStep::Append(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
                 InvoiceStep::Reject(e) => Ok(Verdict::Reject(e)),
             },
             project,
@@ -375,7 +375,13 @@ mod tests {
 
     // --- apply-bill-payment ---
 
-    fn bill_pay_body(head: i64, bill_id: &str, ap: &str, cash: &str, amt: i64) -> serde_json::Value {
+    fn bill_pay_body(
+        head: i64,
+        bill_id: &str,
+        ap: &str,
+        cash: &str,
+        amt: i64,
+    ) -> serde_json::Value {
         serde_json::json!({
             "expected_head_seq": head,
             "bill_id": bill_id,
@@ -413,10 +419,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["error"]
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("exceeds"));
@@ -510,10 +513,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["error"]
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("payments"));
@@ -556,7 +556,13 @@ mod tests {
 
     // --- receive-invoice-payment ---
 
-    fn inv_pay_body(head: i64, invoice_id: &str, ar: &str, cash: &str, amt: i64) -> serde_json::Value {
+    fn inv_pay_body(
+        head: i64,
+        invoice_id: &str,
+        ar: &str,
+        cash: &str,
+        amt: i64,
+    ) -> serde_json::Value {
         serde_json::json!({
             "expected_head_seq": head,
             "invoice_id": invoice_id,
@@ -592,10 +598,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["error"]
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("exceeds"));
@@ -684,10 +687,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["error"]
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("payments"));
@@ -725,5 +725,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    /// The regression this guards is a wiring one, and it is invisible to either
+    /// half alone: the client builds a path and a body, the server owns the route
+    /// and the DTO, and nothing in the type system connects them. A typo'd path is
+    /// a 404 the desktop reports as "the server had a problem", and a drifted field
+    /// name is a serde default the server silently accepts. Driving the real
+    /// [`SyncClient`] against the real router is the only place that shows up.
+    ///
+    /// [`SyncClient`]: crate::sync::client::SyncClient
+    #[tokio::test]
+    async fn the_client_reaches_every_bill_and_invoice_command_it_offers() {
+        use crate::sync::client::{SyncClient, SyncClientError};
+
+        let (base, s) = serve_with_seed().await;
+        let mut client = SyncClient::with_head(base, TOKEN, s.head);
+
+        // Each call advances the head, and the client adopts it — so the *next*
+        // call succeeding is itself evidence that the previous one's reply was
+        // understood rather than guessed at.
+        let head = client
+            .apply_bill_payment(
+                s.bill_id.clone(),
+                NaiveDate::from_ymd_opt(2026, 7, 10).unwrap(),
+                6_000,
+                s.cash.clone(),
+                s.ap.clone(),
+                None,
+            )
+            .await
+            .expect("apply-bill-payment");
+        assert_eq!(
+            head,
+            s.head + 2,
+            "a payment appends its entry and the event"
+        );
+
+        let head = client
+            .receive_invoice_payment(
+                s.invoice_id.clone(),
+                NaiveDate::from_ymd_opt(2026, 7, 11).unwrap(),
+                4_000,
+                s.cash.clone(),
+                s.ar.clone(),
+                None,
+            )
+            .await
+            .expect("receive-invoice-payment");
+        assert_eq!(head, s.head + 4);
+
+        // A part-paid bill may not be voided — and the refusal has to arrive as the
+        // server's own words, not as a transport failure, or the desktop cannot
+        // tell the user what to fix.
+        match client.void_bill(s.bill_id.clone(), "changed my mind").await {
+            Err(SyncClientError::Rejected(why)) => assert!(!why.is_empty(), "a 422 says why"),
+            other => panic!("voiding a paid bill must be a terminal 422, got {other:?}"),
+        }
+
+        // …and one with no payments against it still voids, so the refusal above
+        // was the domain guard and not the wiring.
+        let (base2, s2) = serve_with_seed().await;
+        let mut client2 = SyncClient::with_head(base2, TOKEN, s2.head);
+        let head = client2
+            .void_bill(s2.bill_id.clone(), "duplicate")
+            .await
+            .expect("void-bill");
+        assert_eq!(head, s2.head + 2);
+        let head = client2
+            .void_invoice(s2.invoice_id.clone(), "duplicate")
+            .await
+            .expect("void-invoice");
+        assert_eq!(head, s2.head + 4);
     }
 }

@@ -111,7 +111,9 @@ async fn submit_unvoid_entry(
 mod tests {
     use super::*;
     use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
-    use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand, VoidEntryCommand};
+    use crate::commands::entry_commands::{
+        EntryCommands, EntryLine, PostEntryCommand, VoidEntryCommand,
+    };
     use crate::domain::AccountType;
     use crate::events::types::Event;
     use crate::store::event_store::EventStore;
@@ -270,5 +272,33 @@ mod tests {
             .unwrap();
         assert_eq!(ok.status(), reqwest::StatusCode::OK);
         assert_eq!(head_of(&ok.json().await.unwrap()), head + 1);
+    }
+    /// The wiring the desktop's "void" button actually travels: client path +
+    /// DTO against the real router. A drift in either is a button that reports a
+    /// server problem for a command the server implements perfectly well.
+    #[tokio::test]
+    async fn the_client_reaches_void_and_unvoid_entry() {
+        use crate::sync::client::SyncClient;
+
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let entry_id = seed_posted_entry(&mut store);
+        let head = store.latest_id().unwrap().unwrap_or(0);
+        let base = serve(SyncState::new(store, tokens())).await;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+
+        assert_eq!(
+            client
+                .void_entry(entry_id.clone(), "mistake")
+                .await
+                .unwrap(),
+            head + 1
+        );
+        // The client adopted the new head, so this second call only succeeds if it
+        // read the first reply rather than guessing.
+        assert_eq!(
+            client.unvoid_entry(entry_id, "restored").await.unwrap(),
+            head + 2
+        );
     }
 }

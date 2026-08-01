@@ -30,10 +30,7 @@ use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<SyncState> {
     Router::new()
-        .route(
-            "/sync/commands/create-account",
-            post(submit_create_account),
-        )
+        .route("/sync/commands/create-account", post(submit_create_account))
         .route(
             "/sync/commands/deactivate-account",
             post(submit_deactivate_account),
@@ -328,12 +325,31 @@ mod tests {
             .unwrap();
         // The server enforces the fence: nonzero balance → 422, not a blind append.
         assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["error"]
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("balance"));
+    }
+    /// Deactivation is the one account command the desktop has no local fallback
+    /// for on a replica, so this route is the whole feature. Same wiring
+    /// regression as the other command families.
+    #[tokio::test]
+    async fn the_client_reaches_deactivate_account() {
+        use crate::sync::client::SyncClient;
+
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let account_id = mk_account(&mut store, "1000", AccountType::Asset);
+        let head = store.latest_id().unwrap().unwrap_or(0);
+        let base = serve(SyncState::new(store, tokens())).await;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+
+        assert_eq!(
+            client
+                .deactivate_account(account_id, Some("closed".to_string()))
+                .await
+                .unwrap(),
+            head + 1
+        );
     }
 }
