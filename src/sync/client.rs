@@ -4,7 +4,10 @@
 //! `409` (another member wrote first) is resolved by adopting the server's head
 //! and retrying, so the caller doesn't hand-manage conflicts.
 
-use super::commands::account::{CreateAccountRequest, DeactivateAccountRequest};
+use super::commands::account::{
+    CreateAccountRequest, DeactivateAccountRequest, SeedDefaultAccountsRequest,
+    UpdateAccountRequest,
+};
 use super::commands::bill::{IssueInvoiceRequest, ReceiveBillRequest};
 use super::commands::bill_ops::{
     ApplyBillPaymentRequest, ReceiveInvoicePaymentRequest, VoidBillRequest, VoidInvoiceRequest,
@@ -176,6 +179,71 @@ impl SyncClient {
                 description: description.clone(),
             };
             match self.submit("/sync/commands/create-account", &body).await? {
+                Submitted::Head(head) => return Ok(head),
+                Submitted::Retry => continue,
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Edit an account on the group's ledger.
+    ///
+    /// Same retry contract as [`create_account`]: a `409` means the log moved under
+    /// us, so we adopt the server's head and try again. That is safe here for the
+    /// same reason it is there — the server re-diffs the account against its
+    /// *current* state inside each attempt's transaction, so a retry never replays
+    /// a stale `old_value`.
+    ///
+    /// `parent_id` is `Option<Option<String>>`: `None` leaves the parent alone,
+    /// `Some(None)` clears it, `Some(Some(id))` sets it.
+    ///
+    /// [`create_account`]: SyncClient::create_account
+    pub async fn update_account(
+        &mut self,
+        account_id: impl Into<String>,
+        account_number: Option<String>,
+        name: Option<String>,
+        parent_id: Option<Option<String>>,
+        description: Option<String>,
+    ) -> Result<i64, SyncClientError> {
+        let account_id = account_id.into();
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = UpdateAccountRequest {
+                expected_head_seq: self.head,
+                account_id: account_id.clone(),
+                account_number: account_number.clone(),
+                name: name.clone(),
+                parent_id: parent_id.clone(),
+                description: description.clone(),
+            };
+            match self.submit("/sync/commands/update-account", &body).await? {
+                Submitted::Head(head) => return Ok(head),
+                Submitted::Retry => continue,
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Lay down the default chart of accounts on the group's ledger, atomically.
+    ///
+    /// Takes no arguments: the chart is the server's
+    /// [`DEFAULT_CHART`](crate::commands::account_commands::DEFAULT_CHART), so two
+    /// replicas on different builds cannot seed two different charts.
+    ///
+    /// A `422` here means the ledger already has one of those account numbers —
+    /// i.e. it has been seeded, or someone created `1000` by hand. Nothing is
+    /// appended in that case; it is not a partial seed to be cleaned up.
+    pub async fn seed_default_accounts(&mut self) -> Result<i64, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = SeedDefaultAccountsRequest {
+                expected_head_seq: self.head,
+            };
+            match self
+                .submit("/sync/commands/seed-default-accounts", &body)
+                .await?
+            {
                 Submitted::Head(head) => return Ok(head),
                 Submitted::Retry => continue,
             }

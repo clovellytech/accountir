@@ -405,6 +405,31 @@ pub(crate) fn outcome_to_response<E>(
     }
 }
 
+/// The same, for commands that append a **batch** as one indivisible unit —
+/// `update-account` (one `AccountUpdated` per changed field) and
+/// `seed-default-accounts` (one `AccountCreated` per account).
+///
+/// `unchanged_head` is what the client claimed the head was, and it is the answer
+/// when the batch is legitimately empty: an edit that changed no field appends
+/// nothing, so the head has not moved. Returning `0` there — or treating empty as
+/// an error — would hand the client a bogus `expected_head_seq` and make its very
+/// next write fail with a 409 it cannot explain. The empty case is safe to trust
+/// precisely because `append_checked_many` already verified the head matched before
+/// running the check closure.
+pub(crate) fn outcome_to_response_many<E>(
+    outcome: CheckedOutcome<Vec<crate::events::types::StoredEvent>, E>,
+    unchanged_head: i64,
+    reject: impl FnOnce(E) -> ApiError,
+) -> Result<Json<SubmitResponse>, ApiError> {
+    match outcome {
+        CheckedOutcome::Appended(stored) => Ok(Json(SubmitResponse {
+            head: stored.last().map_or(unchanged_head, |e| e.id),
+        })),
+        CheckedOutcome::HeadMismatch { actual, .. } => Err(ApiError::conflict(actual)),
+        CheckedOutcome::Rejected(e) => Err(reject(e)),
+    }
+}
+
 /// A JSON error response carrying an HTTP status.
 pub struct ApiError {
     status: StatusCode,

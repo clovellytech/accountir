@@ -117,6 +117,116 @@ pub(crate) enum AccountStep {
     Reject(AccountCommandError),
 }
 
+/// The same, for commands that emit **several** events as one indivisible unit —
+/// `update_account` (one `AccountUpdated` per changed field) and the default-chart
+/// seed (one `AccountCreated` per account).
+///
+/// Bare [`Event`]s rather than `EventEnvelope`s, deliberately: the local path
+/// stamps the operator's `user_id` and the sync path stamps the *server-
+/// authenticated* actor. Returning envelopes would force this shared code to pick
+/// one, which is how a replica ends up attributing a colleague's edit to whoever
+/// happened to build the event.
+///
+/// `Append(vec![])` is legitimate and means "the invariants hold and there is
+/// nothing to do" — an edit that changed no field. Callers must not treat it as an
+/// error; see `outcome_to_response_many` for why the head is then unchanged.
+pub(crate) enum AccountBatchStep {
+    Append(Vec<Event>),
+    Reject(AccountCommandError),
+}
+
+/// The default chart of accounts, in creation order.
+///
+/// One definition, because there are now two ways to lay it down — the local
+/// seeder below, and the `seed-default-accounts` command a replica submits to its
+/// group server. Two copies would drift, and the symptom would be two businesses
+/// with charts that differ by an account nobody can account for.
+///
+/// `(number, name, type, parent number)`. Parents appear before their children so
+/// a single forward pass can resolve them.
+pub const DEFAULT_CHART: &[(&str, &str, AccountType, Option<&str>)] = &[
+    ("1000", "Assets", AccountType::Asset, None),
+    (
+        "1001",
+        "Business Checking",
+        AccountType::Asset,
+        Some("1000"),
+    ),
+    ("2000", "Income", AccountType::Revenue, None),
+    ("3000", "Expenses", AccountType::Expense, None),
+    ("4000", "Equity", AccountType::Equity, None),
+    (
+        "4001",
+        "Opening Balances",
+        AccountType::Equity,
+        Some("4000"),
+    ),
+    ("5000", "Liabilities", AccountType::Liability, None),
+];
+
+/// Build every [`DEFAULT_CHART`] account as one batch, inside the append
+/// transaction.
+///
+/// Note what this does that the local seeder does not: because
+/// [`build_create_account_in_txn`] mints the `account_id` itself, a child's
+/// `parent_id` is known while the batch is still being built, so the whole chart is
+/// **seven** `AccountCreated` events with parents already set. The local path
+/// creates them flat and then issues `AccountUpdated` events to re-parent, because
+/// it appends one command at a time and cannot see ahead.
+///
+/// Refuses wholesale if any number is already taken. Seeding is a "this ledger is
+/// new" action, and half a chart of accounts — some created, some not, with nothing
+/// recording which — is materially worse than none: you would have to reconcile it
+/// by hand against a list you cannot see.
+pub(crate) fn build_seed_default_accounts_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+) -> Result<AccountBatchStep, EventStoreError> {
+    let mut ids: std::collections::HashMap<&str, String> = std::collections::HashMap::new();
+    let mut events = Vec::with_capacity(DEFAULT_CHART.len());
+
+    for (number, name, account_type, parent_number) in DEFAULT_CHART {
+        // `parent_number` is resolved against ids minted earlier in THIS batch.
+        // A missing entry would mean the table lists a child before its parent,
+        // which is a programming error in the const above rather than anything the
+        // caller did — so it fails loudly here rather than silently orphaning.
+        let parent_id = match parent_number {
+            Some(p) => match ids.get(p) {
+                Some(id) => Some(id.clone()),
+                None => {
+                    return Err(EventStoreError::SerializationError(format!(
+                        "DEFAULT_CHART lists account {number} before its parent {p}"
+                    )))
+                }
+            },
+            None => None,
+        };
+
+        let cmd = CreateAccountCommand {
+            account_type: *account_type,
+            account_number: number.to_string(),
+            name: name.to_string(),
+            parent_id,
+            currency: Some("USD".to_string()),
+            description: None,
+        };
+        // The same uniqueness fence the single-account path uses, under the same
+        // write lock. In-batch collisions cannot happen (the numbers are distinct
+        // constants); what this catches is a chart that was already seeded, or a
+        // number a human created by hand.
+        match build_create_account_in_txn(tx, &cmd)? {
+            AccountStep::Append(event) => {
+                if let Event::AccountCreated { account_id, .. } = &event {
+                    ids.insert(number, account_id.clone());
+                }
+                events.push(event);
+            }
+            AccountStep::Reject(e) => return Ok(AccountBatchStep::Reject(e)),
+        }
+    }
+
+    Ok(AccountBatchStep::Append(events))
+}
+
 /// Run `create_account`'s state-dependent invariant inside the append
 /// transaction — the account-number uniqueness check — and, if it holds, build
 /// the `AccountCreated` event. Shared by [`AccountCommands::create_account`] and
@@ -152,6 +262,113 @@ pub(crate) fn build_create_account_in_txn(
         description: cmd.description.clone(),
     };
     Ok(AccountStep::Append(event))
+}
+
+/// Diff an account against an [`UpdateAccountCommand`] inside the append
+/// transaction, emitting one `AccountUpdated` per field that actually changes.
+///
+/// Shared by [`AccountCommands::update_account`] and the server-side sync submit
+/// path, so a replica's edit is validated by exactly the code a local edit is.
+/// Reading the old values *inside* the transaction is what makes the `old_value`
+/// recorded on each event true at the instant it is appended — read outside, a
+/// concurrent edit would have the audit trail claiming a transition that never
+/// happened.
+///
+/// Emits **nothing** when no field differs. That is a success, not a rejection: a
+/// user who opens the edit form and saves without typing has not violated
+/// anything, and inventing an event to mark the non-change would put noise in an
+/// audit log.
+pub(crate) fn build_update_account_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &UpdateAccountCommand,
+) -> Result<AccountBatchStep, EventStoreError> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM accounts WHERE id = ?1",
+            [&cmd.account_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        return Ok(AccountBatchStep::Reject(AccountCommandError::NotFound(
+            cmd.account_id.clone(),
+        )));
+    }
+
+    let mut events = Vec::new();
+    let updated = |field: &str, old: String, new: String| Event::AccountUpdated {
+        account_id: cmd.account_id.clone(),
+        field: field.to_string(),
+        old_value: old,
+        new_value: new,
+    };
+
+    // account_number — with rename-uniqueness check
+    if let Some(new_number) = &cmd.account_number {
+        let old_number: String = tx.query_row(
+            "SELECT account_number FROM accounts WHERE id = ?1",
+            [&cmd.account_id],
+            |row| row.get(0),
+        )?;
+        if &old_number != new_number {
+            let duplicate: bool = tx
+                .query_row(
+                    "SELECT 1 FROM accounts WHERE account_number = ?1 AND id != ?2",
+                    [new_number, &cmd.account_id],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if duplicate {
+                return Ok(AccountBatchStep::Reject(
+                    AccountCommandError::AlreadyExists(new_number.clone()),
+                ));
+            }
+            events.push(updated("account_number", old_number, new_number.clone()));
+        }
+    }
+
+    // name
+    if let Some(new_name) = &cmd.name {
+        let old_name: String = tx.query_row(
+            "SELECT name FROM accounts WHERE id = ?1",
+            [&cmd.account_id],
+            |row| row.get(0),
+        )?;
+        if &old_name != new_name {
+            events.push(updated("name", old_name, new_name.clone()));
+        }
+    }
+
+    // parent_id (Option<Option<String>>: Some(x) => set to x)
+    if let Some(new_parent) = &cmd.parent_id {
+        let old_parent: Option<String> = tx.query_row(
+            "SELECT parent_id FROM accounts WHERE id = ?1",
+            [&cmd.account_id],
+            |row| row.get(0),
+        )?;
+        let old_parent_str = old_parent.unwrap_or_default();
+        let new_parent_str = new_parent.clone().unwrap_or_default();
+        if old_parent_str != new_parent_str {
+            events.push(updated("parent_id", old_parent_str, new_parent_str));
+        }
+    }
+
+    // description
+    if let Some(new_desc) = &cmd.description {
+        let old_desc: Option<String> = tx.query_row(
+            "SELECT description FROM accounts WHERE id = ?1",
+            [&cmd.account_id],
+            |row| row.get(0),
+        )?;
+        let old_desc_str = old_desc.unwrap_or_default();
+        if &old_desc_str != new_desc {
+            events.push(updated("description", old_desc_str, new_desc.clone()));
+        }
+    }
+
+    Ok(AccountBatchStep::Append(events))
 }
 
 /// Run `deactivate_account`'s state-dependent invariants inside the append
@@ -273,120 +490,14 @@ impl<'a> AccountCommands<'a> {
             let head = self.store.latest_id()?.unwrap_or(0);
             let outcome = self.store.append_checked_many(
                 head,
-                |tx| {
-                    let exists: bool = tx
-                        .query_row(
-                            "SELECT 1 FROM accounts WHERE id = ?1",
-                            [&cmd.account_id],
-                            |_| Ok(true),
-                        )
-                        .optional()?
-                        .unwrap_or(false);
-                    if !exists {
-                        return Ok(Verdict::Reject(AccountCommandError::NotFound(
-                            cmd.account_id.clone(),
-                        )));
-                    }
-
-                    let mut envelopes = Vec::new();
-
-                    // account_number — with rename-uniqueness check
-                    if let Some(new_number) = &cmd.account_number {
-                        let old_number: String = tx.query_row(
-                            "SELECT account_number FROM accounts WHERE id = ?1",
-                            [&cmd.account_id],
-                            |row| row.get(0),
-                        )?;
-                        if &old_number != new_number {
-                            let duplicate: bool = tx
-                                .query_row(
-                                    "SELECT 1 FROM accounts WHERE account_number = ?1 AND id != ?2",
-                                    [new_number, &cmd.account_id],
-                                    |_| Ok(true),
-                                )
-                                .optional()?
-                                .unwrap_or(false);
-                            if duplicate {
-                                return Ok(Verdict::Reject(AccountCommandError::AlreadyExists(
-                                    new_number.clone(),
-                                )));
-                            }
-                            envelopes.push(EventEnvelope::new(
-                                Event::AccountUpdated {
-                                    account_id: cmd.account_id.clone(),
-                                    field: "account_number".to_string(),
-                                    old_value: old_number,
-                                    new_value: new_number.clone(),
-                                },
-                                user_id.clone(),
-                            ));
-                        }
-                    }
-
-                    // name
-                    if let Some(new_name) = &cmd.name {
-                        let old_name: String = tx.query_row(
-                            "SELECT name FROM accounts WHERE id = ?1",
-                            [&cmd.account_id],
-                            |row| row.get(0),
-                        )?;
-                        if &old_name != new_name {
-                            envelopes.push(EventEnvelope::new(
-                                Event::AccountUpdated {
-                                    account_id: cmd.account_id.clone(),
-                                    field: "name".to_string(),
-                                    old_value: old_name,
-                                    new_value: new_name.clone(),
-                                },
-                                user_id.clone(),
-                            ));
-                        }
-                    }
-
-                    // parent_id (Option<Option<String>>: Some(x) => set to x)
-                    if let Some(new_parent) = &cmd.parent_id {
-                        let old_parent: Option<String> = tx.query_row(
-                            "SELECT parent_id FROM accounts WHERE id = ?1",
-                            [&cmd.account_id],
-                            |row| row.get(0),
-                        )?;
-                        let old_parent_str = old_parent.unwrap_or_default();
-                        let new_parent_str = new_parent.clone().unwrap_or_default();
-                        if old_parent_str != new_parent_str {
-                            envelopes.push(EventEnvelope::new(
-                                Event::AccountUpdated {
-                                    account_id: cmd.account_id.clone(),
-                                    field: "parent_id".to_string(),
-                                    old_value: old_parent_str,
-                                    new_value: new_parent_str,
-                                },
-                                user_id.clone(),
-                            ));
-                        }
-                    }
-
-                    // description
-                    if let Some(new_desc) = &cmd.description {
-                        let old_desc: Option<String> = tx.query_row(
-                            "SELECT description FROM accounts WHERE id = ?1",
-                            [&cmd.account_id],
-                            |row| row.get(0),
-                        )?;
-                        let old_desc_str = old_desc.unwrap_or_default();
-                        if &old_desc_str != new_desc {
-                            envelopes.push(EventEnvelope::new(
-                                Event::AccountUpdated {
-                                    account_id: cmd.account_id.clone(),
-                                    field: "description".to_string(),
-                                    old_value: old_desc_str,
-                                    new_value: new_desc.clone(),
-                                },
-                                user_id.clone(),
-                            ));
-                        }
-                    }
-
-                    Ok(Verdict::Append(envelopes))
+                |tx| match build_update_account_in_txn(tx, &cmd)? {
+                    AccountBatchStep::Append(events) => Ok(Verdict::Append(
+                        events
+                            .into_iter()
+                            .map(|e| EventEnvelope::new(e, user_id.clone()))
+                            .collect(),
+                    )),
+                    AccountBatchStep::Reject(e) => Ok(Verdict::Reject(e)),
                 },
                 |tx, stored| {
                     Projector::new(tx)
@@ -595,31 +706,18 @@ pub fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Opti
 
 /// Create the default chart of accounts. Returns the count of accounts created.
 pub fn create_default_accounts(store: &mut EventStore) -> Result<usize, String> {
-    let defaults: Vec<(&str, &str, AccountType, Option<&str>)> = vec![
-        ("1000", "Assets", AccountType::Asset, None),
-        (
-            "1001",
-            "Business Checking",
-            AccountType::Asset,
-            Some("1000"),
-        ),
-        ("2000", "Income", AccountType::Revenue, None),
-        ("3000", "Expenses", AccountType::Expense, None),
-        ("4000", "Equity", AccountType::Equity, None),
-        (
-            "4001",
-            "Opening Balances",
-            AccountType::Equity,
-            Some("4000"),
-        ),
-        ("5000", "Liabilities", AccountType::Liability, None),
-    ];
+    // The chart itself lives in `DEFAULT_CHART`, shared with the
+    // `seed-default-accounts` command a replica submits to its group server. This
+    // path still creates the accounts flat and re-parents them afterwards: it
+    // appends one command at a time, so a child's parent id does not exist yet
+    // when the child is created. The batched builder does not have that problem.
+    let defaults = DEFAULT_CHART;
 
     let mut account_ids: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut created = 0;
 
-    for (number, name, account_type, _parent_number) in &defaults {
+    for (number, name, account_type, _parent_number) in defaults {
         let mut commands = AccountCommands::new(store, "system".to_string());
         let cmd = CreateAccountCommand {
             account_type: *account_type,
@@ -640,7 +738,7 @@ pub fn create_default_accounts(store: &mut EventStore) -> Result<usize, String> 
         }
     }
 
-    for (number, _name, _account_type, parent_number) in &defaults {
+    for (number, _name, _account_type, parent_number) in defaults {
         if let Some(parent_num) = parent_number {
             let account_id = account_ids.get(*number).cloned();
             let parent_id = account_ids.get(*parent_num).cloned();
