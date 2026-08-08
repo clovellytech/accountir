@@ -14,6 +14,7 @@ use super::commands::bill_ops::{
 };
 use super::commands::entries::{BatchEntry, PostEntriesRequest, PostEntriesResponse};
 use super::commands::entry_ops::{UnvoidEntryRequest, VoidEntryRequest};
+use super::commands::plaid::{ConnectPlaidItemRequest, ConnectPlaidItemResponse};
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
 use crate::domain::{AccountType, PaymentTerms};
 use chrono::NaiveDate;
@@ -308,6 +309,54 @@ impl SyncClient {
                 reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
                 reqwest::StatusCode::NOT_FOUND => {
                     return Err(SyncClientError::ServerTooOld("post entries".to_string()))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Record a bank connection on the group's ledger.
+    ///
+    /// Carries no credential and no proxy handle — see
+    /// [`crate::sync::commands::plaid`]. Returns the server-minted `item_id`,
+    /// which the caller needs to attach a grant to this connection.
+    pub async fn connect_plaid_item(
+        &mut self,
+        institution_name: String,
+        plaid_accounts: Vec<crate::events::types::PlaidAccountInfo>,
+    ) -> Result<ConnectPlaidItemResponse, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = ConnectPlaidItemRequest {
+                expected_head_seq: self.head,
+                institution_name: institution_name.clone(),
+                plaid_accounts: plaid_accounts.clone(),
+            };
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/connect-plaid-item"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let r: ConnectPlaidItemResponse = resp.json().await?;
+                    self.head = r.head;
+                    return Ok(r);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld("connect a bank".to_string()))
                 }
                 s => {
                     let body = resp.text().await.unwrap_or_default();

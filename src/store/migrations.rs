@@ -69,6 +69,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             include_str!("../../migrations/016_event_service_root_url_unique.sql"),
         ),
         (17, include_str!("../../migrations/017_group_binding.sql")),
+        (
+            18,
+            include_str!("../../migrations/018_plaid_item_optional_proxy_handle.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -261,7 +265,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         -- Plaid items connected through the proxy
         CREATE TABLE IF NOT EXISTS plaid_items (
             id TEXT PRIMARY KEY,
-            proxy_item_id TEXT NOT NULL,
+            proxy_item_id TEXT,
             institution_name TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
             last_synced_at TEXT,
@@ -597,8 +601,10 @@ mod tests {
 
         // Apply the actual migration 015 SQL (the ALTER path exercised by
         // run_migrations for a DB whose events table predates the columns).
-        conn.execute_batch(include_str!("../../migrations/015_event_actor_identity.sql"))
-            .unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/015_event_actor_identity.sql"
+        ))
+        .unwrap();
 
         assert!(events_has_column(&conn, "actor_id"));
         assert!(events_has_column(&conn, "received_at"));
@@ -684,5 +690,82 @@ mod tests {
         init_schema(&conn).unwrap();
         run_migrations(&conn).unwrap();
         assert!(has_event_service_url_index(&conn));
+    }
+}
+#[cfg(test)]
+mod plaid_item_rebuild {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Migration 018 rebuilds `plaid_items`, and three tables reference it with
+    /// ON DELETE CASCADE.
+    ///
+    /// The regression: the first draft dropped the parent with foreign keys
+    /// enforced, so the DROP cascaded and deleted every account mapping, every
+    /// dedup record and every staged transaction for that connection. It passed
+    /// the whole suite, because the fixtures had no child rows — it was caught
+    /// only by running it against a real ledger, where three mappings vanished.
+    ///
+    /// So this test's fixture is specifically a connection WITH children.
+    #[test]
+    fn rebuilding_plaid_items_does_not_cascade_away_its_children() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        init_schema(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO plaid_items (id, proxy_item_id, institution_name)
+                 VALUES ('item-1', 'proxy-1', 'Chase');
+             INSERT INTO plaid_local_accounts (item_id, plaid_account_id, name, account_type)
+                 VALUES ('item-1', 'acc-1', 'Checking', 'depository');
+             INSERT INTO plaid_local_accounts (item_id, plaid_account_id, name, account_type)
+                 VALUES ('item-1', 'acc-2', 'Savings', 'depository');
+             INSERT INTO plaid_staged_transactions
+                 (id, item_id, plaid_transaction_id, plaid_account_id, amount_cents, date, name)
+                 VALUES ('s-1', 'item-1', 'txn-1', 'acc-1', 100, '2026-08-01', 'Coffee');",
+        )
+        .unwrap();
+
+        // Re-run the rebuild as an upgrade would: forget it was applied, then
+        // migrate again. This is the exact operation that ate the data.
+        conn.execute("DELETE FROM schema_migrations WHERE version = 18", [])
+            .unwrap();
+        run_migrations(&conn).unwrap();
+
+        let mappings: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plaid_local_accounts", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let staged: i64 = conn
+            .query_row("SELECT COUNT(*) FROM plaid_staged_transactions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            mappings, 2,
+            "the rebuild cascaded away the account mappings — a user would find \
+             every bank account silently unlinked from its ledger account"
+        );
+        assert_eq!(staged, 1, "the rebuild cascaded away staged transactions");
+
+        // …and the point of the whole migration.
+        let notnull: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('plaid_items') WHERE name='proxy_item_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notnull, 0, "proxy_item_id must be nullable after 018");
+
+        // A hosted connection — the case that motivated it — must now insert.
+        conn.execute(
+            "INSERT INTO plaid_items (id, proxy_item_id, institution_name)
+                 VALUES ('item-2', NULL, 'Hosted Bank')",
+            [],
+        )
+        .expect("a connection recorded on hosted books has no proxy handle");
     }
 }
