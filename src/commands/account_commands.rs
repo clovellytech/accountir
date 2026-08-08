@@ -162,6 +162,19 @@ pub const DEFAULT_CHART: &[(&str, &str, AccountType, Option<&str>)] = &[
         Some("4000"),
     ),
     ("5000", "Liabilities", AccountType::Liability, None),
+    // The landing account for anything an import cannot classify.
+    //
+    // In the seed rather than created on demand, because of where it is needed.
+    // `find_or_create_uncategorized` mints it with a local append, and on a group
+    // replica no local append is allowed — so on hosted books the "create" half
+    // simply cannot run, and every import that met an unrecognised transaction
+    // would fail instead of parking it. Seeding it means the *find* half always
+    // succeeds, which is the only half a replica can use.
+    //
+    // 9000-range to match what `find_or_create_uncategorized` would have chosen,
+    // so a business seeded before this existed and one seeded after end up with
+    // the same account rather than two that mean the same thing.
+    ("9000", "Uncategorized", AccountType::Expense, Some("3000")),
 ];
 
 /// Build every [`DEFAULT_CHART`] account as one batch, inside the append
@@ -664,11 +677,9 @@ pub fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Opti
                 // idempotent no-op by the caller). Checked under the write lock so
                 // a concurrent bootstrap can't slip in between check and append.
                 let exists: bool = tx
-                    .query_row(
-                        "SELECT 1 FROM company WHERE id = 'default'",
-                        [],
-                        |_| Ok(true),
-                    )
+                    .query_row("SELECT 1 FROM company WHERE id = 'default'", [], |_| {
+                        Ok(true)
+                    })
                     .optional()?
                     .unwrap_or(false);
                 if exists {
@@ -683,7 +694,10 @@ pub fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Opti
                     base_currency: "USD".to_string(),
                     fiscal_year_start: 1,
                 };
-                Ok(Verdict::Append(EventEnvelope::new(event, "system".to_string())))
+                Ok(Verdict::Append(EventEnvelope::new(
+                    event,
+                    "system".to_string(),
+                )))
             },
             |tx, stored| {
                 Projector::new(tx)
@@ -1167,7 +1181,10 @@ mod tests {
 
         // First call creates the singleton company row.
         let msg = ensure_company(&mut store, path);
-        assert!(msg.is_some(), "first ensure_company should create a company");
+        assert!(
+            msg.is_some(),
+            "first ensure_company should create a company"
+        );
         let rows: i64 = store
             .connection()
             .query_row("SELECT COUNT(*) FROM company", [], |r| r.get(0))

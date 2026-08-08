@@ -78,7 +78,10 @@ async fn get_accounts(
 
     let mut out = Vec::with_capacity(accounts.len());
     for a in accounts {
-        let balance = q.get_account_balance(&a.id, None).map_err(query_err)?.balance;
+        let balance = q
+            .get_account_balance(&a.id, None)
+            .map_err(query_err)?
+            .balance;
         out.push(AccountDto {
             id: a.id,
             account_number: a.account_number,

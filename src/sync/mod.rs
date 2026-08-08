@@ -294,9 +294,10 @@ async fn submit(
         .append_checked(
             req.expected_head_seq,
             move |_tx| {
-                Ok(Verdict::<EventEnvelope, ()>::Append(
-                    stamp(event.clone(), &actor),
-                ))
+                Ok(Verdict::<EventEnvelope, ()>::Append(stamp(
+                    event.clone(),
+                    &actor,
+                )))
             },
             project,
         )
@@ -386,7 +387,10 @@ pub(crate) fn stamp(event: Event, actor: &str) -> EventEnvelope {
 
 /// The `append_checked` project closure: fold the event into projections in the
 /// same transaction.
-pub(crate) fn project(tx: &rusqlite::Transaction<'_>, stored: &crate::events::types::StoredEvent) -> Result<(), EventStoreError> {
+pub(crate) fn project(
+    tx: &rusqlite::Transaction<'_>,
+    stored: &crate::events::types::StoredEvent,
+) -> Result<(), EventStoreError> {
     Projector::new(tx)
         .apply(stored)
         .map_err(|e| EventStoreError::Projection(e.to_string()))
@@ -453,6 +457,18 @@ impl ApiError {
         ApiError {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             body: serde_json::json!({ "error": e.to_string() }),
+        }
+    }
+
+    /// The request itself is malformed — as opposed to a command that was well
+    /// formed and refused. Batch endpoints need the distinction: "no entries" and
+    /// "ten thousand entries" are complaints about the envelope, and dressing them
+    /// up as domain rejections would tell a client to fix an entry that does not
+    /// exist.
+    pub(crate) fn bad_request(message: &str) -> Self {
+        ApiError {
+            status: StatusCode::BAD_REQUEST,
+            body: serde_json::json!({ "error": message }),
         }
     }
 
@@ -641,7 +657,13 @@ mod tests {
                 { "account_id": asset, "amount": -4000, "currency": "USD" },
             ],
         });
-        let r = http.post(&url).bearer_auth(TOKEN).json(&unbalanced).send().await.unwrap();
+        let r = http
+            .post(&url)
+            .bearer_auth(TOKEN)
+            .json(&unbalanced)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
 
         // Stale head → 409 (log is at 3 after the happy path).
@@ -663,10 +685,12 @@ mod tests {
         let expense = mk_account(&mut store, "5000", AccountType::Expense);
         // Deactivate the expense account (zero balance) so the in-txn fence rejects.
         AccountCommands::new(&mut store, "seed".to_string())
-            .deactivate_account(crate::commands::account_commands::DeactivateAccountCommand {
-                account_id: expense.clone(),
-                reason: None,
-            })
+            .deactivate_account(
+                crate::commands::account_commands::DeactivateAccountCommand {
+                    account_id: expense.clone(),
+                    reason: None,
+                },
+            )
             .unwrap();
         let head = store.latest_id().unwrap().unwrap_or(0);
         let base = serve(SyncState::new(store, tokens())).await;
@@ -680,10 +704,7 @@ mod tests {
             .unwrap();
         // The server enforces the fence: inactive account → 422, not a blind append.
         assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(r
-            .json::<serde_json::Value>()
-            .await
-            .unwrap()["error"]
+        assert!(r.json::<serde_json::Value>().await.unwrap()["error"]
             .as_str()
             .unwrap()
             .contains("inactive"));
@@ -719,7 +740,12 @@ mod tests {
         b.refresh_head().await.unwrap();
 
         // B posts first → log at 3. A's cached head (2) is now stale.
-        assert_eq!(b.post_entry(date, "b", balanced(&expense, &asset, 1000), None).await.unwrap(), 3);
+        assert_eq!(
+            b.post_entry(date, "b", balanced(&expense, &asset, 1000), None)
+                .await
+                .unwrap(),
+            3
+        );
 
         // A posts against its stale head; the client resolves the 409 internally.
         let ha = a
@@ -739,7 +765,12 @@ mod tests {
 
         // Unbalanced entry → the server rejects; the client surfaces it as Rejected.
         let err = c
-            .post_entry(date, "bad", vec![line(&expense, 5000), line(&asset, -4000)], None)
+            .post_entry(
+                date,
+                "bad",
+                vec![line(&expense, 5000), line(&asset, -4000)],
+                None,
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SyncClientError::Rejected(_)), "got {err:?}");

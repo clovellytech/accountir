@@ -717,6 +717,93 @@ mod tests {
         assert_eq!(set.parent_id, Some(Some("p".to_string())));
     }
 
+    /// The seed must produce the account `find_or_create_uncategorized` looks for.
+    ///
+    /// This is the pairing the whole workflow rests on for group books. A member
+    /// who cannot classify a bank transaction parks it in Uncategorized so anyone
+    /// can recategorise it later from the journal — but on a replica no local
+    /// append is allowed, so the "create" half of find-or-create cannot run. If the
+    /// seed and the finder ever disagree about the name, hosted books get an import
+    /// that fails on the first unrecognised transaction, and the escape hatch
+    /// silently is not one.
+    #[tokio::test]
+    async fn the_seed_lays_down_the_account_uncategorised_imports_land_in() {
+        use crate::commands::account_commands::find_or_create_uncategorized;
+
+        let store = {
+            let s = EventStore::in_memory().unwrap();
+            init_schema(s.connection()).unwrap();
+            s
+        };
+        let base = serve(SyncState::new(store, tokens())).await;
+
+        let seeded = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/seed-default-accounts"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({ "expected_head_seq": 0 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(seeded.status(), reqwest::StatusCode::OK);
+
+        // Replay the same chart into a local store and ask the finder for it. It
+        // must FIND rather than create — the head must not move.
+        let mut local = EventStore::in_memory().unwrap();
+        init_schema(local.connection()).unwrap();
+        crate::commands::account_commands::create_default_accounts(&mut local).unwrap();
+        let before = local.latest_id().unwrap().unwrap_or(0);
+
+        let id = find_or_create_uncategorized(&mut local).expect("uncategorized");
+        assert!(!id.is_empty());
+        assert_eq!(
+            local.latest_id().unwrap().unwrap_or(0),
+            before,
+            "the seed already provides Uncategorized, so find_or_create must FIND \
+             it — creating would be a local append, which a replica cannot do"
+        );
+    }
+
+    /// The skew message, pinned.
+    ///
+    /// This is the failure a healthy deployment produces: pushing a new image does
+    /// not restart running containers, so a group provisioned before a deploy keeps
+    /// serving the old ledger. The client used to report that as
+    /// "unexpected status 404", which names neither the cause nor the fix.
+    #[tokio::test]
+    async fn a_missing_command_endpoint_reads_as_a_stale_server_not_a_mystery() {
+        use crate::sync::client::{SyncClient, SyncClientError};
+
+        // A server with the sync routes but NOT the account command routes — i.e.
+        // exactly what an instance one deploy behind looks like from out here.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, Router::<()>::new()).await.unwrap();
+        });
+
+        let mut client = SyncClient::with_head(format!("http://{addr}"), TOKEN, 0);
+        let err = client.seed_default_accounts().await.unwrap_err();
+
+        let SyncClientError::ServerTooOld(what) = &err else {
+            panic!("a 404 on a command endpoint must be diagnosed, got: {err:?}");
+        };
+        assert_eq!(
+            what, "seed default accounts",
+            "name the action, not the path"
+        );
+
+        let message = err.to_string();
+        assert!(
+            message.contains("older build"),
+            "the message must say the server is behind: {message}"
+        );
+        assert!(
+            message.contains("nothing was written"),
+            "a user who just pressed Save needs to know it did not half-happen: \
+             {message}"
+        );
+    }
+
     /// Wiring regression for both new routes, driven through the client half.
     #[tokio::test]
     async fn the_client_reaches_the_batch_account_commands() {

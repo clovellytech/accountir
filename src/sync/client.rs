@@ -12,6 +12,7 @@ use super::commands::bill::{IssueInvoiceRequest, ReceiveBillRequest};
 use super::commands::bill_ops::{
     ApplyBillPaymentRequest, ReceiveInvoicePaymentRequest, VoidBillRequest, VoidInvoiceRequest,
 };
+use super::commands::entries::{BatchEntry, PostEntriesRequest, PostEntriesResponse};
 use super::commands::entry_ops::{UnvoidEntryRequest, VoidEntryRequest};
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
 use crate::domain::{AccountType, PaymentTerms};
@@ -28,6 +29,21 @@ pub enum SyncClientError {
     Rejected(String),
     #[error("still conflicting after {0} retries")]
     ConflictExhausted(u32),
+    /// The group server has no such command endpoint.
+    ///
+    /// Its own diagnosis rather than a bare `Unexpected(404, …)`, because there is
+    /// exactly one thing this means and it is actionable: the instance is running
+    /// an older build than this app. It happens on a perfectly healthy deployment —
+    /// pushing a new image does NOT restart running containers, so a group
+    /// provisioned before the deploy keeps serving the old ledger until it is
+    /// re-provisioned. "unexpected status 404" sent the last person who hit this
+    /// looking at auth, DNS and TLS.
+    #[error(
+        "this group's server doesn't support {0} yet — it is running an older build \
+         than this app. Ask whoever administers it to update the group's instance; \
+         nothing was written."
+    )]
+    ServerTooOld(String),
     #[error("unexpected status {0}: {1}")]
     Unexpected(u16, String),
 }
@@ -251,6 +267,57 @@ impl SyncClient {
         Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
     }
 
+    /// Post many entries in one call — a reviewed bank import, typically.
+    ///
+    /// Unlike every other command here this does not return a bare head: entries
+    /// that fail their fences are **skipped and reported**, not fatal. See
+    /// [`crate::sync::commands::entries`] for why an import wants that and a seed
+    /// does not.
+    ///
+    /// Retries on 409 like the others. Safe to retry because the batch is atomic
+    /// and every entry carries an idempotency `reference`: whatever landed before
+    /// the conflict is seen as a duplicate on the way back through and skipped.
+    pub async fn post_entries(
+        &mut self,
+        entries: Vec<BatchEntry>,
+    ) -> Result<PostEntriesResponse, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = PostEntriesRequest {
+                expected_head_seq: self.head,
+                entries: entries.clone(),
+            };
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/post-entries"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let r: PostEntriesResponse = resp.json().await?;
+                    self.head = r.head;
+                    return Ok(r);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld("post entries".to_string()))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
     /// One command POST, with the status mapping every command endpoint shares:
     /// 200 → new head, 409 → adopt the server's head and tell the caller to retry,
     /// 401 → unauthorized, 422 → terminal domain rejection.
@@ -284,6 +351,13 @@ impl SyncClient {
                     v["error"].as_str().unwrap_or_default().to_string(),
                 ))
             }
+            // A command endpoint that isn't there is a version skew, not a
+            // mystery. Naming the command rather than the path: the user is being
+            // told which action is unavailable, and "/sync/commands/…" is our
+            // plumbing, not their vocabulary.
+            reqwest::StatusCode::NOT_FOUND => Err(SyncClientError::ServerTooOld(
+                path.rsplit('/').next().unwrap_or(path).replace('-', " "),
+            )),
             s => {
                 let body = resp.text().await.unwrap_or_default();
                 Err(SyncClientError::Unexpected(s.as_u16(), body))
