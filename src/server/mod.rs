@@ -20,10 +20,32 @@ struct ActiveDb {
     db_path: PathBuf,
 }
 
+/// A bank connection that has been established with the proxy but not yet
+/// recorded in any ledger.
+///
+/// Exists for group-hosted books. The OAuth flow has to finish *somewhere* — the
+/// browser posts back to this server — but the replica is deliberately not
+/// attached to it (see [`attachable`]), so there is nothing here to append to.
+/// The result is parked instead, and the desktop drains it and submits it to the
+/// group server as a command under the member's own session.
+///
+/// `proxy_item_id` is in here and goes no further: the desktop needs it to mint a
+/// grant at the proxy, and that is a conversation between the owner's machine and
+/// their own proxy account. It is not part of what reaches the group.
+#[derive(Debug, Clone)]
+pub struct PendingLink {
+    pub institution_name: String,
+    pub proxy_item_id: String,
+    pub accounts: Vec<crate::events::types::PlaidAccountInfo>,
+}
+
 /// Shared server state — the database may or may not be open.
 struct SharedState {
     db: std::sync::Mutex<Option<ActiveDb>>,
     http_client: reqwest::Client,
+    /// One slot, not a queue: a person links one bank at a time, and a queue
+    /// would let a forgotten result surface long after the flow it belonged to.
+    pending_link: std::sync::Mutex<Option<PendingLink>>,
 }
 
 /// Handle passed to the TUI so it can set/clear the active database.
@@ -65,6 +87,24 @@ fn attachable(store: &EventStore) -> Result<(), String> {
 }
 
 impl ServerDb {
+    /// Take a completed bank link that had nowhere to be written.
+    ///
+    /// Draining rather than reading: the result is a one-shot, and leaving it in
+    /// place would have the desktop record the same connection again on the next
+    /// poll. `None` is the ordinary answer — the desktop asks repeatedly while a
+    /// link is in flight.
+    pub fn take_pending_link(&self) -> Option<PendingLink> {
+        self.inner.pending_link.lock().ok()?.take()
+    }
+
+    /// Forget any parked link. Called when a link flow is abandoned, so a result
+    /// the user walked away from cannot attach itself to a later attempt.
+    pub fn clear_pending_link(&self) {
+        if let Ok(mut slot) = self.inner.pending_link.lock() {
+            *slot = None;
+        }
+    }
+
     /// Open a database and make it available to the sync server. Returns the
     /// canonical path on success. Errors are returned to the caller and also
     /// logged to stderr so they're visible in `tauri dev` output.
@@ -604,6 +644,7 @@ pub async fn start_server_task() -> Option<ServerDb> {
     let shared = Arc::new(SharedState {
         db: std::sync::Mutex::new(None),
         http_client: reqwest::Client::new(),
+        pending_link: std::sync::Mutex::new(None),
     });
 
     let cors = CorsLayer::very_permissive();
@@ -804,6 +845,40 @@ async fn plaid_exchange_token(
         .as_str()
         .ok_or_else(|| proxy_error("Missing item_id".to_string()))?
         .to_string();
+
+    // No ledger attached means these are group-hosted books: the replica is
+    // deliberately kept off this server (see `attachable`), so there is nothing
+    // here to append to. Park the result for the desktop, which submits it to the
+    // group server under the member's own session.
+    //
+    // Checked before taking the write path rather than after failing it, so the
+    // browser gets a clean success instead of "No database open" at the end of an
+    // OAuth flow the user cannot repeat without re-authenticating at their bank.
+    if state.db.lock().unwrap().is_none() {
+        let accounts: Vec<crate::events::types::PlaidAccountInfo> = req
+            .accounts
+            .iter()
+            .map(|a| crate::events::types::PlaidAccountInfo {
+                plaid_account_id: a.id.clone(),
+                name: a.name.clone(),
+                official_name: a.official_name.clone(),
+                account_type: a.account_type.clone(),
+                mask: a.mask.clone(),
+            })
+            .collect();
+        *state.pending_link.lock().unwrap() = Some(PendingLink {
+            institution_name: req.institution.name.clone(),
+            proxy_item_id: proxy_item_id.clone(),
+            accounts,
+        });
+        // The id the ledger will use is minted by the group server when the
+        // desktop submits, so there is none to report yet. The browser only needs
+        // to know the flow succeeded.
+        return Ok(Json(PlaidExchangeTokenResponse {
+            success: true,
+            item_id: String::new(),
+        }));
+    }
 
     // Record the connection through the ledger's own append path.
     //
@@ -2594,5 +2669,58 @@ mod tests {
             err.contains("group server"),
             "the refusal has to say where the writes belong instead: {err}"
         );
+    }
+}
+#[cfg(test)]
+mod pending_link_tests {
+    use super::*;
+
+    /// The parked result is a one-shot.
+    ///
+    /// The failure this prevents: leaving it in place means the desktop, which
+    /// polls while a link is in flight, records the same bank connection over and
+    /// over — one new `PlaidItemConnected` per poll, in the group's shared log,
+    /// with nothing to say they are the same bank.
+    #[test]
+    fn draining_a_pending_link_yields_it_exactly_once() {
+        let sdb = ServerDb {
+            inner: Arc::new(SharedState {
+                db: std::sync::Mutex::new(None),
+                http_client: reqwest::Client::new(),
+                pending_link: std::sync::Mutex::new(Some(PendingLink {
+                    institution_name: "Chase".into(),
+                    proxy_item_id: "p-1".into(),
+                    accounts: vec![],
+                })),
+            }),
+        };
+
+        let first = sdb.take_pending_link().expect("the parked link");
+        assert_eq!(first.institution_name, "Chase");
+        assert!(
+            sdb.take_pending_link().is_none(),
+            "a second drain returned the link again — the desktop polls, so this \
+             would record the same connection once per poll"
+        );
+    }
+
+    /// An abandoned flow must not attach itself to a later one. Someone who
+    /// starts a link, changes their mind, and links a different bank an hour
+    /// later should not get the first bank recorded.
+    #[test]
+    fn an_abandoned_link_can_be_discarded() {
+        let sdb = ServerDb {
+            inner: Arc::new(SharedState {
+                db: std::sync::Mutex::new(None),
+                http_client: reqwest::Client::new(),
+                pending_link: std::sync::Mutex::new(Some(PendingLink {
+                    institution_name: "Abandoned".into(),
+                    proxy_item_id: "p-x".into(),
+                    accounts: vec![],
+                })),
+            }),
+        };
+        sdb.clear_pending_link();
+        assert!(sdb.take_pending_link().is_none());
     }
 }
