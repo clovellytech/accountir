@@ -101,11 +101,7 @@ impl ServerDb {
                 Ok(canonical)
             }
             Err(e) => {
-                let msg = format!(
-                    "sync-server: failed to open {}: {}",
-                    canonical.display(),
-                    e
-                );
+                let msg = format!("sync-server: failed to open {}: {}", canonical.display(), e);
                 eprintln!("{}", msg);
                 Err(msg)
             }
@@ -619,7 +615,10 @@ pub async fn start_server_task() -> Option<ServerDb> {
         .route("/import/bank-csv", post(bg_import_bank_csv))
         .route("/import/bank-file", post(bg_import_bank_file))
         .route("/import/square-sales-file", post(bg_import_square_sales))
-        .route("/import/square-payroll-file", post(bg_import_square_payroll))
+        .route(
+            "/import/square-payroll-file",
+            post(bg_import_square_payroll),
+        )
         // Plaid integration routes
         .route("/plaid/config", get(plaid_config))
         .route("/plaid/link-token", post(plaid_link_token))
@@ -633,10 +632,16 @@ pub async fn start_server_task() -> Option<ServerDb> {
         .route("/plaid/items", get(plaid_items))
         .route("/plaid/link", get(plaid_link_page))
         // Ingest API routes
-        .route("/api/ingest/mappings", get(bg_ingest_get_mappings).put(bg_ingest_set_mappings))
+        .route(
+            "/api/ingest/mappings",
+            get(bg_ingest_get_mappings).put(bg_ingest_set_mappings),
+        )
         .route("/api/ingest/sale", post(bg_ingest_sale))
         .route("/api/ingest/purchase-order", post(bg_ingest_purchase_order))
-        .route("/api/ingest/inventory-adjustment", post(bg_ingest_inventory_adjustment))
+        .route(
+            "/api/ingest/inventory-adjustment",
+            post(bg_ingest_inventory_adjustment),
+        )
         .layer(cors)
         .with_state(shared.clone());
 
@@ -800,9 +805,22 @@ async fn plaid_exchange_token(
         .ok_or_else(|| proxy_error("Missing item_id".to_string()))?
         .to_string();
 
-    // Create local event
-    let guard = state.db.lock().unwrap();
-    let active = guard.as_ref().ok_or((
+    // Record the connection through the ledger's own append path.
+    //
+    // This block used to hand-roll the insert — raw SQL, its own hash formula
+    // (`event_type + payload + timestamp`, with no separators and no `user_id`),
+    // hand-written projection statements, and no validation. The comments said it
+    // was a workaround for needing `&mut EventStore` behind a `Mutex` guard, which
+    // `as_mut()` gives directly.
+    //
+    // What it actually cost: every bank connection ever made through Plaid Link
+    // wrote an event whose hash cannot be re-derived, so it fails chain
+    // verification forever. On a ledger whose tamper-evidence IS the hash chain,
+    // an event that cannot be re-derived is indistinguishable from one that was
+    // altered. Four ledgers were checked and each had exactly one bad event: this
+    // one. See `examples/verify_real_ledger.rs`.
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse {
             success: false,
@@ -822,68 +840,33 @@ async fn plaid_exchange_token(
         })
         .collect();
 
-    // We can't use PlaidCommands because it needs &mut store but we're in a handler
-    // with a Mutex guard. Instead, create the event directly.
     let item_id = uuid::Uuid::new_v4().to_string();
     let event = crate::events::types::Event::PlaidItemConnected {
         item_id: item_id.clone(),
-        proxy_item_id: proxy_item_id.clone(),
+        proxy_item_id: Some(proxy_item_id.clone()),
         institution_name: req.institution.name.clone(),
         plaid_accounts,
     };
-    let envelope = crate::events::types::EventEnvelope::new(event, "plaid-link".to_string());
 
-    // We need mutable access — but ActiveDb.store is behind a shared ref.
-    // The store is already opened exclusively; cast away immutability via
-    // interior-mutable pattern that EventStore uses for the Connection.
-    // Actually, EventStore::open stores a rusqlite::Connection which is not Sync.
-    // The background server opens its own store — we can just use it directly.
-    // The Mutex<Option<ActiveDb>> gives us exclusive access.
-    // However, ActiveDb.store is not &mut. We need to refactor slightly.
-    // For now, use raw SQL instead.
-
-    let conn = active.store.connection();
-
-    // Manually insert the event + projections
-    let payload = serde_json::to_string(&envelope.event).unwrap();
-    let event_type = envelope.event.event_type();
-    let timestamp = envelope.timestamp.to_rfc3339();
-    let hash_input = format!("{}{}{}", event_type, payload, timestamp);
-    let hash = sha2_hash(hash_input.as_bytes());
-
-    conn.execute(
-        "INSERT INTO events (event_type, payload, hash, user_id, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-        rusqlite::params![event_type, payload, hash, envelope.user_id, timestamp],
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-        success: false,
-        error: format!("DB error: {}", e),
-    })))?;
-
-    let event_id: i64 = conn
-        .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
-        .unwrap_or(0);
-
-    // Project: insert plaid_items
-    conn.execute(
-        "INSERT OR REPLACE INTO plaid_items (id, proxy_item_id, institution_name, status, connected_at_event) VALUES (?1, ?2, ?3, 'active', ?4)",
-        rusqlite::params![item_id, proxy_item_id, req.institution.name, event_id],
-    )
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-        success: false,
-        error: format!("DB error: {}", e),
-    })))?;
-
-    for acct in &req.accounts {
-        conn.execute(
-            "INSERT OR REPLACE INTO plaid_local_accounts (item_id, plaid_account_id, name, account_type, mask) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![item_id, acct.id, acct.name, acct.account_type, acct.mask],
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
-            success: false,
-            error: format!("DB error: {}", e),
-        })))?;
-    }
+    // `append` hashes with `compute_event_hash`, validates, and folds the event
+    // into projections through `Projector` — so `plaid_items` and
+    // `plaid_local_accounts` are written by the same code that would rebuild them
+    // from the log, rather than by a second copy that can drift from it.
+    active
+        .store
+        .append(crate::events::types::EventEnvelope::new(
+            event,
+            "plaid-link".to_string(),
+        ))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    success: false,
+                    error: format!("recording the connection: {}", e),
+                }),
+            )
+        })?;
 
     Ok(Json(PlaidExchangeTokenResponse {
         success: true,
@@ -1645,13 +1628,6 @@ fn proxy_error(msg: String) -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-fn sha2_hash(input: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    hasher.finalize().to_vec()
-}
-
 // ---------------------------------------------------------------------------
 // Ingest API (POS, inventory, purchase orders)
 // ---------------------------------------------------------------------------
@@ -1786,7 +1762,6 @@ fn ingest_no_db() -> (StatusCode, Json<ErrorResponse>) {
     ingest_err(StatusCode::SERVICE_UNAVAILABLE, "No database open")
 }
 
-
 async fn bg_ingest_get_mappings(
     State(state): State<Arc<SharedState>>,
 ) -> Result<Json<IngestMappingsResponse>, (StatusCode, Json<ErrorResponse>)> {
@@ -1885,16 +1860,31 @@ async fn bg_ingest_sale(
     let mut guard = state.db.lock().unwrap();
     let active = guard.as_mut().ok_or_else(ingest_no_db)?;
 
-    let total_revenue: i64 = req.items.iter().map(|i| i.qty as i64 * i.unit_price_cents).sum();
-    let total_cogs: i64 = req.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
+    let total_revenue: i64 = req
+        .items
+        .iter()
+        .map(|i| i.qty as i64 * i.unit_price_cents)
+        .sum();
+    let total_cogs: i64 = req
+        .items
+        .iter()
+        .map(|i| i.qty as i64 * i.unit_cost_cents)
+        .sum();
 
     let data = crate::commands::ingest_commands::IngestSaleData {
         date: req.date,
         reference: req.reference,
         memo: req.memo,
-        items: req.items.into_iter().map(|i| crate::commands::ingest_commands::IngestSaleItem {
-            name: i.name, qty: i.qty, unit_price_cents: i.unit_price_cents, unit_cost_cents: i.unit_cost_cents,
-        }).collect(),
+        items: req
+            .items
+            .into_iter()
+            .map(|i| crate::commands::ingest_commands::IngestSaleItem {
+                name: i.name,
+                qty: i.qty,
+                unit_price_cents: i.unit_price_cents,
+                unit_cost_cents: i.unit_cost_cents,
+            })
+            .collect(),
         payments: Vec::new(),
         payment_method: Some(match req.payment_method {
             PaymentMethod::Cash => crate::commands::ingest_commands::IngestPaymentMethod::Cash,
@@ -1908,7 +1898,8 @@ async fn bg_ingest_sale(
         "ingest-api",
         data,
         crate::events::types::JournalEntrySource::Pos,
-    ).map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    )
+    .map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
 
     Ok(Json(IngestSaleResponse {
         success: true,
@@ -1925,19 +1916,31 @@ async fn bg_ingest_purchase_order(
     let mut guard = state.db.lock().unwrap();
     let active = guard.as_mut().ok_or_else(ingest_no_db)?;
 
-    let total_cost: i64 = req.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
+    let total_cost: i64 = req
+        .items
+        .iter()
+        .map(|i| i.qty as i64 * i.unit_cost_cents)
+        .sum();
 
     let data = crate::commands::ingest_commands::IngestPurchaseOrderData {
         date: req.date,
         reference: req.reference,
         memo: req.memo,
         supplier: req.supplier,
-        items: req.items.into_iter().map(|i| crate::commands::ingest_commands::IngestPurchaseItem {
-            name: i.name, qty: i.qty, unit_cost_cents: i.unit_cost_cents,
-        }).collect(),
+        items: req
+            .items
+            .into_iter()
+            .map(|i| crate::commands::ingest_commands::IngestPurchaseItem {
+                name: i.name,
+                qty: i.qty,
+                unit_cost_cents: i.unit_cost_cents,
+            })
+            .collect(),
         payment: Some(match req.payment {
             PurchasePayment::Cash => crate::commands::ingest_commands::IngestPurchasePayment::Cash,
-            PurchasePayment::OnCredit => crate::commands::ingest_commands::IngestPurchasePayment::OnCredit,
+            PurchasePayment::OnCredit => {
+                crate::commands::ingest_commands::IngestPurchasePayment::OnCredit
+            }
         }),
     };
 
@@ -1946,7 +1949,8 @@ async fn bg_ingest_purchase_order(
         "ingest-api",
         data,
         crate::events::types::JournalEntrySource::PurchaseOrder,
-    ).map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    )
+    .map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
 
     Ok(Json(IngestPurchaseOrderResponse {
         success: true,
@@ -1962,15 +1966,26 @@ async fn bg_ingest_inventory_adjustment(
     let mut guard = state.db.lock().unwrap();
     let active = guard.as_mut().ok_or_else(ingest_no_db)?;
 
-    let net: i64 = req.items.iter().map(|i| i.qty_delta as i64 * i.unit_cost_cents).sum();
+    let net: i64 = req
+        .items
+        .iter()
+        .map(|i| i.qty_delta as i64 * i.unit_cost_cents)
+        .sum();
 
     let data = crate::commands::ingest_commands::IngestInventoryAdjustmentData {
         date: req.date,
         reference: req.reference,
         memo: req.memo,
-        items: req.items.into_iter().map(|i| crate::commands::ingest_commands::IngestAdjustmentItem {
-            name: i.name, qty_delta: i.qty_delta, unit_cost_cents: i.unit_cost_cents, reason: i.reason,
-        }).collect(),
+        items: req
+            .items
+            .into_iter()
+            .map(|i| crate::commands::ingest_commands::IngestAdjustmentItem {
+                name: i.name,
+                qty_delta: i.qty_delta,
+                unit_cost_cents: i.unit_cost_cents,
+                reason: i.reason,
+            })
+            .collect(),
     };
 
     let result = crate::commands::ingest_commands::ingest_inventory_adjustment(
@@ -1978,7 +1993,8 @@ async fn bg_ingest_inventory_adjustment(
         "ingest-api",
         data,
         crate::events::types::JournalEntrySource::InventoryAdjustment,
-    ).map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
+    )
+    .map_err(|e| ingest_err(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
 
     Ok(Json(IngestInventoryAdjustmentResponse {
         success: true,
@@ -2017,7 +2033,12 @@ async fn read_import_file(file_path: &str) -> Result<String, (StatusCode, Json<E
     let file_path = file_path.to_string();
     tokio::task::spawn_blocking(move || std::fs::read_to_string(&path))
         .await
-        .map_err(|e| ingest_err(StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {}", e)))?
+        .map_err(|e| {
+            ingest_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Task join error: {}", e),
+            )
+        })?
         .map_err(|e| {
             ingest_err(
                 StatusCode::BAD_REQUEST,

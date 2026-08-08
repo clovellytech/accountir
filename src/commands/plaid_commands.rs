@@ -53,7 +53,7 @@ impl<'a> PlaidCommands<'a> {
 
         let event = Event::PlaidItemConnected {
             item_id,
-            proxy_item_id: proxy_item_id.to_string(),
+            proxy_item_id: Some(proxy_item_id.to_string()),
             institution_name: institution_name.to_string(),
             plaid_accounts: accounts,
         };

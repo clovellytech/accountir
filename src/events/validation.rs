@@ -237,7 +237,11 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             plaid_accounts: _,
         } => {
             validate_non_empty(item_id, "item_id")?;
-            validate_non_empty(proxy_item_id, "proxy_item_id")?;
+            // Present-but-empty is still a bug; absent is legitimate on hosted
+            // books. See `Event::PlaidItemConnected::proxy_item_id`.
+            if let Some(p) = proxy_item_id {
+                validate_non_empty(p, "proxy_item_id")?;
+            }
             validate_non_empty(institution_name, "institution_name")?;
         }
         Event::PlaidItemDisconnected { item_id, reason } => {
@@ -353,10 +357,7 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                 ));
             }
         }
-        Event::InvoiceVoided {
-            invoice_id,
-            reason,
-        } => {
+        Event::InvoiceVoided { invoice_id, reason } => {
             validate_non_empty(invoice_id, "invoice_id")?;
             validate_non_empty(reason, "reason")?;
         }

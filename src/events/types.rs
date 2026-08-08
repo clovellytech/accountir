@@ -209,7 +209,22 @@ pub enum Event {
     // Plaid Integration
     PlaidItemConnected {
         item_id: String,
-        proxy_item_id: String,
+        /// The bank-sync proxy's id for this connection.
+        ///
+        /// Optional because on **group-hosted books it is deliberately omitted**.
+        /// It is a handle, inert without the owner's proxy API key, and it is read
+        /// only by the machine that talks to the proxy — on hosted books nothing
+        /// does, because refreshing goes through the instance's `/bankfeed/` relay
+        /// using a grant. Putting it in a log every member replicates would share
+        /// something no member can use, which is a cost with no benefit.
+        ///
+        /// `Option` rather than an empty string so the absence is a fact rather
+        /// than a sentinel someone has to remember to check for. Serialization is
+        /// unchanged for events that have it — serde writes `Some(x)` exactly as
+        /// it wrote `x` — so existing events deserialize and **hash** identically,
+        /// which matters on a chained log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proxy_item_id: Option<String>,
         institution_name: String,
         plaid_accounts: Vec<PlaidAccountInfo>,
     },
@@ -534,6 +549,125 @@ impl EventEnvelope {
     pub fn with_received_at(mut self, received_at: Option<DateTime<Utc>>) -> Self {
         self.received_at = received_at;
         self
+    }
+}
+
+#[cfg(test)]
+mod hash_is_computed_one_way_only {
+    /// Nothing may compute an event hash except `compute_event_hash`.
+    ///
+    /// The regression: `server/mod.rs` hand-rolled an insert for the Plaid Link
+    /// callback and hashed `event_type + payload + timestamp` — no separators, no
+    /// `user_id`. Every bank connection ever linked wrote an event that could not
+    /// be re-derived and so failed chain verification permanently. It was invisible
+    /// because nothing verifies the chain on the write path, and it went unnoticed
+    /// across 4,586 events in four ledgers, of which exactly the four written that
+    /// way were wrong.
+    ///
+    /// A text lint over this crate's own sources, because the bug was not a wrong
+    /// *value* anywhere — it was a second implementation existing at all.
+    #[test]
+    fn no_source_file_builds_its_own_event_hash() {
+        use std::path::{Path, PathBuf};
+
+        fn walk(dir: &Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("read src/") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push((
+                        path.display().to_string(),
+                        std::fs::read_to_string(&path).expect("read"),
+                    ));
+                }
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        walk(&root, &mut sources);
+        assert!(sources.len() > 10, "the source walk found nothing");
+
+        for (path, body) in &sources {
+            // The two files that legitimately own this: `event_store.rs` IS the
+            // append path, and `payload.rs` holds the one hash implementation.
+            if path.ends_with("store/event_store.rs") || path.ends_with("events/payload.rs") {
+                continue;
+            }
+            // Production code only. Test modules stand up fixture tables and
+            // insert into them, which is not a second write path — and this
+            // codebase puts `#[cfg(test)]` at the end of a file, so truncating
+            // there is enough. Erring toward scanning MORE than needed would make
+            // the lint noisy and get it deleted; erring toward less would let a
+            // real second writer hide by sitting after a test module, which is
+            // why the cut is at the first occurrence rather than any later one.
+            let production = body.split("#[cfg(test)]").next().unwrap_or(body);
+            assert!(
+                !production.contains("INSERT INTO events"),
+                "{path} writes the events table directly. Every append must go \
+                 through EventStore, which hashes with compute_event_hash, \
+                 validates, and projects — a second path silently produced events \
+                 that fail chain verification forever."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod plaid_item_connected_compat {
+    use super::*;
+
+    /// Making `proxy_item_id` optional must not disturb a single existing event.
+    ///
+    /// The log is hash-chained and already has `PlaidItemConnected` events in it
+    /// with this field present. If serialization changed shape — a wrapper, a
+    /// `null`, a reordering — every one of those events would hash differently,
+    /// the chain would fail to verify, and every replica would reject the ledger
+    /// it had already accepted. So: `Some(x)` must serialize to exactly what `x`
+    /// serialized to before, and the payload a pre-change event was written with
+    /// must still deserialize.
+    #[test]
+    fn an_existing_event_deserializes_and_reserializes_byte_identically() {
+        // Exactly the JSON the old `proxy_item_id: String` produced.
+        let stored = r#"{"type":"plaid_item_connected","item_id":"i-1","proxy_item_id":"p-1","institution_name":"Chase","plaid_accounts":[]}"#;
+
+        let event: Event = serde_json::from_str(stored).expect("old payload must still parse");
+        match &event {
+            Event::PlaidItemConnected { proxy_item_id, .. } => {
+                assert_eq!(proxy_item_id.as_deref(), Some("p-1"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let round_tripped = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            round_tripped, stored,
+            "serialization changed for an event already on disk — every existing \
+             PlaidItemConnected would hash differently and break the chain"
+        );
+    }
+
+    /// The new shape: hosted books omit the field entirely rather than writing a
+    /// `null`, so the payload carries no key at all.
+    #[test]
+    fn a_hosted_connection_omits_the_handle_rather_than_nulling_it() {
+        let event = Event::PlaidItemConnected {
+            item_id: "i-2".into(),
+            proxy_item_id: None,
+            institution_name: "Chase".into(),
+            plaid_accounts: vec![],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("proxy_item_id"),
+            "an absent handle must not appear on the wire at all: {json}"
+        );
+        // …and survives a round trip as absent.
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back {
+            Event::PlaidItemConnected { proxy_item_id, .. } => assert_eq!(proxy_item_id, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }
 
