@@ -412,82 +412,9 @@ impl<'a> PlaidCommands<'a> {
     ) -> Result<(u32, u32), PlaidCommandError> {
         // Pre-load mappings and do all staging with conn, then drop the borrow
         let (staged, skipped) = {
-            let conn = self.store.connection();
-
-            let mut stmt = conn.prepare(
-                "SELECT plaid_account_id, local_account_id FROM plaid_local_accounts WHERE item_id = ?1",
-            )?;
-            let mappings: HashMap<String, Option<String>> = stmt
-                .query_map([item_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
-
-            let mut staged = 0u32;
-            let mut skipped = 0u32;
-
-            for txn in transactions {
-                if txn.pending {
-                    skipped += 1;
-                    continue;
-                }
-
-                // Skip if account is not mapped to a local account
-                let local_account_id = mappings.get(&txn.account_id).and_then(|o| o.clone());
-                if local_account_id.is_none() {
-                    skipped += 1;
-                    continue;
-                }
-
-                let already_exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM plaid_staged_transactions WHERE plaid_transaction_id = ?1
-                         UNION ALL
-                         SELECT 1 FROM plaid_imported_transactions WHERE plaid_transaction_id = ?1
-                         LIMIT 1",
-                        [&txn.transaction_id],
-                        |_| Ok(true),
-                    )
-                    .unwrap_or(false);
-
-                if already_exists {
-                    skipped += 1;
-                    continue;
-                }
-                let amount_cents = (txn.amount * 100.0).round() as i64;
-                let currency = txn.iso_currency_code.as_deref().unwrap_or("USD");
-                let id = Uuid::new_v4().to_string();
-
-                let payment_meta_json = txn
-                    .payment_meta
-                    .as_ref()
-                    .filter(|pm| !pm.is_empty())
-                    .and_then(|pm| serde_json::to_string(pm).ok());
-
-                conn.execute(
-                    "INSERT INTO plaid_staged_transactions
-                     (id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
-                      amount_cents, date, name, merchant_name, currency, status, payment_meta)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
-                    rusqlite::params![
-                        id,
-                        item_id,
-                        txn.transaction_id,
-                        txn.account_id,
-                        local_account_id,
-                        amount_cents,
-                        txn.date,
-                        txn.name,
-                        txn.merchant_name,
-                        currency,
-                        payment_meta_json
-                    ],
-                )?;
-                staged += 1;
-            }
-
-            (staged, skipped)
+            let outcome =
+                stage_transactions_in_conn(self.store.connection(), item_id, transactions)?;
+            (outcome.staged, outcome.skipped())
         };
         // Borrow of self.store.connection() is now dropped
 
@@ -860,6 +787,128 @@ impl<'a> PlaidCommands<'a> {
         self.store.apply_projection(&stored)?;
         Ok(stored)
     }
+}
+
+/// What one staging run did with the transactions it was handed.
+///
+/// Counted four ways rather than summed into "staged N, skipped M", because the
+/// outcomes call for different responses and lumping them together sends someone
+/// hunting for hundreds of missing transactions that were mostly duplicates they
+/// already had.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StagedOutcome {
+    /// Rows written to the review table. Includes [`Self::unmapped`].
+    pub staged: u32,
+    /// Of those, how many arrived for a bank account with no local account yet.
+    /// They are staged all the same — see below — and the import path leaves them
+    /// alone until their account is mapped.
+    pub unmapped: u32,
+    /// Already staged, or already imported. The bulk of any re-pull.
+    pub duplicates: u32,
+    /// Not yet settled at the bank. Skipped because the amount can still change;
+    /// they arrive again, as themselves, once they post.
+    pub still_pending: u32,
+}
+
+impl StagedOutcome {
+    /// Everything that did not become a row.
+    pub fn skipped(&self) -> u32 {
+        self.duplicates + self.still_pending
+    }
+}
+
+/// Stage transactions into the machine-local review table.
+///
+/// Takes a connection rather than `&mut self` because the delegated path has no
+/// ledger to write to. On a group-hosted book a pull is not a fact about the
+/// books — only what one member has fetched and not yet posted — so staging is
+/// machine-local, and appending a `PlaidTransactionsSynced` event here would be a
+/// local write that a replica must refuse.
+///
+/// # Why nothing is dropped
+///
+/// A transaction whose bank account is not mapped yet is staged with a null local
+/// account rather than discarded. The provider advances this consumer's position
+/// in the stream as it hands transactions over, so anything dropped here is not
+/// coming back: the next pull starts after it. An unusable row costs a line in a
+/// review list. A dropped one costs a transaction nobody will ever see again, and
+/// nobody will know to look for.
+pub fn stage_transactions_in_conn(
+    conn: &rusqlite::Connection,
+    item_id: &str,
+    transactions: &[SyncedTransaction],
+) -> Result<StagedOutcome, PlaidCommandError> {
+    let mut stmt = conn.prepare(
+        "SELECT plaid_account_id, local_account_id FROM plaid_local_accounts WHERE item_id = ?1",
+    )?;
+    let mappings: HashMap<String, Option<String>> = stmt
+        .query_map([item_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut outcome = StagedOutcome::default();
+    for txn in transactions {
+        if txn.pending {
+            outcome.still_pending += 1;
+            continue;
+        }
+
+        let local_account_id = mappings.get(&txn.account_id).and_then(|o| o.clone());
+
+        let already_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM plaid_staged_transactions WHERE plaid_transaction_id = ?1
+                 UNION ALL
+                 SELECT 1 FROM plaid_imported_transactions WHERE plaid_transaction_id = ?1
+                 LIMIT 1",
+                [&txn.transaction_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if already_exists {
+            outcome.duplicates += 1;
+            continue;
+        }
+
+        let amount_cents = (txn.amount * 100.0).round() as i64;
+        let currency = txn.iso_currency_code.as_deref().unwrap_or("USD");
+        let id = Uuid::new_v4().to_string();
+
+        let payment_meta_json = txn
+            .payment_meta
+            .as_ref()
+            .filter(|pm| !pm.is_empty())
+            .and_then(|pm| serde_json::to_string(pm).ok());
+
+        conn.execute(
+            "INSERT INTO plaid_staged_transactions
+             (id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
+              amount_cents, date, name, merchant_name, currency, status, payment_meta)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11)",
+            rusqlite::params![
+                id,
+                item_id,
+                txn.transaction_id,
+                txn.account_id,
+                local_account_id,
+                amount_cents,
+                txn.date,
+                txn.name,
+                txn.merchant_name,
+                currency,
+                payment_meta_json
+            ],
+        )?;
+        if local_account_id.is_none() {
+            outcome.unmapped += 1;
+        }
+        outcome.staged += 1;
+    }
+
+    Ok(outcome)
 }
 
 /// A transaction received from the proxy's sync endpoint
@@ -1408,5 +1457,155 @@ mod tests {
             .unwrap();
         assert_eq!((added, skipped), (0, 1), "inactive-account txn is skipped");
         assert_eq!(count(&store, "SELECT COUNT(*) FROM journal_entries"), 0);
+    }
+}
+
+/// Tests for the staging policy that the delegated (group) pull depends on.
+///
+/// Kept apart from the module's other tests because they are about one property:
+/// a pull is destructive, so staging must not silently discard anything. The
+/// provider has already moved this consumer's position in the stream by the time
+/// these rows are written.
+#[cfg(test)]
+mod staging_policy_tests {
+    use super::*;
+    use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
+    use crate::domain::AccountType;
+    use crate::store::migrations::init_schema;
+    use crate::store::EventStore;
+
+    fn store_with_one_mapped_account() -> EventStore {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let local = AccountCommands::new(&mut store, "u".to_string())
+            .create_account(CreateAccountCommand {
+                account_type: AccountType::Asset,
+                account_number: "1000".to_string(),
+                name: "Checking".to_string(),
+                parent_id: None,
+                currency: None,
+                description: None,
+            })
+            .unwrap();
+        let local = match &local.event {
+            Event::AccountCreated { account_id, .. } => account_id.clone(),
+            _ => unreachable!(),
+        };
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_items (id, proxy_item_id, institution_name)
+                 VALUES ('item1','p1','Bank')",
+                [],
+            )
+            .unwrap();
+        // 'pa1' is mapped; 'pa2' is deliberately not.
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_local_accounts
+                     (item_id, plaid_account_id, name, account_type, local_account_id)
+                 VALUES ('item1','pa1','Checking','depository',?1)",
+                [&local],
+            )
+            .unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_local_accounts
+                     (item_id, plaid_account_id, name, account_type, local_account_id)
+                 VALUES ('item1','pa2','Savings','depository',NULL)",
+                [],
+            )
+            .unwrap();
+        store
+    }
+
+    fn txn_on(account: &str, id: &str) -> SyncedTransaction {
+        SyncedTransaction {
+            transaction_id: id.to_string(),
+            account_id: account.to_string(),
+            amount: 4.50,
+            date: "2026-03-04".to_string(),
+            name: "Coffee".to_string(),
+            merchant_name: None,
+            pending: false,
+            iso_currency_code: None,
+            currency: None,
+            payment_meta: None,
+        }
+    }
+
+    /// The regression that cost 728 transactions: a transaction for an unmapped
+    /// bank account used to be dropped. The pull that fetched it does not happen
+    /// twice, so dropping it means nobody ever sees it again.
+    #[test]
+    fn a_transaction_for_an_unmapped_account_is_kept_not_dropped() {
+        let store = store_with_one_mapped_account();
+        let outcome = stage_transactions_in_conn(
+            store.connection(),
+            "item1",
+            &[txn_on("pa1", "t1"), txn_on("pa2", "t2")],
+        )
+        .unwrap();
+
+        assert_eq!(outcome.staged, 2, "both must survive the pull");
+        assert_eq!(outcome.unmapped, 1);
+        assert_eq!(outcome.skipped(), 0);
+
+        let held: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM plaid_staged_transactions
+                 WHERE plaid_transaction_id = 't2' AND local_account_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(held, 1, "held for review, with no account guessed at");
+    }
+
+    /// Staging must not touch the ledger: on a group-hosted book there is no
+    /// local write to make, and a pull is not a fact about the books.
+    #[test]
+    fn staging_appends_no_events() {
+        let store = store_with_one_mapped_account();
+        let before: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        stage_transactions_in_conn(store.connection(), "item1", &[txn_on("pa1", "t1")]).unwrap();
+        let after: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "a replica must be able to run this");
+    }
+
+    /// Re-staging the same transactions is a no-op, and says so as duplicates
+    /// rather than as a failure.
+    #[test]
+    fn the_same_transaction_twice_is_counted_as_a_duplicate() {
+        let store = store_with_one_mapped_account();
+        let t = [txn_on("pa1", "t1")];
+        assert_eq!(
+            stage_transactions_in_conn(store.connection(), "item1", &t)
+                .unwrap()
+                .staged,
+            1
+        );
+        let second = stage_transactions_in_conn(store.connection(), "item1", &t).unwrap();
+        assert_eq!((second.staged, second.duplicates), (0, 1));
+    }
+
+    /// Unsettled transactions are the one thing it is safe not to keep: the bank
+    /// sends them again, as themselves, once they post.
+    #[test]
+    fn an_unsettled_transaction_is_left_for_the_bank_to_send_again() {
+        let store = store_with_one_mapped_account();
+        let mut t = txn_on("pa1", "t1");
+        t.pending = true;
+        let outcome = stage_transactions_in_conn(store.connection(), "item1", &[t]).unwrap();
+        assert_eq!((outcome.staged, outcome.still_pending), (0, 1));
     }
 }
