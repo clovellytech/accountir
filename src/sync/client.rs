@@ -14,7 +14,9 @@ use super::commands::bill_ops::{
 };
 use super::commands::entries::{BatchEntry, PostEntriesRequest, PostEntriesResponse};
 use super::commands::entry_ops::{UnvoidEntryRequest, VoidEntryRequest};
-use super::commands::plaid::{ConnectPlaidItemRequest, ConnectPlaidItemResponse};
+use super::commands::plaid::{
+    ConnectPlaidItemRequest, ConnectPlaidItemResponse, MapPlaidAccountRequest,
+};
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
 use crate::domain::{AccountType, PaymentTerms};
 use chrono::NaiveDate;
@@ -362,6 +364,62 @@ impl SyncClient {
                     let body = resp.text().await.unwrap_or_default();
                     return Err(SyncClientError::Unexpected(s.as_u16(), body));
                 }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Link a bank account to a ledger account on the group's books.
+    pub async fn map_plaid_account(
+        &mut self,
+        item_id: impl Into<String>,
+        plaid_account_id: impl Into<String>,
+        local_account_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        self.plaid_mapping(
+            "/sync/commands/map-plaid-account",
+            item_id.into(),
+            plaid_account_id.into(),
+            local_account_id.into(),
+        )
+        .await
+    }
+
+    /// Unlink one. Same shape, different route — see `MapPlaidAccountRequest`
+    /// for why the direction is the endpoint rather than a field.
+    pub async fn unmap_plaid_account(
+        &mut self,
+        item_id: impl Into<String>,
+        plaid_account_id: impl Into<String>,
+        local_account_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        self.plaid_mapping(
+            "/sync/commands/unmap-plaid-account",
+            item_id.into(),
+            plaid_account_id.into(),
+            local_account_id.into(),
+        )
+        .await
+    }
+
+    async fn plaid_mapping(
+        &mut self,
+        path: &str,
+        item_id: String,
+        plaid_account_id: String,
+        local_account_id: String,
+    ) -> Result<i64, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = MapPlaidAccountRequest {
+                expected_head_seq: self.head,
+                item_id: item_id.clone(),
+                plaid_account_id: plaid_account_id.clone(),
+                local_account_id: local_account_id.clone(),
+            };
+            match self.submit(path, &body).await? {
+                Submitted::Head(head) => return Ok(head),
+                Submitted::Retry => continue,
             }
         }
         Err(SyncClientError::ConflictExhausted(MAX_RETRIES))

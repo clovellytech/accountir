@@ -25,17 +25,26 @@
 //! minted here and returned, exactly as `build_create_account_in_txn` mints an
 //! account id rather than taking one.
 
+use crate::commands::plaid_commands::{
+    build_map_account_in_txn, build_unmap_account_in_txn, PlaidCommandError, PlaidStep,
+};
 use crate::events::types::{Event, PlaidAccountInfo};
 use crate::store::event_store::{CheckedOutcome, Verdict};
-use crate::sync::{project, stamp, ApiError, AuthedUser, SyncState};
+use crate::sync::{outcome_to_response, project, stamp, ApiError, AuthedUser, SyncState};
 use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<SyncState> {
-    Router::new().route(
-        "/sync/commands/connect-plaid-item",
-        post(submit_connect_plaid_item),
-    )
+    Router::new()
+        .route(
+            "/sync/commands/connect-plaid-item",
+            post(submit_connect_plaid_item),
+        )
+        .route("/sync/commands/map-plaid-account", post(submit_map_account))
+        .route(
+            "/sync/commands/unmap-plaid-account",
+            post(submit_unmap_account),
+        )
 }
 
 #[derive(Serialize, Deserialize)]
@@ -250,6 +259,151 @@ mod tests {
         assert_ne!(first["item_id"], "victim-item");
     }
 
+    /// Set up a connection and a ledger account, and return `(item_id, account_id)`.
+    async fn connected(base: &str) -> (String, String) {
+        let http = reqwest::Client::new();
+        let v: serde_json::Value = http
+            .post(format!("{base}/sync/commands/connect-plaid-item"))
+            .bearer_auth(TOKEN)
+            .json(&body(0))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let item = v["item_id"].as_str().unwrap().to_string();
+        let head = v["head"].as_i64().unwrap();
+
+        let acct: serde_json::Value = http
+            .post(format!("{base}/sync/commands/create-account"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head,
+                "account_type": "asset",
+                "account_number": "1001",
+                "name": "Business Checking",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let _ = acct;
+
+        let accounts: serde_json::Value = http
+            .get(format!("{base}/sync/accounts"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let account_id = accounts["accounts"][0]["id"]
+            .as_str()
+            .expect("the created account")
+            .to_string();
+        (item, account_id)
+    }
+
+    async fn head_of(base: &str) -> i64 {
+        reqwest::Client::new()
+            .get(format!("{base}/sync/head"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["head"]
+            .as_i64()
+            .unwrap()
+    }
+
+    /// The thing that was blocked: a member on hosted books links a bank account
+    /// to a ledger account, and can unlink it again.
+    #[tokio::test]
+    async fn a_bank_account_can_be_linked_and_unlinked_on_hosted_books() {
+        let base = serve().await;
+        let (item, account) = connected(&base).await;
+        let http = reqwest::Client::new();
+
+        let map = http
+            .post(format!("{base}/sync/commands/map-plaid-account"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "item_id": item,
+                "plaid_account_id": "acc-business",
+                "local_account_id": account,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(map.status(), reqwest::StatusCode::OK);
+
+        let unmap = http
+            .post(format!("{base}/sync/commands/unmap-plaid-account"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "item_id": item,
+                "plaid_account_id": "acc-business",
+                "local_account_id": account,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unmap.status(), reqwest::StatusCode::OK);
+    }
+
+    /// A typo'd ledger account used to be accepted and then blow up inside the
+    /// projector as a foreign-key failure — an internal error where the honest
+    /// answer is "no such account".
+    #[tokio::test]
+    async fn mapping_to_an_account_that_does_not_exist_is_a_domain_rejection() {
+        let base = serve().await;
+        let (item, _account) = connected(&base).await;
+
+        let r = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/map-plaid-account"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "item_id": item,
+                "plaid_account_id": "acc-business",
+                "local_account_id": "no-such-account",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// Unmapping something that is not mapped must not report success — a stale
+    /// UI would otherwise show a removal that never happened.
+    #[tokio::test]
+    async fn unmapping_what_was_never_mapped_is_refused() {
+        let base = serve().await;
+        let (item, account) = connected(&base).await;
+
+        let r = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/unmap-plaid-account"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "item_id": item,
+                "plaid_account_id": "acc-business",
+                "local_account_id": account,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
     #[tokio::test]
     async fn an_empty_connection_is_refused_and_auth_is_required() {
         let base = serve().await;
@@ -281,4 +435,73 @@ mod tests {
              the books as a permanent dead entry"
         );
     }
+}
+
+/// Link or unlink one of a connection's bank accounts to a ledger account.
+///
+/// Both shapes are identical, so one DTO. Which endpoint it is sent to decides
+/// the direction — a `mapped: bool` field would be a way to get the wrong one by
+/// typo, on a request that otherwise looks correct.
+#[derive(Serialize, Deserialize)]
+pub struct MapPlaidAccountRequest {
+    pub expected_head_seq: i64,
+    pub item_id: String,
+    pub plaid_account_id: String,
+    pub local_account_id: String,
+}
+
+/// Map a bank account to a ledger account, validated server-side.
+///
+/// Runs the SAME in-txn fences the local handler does — the connection exists and
+/// the ledger account is real — under the write lock, so a mapping cannot be
+/// created against a connection that was disconnected a moment earlier.
+async fn submit_map_account(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<MapPlaidAccountRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_map_account_in_txn(
+                tx,
+                &req.item_id,
+                &req.plaid_account_id,
+                &req.local_account_id,
+            )? {
+                PlaidStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PlaidStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PlaidCommandError>)
+}
+
+/// Unmap a bank account, validated server-side. A mapping that is not there is a
+/// `422` rather than a silent success, so a stale UI cannot report a removal that
+/// never happened.
+async fn submit_unmap_account(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<MapPlaidAccountRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_unmap_account_in_txn(
+                tx,
+                &req.item_id,
+                &req.plaid_account_id,
+                &req.local_account_id,
+            )? {
+                PlaidStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PlaidStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PlaidCommandError>)
 }

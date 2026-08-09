@@ -1,11 +1,11 @@
 use crate::commands::entry_commands::{check_entry_invariants_in_txn, check_reference_free_in_txn};
-use rusqlite::OptionalExtension;
 use crate::events::types::{
     Event, EventEnvelope, JournalEntrySource, JournalLineData, PlaidAccountInfo, StoredEvent,
 };
 use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::{ProjectionError, ProjectionStore, Projector};
 use chrono::{NaiveDate, Utc};
+use rusqlite::OptionalExtension;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
@@ -30,6 +30,96 @@ pub enum PlaidCommandError {
     AccountError(#[from] crate::commands::account_commands::AccountCommandError),
     #[error("Entry invariant: {0}")]
     EntryError(#[from] crate::commands::entry_commands::EntryCommandError),
+}
+
+/// Outcome of a Plaid command's in-txn validation. Mirrors `AccountStep`: the
+/// caller wraps the event, stamping identity as appropriate — the local
+/// `user_id`, or the server-authenticated actor on the sync path.
+pub(crate) enum PlaidStep {
+    Append(Event),
+    Reject(PlaidCommandError),
+}
+
+/// Check that the connection exists and the ledger account is real, then build
+/// the `PlaidAccountMapped` event.
+///
+/// Inside the transaction, not before it. The previous version read
+/// `SELECT 1 FROM plaid_items` on a plain connection and appended afterwards —
+/// a read-then-append window in which the item could be disconnected, leaving a
+/// mapping that points at a connection which no longer exists.
+///
+/// The `local_account_id` check is new. Without it a typo'd account id was
+/// accepted and only surfaced later as a foreign-key failure inside the
+/// projector, which reads as an internal error rather than "no such account".
+pub(crate) fn build_map_account_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    item_id: &str,
+    plaid_account_id: &str,
+    local_account_id: &str,
+) -> Result<PlaidStep, EventStoreError> {
+    let item_exists: bool = tx
+        .query_row("SELECT 1 FROM plaid_items WHERE id = ?1", [item_id], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .unwrap_or(false);
+    if !item_exists {
+        return Ok(PlaidStep::Reject(PlaidCommandError::ItemNotFound(
+            item_id.to_string(),
+        )));
+    }
+
+    let account_exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM accounts WHERE id = ?1",
+            [local_account_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !account_exists {
+        return Ok(PlaidStep::Reject(PlaidCommandError::AccountNotMapped(
+            format!("no such ledger account: {local_account_id}"),
+        )));
+    }
+
+    Ok(PlaidStep::Append(Event::PlaidAccountMapped {
+        item_id: item_id.to_string(),
+        plaid_account_id: plaid_account_id.to_string(),
+        local_account_id: local_account_id.to_string(),
+    }))
+}
+
+/// Check the mapping is actually there, then build the `PlaidAccountUnmapped`
+/// event. Same in-txn reasoning as [`build_map_account_in_txn`]: read outside the
+/// transaction and two concurrent unmaps both succeed, appending two events for
+/// one removal.
+pub(crate) fn build_unmap_account_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    item_id: &str,
+    plaid_account_id: &str,
+    local_account_id: &str,
+) -> Result<PlaidStep, EventStoreError> {
+    let mapped: bool = tx
+        .query_row(
+            "SELECT 1 FROM plaid_local_accounts
+              WHERE item_id = ?1 AND plaid_account_id = ?2 AND local_account_id = ?3",
+            rusqlite::params![item_id, plaid_account_id, local_account_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !mapped {
+        return Ok(PlaidStep::Reject(PlaidCommandError::AccountNotMapped(
+            format!("{item_id}:{plaid_account_id}"),
+        )));
+    }
+
+    Ok(PlaidStep::Append(Event::PlaidAccountUnmapped {
+        item_id: item_id.to_string(),
+        plaid_account_id: plaid_account_id.to_string(),
+        local_account_id: local_account_id.to_string(),
+    }))
 }
 
 pub struct PlaidCommands<'a> {
@@ -71,29 +161,9 @@ impl<'a> PlaidCommands<'a> {
         plaid_account_id: &str,
         local_account_id: &str,
     ) -> Result<StoredEvent, PlaidCommandError> {
-        // Verify item exists
-        let exists: bool = self
-            .store
-            .connection()
-            .query_row("SELECT 1 FROM plaid_items WHERE id = ?1", [item_id], |_| {
-                Ok(true)
-            })
-            .unwrap_or(false);
-
-        if !exists {
-            return Err(PlaidCommandError::ItemNotFound(item_id.to_string()));
-        }
-
-        let event = Event::PlaidAccountMapped {
-            item_id: item_id.to_string(),
-            plaid_account_id: plaid_account_id.to_string(),
-            local_account_id: local_account_id.to_string(),
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-        self.store.apply_projection(&stored)?;
-        Ok(stored)
+        self.append_step(|tx| {
+            build_map_account_in_txn(tx, item_id, plaid_account_id, local_account_id)
+        })
     }
 
     /// Unmap a Plaid account from a local account
@@ -103,34 +173,44 @@ impl<'a> PlaidCommands<'a> {
         plaid_account_id: &str,
         local_account_id: &str,
     ) -> Result<StoredEvent, PlaidCommandError> {
-        // Verify item exists and mapping exists
-        let mapped: bool = self
-            .store
-            .connection()
-            .query_row(
-                "SELECT 1 FROM plaid_local_accounts WHERE item_id = ?1 AND plaid_account_id = ?2 AND local_account_id = ?3",
-                rusqlite::params![item_id, plaid_account_id, local_account_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        self.append_step(|tx| {
+            build_unmap_account_in_txn(tx, item_id, plaid_account_id, local_account_id)
+        })
+    }
 
-        if !mapped {
-            return Err(PlaidCommandError::AccountNotMapped(format!(
-                "{}:{}",
-                item_id, plaid_account_id
-            )));
+    /// Append one event whose invariants are checked inside the transaction,
+    /// retrying on a head move.
+    ///
+    /// The retry is what makes moving these checks in-txn free for the local
+    /// caller: a concurrent append no longer means a lost command, it means one
+    /// more attempt against the state that actually exists now.
+    fn append_step(
+        &mut self,
+        build: impl Fn(&rusqlite::Transaction<'_>) -> Result<PlaidStep, EventStoreError>,
+    ) -> Result<StoredEvent, PlaidCommandError> {
+        let user_id = self.user_id.clone();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build(tx)? {
+                    PlaidStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    PlaidStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue,
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
         }
-
-        let event = Event::PlaidAccountUnmapped {
-            item_id: item_id.to_string(),
-            plaid_account_id: plaid_account_id.to_string(),
-            local_account_id: local_account_id.to_string(),
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-        self.store.apply_projection(&stored)?;
-        Ok(stored)
     }
 
     /// Import synced transactions from the proxy into journal entries.
@@ -200,7 +280,11 @@ impl<'a> PlaidCommands<'a> {
 
             let amount_cents = (txn.amount * 100.0).round() as i64;
             let currency = txn.currency.clone().unwrap_or_else(|| "USD".to_string());
-            let memo = txn.merchant_name.as_deref().unwrap_or(&txn.name).to_string();
+            let memo = txn
+                .merchant_name
+                .as_deref()
+                .unwrap_or(&txn.name)
+                .to_string();
             let user_id = self.user_id.clone();
             let uncat = uncategorized_id.clone();
             let txn_ref = txn.transaction_id.clone();
@@ -294,7 +378,7 @@ impl<'a> PlaidCommands<'a> {
                 match outcome {
                     CheckedOutcome::Appended(_) => break true,
                     CheckedOutcome::HeadMismatch { .. } => continue, // refetch & retry
-                    CheckedOutcome::Rejected(_) => break false, // duplicate or fence → skip
+                    CheckedOutcome::Rejected(_) => break false,      // duplicate or fence → skip
                 }
             };
             if posted {
@@ -454,9 +538,10 @@ impl<'a> PlaidCommands<'a> {
                 (&txn2, &txn1)
             }
         } else {
-            let txn1_is_asset = account_type_of(self.store.connection(), txn1.local_account_id.as_deref())
-                .as_deref()
-                == Some("asset");
+            let txn1_is_asset =
+                account_type_of(self.store.connection(), txn1.local_account_id.as_deref())
+                    .as_deref()
+                    == Some("asset");
             if txn1_is_asset {
                 (&txn1, &txn2)
             } else {
@@ -710,8 +795,9 @@ impl<'a> PlaidCommands<'a> {
         // Collect pending transfer candidate IDs
         let candidate_ids: Vec<String> = {
             let conn = self.store.connection();
-            let mut stmt =
-                conn.prepare("SELECT id FROM plaid_transfer_candidates WHERE status IN ('pending', 'manual')")?;
+            let mut stmt = conn.prepare(
+                "SELECT id FROM plaid_transfer_candidates WHERE status IN ('pending', 'manual')",
+            )?;
             let ids: Vec<String> = stmt
                 .query_map([], |row| row.get(0))?
                 .filter_map(|r| r.ok())
@@ -978,8 +1064,7 @@ pub fn create_manual_transfer(
     }
     if t1.local_account_id == t2.local_account_id {
         return Err(PlaidCommandError::InvalidTransfer(
-            "both legs are on the same account — a transfer moves between two accounts"
-                .to_string(),
+            "both legs are on the same account — a transfer moves between two accounts".to_string(),
         ));
     }
     if t1.status != "pending" || t2.status != "pending" {
@@ -1244,7 +1329,10 @@ mod tests {
             .unwrap();
         assert_eq!((added, skipped), (1, 0));
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM journal_entries WHERE reference = 't1'"),
+            count(
+                &store,
+                "SELECT COUNT(*) FROM journal_entries WHERE reference = 't1'"
+            ),
             1
         );
         assert_eq!(
@@ -1269,7 +1357,10 @@ mod tests {
             .unwrap();
         assert_eq!((added, skipped), (0, 1), "re-import is a no-op");
         assert_eq!(
-            count(&store, "SELECT COUNT(*) FROM journal_entries WHERE reference = 't1'"),
+            count(
+                &store,
+                "SELECT COUNT(*) FROM journal_entries WHERE reference = 't1'"
+            ),
             1,
             "no double-post"
         );
