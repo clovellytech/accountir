@@ -77,6 +77,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             19,
             include_str!("../../migrations/019_recurring_transfers.sql"),
         ),
+        (
+            20,
+            include_str!("../../migrations/020_event_service_optional_api_key.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -438,7 +442,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             root_url TEXT NOT NULL,
-            api_key TEXT NOT NULL,
+            -- Nullable since migration 020: a service registered on group-hosted
+            -- books keeps its key on the group's instance, never in this log.
+            api_key TEXT,
             status TEXT NOT NULL DEFAULT 'active',
             cursor TEXT,
             last_synced_at TEXT,
@@ -696,6 +702,96 @@ mod tests {
         assert!(has_event_service_url_index(&conn));
     }
 }
+#[cfg(test)]
+mod event_service_rebuild {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Migration 020 rebuilds `event_services`, and `staged_service_events`
+    /// references it.
+    ///
+    /// Same shape as the 018 regression, which ate real data: drop a parent table
+    /// with foreign keys enforced and the children go with it — here, a member's
+    /// queue of fetched-but-unposted events. The fixture therefore has children,
+    /// because a fixture without them cannot catch this.
+    #[test]
+    fn rebuilding_event_services_keeps_its_staged_events_and_its_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        init_schema(&conn).unwrap();
+        run_migrations(&conn).unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO event_services (id, name, root_url, api_key, cursor, events_processed)
+                 VALUES ('svc-1', 'Bugbear Bikes', 'https://bugbearbikes.com', 'k-1', 'c-9', 7);
+             INSERT INTO staged_service_events
+                 (id, service_id, remote_event_id, event_type, data, timestamp)
+                 VALUES ('st-1', 'svc-1', 'r-1', 'sale', '{}', '2026-08-01T00:00:00Z');",
+        )
+        .unwrap();
+
+        // Re-run the rebuild the way an upgrade does.
+        conn.execute("DELETE FROM schema_migrations WHERE version = 20", [])
+            .unwrap();
+        run_migrations(&conn).unwrap();
+
+        let staged: i64 = conn
+            .query_row("SELECT COUNT(*) FROM staged_service_events", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            staged, 1,
+            "the rebuild took the staged events with it — a member would lose \
+             every fetched event they had not yet posted"
+        );
+
+        // Every column has to survive, not just the row: a dropped `cursor` would
+        // silently re-fetch a service's whole history on the next sync.
+        let (key, cursor, processed): (Option<String>, Option<String>, i64) = conn
+            .query_row(
+                "SELECT api_key, cursor, events_processed FROM event_services WHERE id = 'svc-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            key.as_deref(),
+            Some("k-1"),
+            "a standalone book keeps its key"
+        );
+        assert_eq!(cursor.as_deref(), Some("c-9"));
+        assert_eq!(processed, 7);
+
+        let notnull: i64 = conn
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info('event_services') WHERE name='api_key'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(notnull, 0, "api_key must be nullable after 020");
+
+        // The case the migration exists for.
+        conn.execute(
+            "INSERT INTO event_services (id, name, root_url, api_key)
+                 VALUES ('svc-2', 'Hosted Service', 'https://hosted.test', NULL)",
+            [],
+        )
+        .expect("a service registered on hosted books has no key in the log");
+
+        // The uniqueness backstop is part of the table's contract and the rebuild
+        // dropped the index along with the old table. Losing it would let a
+        // service be registered twice and double-post every event it publishes.
+        conn.execute(
+            "INSERT INTO event_services (id, name, root_url, api_key)
+                 VALUES ('svc-3', 'Duplicate', 'https://hosted.test', NULL)",
+            [],
+        )
+        .expect_err("the active-root_url unique index must survive the rebuild");
+    }
+}
+
 #[cfg(test)]
 mod plaid_item_rebuild {
     use super::*;

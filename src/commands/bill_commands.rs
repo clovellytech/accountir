@@ -39,6 +39,7 @@ pub enum BillCommandError {
     InvalidData(String),
 }
 
+#[derive(Debug, Clone)]
 pub struct ReceiveBillCommand {
     pub vendor: String,
     pub amount: i64,

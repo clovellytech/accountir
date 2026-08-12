@@ -326,6 +326,21 @@ pub fn check_idempotent(conn: &Connection, reference: &str) -> Option<String> {
     .ok()
 }
 
+/// The "we already have this one" answer, for an ingest about to be posted
+/// locally.
+///
+/// A pre-transaction check, so the common re-import case costs a read rather than
+/// a rejected append. It is not the correctness boundary — that is the in-txn
+/// duplicate-reference check plus the unique index behind it, which is what
+/// catches a concurrent import that won the race after this returned `None`.
+fn already_posted(conn: &Connection, reference: Option<&str>) -> Option<IngestResult> {
+    let existing_id = check_idempotent(conn, reference?)?;
+    Some(IngestResult {
+        entry_id: existing_id,
+        was_duplicate: true,
+    })
+}
+
 fn extract_entry_id(stored: &crate::events::types::StoredEvent) -> String {
     if let crate::events::types::Event::JournalEntryPosted { entry_id, .. } = &stored.event {
         entry_id.clone()
@@ -355,29 +370,95 @@ pub(crate) fn post_ingest_entry(
     }
 }
 
-// --- Ingest functions ---
-
-pub fn ingest_sale(
+/// Write a planned entry to standalone books: skip it if its reference is
+/// already there, otherwise post it.
+///
+/// The counterpart of [`plan_sale`] and friends, and the only thing standing
+/// between a plan and the log. On hosted books this half is the group server's
+/// job instead — same plan, different writer.
+pub fn post_planned_entry(
     store: &mut EventStore,
     user_id: &str,
+    cmd: PostEntryCommand,
+) -> Result<IngestResult, IngestError> {
+    if let Some(result) = already_posted(store.connection(), cmd.reference.as_deref()) {
+        return Ok(result);
+    }
+    let mut commands = EntryCommands::new(store, user_id.to_string());
+    let (entry_id, was_duplicate) = post_ingest_entry(&mut commands, cmd)?;
+    Ok(IngestResult {
+        entry_id,
+        was_duplicate,
+    })
+}
+
+/// Write a planned bill to standalone books. See [`post_planned_entry`].
+///
+/// A concurrent import for the same source event that won the race after the
+/// pre-check is rejected in-txn as a duplicate; that maps to a graceful skip
+/// rather than an error, because it means the work is done, not that it failed.
+pub fn post_planned_bill(
+    store: &mut EventStore,
+    user_id: &str,
+    cmd: ReceiveBillCommand,
+) -> Result<IngestResult, IngestError> {
+    if let Some(result) = already_posted(store.connection(), cmd.reference.as_deref()) {
+        return Ok(result);
+    }
+    let mut bill_cmds = BillCommands::new(store, user_id.to_string());
+    let (entry_id, was_duplicate) = match bill_cmds.receive_bill(cmd) {
+        Ok(stored) => {
+            let entry_id = if let crate::events::types::Event::BillReceived { entry_id, .. } =
+                &stored.event
+            {
+                entry_id.clone()
+            } else {
+                String::new()
+            };
+            (entry_id, false)
+        }
+        Err(BillCommandError::DuplicateReference {
+            existing_entry_id, ..
+        }) => (existing_entry_id, true),
+        Err(e) => return Err(IngestError::EntryError(e.to_string())),
+    };
+    Ok(IngestResult {
+        entry_id,
+        was_duplicate,
+    })
+}
+
+// --- Planning ---
+//
+// Every ingest below is two separable halves: *decide* what to post — which
+// accounts, which lines, which memo — and then *write* it. The deciding half
+// needs only a read of the mappings and the vendor rules; the writing half needs
+// a `&mut EventStore`, which group-hosted books do not have, because their event
+// ids are the group server's to mint.
+//
+// So the deciding half lives in these `plan_*` functions, over a plain
+// `&Connection`. A member on hosted books plans against their replica's
+// projection and submits the result to the group server's command endpoints,
+// which is the only route by which anything reaches those books.
+//
+// The `ingest_*` functions keep their signatures and call straight through, so
+// there is exactly one description of what a sale posts to. The alternative —
+// the desktop assembling entries of its own for hosted books — is two copies of
+// the chart-of-accounts logic that would drift, and the symptom of that drift is
+// two members' books disagreeing about the same sale.
+
+/// The entry a sale posts, decided but not written.
+pub fn plan_sale(
+    conn: &Connection,
     data: IngestSaleData,
     source: JournalEntrySource,
-) -> Result<IngestResult, IngestError> {
+) -> Result<PostEntryCommand, IngestError> {
     if data.items.is_empty() {
         return Err(IngestError::EmptyItems);
     }
 
     let date = parse_ingest_date(&data.date)?;
     let tax = data.tax_collected_cents.unwrap_or(0);
-
-    if let Some(ref reference) = data.reference {
-        if let Some(existing_id) = check_idempotent(store.connection(), reference) {
-            return Ok(IngestResult {
-                entry_id: existing_id,
-                was_duplicate: true,
-            });
-        }
-    }
 
     let total_revenue: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_price_cents).sum();
     let total_cogs: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
@@ -393,7 +474,7 @@ pub fn ingest_sale(
         required.push("sales_tax_payable");
     }
 
-    let mappings = load_ingest_mappings(store.connection(), &required)?;
+    let mappings = load_ingest_mappings(conn, &required)?;
 
     let items_desc: String = data
         .items
@@ -430,21 +511,23 @@ pub fn ingest_sale(
         );
     }
 
-    let cmd = PostEntryCommand {
+    Ok(PostEntryCommand {
         date,
         memo,
         lines,
         reference: data.reference,
         source: Some(source),
-    };
-
-    let mut commands = EntryCommands::new(store, user_id.to_string());
-    let (entry_id, was_duplicate) = post_ingest_entry(&mut commands, cmd)?;
-
-    Ok(IngestResult {
-        entry_id,
-        was_duplicate,
     })
+}
+
+pub fn ingest_sale(
+    store: &mut EventStore,
+    user_id: &str,
+    data: IngestSaleData,
+    source: JournalEntrySource,
+) -> Result<IngestResult, IngestError> {
+    let cmd = plan_sale(store.connection(), data, source)?;
+    post_planned_entry(store, user_id, cmd)
 }
 
 /// Ingest a refund / return — the reverse of [`ingest_sale`]. Revenue is booked
@@ -452,27 +535,17 @@ pub fn ingest_sale(
 /// the money flows back out of the payment account, sales tax is reversed, and —
 /// when `restock` is set and the returned items carry a cost — inventory is
 /// restocked and COGS reversed.
-pub fn ingest_refund(
-    store: &mut EventStore,
-    user_id: &str,
+pub fn plan_refund(
+    conn: &Connection,
     data: IngestRefundData,
     source: JournalEntrySource,
-) -> Result<IngestResult, IngestError> {
+) -> Result<PostEntryCommand, IngestError> {
     if data.items.is_empty() {
         return Err(IngestError::EmptyItems);
     }
 
     let date = parse_ingest_date(&data.date)?;
     let tax = data.tax_refunded_cents.unwrap_or(0);
-
-    if let Some(ref reference) = data.reference {
-        if let Some(existing_id) = check_idempotent(store.connection(), reference) {
-            return Ok(IngestResult {
-                entry_id: existing_id,
-                was_duplicate: true,
-            });
-        }
-    }
 
     let total_revenue: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_price_cents).sum();
     let total_cost: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
@@ -494,7 +567,7 @@ pub fn ingest_refund(
         required.push("inventory");
     }
 
-    let mappings = load_ingest_mappings(store.connection(), &required)?;
+    let mappings = load_ingest_mappings(conn, &required)?;
 
     let items_desc: String = data
         .items
@@ -530,60 +603,51 @@ pub fn ingest_refund(
         );
     }
 
-    let cmd = PostEntryCommand {
+    Ok(PostEntryCommand {
         date,
         memo,
         lines,
         reference: data.reference,
         source: Some(source),
-    };
-
-    let mut commands = EntryCommands::new(store, user_id.to_string());
-    let (entry_id, was_duplicate) = post_ingest_entry(&mut commands, cmd)?;
-
-    Ok(IngestResult {
-        entry_id,
-        was_duplicate,
     })
 }
 
-pub fn ingest_purchase_order(
+pub fn ingest_refund(
     store: &mut EventStore,
     user_id: &str,
-    data: IngestPurchaseOrderData,
+    data: IngestRefundData,
     source: JournalEntrySource,
 ) -> Result<IngestResult, IngestError> {
+    let cmd = plan_refund(store.connection(), data, source)?;
+    post_planned_entry(store, user_id, cmd)
+}
+
+pub fn plan_purchase_order(
+    conn: &Connection,
+    data: IngestPurchaseOrderData,
+    source: JournalEntrySource,
+) -> Result<PostEntryCommand, IngestError> {
     if data.items.is_empty() {
         return Err(IngestError::EmptyItems);
     }
 
     let date = parse_ingest_date(&data.date)?;
 
-    if let Some(ref reference) = data.reference {
-        if let Some(existing_id) = check_idempotent(store.connection(), reference) {
-            return Ok(IngestResult {
-                entry_id: existing_id,
-                was_duplicate: true,
-            });
-        }
-    }
-
     let payment = data.payment.unwrap_or(IngestPurchasePayment::OnCredit);
-    let inventory_account =
-        load_ingest_mappings(store.connection(), &["inventory"])?["inventory"].clone();
+    let inventory_account = load_ingest_mappings(conn, &["inventory"])?["inventory"].clone();
     // On-credit purchases route to a vendor-specific payable if a rule matches
     // the supplier, else the generic accounts_payable mapping. Cash uses pos_cash.
     let credit_account = match payment {
         IngestPurchasePayment::Cash => {
-            load_ingest_mappings(store.connection(), &["pos_cash"])?["pos_cash"].clone()
+            load_ingest_mappings(conn, &["pos_cash"])?["pos_cash"].clone()
         }
         IngestPurchasePayment::OnCredit => {
             let supplier = data.supplier.as_deref().unwrap_or("supplier");
-            match crate::commands::vendor_rules::match_account(store.connection(), supplier) {
+            match crate::commands::vendor_rules::match_account(conn, supplier) {
                 Some(id) => id,
-                None => load_ingest_mappings(store.connection(), &["accounts_payable"])?
-                    ["accounts_payable"]
-                    .clone(),
+                None => {
+                    load_ingest_mappings(conn, &["accounts_payable"])?["accounts_payable"].clone()
+                }
             }
         }
     };
@@ -612,45 +676,37 @@ pub fn ingest_purchase_order(
             }),
     ];
 
-    let cmd = PostEntryCommand {
+    Ok(PostEntryCommand {
         date,
         memo,
         lines,
         reference: data.reference,
         source: Some(source),
-    };
-
-    let mut commands = EntryCommands::new(store, user_id.to_string());
-    let (entry_id, was_duplicate) = post_ingest_entry(&mut commands, cmd)?;
-
-    Ok(IngestResult {
-        entry_id,
-        was_duplicate,
     })
 }
 
-pub fn ingest_inventory_adjustment(
+pub fn ingest_purchase_order(
     store: &mut EventStore,
     user_id: &str,
-    data: IngestInventoryAdjustmentData,
+    data: IngestPurchaseOrderData,
     source: JournalEntrySource,
 ) -> Result<IngestResult, IngestError> {
+    let cmd = plan_purchase_order(store.connection(), data, source)?;
+    post_planned_entry(store, user_id, cmd)
+}
+
+pub fn plan_inventory_adjustment(
+    conn: &Connection,
+    data: IngestInventoryAdjustmentData,
+    source: JournalEntrySource,
+) -> Result<PostEntryCommand, IngestError> {
     if data.items.is_empty() {
         return Err(IngestError::EmptyItems);
     }
 
     let date = parse_ingest_date(&data.date)?;
 
-    if let Some(ref reference) = data.reference {
-        if let Some(existing_id) = check_idempotent(store.connection(), reference) {
-            return Ok(IngestResult {
-                entry_id: existing_id,
-                was_duplicate: true,
-            });
-        }
-    }
-
-    let mappings = load_ingest_mappings(store.connection(), &["inventory", "inventory_adjustment"])?;
+    let mappings = load_ingest_mappings(conn, &["inventory", "inventory_adjustment"])?;
 
     let net: i64 = data.items.iter().map(|i| i.qty_delta as i64 * i.unit_cost_cents).sum();
 
@@ -688,51 +744,45 @@ pub fn ingest_inventory_adjustment(
         ]
     };
 
-    let cmd = PostEntryCommand {
+    Ok(PostEntryCommand {
         date,
         memo,
         lines,
         reference: data.reference,
         source: Some(source),
-    };
-
-    let mut commands = EntryCommands::new(store, user_id.to_string());
-    let (entry_id, was_duplicate) = post_ingest_entry(&mut commands, cmd)?;
-
-    Ok(IngestResult {
-        entry_id,
-        was_duplicate,
     })
 }
 
-/// Ingest a goods received event: creates inventory journal entry + AP bill.
-/// This is the proper procurement flow — goods arrive, inventory increases,
-/// and a bill is created in the AP system for tracking payment.
-pub fn ingest_goods_received(
+pub fn ingest_inventory_adjustment(
     store: &mut EventStore,
     user_id: &str,
-    data: IngestGoodsReceivedData,
+    data: IngestInventoryAdjustmentData,
+    source: JournalEntrySource,
 ) -> Result<IngestResult, IngestError> {
+    let cmd = plan_inventory_adjustment(store.connection(), data, source)?;
+    post_planned_entry(store, user_id, cmd)
+}
+
+/// The bill a goods-received event raises, decided but not written.
+///
+/// A bill rather than a plain entry on purpose: goods arriving creates a debt to
+/// the supplier that somebody has to pay, and the payables list is where that is
+/// tracked. Posting the same two lines as a bare journal entry would balance the
+/// books and lose the obligation.
+pub fn plan_goods_received(
+    conn: &Connection,
+    data: IngestGoodsReceivedData,
+) -> Result<ReceiveBillCommand, IngestError> {
     if data.items.is_empty() {
         return Err(IngestError::EmptyItems);
     }
 
     let date = parse_ingest_date(&data.date)?;
 
-    if let Some(ref reference) = data.reference {
-        if let Some(existing_id) = check_idempotent(store.connection(), reference) {
-            return Ok(IngestResult {
-                entry_id: existing_id,
-                was_duplicate: true,
-            });
-        }
-    }
-
     // Inventory is always required; the payable account is resolved per-vendor
     // (see below), so the generic accounts_payable mapping is only needed as a
     // fallback.
-    let inventory_account =
-        load_ingest_mappings(store.connection(), &["inventory"])?["inventory"].clone();
+    let inventory_account = load_ingest_mappings(conn, &["inventory"])?["inventory"].clone();
 
     let total_cost: i64 = data
         .items
@@ -744,13 +794,9 @@ pub fn ingest_goods_received(
 
     // Route the payable leg to a vendor-specific account if a rule matches the
     // supplier name; otherwise fall back to the generic accounts_payable mapping.
-    let ap_account_id = match crate::commands::vendor_rules::match_account(store.connection(), supplier)
-    {
+    let ap_account_id = match crate::commands::vendor_rules::match_account(conn, supplier) {
         Some(id) => id,
-        None => {
-            load_ingest_mappings(store.connection(), &["accounts_payable"])?["accounts_payable"]
-                .clone()
-        }
+        None => load_ingest_mappings(conn, &["accounts_payable"])?["accounts_payable"].clone(),
     };
 
     let items_desc: String = data
@@ -771,12 +817,7 @@ pub fn ingest_goods_received(
         .map(PaymentTerms::parse)
         .unwrap_or(PaymentTerms::Net { days: 30 });
 
-    // Create the bill via BillCommands (this creates the journal entry
-    // internally). A concurrent goods-received for the same source event that
-    // won the race after our pre-check is rejected in-txn as a duplicate; map
-    // that to a graceful skip rather than an error.
-    let mut bill_cmds = BillCommands::new(store, user_id.to_string());
-    let (entry_id, was_duplicate) = match bill_cmds.receive_bill(ReceiveBillCommand {
+    Ok(ReceiveBillCommand {
         vendor: supplier.to_string(),
         amount: total_cost,
         currency: "USD".to_string(),
@@ -787,7 +828,28 @@ pub fn ingest_goods_received(
         ap_account_id,
         // Carry the source event's reference so a re-sync is idempotent.
         reference: data.reference.clone(),
-    }) {
+    })
+}
+
+/// Ingest a goods received event: creates inventory journal entry + AP bill.
+/// This is the proper procurement flow — goods arrive, inventory increases,
+/// and a bill is created in the AP system for tracking payment.
+pub fn ingest_goods_received(
+    store: &mut EventStore,
+    user_id: &str,
+    data: IngestGoodsReceivedData,
+) -> Result<IngestResult, IngestError> {
+    if let Some(result) = already_posted(store.connection(), data.reference.as_deref()) {
+        return Ok(result);
+    }
+    let cmd = plan_goods_received(store.connection(), data)?;
+
+    // Create the bill via BillCommands (this creates the journal entry
+    // internally). A concurrent goods-received for the same source event that
+    // won the race after our pre-check is rejected in-txn as a duplicate; map
+    // that to a graceful skip rather than an error.
+    let mut bill_cmds = BillCommands::new(store, user_id.to_string());
+    let (entry_id, was_duplicate) = match bill_cmds.receive_bill(cmd) {
         Ok(stored) => {
             let entry_id = if let crate::events::types::Event::BillReceived { entry_id, .. } =
                 &stored.event
@@ -807,20 +869,6 @@ pub fn ingest_goods_received(
     Ok(IngestResult {
         entry_id,
         was_duplicate,
-    })
-}
-
-/// Record a purchase order commitment. This is an off-ledger event —
-/// no journal entry is created. The PO is logged in the event stream
-/// and can be referenced when goods are later received.
-pub fn ingest_purchase_order_commitment(
-    _store: &mut EventStore,
-    _user_id: &str,
-    data: IngestPurchaseOrderData,
-) -> Result<IngestResult, IngestError> {
-    Ok(IngestResult {
-        entry_id: data.reference.unwrap_or_default(),
-        was_duplicate: false,
     })
 }
 

@@ -1,6 +1,7 @@
+use crate::commands::bill_commands::ReceiveBillCommand;
+use crate::commands::entry_commands::PostEntryCommand;
 use crate::commands::ingest_commands::{
-    ingest_goods_received, ingest_inventory_adjustment, ingest_purchase_order,
-    ingest_purchase_order_commitment, ingest_refund, ingest_sale, IngestGoodsReceivedData,
+    self as ingest_commands, IngestError, IngestGoodsReceivedData,
     IngestInventoryAdjustmentData, IngestPurchaseOrderData, IngestRefundData, IngestSaleData,
 };
 use crate::events::types::{Event, EventEnvelope, JournalEntrySource, StoredEvent};
@@ -71,7 +72,10 @@ pub struct ServiceRecord {
     pub id: String,
     pub name: String,
     pub root_url: String,
-    pub api_key: String,
+    /// `None` on group-hosted books: the key is held by the group's instance and
+    /// this machine is not meant to have it. Callers there fetch through the
+    /// instance's `/servicefeed` relay instead of talking to the service directly.
+    pub api_key: Option<String>,
     pub cursor: Option<String>,
 }
 
@@ -179,7 +183,7 @@ pub fn register_service(
                         service_id: uuid::Uuid::new_v4().to_string(),
                         name: name.clone(),
                         root_url: url.clone(),
-                        api_key: api_key.clone(),
+                        api_key: Some(api_key.clone()),
                     };
                     Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
                 },
@@ -216,6 +220,143 @@ pub fn remove_service(
         .apply_projection(&stored)
         .map_err(|e| EventServiceError::StoreError(e.to_string()))?;
     Ok(stored)
+}
+
+// --- Planning a remote event ---
+
+/// What one remote event turns into, decided against the books but not yet
+/// written to them.
+///
+/// This is the seam that lets group-hosted books ingest at all. A replica cannot
+/// append — its event ids belong to the group server — so a member there plans
+/// against their local projection and submits the result to the server's command
+/// endpoints. Standalone books plan and post in one step, but plan through the
+/// *same* function, so there is one answer to "what does a sale post to" rather
+/// than one per deployment shape.
+#[derive(Debug)]
+pub enum PlannedIngest {
+    /// A journal entry, ready for `post_entry` locally or `post-entries` over the
+    /// sync transport.
+    Entry(Box<PostEntryCommand>),
+    /// A bill: goods arrived, so inventory rises and the supplier is owed. Kept
+    /// distinct from `Entry` because the payable has to be trackable, not merely
+    /// balanced.
+    Bill(Box<ReceiveBillCommand>),
+    /// Nothing to post, and that is the correct outcome — a purchase-order
+    /// commitment is a promise, not a transaction. The reason is carried so the
+    /// sync report can say why rather than showing a silent gap.
+    Nothing { reason: String },
+}
+
+/// Why a remote event could not be turned into a plan.
+///
+/// Separate from [`IngestError`] because the first two are about the *event* —
+/// a producer sending a shape we do not understand — while an `Ingest` failure
+/// is about these books: a mapping the user has not set yet. They read
+/// differently in the sync report and they have different fixes.
+#[derive(Error, Debug)]
+pub enum PlanError {
+    #[error("Unexpected {event_type} payload shape: {source}")]
+    Payload {
+        event_type: String,
+        source: serde_json::Error,
+    },
+    #[error("Unknown event type: {0}")]
+    UnknownType(String),
+    #[error("{0}")]
+    Ingest(#[from] IngestError),
+}
+
+/// The idempotency key stamped on everything one service's event produces.
+///
+/// Scoped by service name so two services that both number their events from 1
+/// cannot collide and silently swallow each other's records as duplicates.
+pub fn event_reference(service_name: &str, remote_event_id: &str) -> String {
+    format!("{}:{}", service_name, remote_event_id)
+}
+
+/// Decide what a remote event posts, without writing anything.
+///
+/// `conn` supplies the account mappings and vendor rules; on a replica that is a
+/// perfectly good read of books the server owns. Nothing here appends, so it is
+/// safe on hosted books, which is the whole point.
+pub fn plan_remote_event(
+    conn: &Connection,
+    service_name: &str,
+    remote_event: &RemoteEvent,
+) -> Result<PlannedIngest, PlanError> {
+    let reference = event_reference(service_name, &remote_event.id);
+
+    macro_rules! parsed {
+        ($ty:ty) => {
+            serde_json::from_value::<$ty>(remote_event.data.clone()).map_err(|e| {
+                PlanError::Payload {
+                    event_type: remote_event.event_type.clone(),
+                    source: e,
+                }
+            })?
+        };
+    }
+
+    match remote_event.event_type.as_str() {
+        "sale" => {
+            let mut data: IngestSaleData = parsed!(IngestSaleData);
+            data.reference = Some(reference);
+            Ok(PlannedIngest::Entry(Box::new(ingest_commands::plan_sale(
+                conn,
+                data,
+                JournalEntrySource::EventService,
+            )?)))
+        }
+        "refund" => {
+            let mut data: IngestRefundData = parsed!(IngestRefundData);
+            data.reference = Some(reference);
+            Ok(PlannedIngest::Entry(Box::new(ingest_commands::plan_refund(
+                conn,
+                data,
+                JournalEntrySource::EventService,
+            )?)))
+        }
+        "purchase_order" => {
+            let mut data: IngestPurchaseOrderData = parsed!(IngestPurchaseOrderData);
+            data.reference = Some(reference);
+            // Legacy detection, matching `process_remote_events`: a `payment`
+            // field means the money moved, so it posts. Without one the PO is a
+            // commitment — an intention to buy, which is not yet a transaction.
+            if remote_event.data.get("payment").is_some() {
+                Ok(PlannedIngest::Entry(Box::new(
+                    ingest_commands::plan_purchase_order(
+                        conn,
+                        data,
+                        JournalEntrySource::EventService,
+                    )?,
+                )))
+            } else {
+                Ok(PlannedIngest::Nothing {
+                    reason: "Commitment recorded (no journal entry)".to_string(),
+                })
+            }
+        }
+        "goods_received" => {
+            let mut data: IngestGoodsReceivedData = parsed!(IngestGoodsReceivedData);
+            data.reference = Some(reference);
+            Ok(PlannedIngest::Bill(Box::new(
+                ingest_commands::plan_goods_received(conn, data)?,
+            )))
+        }
+        "inventory_adjustment" => {
+            let mut data: IngestInventoryAdjustmentData = parsed!(IngestInventoryAdjustmentData);
+            data.reference = Some(reference);
+            Ok(PlannedIngest::Entry(Box::new(
+                ingest_commands::plan_inventory_adjustment(
+                    conn,
+                    data,
+                    JournalEntrySource::EventService,
+                )?,
+            )))
+        }
+        other => Err(PlanError::UnknownType(other.to_string())),
+    }
 }
 
 /// Fetch events from a remote event service. Designed to run on a background thread.
@@ -285,133 +426,65 @@ pub fn process_remote_events(
     let mut event_results: Vec<SyncEventResult> = Vec::new();
 
     for remote_event in &events {
-        let reference = format!("{}:{}", service_name, remote_event.id);
         let event_id = remote_event.id.clone();
         let event_type = remote_event.event_type.clone();
 
-        // Parse the event payload into its ingest shape. A malformed payload is
-        // reported as a per-event error (with the offending field, from serde)
-        // rather than aborting the whole sync — one bad record can't block the
-        // rest, and the reason shows up in the sync results.
-        macro_rules! parse_or_record {
-            ($ty:ty) => {
-                match serde_json::from_value::<$ty>(remote_event.data.clone()) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        errors += 1;
-                        event_results.push(SyncEventResult {
-                            event_id: event_id.clone(),
-                            event_type: event_type.clone(),
-                            status: SyncEventStatus::Error {
-                                message: format!("Unexpected {} payload shape: {}", event_type, e),
-                            },
-                        });
-                        continue;
-                    }
-                }
-            };
-        }
-
-        let result = match remote_event.event_type.as_str() {
-            "sale" => {
-                let mut data: IngestSaleData = parse_or_record!(IngestSaleData);
-                data.reference = Some(reference);
-                ingest_sale(
-                    store,
-                    "event-service-sync",
-                    data,
-                    JournalEntrySource::EventService,
-                )
-            }
-            "refund" => {
-                let mut data: IngestRefundData = parse_or_record!(IngestRefundData);
-                data.reference = Some(reference);
-                ingest_refund(
-                    store,
-                    "event-service-sync",
-                    data,
-                    JournalEntrySource::EventService,
-                )
-            }
-            "purchase_order" => {
-                // Legacy detection: if the data has a "payment" field, treat it as
-                // a legacy goods-received event (old behavior). Otherwise, treat it
-                // as a commitment-only PO (new behavior).
-                if remote_event.data.get("payment").is_some() {
-                    let mut data: IngestPurchaseOrderData =
-                        parse_or_record!(IngestPurchaseOrderData);
-                    data.reference = Some(reference);
-                    ingest_purchase_order(
-                        store,
-                        "event-service-sync",
-                        data,
-                        JournalEntrySource::EventService,
-                    )
-                } else {
-                    let mut data: IngestPurchaseOrderData =
-                        parse_or_record!(IngestPurchaseOrderData);
-                    data.reference = Some(reference);
-                    ingest_purchase_order_commitment(store, "event-service-sync", data)
-                }
-            }
-            "goods_received" => {
-                let mut data: IngestGoodsReceivedData = parse_or_record!(IngestGoodsReceivedData);
-                data.reference = Some(reference);
-                ingest_goods_received(store, "event-service-sync", data)
-            }
-            "inventory_adjustment" => {
-                let mut data: IngestInventoryAdjustmentData =
-                    parse_or_record!(IngestInventoryAdjustmentData);
-                data.reference = Some(reference);
-                ingest_inventory_adjustment(
-                    store,
-                    "event-service-sync",
-                    data,
-                    JournalEntrySource::EventService,
-                )
-            }
-            other => {
+        // Plan first, then write. Both halves are shared with the group-hosted
+        // path (see `plan_remote_event`), so a sale posts to the same accounts
+        // whichever kind of books it lands in.
+        //
+        // A failure here is per-event: one malformed record, or one event needing
+        // a mapping nobody has set yet, must not stop the rest of the batch. The
+        // reason travels into the sync report instead of being swallowed.
+        let planned = match plan_remote_event(store.connection(), service_name, remote_event) {
+            Ok(planned) => planned,
+            Err(e) => {
                 errors += 1;
                 event_results.push(SyncEventResult {
                     event_id,
                     event_type,
                     status: SyncEventStatus::Error {
-                        message: format!("Unknown event type: {}", other),
+                        message: e.to_string(),
                     },
                 });
                 continue;
             }
         };
 
+        let result = match planned {
+            PlannedIngest::Entry(cmd) => {
+                ingest_commands::post_planned_entry(store, "event-service-sync", *cmd)
+            }
+            PlannedIngest::Bill(cmd) => {
+                ingest_commands::post_planned_bill(store, "event-service-sync", *cmd)
+            }
+            PlannedIngest::Nothing { reason } => {
+                event_results.push(SyncEventResult {
+                    event_id,
+                    event_type,
+                    status: SyncEventStatus::Skipped { reason },
+                });
+                continue;
+            }
+        };
+
         match result {
+            Ok(r) if r.was_duplicate => event_results.push(SyncEventResult {
+                event_id,
+                event_type,
+                status: SyncEventStatus::Skipped {
+                    reason: "Duplicate".to_string(),
+                },
+            }),
             Ok(r) => {
-                if r.was_duplicate {
-                    event_results.push(SyncEventResult {
-                        event_id,
-                        event_type,
-                        status: SyncEventStatus::Skipped {
-                            reason: "Duplicate".to_string(),
-                        },
-                    });
-                } else if r.entry_id.is_empty() {
-                    // No journal entry created (e.g. PO commitment)
-                    event_results.push(SyncEventResult {
-                        event_id,
-                        event_type,
-                        status: SyncEventStatus::Skipped {
-                            reason: "Commitment recorded (no journal entry)".to_string(),
-                        },
-                    });
-                } else {
-                    entries_created += 1;
-                    event_results.push(SyncEventResult {
-                        event_id,
-                        event_type,
-                        status: SyncEventStatus::Created {
-                            entry_id: r.entry_id,
-                        },
-                    });
-                }
+                entries_created += 1;
+                event_results.push(SyncEventResult {
+                    event_id,
+                    event_type,
+                    status: SyncEventStatus::Created {
+                        entry_id: r.entry_id,
+                    },
+                });
             }
             Err(e) => {
                 errors += 1;
@@ -908,5 +981,235 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 1, "only one active service for the URL");
+    }
+}
+
+#[cfg(test)]
+mod planning_tests {
+    use super::*;
+    use crate::commands::ingest_commands::set_account_mapping;
+    use crate::events::types::{EventAccountType, EventEnvelope};
+    use crate::store::migrations::SchemaStore;
+    use crate::store::projections::ProjectionStore;
+
+    /// A ledger with the chart and mappings a POS sale and a goods receipt need.
+    fn books() -> EventStore {
+        let mut store = EventStore::in_memory().unwrap();
+        store.init_schema().unwrap();
+        for (id, ty, num, name) in [
+            ("cash", EventAccountType::Asset, "1000", "Cash"),
+            ("inv", EventAccountType::Asset, "1200", "Inventory"),
+            ("rev", EventAccountType::Revenue, "4000", "Sales"),
+            ("cogs", EventAccountType::Expense, "5000", "COGS"),
+            ("ap", EventAccountType::Liability, "2000", "Accounts payable"),
+            ("adj", EventAccountType::Expense, "5100", "Inventory adjustment"),
+            ("ref", EventAccountType::Revenue, "4100", "Refunds"),
+        ] {
+            let ev = Event::AccountCreated {
+                account_id: id.to_string(),
+                account_type: ty,
+                account_number: num.to_string(),
+                name: name.to_string(),
+                parent_id: None,
+                currency: None,
+                description: None,
+            };
+            let stored = store
+                .append(EventEnvelope::new(ev, "test".to_string()))
+                .unwrap();
+            store.apply_projection(&stored).unwrap();
+        }
+        let conn = store.connection();
+        for (key, account) in [
+            ("pos_cash", "cash"),
+            ("pos_revenue", "rev"),
+            ("inventory", "inv"),
+            ("cogs", "cogs"),
+            ("accounts_payable", "ap"),
+            ("inventory_adjustment", "adj"),
+            ("refunds", "ref"),
+        ] {
+            set_account_mapping(conn, key, account).unwrap();
+        }
+        store
+    }
+
+    fn remote(id: &str, event_type: &str, data: serde_json::Value) -> RemoteEvent {
+        RemoteEvent {
+            id: id.to_string(),
+            event_type: event_type.to_string(),
+            data,
+            timestamp: "2026-08-01T00:00:00Z".to_string(),
+        }
+    }
+
+    fn sale() -> RemoteEvent {
+        remote(
+            "e-1",
+            "sale",
+            serde_json::json!({
+                "date": "2026-08-01",
+                "payment_method": "cash",
+                "items": [{"name": "Tube", "qty": 2, "unit_price_cents": 800, "unit_cost_cents": 300}],
+            }),
+        )
+    }
+
+    /// The property the whole split exists for: planning reads, and only reads.
+    /// If it appended anything, a member on group-hosted books could not run it —
+    /// their event ids belong to the group server, and one locally minted id makes
+    /// the two logs stop being the same log.
+    #[test]
+    fn planning_writes_nothing_to_the_books() {
+        let store = books();
+        let before = store.count().unwrap();
+        let entries: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM journal_entries", [], |r| r.get(0))
+            .unwrap();
+
+        plan_remote_event(store.connection(), "Bugbear", &sale()).expect("a sale must plan");
+
+        assert_eq!(store.count().unwrap(), before, "planning appended an event");
+        assert_eq!(
+            store
+                .connection()
+                .query_row::<i64, _, _>("SELECT COUNT(*) FROM journal_entries", [], |r| r.get(0))
+                .unwrap(),
+            entries,
+            "planning posted an entry"
+        );
+    }
+
+    /// Every event type the local sync handles has to plan, because the hosted
+    /// path has no fallback: an event that will not plan simply never reaches the
+    /// group's books.
+    #[test]
+    fn every_supported_event_type_plans() {
+        let store = books();
+        let conn = store.connection();
+
+        let cases = [
+            sale(),
+            remote(
+                "e-2",
+                "refund",
+                serde_json::json!({
+                    "date": "2026-08-02",
+                    "payment_method": "cash",
+                    "restock": false,
+                    "items": [{"name": "Tube", "qty": 1, "unit_price_cents": 800, "unit_cost_cents": 300}],
+                }),
+            ),
+            remote(
+                "e-3",
+                "purchase_order",
+                serde_json::json!({
+                    "date": "2026-08-03",
+                    "payment": "on_credit",
+                    "supplier": "QBP",
+                    "items": [{"name": "Tube", "qty": 10, "unit_cost_cents": 300}],
+                }),
+            ),
+            remote(
+                "e-5",
+                "inventory_adjustment",
+                serde_json::json!({
+                    "date": "2026-08-05",
+                    "items": [{"name": "Tube", "qty_delta": -2, "unit_cost_cents": 300}],
+                }),
+            ),
+        ];
+        for ev in &cases {
+            match plan_remote_event(conn, "Bugbear", ev) {
+                Ok(PlannedIngest::Entry(cmd)) => assert_eq!(
+                    cmd.reference.as_deref(),
+                    Some(format!("Bugbear:{}", ev.id).as_str()),
+                    "the plan must carry the idempotency reference, or a re-sync \
+                     posts everything twice"
+                ),
+                other => panic!(
+                    "{} planned as something other than an entry: {}",
+                    ev.event_type,
+                    match other {
+                        Ok(PlannedIngest::Bill(_)) => "a bill".to_string(),
+                        Ok(PlannedIngest::Nothing { reason }) => format!("nothing ({reason})"),
+                        Err(e) => e.to_string(),
+                        _ => unreachable!(),
+                    }
+                ),
+            }
+        }
+
+        // Goods received raises a bill, not a bare entry — the supplier is owed,
+        // and a plain entry would balance the books while losing the obligation.
+        let gr = remote(
+            "e-4",
+            "goods_received",
+            serde_json::json!({
+                "date": "2026-08-04",
+                "supplier": "QBP",
+                "items": [{"name": "Tube", "qty": 10, "unit_cost_cents": 300}],
+            }),
+        );
+        match plan_remote_event(conn, "Bugbear", &gr) {
+            Ok(PlannedIngest::Bill(cmd)) => {
+                assert_eq!(cmd.amount, 3000);
+                assert_eq!(cmd.reference.as_deref(), Some("Bugbear:e-4"));
+                assert_eq!(cmd.expense_account_id, "inv");
+                assert_eq!(cmd.ap_account_id, "ap");
+            }
+            _ => panic!("goods_received must plan as a bill"),
+        }
+    }
+
+    /// A purchase order with no payment is an intention to buy. Planning it as
+    /// `Nothing` — with a reason — is what keeps it out of the books while still
+    /// accounting for it in the sync report, rather than leaving a silent gap.
+    #[test]
+    fn a_commitment_only_purchase_order_plans_to_nothing() {
+        let store = books();
+        let po = remote(
+            "e-6",
+            "purchase_order",
+            serde_json::json!({
+                "date": "2026-08-06",
+                "supplier": "QBP",
+                "items": [{"name": "Tube", "qty": 10, "unit_cost_cents": 300}],
+            }),
+        );
+        match plan_remote_event(store.connection(), "Bugbear", &po) {
+            Ok(PlannedIngest::Nothing { reason }) => assert!(!reason.is_empty()),
+            _ => panic!("a PO with no payment must not post"),
+        }
+    }
+
+    /// The three ways planning fails have three different fixes — update the
+    /// producer, wait for support, set a mapping — so they must not collapse into
+    /// one message.
+    #[test]
+    fn the_ways_planning_fails_stay_distinguishable() {
+        let store = books();
+        let conn = store.connection();
+
+        let unknown = remote("e-7", "loyalty_points_issued", serde_json::json!({}));
+        assert!(matches!(
+            plan_remote_event(conn, "Bugbear", &unknown),
+            Err(PlanError::UnknownType(_))
+        ));
+
+        let malformed = remote("e-8", "sale", serde_json::json!({"date": "2026-08-01"}));
+        assert!(matches!(
+            plan_remote_event(conn, "Bugbear", &malformed),
+            Err(PlanError::Payload { .. })
+        ));
+
+        // A mapping these books have not set: the fix is on the Services page, and
+        // the message has to name the key so the user knows which row to fill in.
+        conn.execute("DELETE FROM ingest_account_mappings WHERE key = 'cogs'", [])
+            .unwrap();
+        let err = plan_remote_event(conn, "Bugbear", &sale()).unwrap_err();
+        assert!(matches!(err, PlanError::Ingest(IngestError::MissingMapping(_))));
+        assert!(err.to_string().contains("cogs"), "{err}");
     }
 }

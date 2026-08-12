@@ -255,7 +255,18 @@ pub enum Event {
         service_id: String,
         name: String,
         root_url: String,
-        api_key: String,
+        /// `None` on group-hosted books, where the key lives on the group's
+        /// instance instead — see `accountir-server/src/servicekeys.rs`. This log
+        /// is replicated in full to every member's laptop, so a key written here
+        /// is a key on every one of them, unrecoverably.
+        ///
+        /// Optional rather than empty-string so the field is *absent* on the wire
+        /// and nothing downstream has to decide what a blank key means. The
+        /// serialization is unchanged for events that have one — serde writes
+        /// `Some(x)` exactly as it wrote `x` — so existing events deserialize and
+        /// **hash** identically, which matters on a chained log.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
     },
     EventServiceRemoved {
         service_id: String,
@@ -666,6 +677,63 @@ mod plaid_item_connected_compat {
         let back: Event = serde_json::from_str(&json).unwrap();
         match back {
             Event::PlaidItemConnected { proxy_item_id, .. } => assert_eq!(proxy_item_id, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod event_service_registered_compat {
+    use super::*;
+
+    /// Making `api_key` optional must not disturb a single existing event.
+    ///
+    /// Same hazard as `plaid_item_connected_compat`: the log is hash-chained and
+    /// standalone ledgers already hold `EventServiceRegistered` events with the
+    /// key present. If `Some(x)` serialized to anything other than what `x`
+    /// serialized to, every one of those events would hash differently and the
+    /// chain would stop verifying.
+    #[test]
+    fn an_existing_event_deserializes_and_reserializes_byte_identically() {
+        // Exactly the JSON the old `api_key: String` produced.
+        let stored = r#"{"type":"event_service_registered","service_id":"s-1","name":"Bugbear Bikes","root_url":"https://bugbearbikes.com","api_key":"k-1"}"#;
+
+        let event: Event = serde_json::from_str(stored).expect("old payload must still parse");
+        match &event {
+            Event::EventServiceRegistered { api_key, .. } => {
+                assert_eq!(api_key.as_deref(), Some("k-1"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        assert_eq!(
+            serde_json::to_string(&event).unwrap(),
+            stored,
+            "serialization changed for an event already on disk — every existing \
+             EventServiceRegistered would hash differently and break the chain"
+        );
+    }
+
+    /// The point of the change: a service registered on hosted books carries no
+    /// key at all, so nothing that replicates the group's log replicates a
+    /// credential. Absent rather than `null` — a `null` is still a field saying
+    /// "there was a key here", and something downstream eventually reads it.
+    #[test]
+    fn a_hosted_registration_carries_no_key_at_all() {
+        let event = Event::EventServiceRegistered {
+            service_id: "s-2".into(),
+            name: "Bugbear Bikes".into(),
+            root_url: "https://bugbearbikes.com".into(),
+            api_key: None,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(
+            !json.contains("api_key"),
+            "an absent key must not appear on the wire at all: {json}"
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        match back {
+            Event::EventServiceRegistered { api_key, .. } => assert_eq!(api_key, None),
             other => panic!("wrong variant: {other:?}"),
         }
     }

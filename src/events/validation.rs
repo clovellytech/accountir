@@ -283,7 +283,12 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             validate_non_empty(service_id, "service_id")?;
             validate_non_empty(name, "name")?;
             validate_non_empty(root_url, "root_url")?;
-            validate_non_empty(api_key, "api_key")?;
+            // Absent is legitimate — a service registered on hosted books keeps
+            // its key on the instance. Present-but-blank is not: that is a caller
+            // who meant to send one and sent nothing.
+            if let Some(api_key) = api_key {
+                validate_non_empty(api_key, "api_key")?;
+            }
         }
         Event::EventServiceRemoved { service_id } => {
             validate_non_empty(service_id, "service_id")?;

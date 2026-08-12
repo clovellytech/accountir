@@ -3370,7 +3370,18 @@ fn handle_service_action(app: &mut App, store: &mut EventStore, action: ServiceA
             };
 
             let root_url = service.root_url.clone();
-            let api_key = service.api_key.clone();
+            // No key here means these books are a group replica and the key is
+            // held by the group's instance. The TUI has no client for that relay,
+            // so it says which tool does rather than failing at the service with
+            // an empty bearer token.
+            let Some(api_key) = service.api_key.clone() else {
+                app.status_message = Some(format!(
+                    "'{}' is shared with a group, so its key is held by the group's \
+                     server rather than by this machine. Sync it from the desktop app.",
+                    service.name
+                ));
+                return;
+            };
             let cursor = service.cursor.clone();
             let svc_name = service.name.clone();
 

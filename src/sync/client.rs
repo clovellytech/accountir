@@ -14,6 +14,10 @@ use super::commands::bill_ops::{
 };
 use super::commands::entries::{BatchEntry, PostEntriesRequest, PostEntriesResponse};
 use super::commands::entry_ops::{UnvoidEntryRequest, VoidEntryRequest};
+use super::commands::event_service::{
+    RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
+    RemoveEventServiceRequest,
+};
 use super::commands::plaid::{
     ConnectPlaidItemRequest, ConnectPlaidItemResponse, MapPlaidAccountRequest,
 };
@@ -316,6 +320,115 @@ impl SyncClient {
                     let body = resp.text().await.unwrap_or_default();
                     return Err(SyncClientError::Unexpected(s.as_u16(), body));
                 }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Connect an event service to the group's books.
+    ///
+    /// Carries no API key — see [`crate::sync::commands::event_service`]. Returns
+    /// the server-minted `service_id`, which the caller needs to file the key
+    /// with the group's instance.
+    pub async fn register_event_service(
+        &mut self,
+        name: String,
+        root_url: String,
+    ) -> Result<RegisterEventServiceResponse, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = RegisterEventServiceRequest {
+                expected_head_seq: self.head,
+                name: name.clone(),
+                root_url: root_url.clone(),
+            };
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/register-event-service"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let r: RegisterEventServiceResponse = resp.json().await?;
+                    self.head = r.head;
+                    return Ok(r);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY | reqwest::StatusCode::BAD_REQUEST => {
+                    let v: serde_json::Value = resp.json().await?;
+                    return Err(SyncClientError::Rejected(
+                        v["error"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld(
+                        "connect an event service".to_string(),
+                    ))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Disconnect an event service from the group's books.
+    pub async fn remove_event_service(
+        &mut self,
+        service_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        let service_id = service_id.into();
+        for _ in 0..=MAX_RETRIES {
+            let body = RemoveEventServiceRequest {
+                expected_head_seq: self.head,
+                service_id: service_id.clone(),
+            };
+            match self
+                .submit("/sync/commands/remove-event-service", &body)
+                .await?
+            {
+                Submitted::Head(head) => return Ok(head),
+                Submitted::Retry => continue,
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Record a completed sync of an event service against the group's books, so
+    /// every member can see that someone pulled it and what came of it.
+    pub async fn record_event_service_sync(
+        &mut self,
+        service_id: impl Into<String>,
+        events_processed: u32,
+        entries_created: u32,
+        errors: u32,
+    ) -> Result<i64, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        let service_id = service_id.into();
+        for _ in 0..=MAX_RETRIES {
+            let body = RecordEventServiceSyncRequest {
+                expected_head_seq: self.head,
+                service_id: service_id.clone(),
+                events_processed,
+                entries_created,
+                errors,
+            };
+            match self
+                .submit("/sync/commands/record-event-service-sync", &body)
+                .await?
+            {
+                Submitted::Head(head) => return Ok(head),
+                Submitted::Retry => continue,
             }
         }
         Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
