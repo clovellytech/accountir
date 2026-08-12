@@ -9,6 +9,7 @@ pub mod ingest_commands;
 pub mod invoice_commands;
 pub mod plaid_commands;
 pub mod reconciliation_commands;
+pub mod recurring_transfers;
 pub mod vendor_rules;
 pub mod square_commands;
 

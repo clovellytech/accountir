@@ -73,6 +73,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             18,
             include_str!("../../migrations/018_plaid_item_optional_proxy_handle.sql"),
         ),
+        (
+            19,
+            include_str!("../../migrations/019_recurring_transfers.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
