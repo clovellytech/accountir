@@ -261,6 +261,96 @@ pub(crate) enum PostEntryStep {
 /// enforce the SAME invariants under the write lock; the caller wraps the event
 /// in an envelope (stamping identity as appropriate). Pure checks are the
 /// caller's responsibility ([`check_entry_pure`]).
+/// The outcome of a reassignment's in-transaction fences. Same shape as
+/// [`PostEntryStep`] and kept separate for the same reason its name is specific:
+/// an enum called "post entry" appearing in a reassignment reads as a mistake.
+pub(crate) enum ReassignLineStep {
+    Append(Event),
+    Reject(EntryCommandError),
+}
+
+/// Run a reassignment's state-dependent guards inside the append transaction and,
+/// if they hold, build the `JournalLineReassigned` event.
+///
+/// Shared by [`EntryCommands::reassign_line`] and the server-side sync path, so a
+/// member on group-hosted books is held to exactly the same fences as a standalone
+/// ledger: the entry exists and is live, the line exists, and the *target* account
+/// exists and is active — that last one under the write lock, closing the TOCTOU
+/// where a concurrent writer deactivates it between check and append.
+pub(crate) fn build_reassign_line_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &ReassignLineCommand,
+) -> Result<ReassignLineStep, EventStoreError> {
+    // Entry exists and is not voided.
+    let is_void: Option<bool> = tx
+        .query_row(
+            "SELECT is_void = 1 FROM journal_entries WHERE id = ?1",
+            [&cmd.entry_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match is_void {
+        None => {
+            return Ok(ReassignLineStep::Reject(EntryCommandError::NotFound(
+                cmd.entry_id.clone(),
+            )))
+        }
+        Some(true) => return Ok(ReassignLineStep::Reject(EntryCommandError::AlreadyVoided)),
+        Some(false) => {}
+    }
+
+    // Line exists — read its current account.
+    let old_account_id: Option<String> = tx
+        .query_row(
+            "SELECT account_id FROM journal_lines WHERE id = ?1 AND entry_id = ?2",
+            [&cmd.line_id, &cmd.entry_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(old_account_id) = old_account_id else {
+        return Ok(ReassignLineStep::Reject(EntryCommandError::NotFound(
+            format!("Line {} in entry {}", cmd.line_id, cmd.entry_id),
+        )));
+    };
+
+    // New account exists and is active — checked under the write lock so a
+    // concurrent deactivation can't slip in.
+    let new_account_active: Option<bool> = tx
+        .query_row(
+            "SELECT is_active = 1 FROM accounts WHERE id = ?1",
+            [&cmd.new_account_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match new_account_active {
+        None => {
+            return Ok(ReassignLineStep::Reject(EntryCommandError::AccountNotFound(
+                cmd.new_account_id.clone(),
+            )))
+        }
+        Some(false) => {
+            return Ok(ReassignLineStep::Reject(EntryCommandError::AccountInactive(
+                cmd.new_account_id.clone(),
+            )))
+        }
+        Some(true) => {}
+    }
+
+    // No-op if the account isn't changing.
+    if old_account_id == cmd.new_account_id {
+        return Ok(ReassignLineStep::Reject(EntryCommandError::InvalidData(
+            "New account is the same as current account".to_string(),
+        )));
+    }
+
+    Ok(ReassignLineStep::Append(Event::JournalLineReassigned {
+        entry_id: cmd.entry_id.clone(),
+        line_id: cmd.line_id.clone(),
+        old_account_id,
+        new_account_id: cmd.new_account_id.clone(),
+    }))
+}
+
 pub(crate) fn build_post_entry_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &PostEntryCommand,
@@ -575,82 +665,11 @@ impl<'a> EntryCommands<'a> {
             let head = self.store.latest_id()?.unwrap_or(0);
             let outcome = self.store.append_checked(
                 head,
-                |tx| {
-                    // Entry exists and is not voided.
-                    let is_void: Option<bool> = tx
-                        .query_row(
-                            "SELECT is_void = 1 FROM journal_entries WHERE id = ?1",
-                            [&cmd.entry_id],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    match is_void {
-                        None => {
-                            return Ok(Verdict::Reject(EntryCommandError::NotFound(
-                                cmd.entry_id.clone(),
-                            )))
-                        }
-                        Some(true) => {
-                            return Ok(Verdict::Reject(EntryCommandError::AlreadyVoided))
-                        }
-                        Some(false) => {}
+                |tx| match build_reassign_line_in_txn(tx, &cmd)? {
+                    ReassignLineStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
                     }
-
-                    // Line exists — read its current account.
-                    let old_account_id: Option<String> = tx
-                        .query_row(
-                            "SELECT account_id FROM journal_lines WHERE id = ?1 AND entry_id = ?2",
-                            [&cmd.line_id, &cmd.entry_id],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    let old_account_id = match old_account_id {
-                        Some(a) => a,
-                        None => {
-                            return Ok(Verdict::Reject(EntryCommandError::NotFound(format!(
-                                "Line {} in entry {}",
-                                cmd.line_id, cmd.entry_id
-                            ))))
-                        }
-                    };
-
-                    // New account exists and is active — checked under the write
-                    // lock so a concurrent deactivation can't slip in.
-                    let new_account_active: Option<bool> = tx
-                        .query_row(
-                            "SELECT is_active = 1 FROM accounts WHERE id = ?1",
-                            [&cmd.new_account_id],
-                            |row| row.get(0),
-                        )
-                        .optional()?;
-                    match new_account_active {
-                        None => {
-                            return Ok(Verdict::Reject(EntryCommandError::AccountNotFound(
-                                cmd.new_account_id.clone(),
-                            )))
-                        }
-                        Some(false) => {
-                            return Ok(Verdict::Reject(EntryCommandError::AccountInactive(
-                                cmd.new_account_id.clone(),
-                            )))
-                        }
-                        Some(true) => {}
-                    }
-
-                    // No-op if the account isn't changing.
-                    if old_account_id == cmd.new_account_id {
-                        return Ok(Verdict::Reject(EntryCommandError::InvalidData(
-                            "New account is the same as current account".to_string(),
-                        )));
-                    }
-
-                    let event = Event::JournalLineReassigned {
-                        entry_id: cmd.entry_id.clone(),
-                        line_id: cmd.line_id.clone(),
-                        old_account_id,
-                        new_account_id: cmd.new_account_id.clone(),
-                    };
-                    Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    ReassignLineStep::Reject(e) => Ok(Verdict::Reject(e)),
                 },
                 |tx, stored| {
                     Projector::new(tx)

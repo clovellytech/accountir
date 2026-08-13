@@ -168,7 +168,39 @@ async fn submit_post_entries(
             expected,
             |tx| {
                 let mut events: Vec<Event> = Vec::new();
+                // References claimed by earlier entries *in this batch*.
+                //
+                // `build_post_entry_in_txn` asks the projection whether a reference
+                // is free, and the projection does not exist yet for anything in
+                // this batch: `append_checked_many` runs this whole closure before
+                // it appends or projects a single event. So two entries carrying the
+                // same reference both pass the fence, both get appended, and the
+                // second one's projection trips
+                // `idx_journal_entries_reference_unique` — which is not a rejection
+                // but a store error, so the WHOLE batch rolls back and the caller
+                // gets a 500 with nothing imported.
+                //
+                // That is not hypothetical. An event feed's `since` cursor is
+                // usually inclusive, so consecutive pages overlap by one event, and
+                // a 368-event import died on it: 367 good entries lost to one
+                // repeat. The fence has to cover the batch as well as the books.
+                let mut claimed: std::collections::HashSet<&str> = std::collections::HashSet::new();
                 for (index, cmd) in &candidates {
+                    if let Some(reference) = cmd.reference.as_deref() {
+                        if !claimed.insert(reference) {
+                            // Worded exactly like the persisted-duplicate rejection
+                            // above, because it means the same thing to the caller —
+                            // this entry is already accounted for — and clients
+                            // classify skips by that wording.
+                            in_txn_skips.borrow_mut().push(SkippedEntry {
+                                index: *index,
+                                reason: format!(
+                                    "An entry with reference {reference} already exists"
+                                ),
+                            });
+                            continue;
+                        }
+                    }
                     match build_post_entry_in_txn(tx, cmd)? {
                         PostEntryStep::Append(event) => events.push(event),
                         // The expected case, not an error: already imported, a
@@ -444,6 +476,88 @@ mod tests {
             r["skipped"].as_array().unwrap().len() + r["posted"].as_u64().unwrap() as usize,
             2,
             "every submitted entry must be accounted for exactly once: {r}"
+        );
+    }
+
+    /// The failure that cost a real import all 368 of its entries.
+    ///
+    /// `build_post_entry_in_txn` asks the *projection* whether a reference is free,
+    /// and `append_checked_many` runs the whole check closure before it projects
+    /// anything — so two entries in one batch carrying the same reference both
+    /// passed, both appended, and the second one's projection tripped
+    /// `idx_journal_entries_reference_unique`. That is a store error, not a
+    /// rejection: the entire transaction rolled back and the caller got a 500 with
+    /// nothing imported.
+    ///
+    /// It is not an exotic input. An event feed's `since` cursor is usually
+    /// inclusive, so consecutive pages overlap by one event, and every import of
+    /// more than one page carried a repeat.
+    #[tokio::test]
+    async fn a_reference_repeated_inside_one_batch_is_skipped_not_fatal() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let cash = mk_account(&mut store, "1000", AccountType::Asset);
+        let income = mk_account(&mut store, "2000", AccountType::Revenue);
+        let base = serve(SyncState::new(
+            store,
+            HashMap::from([(TOKEN.to_string(), "user-1".to_string())]),
+        ))
+        .await;
+
+        let r = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/post-entries"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": 2,
+                "entries": [
+                    entry(&cash, &income, "feed:e-1", 100),
+                    entry(&cash, &income, "feed:e-2", 200),
+                    // The overlap: page 2 re-served the last row of page 1.
+                    entry(&cash, &income, "feed:e-2", 200),
+                    entry(&cash, &income, "feed:e-3", 300),
+                ],
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.status(),
+            reqwest::StatusCode::OK,
+            "a repeated reference inside the batch killed the whole import"
+        );
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["posted"], 3, "the three distinct entries must land: {v}");
+        assert_eq!(v["skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["skipped"][0]["index"], 2,
+            "the SECOND copy is the one dropped: {v}"
+        );
+        assert!(
+            v["skipped"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("already exists"),
+            "clients classify duplicates by this wording: {v}"
+        );
+
+        // And the books hold each reference exactly once.
+        let entries: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/sync/events?since=0&limit=50"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // Count the REFERENCE field specifically — the test fixture also puts the
+        // reference in the memo, so a bare substring count sees each entry twice.
+        let dump = entries.to_string();
+        assert_eq!(
+            dump.matches(r#""reference":"feed:e-2""#).count(),
+            1,
+            "feed:e-2 was posted twice: {dump}"
         );
     }
 

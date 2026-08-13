@@ -13,7 +13,10 @@ use super::commands::bill_ops::{
     ApplyBillPaymentRequest, ReceiveInvoicePaymentRequest, VoidBillRequest, VoidInvoiceRequest,
 };
 use super::commands::entries::{BatchEntry, PostEntriesRequest, PostEntriesResponse};
-use super::commands::entry_ops::{UnvoidEntryRequest, VoidEntryRequest};
+use super::commands::entry_ops::{
+    LineAssignment, ReassignLinesRequest, ReassignLinesResponse, UnvoidEntryRequest,
+    VoidEntryRequest,
+};
 use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
     RemoveEventServiceRequest,
@@ -315,6 +318,60 @@ impl SyncClient {
                 reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
                 reqwest::StatusCode::NOT_FOUND => {
                     return Err(SyncClientError::ServerTooOld("post entries".to_string()))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Move many posted lines to different accounts in one call.
+    ///
+    /// The second half of a bank import: everything uncategorised posts to
+    /// Uncategorized, and filing it is done in bulk. Like [`post_entries`], lines
+    /// that fail their fences are **skipped and reported**, not fatal — a line
+    /// somebody else already moved should not cost the other thirty-nine.
+    ///
+    /// Retries on 409. Safe to retry: a line already moved to the target reads as
+    /// "same as current account" on the way back through and is skipped.
+    ///
+    /// [`post_entries`]: SyncClient::post_entries
+    pub async fn reassign_lines(
+        &mut self,
+        assignments: Vec<LineAssignment>,
+    ) -> Result<ReassignLinesResponse, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = ReassignLinesRequest {
+                expected_head_seq: self.head,
+                assignments: assignments.clone(),
+            };
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/reassign-lines"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let r: ReassignLinesResponse = resp.json().await?;
+                    self.head = r.head;
+                    return Ok(r);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld(
+                        "move posted lines to other accounts".to_string(),
+                    ))
                 }
                 s => {
                     let body = resp.text().await.unwrap_or_default();
