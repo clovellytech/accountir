@@ -41,6 +41,29 @@ pub fn add_rule(conn: &Connection, pattern: &str, account_id: &str) -> Result<St
     Ok(id)
 }
 
+/// Point one vendor at a payable account, replacing any rule already naming them.
+///
+/// Distinct from [`add_rule`], which appends: linking a vendor is something a
+/// person will do twice — once wrongly — and appending would leave two rules for
+/// the same name, with [`match_account`] picking between them by length rather
+/// than by which was meant.
+///
+/// The pattern is the vendor's name exactly as their bills carry it, so the
+/// substring match that routes ingest postings also matches the bills this rule
+/// was created from.
+pub fn set_rule_for(
+    conn: &Connection,
+    vendor: &str,
+    account_id: &str,
+) -> Result<String, rusqlite::Error> {
+    let pattern = vendor.trim();
+    conn.execute(
+        "DELETE FROM vendor_account_rules WHERE LOWER(pattern) = LOWER(?1)",
+        [pattern],
+    )?;
+    add_rule(conn, pattern, account_id)
+}
+
 pub fn delete_rule(conn: &Connection, id: &str) -> Result<(), rusqlite::Error> {
     conn.execute("DELETE FROM vendor_account_rules WHERE id = ?1", [id])?;
     Ok(())
@@ -90,5 +113,65 @@ mod tests {
         );
         assert_eq!(match_account(conn, "BTI Supplier").as_deref(), Some("acct-bti"));
         assert_eq!(match_account(conn, "Some Other Vendor"), None);
+    }
+}
+
+#[cfg(test)]
+mod set_rule_tests {
+    use super::*;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+
+    fn conn() -> EventStore {
+        let store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        store
+    }
+
+    /// Linking a vendor twice must leave one rule, not two.
+    ///
+    /// `add_rule` appends, and linking a vendor is something a person does twice —
+    /// once wrongly. Two rules naming the same vendor leaves `match_account`
+    /// choosing between them by pattern length, which for identical patterns is
+    /// whichever the query happened to return first: the correction would appear
+    /// to have worked and then not have.
+    #[test]
+    fn relinking_a_vendor_replaces_its_rule() {
+        let store = conn();
+        set_rule_for(store.connection(), "Quality Bicycle", "acct-wrong").unwrap();
+        set_rule_for(store.connection(), "Quality Bicycle", "acct-right").unwrap();
+
+        let rules = list_rules(store.connection());
+        assert_eq!(rules.len(), 1, "the old rule survived: {rules:?}");
+        assert_eq!(rules[0].account_id, "acct-right");
+        assert_eq!(
+            match_account(store.connection(), "Quality Bicycle").as_deref(),
+            Some("acct-right")
+        );
+    }
+
+    /// Case is how a vendor name arrives from a bill, an import and a bank feed —
+    /// three sources that will not agree — so replacing has to be case-insensitive
+    /// or the "replacement" silently becomes a second rule.
+    #[test]
+    fn replacing_ignores_the_case_the_vendor_was_typed_in() {
+        let store = conn();
+        set_rule_for(store.connection(), "quality bicycle", "acct-one").unwrap();
+        set_rule_for(store.connection(), "QUALITY BICYCLE", "acct-two").unwrap();
+        assert_eq!(list_rules(store.connection()).len(), 1);
+    }
+
+    /// Other vendors are left alone — an obvious property, and the one a `DELETE`
+    /// with a loose predicate would break.
+    #[test]
+    fn other_vendors_are_untouched() {
+        let store = conn();
+        set_rule_for(store.connection(), "Shimano", "acct-shimano").unwrap();
+        set_rule_for(store.connection(), "Quality Bicycle", "acct-qbp").unwrap();
+        assert_eq!(list_rules(store.connection()).len(), 2);
+        assert_eq!(
+            match_account(store.connection(), "Shimano").as_deref(),
+            Some("acct-shimano")
+        );
     }
 }
