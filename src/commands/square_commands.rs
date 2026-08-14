@@ -55,6 +55,7 @@ use crate::commands::ingest_commands::{
 };
 use crate::events::types::JournalEntrySource;
 use crate::store::event_store::EventStore;
+use rusqlite::Connection;
 use calamine::{open_workbook, Data, Reader, Xlsx};
 use chrono::NaiveDate;
 use std::collections::HashMap;
@@ -199,12 +200,17 @@ fn parse_sales_summary(content: &str) -> SalesSummary {
 
 /// Ingest a Square sales-summary CSV: one balanced journal entry for the export
 /// period (parsed from `file_name`), idempotent on `square-sales-<start>[_<end>]`.
-pub fn ingest_square_sales(
-    store: &mut EventStore,
-    user_id: &str,
+/// Decide what a Square sales export posts, without writing anything.
+///
+/// The deciding half of [`ingest_square_sales`], over a plain `&Connection` so it
+/// runs on a group replica — which may not append, its event ids being the
+/// server's. `Ok((None, summary))` means there is nothing to post: an empty
+/// period, or one already imported.
+pub fn plan_square_sales(
+    conn: &Connection,
     content: &str,
     file_name: &str,
-) -> Result<SquareImportSummary, IngestError> {
+) -> Result<(Option<PostEntryCommand>, SquareImportSummary), IngestError> {
     let (start, end) = extract_period(file_name).ok_or_else(|| {
         IngestError::InvalidDate(format!(
             "no YYYY-MM-DD period found in filename '{}'",
@@ -219,7 +225,7 @@ pub fn ingest_square_sales(
     };
 
     if s.revenue == 0 && s.tax == 0 && s.tips == 0 && s.fees == 0 {
-        return Ok(summary);
+        return Ok((None, summary));
     }
 
     let reference = if start == end {
@@ -231,9 +237,9 @@ pub fn ingest_square_sales(
             end.format("%Y-%m-%d")
         )
     };
-    if check_idempotent(store.connection(), &reference).is_some() {
+    if check_idempotent(conn, &reference).is_some() {
         summary.skipped_duplicates += 1;
-        return Ok(summary);
+        return Ok((None, summary));
     }
 
     let mut required = vec!["pos_square", "pos_revenue", "square_fees"];
@@ -243,7 +249,7 @@ pub fn ingest_square_sales(
     if s.tips > 0 {
         required.push("tips_payable");
     }
-    let mappings = load_ingest_mappings(store.connection(), &required)?;
+    let mappings = load_ingest_mappings(conn, &required)?;
 
     // Net change to the Square balance (matches the report's "Net total").
     let net_to_balance = s.revenue + s.tax + s.tips - s.fees;
@@ -282,13 +288,23 @@ pub fn ingest_square_sales(
         )
     };
 
-    let cmd = PostEntryCommand {
+    Ok((Some(PostEntryCommand {
         date: end,
         memo,
         lines,
         reference: Some(reference),
         source: Some(JournalEntrySource::Pos),
-    };
+    }), summary))
+}
+
+pub fn ingest_square_sales(
+    store: &mut EventStore,
+    user_id: &str,
+    content: &str,
+    file_name: &str,
+) -> Result<SquareImportSummary, IngestError> {
+    let (cmd, mut summary) = plan_square_sales(store.connection(), content, file_name)?;
+    let Some(cmd) = cmd else { return Ok(summary) };
 
     let mut commands = EntryCommands::new(store, user_id.to_string());
     // A concurrent import that won the race after our pre-check is rejected
@@ -299,7 +315,6 @@ pub fn ingest_square_sales(
     } else {
         summary.entries_posted += 1;
     }
-
     Ok(summary)
 }
 
@@ -404,11 +419,12 @@ fn parse_company_totals_xlsx(path: &str) -> Result<PayrollTotals, IngestError> {
 /// Ingest a Square payroll "Company Totals" xlsx: one balanced journal entry for
 /// the report period (parsed from the filename), idempotent on
 /// `square-payroll-<start>[_<end>]`.
-pub fn ingest_square_payroll(
-    store: &mut EventStore,
-    user_id: &str,
+/// Decide what a Square payroll export posts, without writing anything. The
+/// deciding half of [`ingest_square_payroll`]; see [`plan_square_sales`].
+pub fn plan_square_payroll(
+    conn: &Connection,
     file_path: &str,
-) -> Result<SquareImportSummary, IngestError> {
+) -> Result<(Option<PostEntryCommand>, SquareImportSummary), IngestError> {
     let (start, end) = extract_period(file_path).ok_or_else(|| {
         IngestError::InvalidDate(format!(
             "no YYYY-MM-DD period found in filename '{}'",
@@ -423,7 +439,7 @@ pub fn ingest_square_payroll(
     };
 
     if t.gross == 0 && t.net_pay == 0 {
-        return Ok(summary);
+        return Ok((None, summary));
     }
 
     let reference = if start == end {
@@ -435,13 +451,13 @@ pub fn ingest_square_payroll(
             end.format("%Y-%m-%d")
         )
     };
-    if check_idempotent(store.connection(), &reference).is_some() {
+    if check_idempotent(conn, &reference).is_some() {
         summary.skipped_duplicates += 1;
-        return Ok(summary);
+        return Ok((None, summary));
     }
 
     let mappings = load_ingest_mappings(
-        store.connection(),
+        conn,
         &[
             "payroll_wages_expense",
             "payroll_tax_expense",
@@ -494,13 +510,25 @@ pub fn ingest_square_payroll(
         )
     };
 
-    let cmd = PostEntryCommand {
-        date: end,
-        memo,
-        lines,
-        reference: Some(reference),
-        source: Some(JournalEntrySource::Import),
-    };
+    Ok((
+        Some(PostEntryCommand {
+            date: end,
+            memo,
+            lines,
+            reference: Some(reference),
+            source: Some(JournalEntrySource::Import),
+        }),
+        summary,
+    ))
+}
+
+pub fn ingest_square_payroll(
+    store: &mut EventStore,
+    user_id: &str,
+    file_path: &str,
+) -> Result<SquareImportSummary, IngestError> {
+    let (cmd, mut summary) = plan_square_payroll(store.connection(), file_path)?;
+    let Some(cmd) = cmd else { return Ok(summary) };
 
     let mut commands = EntryCommands::new(store, user_id.to_string());
     // A concurrent import that won the race after our pre-check is rejected

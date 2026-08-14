@@ -24,19 +24,38 @@ pub enum AccountCommandError {
 
 /// Find or create the "Uncategorized" expense account.
 /// Uses the event store so the creation is properly event-sourced.
+/// The Uncategorized account's id, or `None` if these books have none.
+///
+/// The read-only half of [`find_or_create_uncategorized`], split out for the
+/// callers that cannot create one: on group-hosted books the log belongs to the
+/// server, so an importer there has to *find* this account and say so plainly if
+/// it is missing rather than minting it locally and forking the ledger.
+pub fn find_uncategorized(conn: &rusqlite::Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT id FROM accounts WHERE LOWER(name) = 'uncategorized' AND is_active = 1",
+        [],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// What to tell someone whose books have no Uncategorized account and who cannot
+/// be given one from here.
+///
+/// Named once so every importer says the same thing: the fix is on the Accounts
+/// page, and it is one button.
+pub fn missing_uncategorized_refusal() -> String {
+    "These books have no Uncategorized account, so there is nowhere to park \
+     transactions you haven't categorised yet. Seed the default chart of accounts \
+     from the Accounts page first — that does go to the group server — then import \
+     again."
+        .to_string()
+}
+
 pub fn find_or_create_uncategorized(store: &mut EventStore) -> Result<String, AccountCommandError> {
     let conn = store.connection();
 
-    // Check if it already exists
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM accounts WHERE LOWER(name) = 'uncategorized' AND is_active = 1",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-
-    if let Some(id) = existing {
+    if let Some(id) = find_uncategorized(conn) {
         return Ok(id);
     }
 

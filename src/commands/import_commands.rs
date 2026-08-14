@@ -6,6 +6,7 @@ use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand
 use crate::domain::AccountType;
 use crate::events::types::JournalEntrySource;
 use crate::store::event_store::EventStore;
+use rusqlite::Connection;
 
 // ── CSV/bank file parsing utilities ──────────────────────────────────────────
 
@@ -113,50 +114,64 @@ pub struct ImportTransaction {
     pub amount: i64, // cents, positive = increase, negative = decrease
 }
 
-/// Import transactions from a CSV file.
-/// Returns the number of successfully imported transactions.
-pub fn import_csv(store: &mut EventStore, params: &CsvImportParams) -> Result<usize, ImportError> {
+/// Read a CSV and decide what it posts, without writing anything.
+///
+/// The deciding half of [`import_csv`]. Split out for group-hosted books: a
+/// replica may not append — its event ids are the group server's — so a member
+/// there parses the file against their own copy and submits the result to the
+/// server, while a standalone ledger parses and posts in one step. Same rows in,
+/// same entries out, one description of what a CSV row becomes.
+///
+/// Rows that cannot be read — an unparseable date, a missing or zero amount — are
+/// skipped exactly as the local path skips them, with a line number so the file
+/// can be corrected.
+pub fn plan_csv(
+    conn: &Connection,
+    params: &CsvImportParams,
+) -> Result<(Vec<PostEntryCommand>, Vec<String>), ImportError> {
     let content = std::fs::read_to_string(&params.file_path)
         .map_err(|e| ImportError::General(format!("Failed to read file: {}", e)))?;
 
-    let mut lines = content.lines();
+    let uncategorized_id =
+        crate::commands::account_commands::find_uncategorized(conn).ok_or_else(|| {
+            ImportError::General(crate::commands::account_commands::missing_uncategorized_refusal())
+        })?;
 
+    let mut lines_iter = content.lines().enumerate();
     for _ in 0..params.skip_lines {
-        lines.next();
+        lines_iter.next();
     }
     if params.has_header {
-        lines.next();
+        lines_iter.next();
     }
 
-    let uncategorized_id = find_or_create_uncategorized(store)?;
-
-    let mut count = 0;
-    let mut commands = EntryCommands::new(store, "csv-import".to_string());
-
-    for line in lines {
+    let mut entries = Vec::new();
+    let mut skipped = Vec::new();
+    for (n, line) in lines_iter {
+        if line.trim().is_empty() {
+            continue;
+        }
         let fields = parse_delimited_line(line, params.delimiter);
+        let field = |i: usize| fields.get(i).map(|s| s.as_str()).unwrap_or("");
 
-        let date_str = fields
-            .get(params.date_column)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let description = fields
-            .get(params.description_column)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        let amount_str = fields
-            .get(params.amount_column)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        let date = match parse_date(date_str) {
-            Some(d) => d,
-            None => continue,
+        let Some(date) = parse_date(field(params.date_column)) else {
+            skipped.push(format!(
+                "line {}: could not read a date from {:?}",
+                n + 1,
+                field(params.date_column)
+            ));
+            continue;
         };
-
-        let amount = match parse_amount(amount_str) {
+        let amount = match parse_amount(field(params.amount_column)) {
             Some(a) if a != 0 => a,
-            _ => continue,
+            _ => {
+                skipped.push(format!(
+                    "line {}: could not read an amount from {:?}",
+                    n + 1,
+                    field(params.amount_column)
+                ));
+                continue;
+            }
         };
 
         let (target_amount, offset_amount) = if params.target_is_asset {
@@ -165,37 +180,49 @@ pub fn import_csv(store: &mut EventStore, params: &CsvImportParams) -> Result<us
             (-amount, amount)
         };
 
-        let entry_lines = vec![
-            EntryLine {
-                account_id: params.target_account_id.clone(),
-                amount: target_amount,
-                currency: "USD".to_string(),
-                exchange_rate: None,
-                memo: None,
-            },
-            EntryLine {
-                account_id: uncategorized_id.clone(),
-                amount: offset_amount,
-                currency: "USD".to_string(),
-                exchange_rate: None,
-                memo: None,
-            },
-        ];
-
-        match commands.post_entry(PostEntryCommand {
+        entries.push(PostEntryCommand {
             date,
-            memo: description.to_string(),
-            lines: entry_lines,
+            memo: field(params.description_column).to_string(),
+            lines: vec![
+                EntryLine {
+                    account_id: params.target_account_id.clone(),
+                    amount: target_amount,
+                    currency: "USD".to_string(),
+                    exchange_rate: None,
+                    memo: None,
+                },
+                EntryLine {
+                    account_id: uncategorized_id.clone(),
+                    amount: offset_amount,
+                    currency: "USD".to_string(),
+                    exchange_rate: None,
+                    memo: None,
+                },
+            ],
             reference: None,
             source: Some(JournalEntrySource::Import),
-        }) {
-            Ok(_) => count += 1,
-            Err(e) => {
-                eprintln!("Failed to import row: {}", e);
-            }
-        }
+        });
     }
 
+    Ok((entries, skipped))
+}
+
+/// Import transactions from a CSV file.
+/// Returns the number of successfully imported transactions.
+pub fn import_csv(store: &mut EventStore, params: &CsvImportParams) -> Result<usize, ImportError> {
+    // Create the parking account if it is missing — a standalone ledger may, and
+    // it keeps the local flow a one-click affair.
+    find_or_create_uncategorized(store).map_err(|e| ImportError::General(e.to_string()))?;
+    let (entries, _skipped) = plan_csv(store.connection(), params)?;
+
+    let mut count = 0;
+    let mut commands = EntryCommands::new(store, "csv-import".to_string());
+    for cmd in entries {
+        match commands.post_entry(cmd) {
+            Ok(_) => count += 1,
+            Err(e) => eprintln!("Failed to import row: {}", e),
+        }
+    }
     Ok(count)
 }
 

@@ -49,6 +49,7 @@ use crate::commands::ingest_commands::{
 };
 use crate::events::types::JournalEntrySource;
 use crate::store::event_store::EventStore;
+use rusqlite::Connection;
 use chrono::NaiveDate;
 use std::collections::{HashMap, HashSet};
 
@@ -237,11 +238,20 @@ fn parse_amazon_orders(content: &str) -> AmazonParse {
 /// Ingest an Amazon Business Order History Report CSV: one balanced journal
 /// entry per card charge, clearing the `amazon_clearing` account. Idempotent —
 /// re-importing the same file skips charges already posted.
-pub fn ingest_amazon_orders(
-    store: &mut EventStore,
-    user_id: &str,
+/// Decide what an Amazon order history posts, without writing anything.
+///
+/// The deciding half of [`ingest_amazon_orders`], over a plain `&Connection` so a
+/// member on group-hosted books can run it against their replica and submit the
+/// result — a replica may not append, its event ids belonging to the server.
+///
+/// Distinct from [`plan_amazon_orders`], which answers "what would this do?" for
+/// the preview panel in the shape the UI wants. This one produces the entries
+/// themselves, and the two are deliberately separate: the preview is allowed to
+/// be approximate about a missing mapping, while this must refuse.
+pub fn plan_amazon_entries(
+    conn: &Connection,
     content: &str,
-) -> Result<AmazonImportSummary, IngestError> {
+) -> Result<(Vec<PostEntryCommand>, AmazonImportSummary), IngestError> {
     let parsed = parse_amazon_orders(content);
 
     let mut summary = AmazonImportSummary {
@@ -252,31 +262,37 @@ pub fn ingest_amazon_orders(
     };
 
     if parsed.charges.is_empty() {
-        return Ok(summary);
+        return Ok((Vec::new(), summary));
     }
 
     // Pass 1 (immutable store borrow): drop charges already imported.
     let mut to_post: Vec<(Charge, String)> = Vec::new();
     for charge in parsed.charges {
         let reference = charge_reference(&charge);
-        if check_idempotent(store.connection(), &reference).is_some() {
+        if check_idempotent(conn, &reference).is_some() {
             summary.skipped_duplicates += 1;
         } else {
             to_post.push((charge, reference));
         }
     }
     if to_post.is_empty() {
-        return Ok(summary);
+        return Ok((Vec::new(), summary));
     }
 
-    // Resolve accounts (mutable then immutable borrow, each released in turn).
-    let uncategorized_id = find_or_create_uncategorized(store)
-        .map_err(|e| IngestError::EntryError(e.to_string()))?;
-    let mappings = load_ingest_mappings(store.connection(), &[AMAZON_CLEARING_KEY])?;
+    // Both accounts must already exist. On hosted books nothing here may create
+    // one, and on a standalone ledger `ingest_amazon_orders` has already made the
+    // parking account before calling in.
+    let uncategorized_id = crate::commands::account_commands::find_uncategorized(conn)
+        .ok_or_else(|| {
+            IngestError::EntryError(
+                crate::commands::account_commands::missing_uncategorized_refusal(),
+            )
+        })?;
+    let mappings = load_ingest_mappings(conn, &[AMAZON_CLEARING_KEY])?;
     let clearing_id = mappings[AMAZON_CLEARING_KEY].clone();
 
-    // Pass 2: post.
-    let mut commands = EntryCommands::new(store, user_id.to_string());
+    // Pass 2: build.
+    let mut entries = Vec::new();
     for (charge, reference) in to_post {
         let mut lines: Vec<EntryLine> = Vec::new();
         let mut items_sum = 0i64;
@@ -311,14 +327,30 @@ pub fn ingest_amazon_orders(
                 .with_memo(&format!("Amazon order {} ({})", charge.order_id, card)),
         );
 
-        let cmd = PostEntryCommand {
+        entries.push(PostEntryCommand {
             date: charge.date,
             memo: format!("Amazon order {}", charge.order_id),
             lines,
             reference: Some(reference),
             source: Some(JournalEntrySource::Import),
-        };
+        });
+    }
 
+    Ok((entries, summary))
+}
+
+pub fn ingest_amazon_orders(
+    store: &mut EventStore,
+    user_id: &str,
+    content: &str,
+) -> Result<AmazonImportSummary, IngestError> {
+    // A standalone ledger may mint the parking account; a replica may not, which
+    // is why the planner only looks for it.
+    find_or_create_uncategorized(store).map_err(|e| IngestError::EntryError(e.to_string()))?;
+    let (entries, mut summary) = plan_amazon_entries(store.connection(), content)?;
+
+    let mut commands = EntryCommands::new(store, user_id.to_string());
+    for cmd in entries {
         // A concurrent import that won the race after our pre-check is rejected
         // in-txn as a duplicate; count it as skipped rather than erroring.
         let (_, was_duplicate) = post_ingest_entry(&mut commands, cmd)?;
@@ -451,7 +483,7 @@ mod tests {
     // a clean 2-item order, a cancelled order (skip), a pending order (skip),
     // a split order (two charges on the same order id), an Excel-escaped card
     // identifier, and an order whose items don't foot to the payment total.
-    const SAMPLE: &str = "\u{feff}Order Date,Order ID,Order Status,Payment Date,Payment Amount,Payment Instrument Type,Payment Identifier,Item Net Total,Title\n\
+    pub(super) const SAMPLE: &str = "\u{feff}Order Date,Order ID,Order Status,Payment Date,Payment Amount,Payment Instrument Type,Payment Identifier,Item Net Total,Title\n\
 06/25/2026,111-AAA,Closed,06/26/2026,$30.00,Mastercard,\"=\"\"1111\"\"\",$10.00,Widget A\n\
 06/25/2026,111-AAA,Closed,06/26/2026,$30.00,Mastercard,\"=\"\"1111\"\"\",$20.00,Widget B\n\
 06/01/2026,111-BBB,Cancelled,,,N/A,,$0.00,Cancelled thing\n\
@@ -508,5 +540,110 @@ mod tests {
         let items_sum: i64 = eee.items.iter().map(|(_, a)| a).sum();
         assert_eq!(eee.payment_amount, 5000);
         assert_eq!(items_sum, 2000, "items under-foot; reconciling line covers the 30.00 gap");
+    }
+}
+
+#[cfg(test)]
+mod plan_and_post_agree {
+    use super::*;
+    use crate::commands::ingest_commands::set_account_mapping;
+    use crate::events::types::{Event, EventAccountType, EventEnvelope};
+    use crate::store::migrations::SchemaStore;
+    use crate::store::projections::ProjectionStore;
+
+    /// Books with the Amazon clearing mapping and a parking account, as a real
+    /// import needs.
+    fn books() -> EventStore {
+        let mut store = EventStore::in_memory().unwrap();
+        store.init_schema().unwrap();
+        for (id, ty, num, name) in [
+            ("clearing", EventAccountType::Liability, "2100", "Amazon clearing"),
+            ("uncat", EventAccountType::Expense, "9000", "Uncategorized"),
+        ] {
+            let ev = Event::AccountCreated {
+                account_id: id.to_string(),
+                account_type: ty,
+                account_number: num.to_string(),
+                name: name.to_string(),
+                parent_id: None,
+                currency: None,
+                description: None,
+            };
+            let stored = store
+                .append(EventEnvelope::new(ev, "test".to_string()))
+                .unwrap();
+            store.apply_projection(&stored).unwrap();
+        }
+        set_account_mapping(store.connection(), AMAZON_CLEARING_KEY, "clearing").unwrap();
+        store
+    }
+
+    /// The property the split exists for: what a replica plans is exactly what a
+    /// standalone ledger posts. Two descriptions of what an Amazon charge becomes
+    /// would drift, and the symptom is two members' books disagreeing about the
+    /// same order.
+    #[test]
+    fn the_planner_produces_exactly_what_the_local_import_posts() {
+        // Plan against a read-only view.
+        let planning = books();
+        let (planned, plan_summary) =
+            plan_amazon_entries(planning.connection(), super::tests::SAMPLE).unwrap();
+
+        // Post through the local path on identical books.
+        let mut posting = books();
+        let post_summary = ingest_amazon_orders(&mut posting, "test", super::tests::SAMPLE).unwrap();
+
+        assert_eq!(
+            planned.len(),
+            post_summary.entries_posted,
+            "the planner and the local import disagree on how many entries an \
+             order history produces"
+        );
+        assert_eq!(plan_summary.charges_seen, post_summary.charges_seen);
+        assert_eq!(plan_summary.cancelled_orders, post_summary.cancelled_orders);
+        assert_eq!(plan_summary.pending_orders, post_summary.pending_orders);
+
+        // …and line for line, against what actually landed.
+        let conn = posting.connection();
+        for cmd in &planned {
+            let reference = cmd.reference.as_deref().expect("every charge is idempotent");
+            let entry_id: String = conn
+                .query_row(
+                    "SELECT id FROM journal_entries WHERE reference = ?1",
+                    [reference],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| panic!("planned {reference} never posted"));
+            let mut stmt = conn
+                .prepare("SELECT account_id, amount FROM journal_lines WHERE entry_id = ?1 ORDER BY account_id, amount")
+                .unwrap();
+            let posted: Vec<(String, i64)> = stmt
+                .query_map([&entry_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            let mut expected: Vec<(String, i64)> = cmd
+                .lines
+                .iter()
+                .map(|l| (l.account_id.clone(), l.amount))
+                .collect();
+            expected.sort();
+            assert_eq!(posted, expected, "lines differ for {reference}");
+        }
+    }
+
+    /// Books with no parking account cannot be planned against, and the refusal
+    /// has to name the fix — on hosted books nothing here may create one.
+    #[test]
+    fn missing_uncategorized_is_refused_with_something_to_do_about_it() {
+        let store = books();
+        store
+            .connection()
+            .execute("UPDATE accounts SET is_active = 0 WHERE id = 'uncat'", [])
+            .unwrap();
+        let err = plan_amazon_entries(store.connection(), super::tests::SAMPLE).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Accounts page"), "no route out: {msg}");
+        assert!(msg.contains("Uncategorized"), "{msg}");
     }
 }
