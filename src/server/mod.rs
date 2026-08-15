@@ -703,6 +703,7 @@ pub async fn start_server_task() -> Option<ServerDb> {
         .route("/plaid/link-token", post(plaid_link_token))
         .route("/plaid/exchange-token", post(plaid_exchange_token))
         .route("/plaid/refresh-accounts", post(plaid_refresh_accounts))
+        .route("/plaid/disconnect", post(plaid_disconnect))
         .route("/plaid/sync", post(plaid_sync))
         .route("/plaid/balances", post(plaid_balances))
         .route("/plaid/staged", get(plaid_staged_list))
@@ -1209,6 +1210,47 @@ async fn plaid_refresh_accounts(
         added,
         recorded,
     }))
+}
+
+#[derive(Deserialize)]
+struct PlaidDisconnectRequest {
+    item_id: String,
+    reason: String,
+}
+
+/// Stop a connection on books this machine owns.
+///
+/// Nothing is deleted. Its accounts, their mappings and every transaction
+/// imported through it stay exactly where they are — a connection that has
+/// stopped is not one that never existed, and erasing it would lose the answer
+/// to where those transactions came from.
+async fn plaid_disconnect(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<PlaidDisconnectRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            success: false,
+            error: "No database open".to_string(),
+        }),
+    ))?;
+    crate::commands::plaid_commands::PlaidCommands::new(
+        &mut active.store,
+        "plaid-disconnect".to_string(),
+    )
+    .disconnect_item(&req.item_id, &req.reason)
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                success: false,
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(serde_json::json!({ "success": true })))
 }
 
 async fn plaid_sync(

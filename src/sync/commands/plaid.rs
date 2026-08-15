@@ -26,8 +26,8 @@
 //! account id rather than taking one.
 
 use crate::commands::plaid_commands::{
-    build_map_account_in_txn, build_refresh_accounts_in_txn, build_unmap_account_in_txn,
-    PlaidCommandError, PlaidStep,
+    build_disconnect_item_in_txn, build_map_account_in_txn, build_refresh_accounts_in_txn,
+    build_unmap_account_in_txn, PlaidCommandError, PlaidStep,
 };
 use crate::events::types::{Event, PlaidAccountInfo};
 use crate::store::event_store::{CheckedOutcome, Verdict};
@@ -44,6 +44,10 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/refresh-plaid-accounts",
             post(submit_refresh_accounts),
+        )
+        .route(
+            "/sync/commands/disconnect-plaid-item",
+            post(submit_disconnect_item),
         )
         .route("/sync/commands/map-plaid-account", post(submit_map_account))
         .route(
@@ -436,6 +440,69 @@ mod tests {
         );
     }
 
+    /// A member on hosted books can stop a connection.
+    ///
+    /// Without this there was no way at all: a member cannot append, and no
+    /// endpoint carried the event — so a group's books accumulated connections
+    /// with no means of removing any. What is checked here is that the connection
+    /// really stops, and that stopping it twice is refused rather than recorded
+    /// twice.
+    #[tokio::test]
+    async fn a_connection_can_be_stopped_and_not_stopped_twice() {
+        let base = serve().await;
+        let (item, _account) = connected(&base).await;
+        let http = reqwest::Client::new();
+
+        let stop = |head: i64, reason: &'static str| {
+            let http = http.clone();
+            let base = base.clone();
+            let item = item.clone();
+            async move {
+                http.post(format!("{base}/sync/commands/disconnect-plaid-item"))
+                    .bearer_auth(TOKEN)
+                    .json(&serde_json::json!({
+                        "expected_head_seq": head,
+                        "item_id": item,
+                        "reason": reason,
+                    }))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = stop(head_of(&base).await, "replaced by a re-link").await;
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+        let again = stop(head_of(&base).await, "again").await;
+        assert_eq!(
+            again.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "stopping an already-stopped connection was recorded a second time"
+        );
+    }
+
+    /// A reason is required, for the same purpose a void's is: six months on,
+    /// the only person who knew why has left.
+    #[tokio::test]
+    async fn stopping_a_connection_without_a_reason_is_refused() {
+        let base = serve().await;
+        let (item, _account) = connected(&base).await;
+
+        let r = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/disconnect-plaid-item"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "item_id": item,
+                "reason": "   ",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
     /// An empty list is refused rather than recorded.
     ///
     /// "The bank has nothing behind this login" is far more likely to be a fault
@@ -651,6 +718,49 @@ async fn submit_refresh_accounts(
         }
         CheckedOutcome::Rejected(e) => Err(ApiError::domain(e)),
     }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DisconnectPlaidItemRequest {
+    pub expected_head_seq: i64,
+    pub item_id: String,
+    pub reason: String,
+}
+
+/// Stop a bank connection being a source of new transactions.
+///
+/// Nothing is deleted: its accounts, their mappings and everything imported
+/// through them stay. A connection that has stopped is not a connection that
+/// never was, and a ledger that erased it would lose the answer to "where did
+/// these transactions come from".
+///
+/// Needed on hosted books because a member cannot append. Without it a group's
+/// only way to be rid of a connection was to leave it there — which is how a
+/// single bank login linked three times stayed in one group's books as three
+/// connections, two of them holding account ids the bank had long retired.
+async fn submit_disconnect_item(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<DisconnectPlaidItemRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    if req.reason.trim().is_empty() {
+        // Required for the same reason a void's is: six months on, the only
+        // person who knew why has left.
+        return Err(ApiError::bad_request("a reason is required"));
+    }
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_disconnect_item_in_txn(tx, &req.item_id, &req.reason)? {
+                PlaidStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PlaidStep::Reject(e) => Ok(Verdict::Reject(e)),
+                PlaidStep::Nothing => unreachable!("disconnect always appends or refuses"),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PlaidCommandError>)
 }
 
 /// Unmap a bank account, validated server-side. A mapping that is not there is a

@@ -166,6 +166,43 @@ pub(crate) fn build_refresh_accounts_in_txn(
     }))
 }
 
+/// Check the connection exists, then build the `PlaidItemDisconnected` event.
+///
+/// In-txn like its neighbours, and it was not before: `disconnect_item` read on a
+/// plain connection and appended afterwards, so two disconnects of the same
+/// connection could both find it present and append twice. Harmless-looking, but
+/// it puts two contradictory-looking records of one action in a log people read
+/// to work out what happened.
+///
+/// Nothing is deleted. The connection's accounts, their mappings and every
+/// transaction imported through them stay exactly where they are — a disconnected
+/// connection has stopped being a source of new transactions, which is not the
+/// same as never having been one.
+pub(crate) fn build_disconnect_item_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    item_id: &str,
+    reason: &str,
+) -> Result<PlaidStep, EventStoreError> {
+    let active: bool = tx
+        .query_row(
+            "SELECT 1 FROM plaid_items WHERE id = ?1 AND status = 'active'",
+            [item_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !active {
+        return Ok(PlaidStep::Reject(PlaidCommandError::ItemNotFound(
+            item_id.to_string(),
+        )));
+    }
+
+    Ok(PlaidStep::Append(Event::PlaidItemDisconnected {
+        item_id: item_id.to_string(),
+        reason: reason.to_string(),
+    }))
+}
+
 /// Check the mapping is actually there, then build the `PlaidAccountUnmapped`
 /// event. Same in-txn reasoning as [`build_map_account_in_txn`]: read outside the
 /// transaction and two concurrent unmaps both succeed, appending two events for
@@ -884,27 +921,7 @@ impl<'a> PlaidCommands<'a> {
         item_id: &str,
         reason: &str,
     ) -> Result<StoredEvent, PlaidCommandError> {
-        let exists: bool = self
-            .store
-            .connection()
-            .query_row("SELECT 1 FROM plaid_items WHERE id = ?1", [item_id], |_| {
-                Ok(true)
-            })
-            .unwrap_or(false);
-
-        if !exists {
-            return Err(PlaidCommandError::ItemNotFound(item_id.to_string()));
-        }
-
-        let event = Event::PlaidItemDisconnected {
-            item_id: item_id.to_string(),
-            reason: reason.to_string(),
-        };
-
-        let envelope = EventEnvelope::new(event, self.user_id.clone());
-        let stored = self.store.append(envelope)?;
-        self.store.apply_projection(&stored)?;
-        Ok(stored)
+        self.append_step(|tx| build_disconnect_item_in_txn(tx, item_id, reason))
     }
 }
 

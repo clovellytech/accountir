@@ -22,8 +22,8 @@ use super::commands::event_service::{
     RemoveEventServiceRequest,
 };
 use super::commands::plaid::{
-    ConnectPlaidItemRequest, ConnectPlaidItemResponse, MapPlaidAccountRequest,
-    RefreshPlaidAccountsRequest, RefreshPlaidAccountsResponse,
+    ConnectPlaidItemRequest, ConnectPlaidItemResponse, DisconnectPlaidItemRequest,
+    MapPlaidAccountRequest, RefreshPlaidAccountsRequest, RefreshPlaidAccountsResponse,
 };
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
 use crate::domain::{AccountType, PaymentTerms};
@@ -600,6 +600,29 @@ impl SyncClient {
             }
         }
         Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Stop a bank connection on the group's books.
+    ///
+    /// Nothing is deleted — its accounts, their mappings and everything imported
+    /// through them remain. Safe to retry blindly on a `409`: the item id and the
+    /// reason are the caller's own, not derived from a projection a competing
+    /// write could have moved, and the server re-checks that the connection is
+    /// still active inside the append.
+    pub async fn disconnect_plaid_item(
+        &mut self,
+        item_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (item_id, reason) = (item_id.into(), reason.into());
+        self.submit_retrying("/sync/commands/disconnect-plaid-item", |head| {
+            DisconnectPlaidItemRequest {
+                expected_head_seq: head,
+                item_id: item_id.clone(),
+                reason: reason.clone(),
+            }
+        })
+        .await
     }
 
     /// Link a bank account to a ledger account on the group's books.
