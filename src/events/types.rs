@@ -41,6 +41,21 @@ pub struct PlaidAccountInfo {
     pub official_name: Option<String>,
     pub account_type: String,
     pub mask: Option<String>,
+    /// The id that survives a re-link, where the institution provides one.
+    ///
+    /// `plaid_account_id` does not: Plaid mints account ids per Item, so linking
+    /// the same bank again brings the same real account back under a different
+    /// id. Anything keying on the old one sees a stranger — which is how one
+    /// Chase login ended up recorded as three connections holding three sets of
+    /// ids for the same checking account and card.
+    ///
+    /// `Option`, and omitted entirely when absent, so events written before this
+    /// field existed deserialize and **hash** identically — the same rule
+    /// `PlaidItemConnected::proxy_item_id` follows, and for the same reason: this
+    /// is a hash-chained log and a changed byte is indistinguishable from
+    /// tampering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_account_id: Option<String>,
 }
 
 /// User role in the system

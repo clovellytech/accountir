@@ -81,6 +81,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             20,
             include_str!("../../migrations/020_event_service_optional_api_key.sql"),
         ),
+        (
+            21,
+            include_str!("../../migrations/021_plaid_persistent_account_id.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -290,6 +294,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             local_account_id TEXT REFERENCES accounts(id),
             plaid_balance_cents INTEGER,
             balance_updated_at TEXT,
+            -- Stable across re-links where the institution provides it; see
+            -- migration 021. `plaid_account_id` is not.
+            persistent_account_id TEXT,
             PRIMARY KEY (item_id, plaid_account_id)
         );
 

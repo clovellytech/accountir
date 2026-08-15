@@ -1453,6 +1453,27 @@ mod tests {
             official_name: None,
             account_type: "depository".to_string(),
             mask: Some("0000".to_string()),
+            persistent_account_id: None,
+        }
+    }
+
+    /// An account shaped the way the reported Chase data was.
+    fn chase(id: &str, name: &str, kind: &str, mask: &str) -> PlaidAccountInfo {
+        PlaidAccountInfo {
+            plaid_account_id: id.to_string(),
+            name: name.to_string(),
+            official_name: None,
+            account_type: kind.to_string(),
+            mask: Some(mask.to_string()),
+            persistent_account_id: None,
+        }
+    }
+
+    /// The same, with the id that survives a re-link.
+    fn acct_persistent(id: &str, name: &str, persistent: &str) -> PlaidAccountInfo {
+        PlaidAccountInfo {
+            persistent_account_id: Some(persistent.to_string()),
+            ..acct(id, name)
         }
     }
 
@@ -1534,6 +1555,199 @@ mod tests {
         assert_eq!(name, "Checking renamed");
     }
 
+    /// The bug this was reported as: one bank account, listed twice.
+    ///
+    /// Reproduced from real data. A Chase login was linked three times; each link
+    /// minted fresh Plaid ids for the same checking account and card, and the
+    /// ledger kept a connection per link. Refreshing one of the older connections
+    /// returned the *current* ids, which nothing recognised as accounts already
+    /// held — so "BUS COMPLETE CHK 0908" appeared twice, under two ids, and so
+    /// did the card.
+    #[test]
+    fn an_account_that_comes_back_with_a_new_id_is_not_a_second_account() {
+        let (mut store, _local) = setup();
+
+        // The connection as first linked: two accounts, the ids of that link.
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![
+                    chase("KqZmpVXnk8HRr5", "BUS COMPLETE CHK", "depository", "0908"),
+                    chase("k18b75e9a6fmpg", "Z. PATTERSON", "credit", "3082"),
+                ],
+            )
+            .expect("first")
+            .expect("something to record");
+
+        // The same bank, re-linked: same two accounts, new ids.
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![
+                    chase("by1BD60nJQi53b", "BUS COMPLETE CHK", "depository", "0908"),
+                    chase("g0gD3qxJbEfAbD", "Z. PATTERSON", "credit", "3082"),
+                ],
+            )
+            .expect("second");
+
+        let rows = recorded_accounts(&store);
+        let ids: Vec<&str> = rows.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "the re-linked accounts were added instead of recognised: {rows:?}"
+        );
+        assert!(ids.contains(&"by1BD60nJQi53b"), "{rows:?}");
+        assert!(ids.contains(&"g0gD3qxJbEfAbD"), "{rows:?}");
+        assert!(
+            !ids.contains(&"KqZmpVXnk8HRr5") && !ids.contains(&"k18b75e9a6fmpg"),
+            "the old ids survived alongside the new ones: {rows:?}"
+        );
+    }
+
+    /// And the mapping moves with it.
+    ///
+    /// The quieter half of the same bug, and the more expensive one: the ledger
+    /// account a bank account is mapped to lives on that row. Treat a re-link as a
+    /// new account and the mapping stays on an id the bank will never mention
+    /// again — the connection looks healthy and imports nothing at all.
+    #[test]
+    fn a_re_linked_account_keeps_the_ledger_account_it_was_mapped_to() {
+        let (mut store, local) = setup();
+
+        // `setup` maps 'pa1' to a ledger account. Same account, new id.
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![PlaidAccountInfo {
+                    plaid_account_id: "pa1-relinked".to_string(),
+                    name: "Checking".to_string(),
+                    official_name: None,
+                    account_type: "depository".to_string(),
+                    mask: None,
+                    persistent_account_id: None,
+                }],
+            )
+            .expect("refresh");
+
+        let rows = recorded_accounts(&store);
+        assert_eq!(
+            rows,
+            vec![("pa1-relinked".to_string(), Some(local))],
+            "the mapping did not follow the account to its new id: {rows:?}"
+        );
+    }
+
+    /// Plaid's own stable id is believed over name and mask.
+    ///
+    /// Two cards can share a holder's name and a last-4; the persistent id is the
+    /// bank saying which account this is, and it wins.
+    #[test]
+    fn the_persistent_id_decides_when_there_is_one() {
+        let (mut store, _local) = setup();
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![
+                    acct_persistent("old-a", "Card", "stable-a"),
+                    acct_persistent("old-b", "Card", "stable-b"),
+                ],
+            )
+            .expect("first");
+
+        // Both ids rotate, and both accounts look identical apart from the
+        // persistent id. Name-and-mask matching could not tell them apart.
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![
+                    acct_persistent("new-a", "Card", "stable-a"),
+                    acct_persistent("new-b", "Card", "stable-b"),
+                ],
+            )
+            .expect("second");
+
+        let mut ids: Vec<String> = recorded_accounts(&store)
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| id != "pa1")
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["new-a", "new-b"], "ids were not migrated cleanly");
+    }
+
+    /// An ambiguous match is refused rather than guessed.
+    ///
+    /// Two accounts identical in name, type and mask, and no persistent id to
+    /// separate them: merging one into the other would put a card's transactions
+    /// into another card's ledger account, silently and permanently. Adding it as
+    /// new is wrong too, but it is *visible* and somebody can fix it.
+    #[test]
+    fn two_indistinguishable_accounts_are_not_merged() {
+        let (mut store, _local) = setup();
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![
+                    acct("twin-1", "Employee Card"),
+                    acct("twin-2", "Employee Card"),
+                ],
+            )
+            .expect("first");
+
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts("item1", vec![acct("twin-3", "Employee Card")])
+            .expect("second");
+
+        let ids: Vec<String> = recorded_accounts(&store)
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| id != "pa1")
+            .collect();
+        assert!(
+            ids.contains(&"twin-1".to_string())
+                && ids.contains(&"twin-2".to_string())
+                && ids.contains(&"twin-3".to_string()),
+            "an ambiguous match was guessed at rather than left alone: {ids:?}"
+        );
+    }
+
+    /// A genuinely new account is still added.
+    ///
+    /// The matcher must not become so eager that a card opened at the bank gets
+    /// absorbed into an existing row.
+    #[test]
+    fn an_account_that_is_actually_new_is_still_added() {
+        let (mut store, _local) = setup();
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![
+                    chase("chk-1", "BUS COMPLETE CHK", "depository", "0908"),
+                    chase("card-1", "Z. PATTERSON", "credit", "3082"),
+                ],
+            )
+            .expect("first");
+
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![
+                    chase("chk-1", "BUS COMPLETE CHK", "depository", "0908"),
+                    chase("card-1", "Z. PATTERSON", "credit", "3082"),
+                    chase("card-2", "A. OTHER", "credit", "4402"),
+                ],
+            )
+            .expect("second");
+
+        let ids: Vec<String> = recorded_accounts(&store)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ids.contains(&"card-2".to_string()), "{ids:?}");
+        assert_eq!(ids.len(), 4, "pa1 plus the three: {ids:?}");
+    }
+
     /// A refresh that finds nothing new writes nothing.
     ///
     /// Refresh is what somebody presses when they are not sure, so it gets
@@ -1585,6 +1799,48 @@ mod tests {
             .refresh_accounts("no-such-item", vec![acct("pa9", "Ghost")])
             .expect_err("an unknown item must be refused");
         assert!(matches!(err, PlaidCommandError::ItemNotFound(_)), "{err:?}");
+    }
+
+    /// One bank login is one connection, however many times it is linked.
+    ///
+    /// The proxy keeps one connection per user and institution and reuses it on a
+    /// reconnect, so the same handle identifies the same login. The local link
+    /// path looks it up before minting anything — without that lookup a real
+    /// Chase login became three connections, each holding its own generation of
+    /// Plaid's per-Item ids for the same two accounts.
+    ///
+    /// This checks the lookup the handler performs; the handler itself needs an
+    /// HTTP round trip to the proxy, which is not what is in question here.
+    #[test]
+    fn a_reconnect_is_found_by_its_proxy_handle_rather_than_creating_a_second() {
+        let (store, _local) = setup();
+
+        let found: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT id FROM plaid_items WHERE proxy_item_id = ?1 AND status = 'active'",
+                ["p1"],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("query");
+        assert_eq!(
+            found.as_deref(),
+            Some("item1"),
+            "a reconnect of this bank would have minted a second connection"
+        );
+
+        // And a genuinely different bank is not mistaken for it.
+        let other: Option<String> = store
+            .connection()
+            .query_row(
+                "SELECT id FROM plaid_items WHERE proxy_item_id = ?1 AND status = 'active'",
+                ["p-someone-elses-bank"],
+                |r| r.get(0),
+            )
+            .optional()
+            .expect("query");
+        assert_eq!(other, None);
     }
 
     /// Store with a local asset account mapped to Plaid account 'pa1' on item

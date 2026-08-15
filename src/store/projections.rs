@@ -1,6 +1,6 @@
 use crate::events::types::{Event, EventAccountType, StoredEvent};
 use chrono::Datelike;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -151,10 +151,14 @@ impl<'a> Projector<'a> {
                     crate::events::types::JournalEntrySource::Plaid => "plaid",
                     crate::events::types::JournalEntrySource::Pos => "pos",
                     crate::events::types::JournalEntrySource::PurchaseOrder => "purchase_order",
-                    crate::events::types::JournalEntrySource::InventoryAdjustment => "inventory_adjustment",
+                    crate::events::types::JournalEntrySource::InventoryAdjustment => {
+                        "inventory_adjustment"
+                    }
                     crate::events::types::JournalEntrySource::EventService => "event_service",
                     crate::events::types::JournalEntrySource::BillPayable => "bill_payable",
-                    crate::events::types::JournalEntrySource::InvoiceReceivable => "invoice_receivable",
+                    crate::events::types::JournalEntrySource::InvoiceReceivable => {
+                        "invoice_receivable"
+                    }
                     crate::events::types::JournalEntrySource::BillPayment => "bill_payment",
                     crate::events::types::JournalEntrySource::InvoicePayment => "invoice_payment",
                 });
@@ -351,30 +355,74 @@ impl<'a> Projector<'a> {
                 // already posted through it, and the mapping is not the bank's to
                 // decide. `INSERT OR REPLACE` would also blank it, so the columns
                 // the bank owns are updated by name and the mapping is left alone.
+                //
+                // Two passes, because the second depends on what the first
+                // claimed. An account whose id the bank has changed must not be
+                // matched against a row that some other incoming account already
+                // is.
+                let mut unmatched = Vec::new();
                 for acct in plaid_accounts {
                     let updated = self.conn.execute(
-                        "UPDATE plaid_local_accounts SET name = ?3, account_type = ?4, mask = ?5
-                         WHERE item_id = ?1 AND plaid_account_id = ?2",
+                        "UPDATE plaid_local_accounts
+                            SET name = ?3, account_type = ?4, mask = ?5,
+                                persistent_account_id = COALESCE(?6, persistent_account_id)
+                          WHERE item_id = ?1 AND plaid_account_id = ?2",
                         params![
                             item_id,
                             acct.plaid_account_id,
                             acct.name,
                             acct.account_type,
-                            acct.mask
+                            acct.mask,
+                            acct.persistent_account_id
                         ],
                     )?;
                     if updated == 0 {
-                        self.conn.execute(
-                            "INSERT INTO plaid_local_accounts (item_id, plaid_account_id, name, account_type, mask)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![
-                                item_id,
-                                acct.plaid_account_id,
-                                acct.name,
-                                acct.account_type,
-                                acct.mask
-                            ],
-                        )?;
+                        unmatched.push(acct);
+                    }
+                }
+
+                let claimed: std::collections::HashSet<&str> = plaid_accounts
+                    .iter()
+                    .map(|a| a.plaid_account_id.as_str())
+                    .collect();
+                for acct in unmatched {
+                    // The same account under a new id keeps its row — and with it
+                    // the ledger account it is mapped to. Treating it as new
+                    // instead is what showed one checking account twice, and it
+                    // would also silently strand the mapping on the dead id: the
+                    // connection looks healthy and imports nothing.
+                    match same_account_under_a_new_id(self.conn, item_id, acct, &claimed)? {
+                        Some(old_id) => {
+                            self.conn.execute(
+                                "UPDATE plaid_local_accounts
+                                    SET plaid_account_id = ?3, name = ?4, account_type = ?5,
+                                        mask = ?6, persistent_account_id = ?7
+                                  WHERE item_id = ?1 AND plaid_account_id = ?2",
+                                params![
+                                    item_id,
+                                    old_id,
+                                    acct.plaid_account_id,
+                                    acct.name,
+                                    acct.account_type,
+                                    acct.mask,
+                                    acct.persistent_account_id
+                                ],
+                            )?;
+                        }
+                        None => {
+                            self.conn.execute(
+                                "INSERT INTO plaid_local_accounts (item_id, plaid_account_id, name, account_type, mask, persistent_account_id)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                params![
+                                    item_id,
+                                    acct.plaid_account_id,
+                                    acct.name,
+                                    acct.account_type,
+                                    acct.mask,
+                                    acct.persistent_account_id
+                                ],
+                            )?;
+                        }
                     }
                 }
             }
@@ -497,10 +545,7 @@ impl<'a> Projector<'a> {
                     params![amount_applied, stored_event.id, bill_id],
                 )?;
             }
-            Event::BillVoided {
-                bill_id,
-                reason: _,
-            } => {
+            Event::BillVoided { bill_id, reason: _ } => {
                 self.conn.execute(
                     "UPDATE bills SET status = 'void', updated_at_event = ?1 WHERE id = ?2",
                     params![stored_event.id, bill_id],
@@ -688,6 +733,101 @@ impl<'a> Projector<'a> {
 ///
 /// The SQLite implementation below just drives the existing [`Projector`]. The
 /// methods take `&mut self` because a Postgres client requires a mutable
+/// The row this account already has under an id the bank has since changed.
+///
+/// Plaid mints account ids per Item, so re-linking a bank returns the same real
+/// accounts wearing new ids. Recognising that is what keeps one bank account as
+/// one row — and, more importantly, keeps the ledger account it is mapped to
+/// attached to it. Treating a re-link as a set of new accounts leaves the mapping
+/// on ids the bank will never mention again: the connection looks healthy and
+/// imports nothing.
+///
+/// Two ways to recognise it, in order of how much they are worth trusting:
+///
+/// 1. `persistent_account_id` — Plaid's own answer to this, stable across Items.
+///    Present for the institutions that support it, absent for the rest and for
+///    every row written before we stored it.
+/// 2. Failing that, the account's mask, name and type together — **and only when
+///    exactly one stored row matches.** Two cards ending 3082 held by the same
+///    person is a shape a bank can produce, and merging them would put one
+///    account's transactions into another's ledger account. Silently. So an
+///    ambiguous match is not a match: the account is added as new, which is
+///    visible and correctable, rather than merged, which is neither.
+///
+/// Rows whose id the incoming list already names are excluded — they are spoken
+/// for, and matching against them would move an account onto a row that belongs
+/// to a different one.
+fn same_account_under_a_new_id(
+    conn: &Connection,
+    item_id: &str,
+    acct: &crate::events::types::PlaidAccountInfo,
+    claimed: &std::collections::HashSet<&str>,
+) -> Result<Option<String>, ProjectionError> {
+    let mut candidates: Vec<String> = Vec::new();
+
+    if let Some(persistent) = acct.persistent_account_id.as_deref() {
+        let mut stmt = conn.prepare(
+            "SELECT plaid_account_id FROM plaid_local_accounts
+              WHERE item_id = ?1 AND persistent_account_id = ?2",
+        )?;
+        let rows = stmt.query_map(params![item_id, persistent], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let id = row?;
+            if !claimed.contains(id.as_str()) {
+                candidates.push(id);
+            }
+        }
+        // A persistent id that matched nothing does not fall through to the
+        // weaker rule. The bank told us which account this is; if we hold no row
+        // for it, it is new.
+        if !candidates.is_empty() {
+            return Ok(candidates.pop().filter(|_| candidates.is_empty()));
+        }
+        if stored_any_persistent_id(conn, item_id)? {
+            return Ok(None);
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT plaid_account_id FROM plaid_local_accounts
+          WHERE item_id = ?1 AND name = ?2 AND account_type = ?3
+            AND mask IS ?4 AND persistent_account_id IS NULL",
+    )?;
+    let rows = stmt.query_map(
+        params![item_id, acct.name, acct.account_type, acct.mask],
+        |r| r.get::<_, String>(0),
+    )?;
+    for row in rows {
+        let id = row?;
+        if !claimed.contains(id.as_str()) {
+            candidates.push(id);
+        }
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates.pop());
+    }
+    Ok(None)
+}
+
+/// Whether this connection has any account carrying a persistent id.
+///
+/// The guard on falling back to mask-and-name matching. Where the institution
+/// supplies persistent ids, a persistent id that matched nothing means the
+/// account really is new — and guessing by name after that could merge it into an
+/// unrelated row. Where it supplies none, every row is NULL and the weaker rule
+/// is all there is.
+fn stored_any_persistent_id(conn: &Connection, item_id: &str) -> Result<bool, ProjectionError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM plaid_local_accounts
+              WHERE item_id = ?1 AND persistent_account_id IS NOT NULL LIMIT 1",
+            params![item_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
+}
+
 /// borrow to execute; SQLite is happy either way.
 pub trait ProjectionStore {
     /// Apply a single event to the projection tables.

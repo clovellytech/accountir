@@ -5,6 +5,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -66,6 +67,10 @@ fn plaid_accounts_from_proxy(
                         .unwrap_or("depository")
                         .to_string(),
                     mask: a["mask"].as_str().map(str::to_string),
+                    // Absent for institutions that do not provide one, and from
+                    // any proxy older than the field. Both read as `None`, which
+                    // is what the matcher expects.
+                    persistent_account_id: a["persistent_account_id"].as_str().map(str::to_string),
                 })
             })
             .collect(),
@@ -908,6 +913,9 @@ async fn plaid_exchange_token(
                 official_name: a.official_name.clone(),
                 account_type: a.account_type.clone(),
                 mask: a.mask.clone(),
+                // The browser's metadata never carries one. This branch is only
+                // reached when Plaid could not be asked at all.
+                persistent_account_id: None,
             })
             .collect(),
     };
@@ -958,6 +966,57 @@ async fn plaid_exchange_token(
             error: "No database open".to_string(),
         }),
     ))?;
+
+    // Re-linking a bank is not a second bank.
+    //
+    // The proxy keeps one connection per user and institution and reuses it on a
+    // reconnect, so the same handle coming back means this is the same bank
+    // login. Recording it as a new connection is how one Chase login became three
+    // in a real ledger — each holding a different generation of Plaid's per-Item
+    // account ids for the same checking account and card, each with its own
+    // grant, only the newest of which named ids that still existed.
+    //
+    // So a reconnect updates the connection it already has, which also carries
+    // every account's mapping across the new ids rather than stranding it.
+    let existing = active
+        .store
+        .connection()
+        .query_row(
+            "SELECT id FROM plaid_items WHERE proxy_item_id = ?1 AND status = 'active'",
+            [&proxy_item_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    success: false,
+                    error: format!("looking for an existing connection: {e}"),
+                }),
+            )
+        })?;
+
+    if let Some(item_id) = existing {
+        crate::commands::plaid_commands::PlaidCommands::new(
+            &mut active.store,
+            "plaid-link".to_string(),
+        )
+        .refresh_accounts(&item_id, plaid_accounts)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    success: false,
+                    error: format!("recording the reconnection: {e}"),
+                }),
+            )
+        })?;
+        return Ok(Json(PlaidExchangeTokenResponse {
+            success: true,
+            item_id,
+        }));
+    }
 
     let item_id = uuid::Uuid::new_v4().to_string();
     let event = crate::events::types::Event::PlaidItemConnected {
