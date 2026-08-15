@@ -49,7 +49,9 @@ pub struct PendingLink {
 /// `None` when the response carries no usable list at all — an older proxy, or a
 /// shape we do not recognise. The caller falls back to the browser's list, which
 /// is what this whole function exists to avoid depending on.
-fn plaid_accounts_from_proxy(body: &serde_json::Value) -> Option<Vec<crate::events::types::PlaidAccountInfo>> {
+fn plaid_accounts_from_proxy(
+    body: &serde_json::Value,
+) -> Option<Vec<crate::events::types::PlaidAccountInfo>> {
     let accounts = body["accounts"].as_array()?;
     Some(
         accounts
@@ -891,7 +893,10 @@ async fn plaid_exchange_token(
     // Falls back to the browser's list only when the proxy could not verify one
     // either (`account_source == "link"`), which it reports rather than hides.
     let discovered = plaid_accounts_from_proxy(&body);
-    let account_source = body["account_source"].as_str().unwrap_or("link").to_string();
+    let account_source = body["account_source"]
+        .as_str()
+        .unwrap_or("link")
+        .to_string();
     let plaid_accounts = match discovered {
         Some(accounts) if !accounts.is_empty() => accounts,
         _ => req

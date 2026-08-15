@@ -153,9 +153,7 @@ pub(crate) fn build_refresh_accounts_in_txn(
     let differs = found.iter().any(|a| {
         known
             .get(&a.plaid_account_id)
-            .map(|(name, kind, mask)| {
-                *name != a.name || *kind != a.account_type || *mask != a.mask
-            })
+            .map(|(name, kind, mask)| *name != a.name || *kind != a.account_type || *mask != a.mask)
             .unwrap_or(true)
     });
     if !differs {
@@ -1484,13 +1482,13 @@ mod tests {
         let (mut store, _local) = setup();
 
         let stored = PlaidCommands::new(&mut store, "u".to_string())
-            .refresh_accounts("item1", vec![acct("pa1", "Checking"), acct("pa2", "Card 2")])
+            .refresh_accounts(
+                "item1",
+                vec![acct("pa1", "Checking"), acct("pa2", "Card 2")],
+            )
             .expect("refresh")
             .expect("something to record");
-        assert!(matches!(
-            stored.event,
-            Event::PlaidAccountsRefreshed { .. }
-        ));
+        assert!(matches!(stored.event, Event::PlaidAccountsRefreshed { .. }));
 
         let rows = recorded_accounts(&store);
         assert_eq!(rows.len(), 2, "{rows:?}");

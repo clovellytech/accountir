@@ -425,8 +425,15 @@ mod tests {
             .unwrap();
         assert_eq!(again.status(), reqwest::StatusCode::OK);
         let v: serde_json::Value = again.json().await.unwrap();
-        assert_eq!(v["recorded"], false, "a second identical refresh wrote: {v}");
-        assert_eq!(head_of(&base).await, head, "the shared log moved for nothing");
+        assert_eq!(
+            v["recorded"], false,
+            "a second identical refresh wrote: {v}"
+        );
+        assert_eq!(
+            head_of(&base).await,
+            head,
+            "the shared log moved for nothing"
+        );
     }
 
     /// An empty list is refused rather than recorded.
