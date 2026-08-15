@@ -38,6 +38,11 @@ pub enum PlaidCommandError {
 pub(crate) enum PlaidStep {
     Append(Event),
     Reject(PlaidCommandError),
+    /// Nothing to record. Not a refusal — the command ran, and found the log
+    /// already says what it was going to say. Distinct from `Reject` because the
+    /// caller should report success, and distinct from appending an event that
+    /// changes nothing because a log is read by people.
+    Nothing,
 }
 
 /// Check that the connection exists and the ledger account is real, then build
@@ -87,6 +92,79 @@ pub(crate) fn build_map_account_in_txn(
         item_id: item_id.to_string(),
         plaid_account_id: plaid_account_id.to_string(),
         local_account_id: local_account_id.to_string(),
+    }))
+}
+
+/// What a refresh would change, and the event to record it.
+///
+/// Read **inside** the transaction for the same reason the two builders around it
+/// are: the decision is "is this list different from what we hold", and answering
+/// it outside the write lock lets two refreshes of the same connection both
+/// conclude "yes" and append two events for one change.
+///
+/// A refresh that finds nothing new appends nothing. Pressing refresh is the
+/// thing somebody does when they are *not sure*, so it will be pressed often and
+/// mostly find nothing; a log with an event per press is a log nobody can read.
+pub(crate) fn build_refresh_accounts_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    item_id: &str,
+    found: &[PlaidAccountInfo],
+) -> Result<PlaidStep, EventStoreError> {
+    let item_exists: bool = tx
+        .query_row("SELECT 1 FROM plaid_items WHERE id = ?1", [item_id], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .unwrap_or(false);
+    if !item_exists {
+        return Ok(PlaidStep::Reject(PlaidCommandError::ItemNotFound(
+            item_id.to_string(),
+        )));
+    }
+    if found.is_empty() {
+        // The bank reporting nothing behind a login is not a refresh finding
+        // nothing — it is an answer that would be wrong to record, and recording
+        // it would say the connection had been checked and found empty.
+        return Ok(PlaidStep::Reject(PlaidCommandError::ItemNotFound(format!(
+            "{item_id}: the bank returned no accounts"
+        ))));
+    }
+
+    let mut known: std::collections::HashMap<String, (String, String, Option<String>)> =
+        std::collections::HashMap::new();
+    let mut stmt = tx.prepare(
+        "SELECT plaid_account_id, name, account_type, mask FROM plaid_local_accounts
+          WHERE item_id = ?1",
+    )?;
+    let rows = stmt.query_map([item_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            (r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get(3)?),
+        ))
+    })?;
+    for row in rows {
+        let (id, rest) = row?;
+        known.insert(id, rest);
+    }
+
+    // A renamed or re-masked account counts as a change too: the name is what a
+    // person picks from when mapping, and one that silently disagrees with the
+    // bank's is worse than one that is a day out of date.
+    let differs = found.iter().any(|a| {
+        known
+            .get(&a.plaid_account_id)
+            .map(|(name, kind, mask)| {
+                *name != a.name || *kind != a.account_type || *mask != a.mask
+            })
+            .unwrap_or(true)
+    });
+    if !differs {
+        return Ok(PlaidStep::Nothing);
+    }
+
+    Ok(PlaidStep::Append(Event::PlaidAccountsRefreshed {
+        item_id: item_id.to_string(),
+        plaid_accounts: found.to_vec(),
     }))
 }
 
@@ -154,6 +232,21 @@ impl<'a> PlaidCommands<'a> {
         Ok(stored)
     }
 
+    /// Record the accounts a bank now reports behind a connection.
+    ///
+    /// `found` is the whole list from the bank, not a delta, and nothing is
+    /// removed by it — see [`Event::PlaidAccountsRefreshed`].
+    ///
+    /// `Ok(None)` means the books already agreed with the bank. That is the
+    /// common outcome and it appends nothing.
+    pub fn refresh_accounts(
+        &mut self,
+        item_id: &str,
+        found: Vec<PlaidAccountInfo>,
+    ) -> Result<Option<StoredEvent>, PlaidCommandError> {
+        self.append_optional_step(|tx| build_refresh_accounts_in_txn(tx, item_id, &found))
+    }
+
     /// Map a Plaid account to a local account
     pub fn map_account(
         &mut self,
@@ -188,8 +281,25 @@ impl<'a> PlaidCommands<'a> {
         &mut self,
         build: impl Fn(&rusqlite::Transaction<'_>) -> Result<PlaidStep, EventStoreError>,
     ) -> Result<StoredEvent, PlaidCommandError> {
+        self.append_optional_step(build)?
+            .ok_or_else(|| PlaidCommandError::ItemNotFound("nothing to record".to_string()))
+    }
+
+    /// The same, for commands that may legitimately have nothing to say.
+    ///
+    /// `Ok(None)` is success with no event. Only [`build_refresh_accounts_in_txn`]
+    /// uses it today; [`append_step`] keeps the simpler signature for the commands
+    /// where "nothing to record" would be a bug.
+    ///
+    /// [`append_step`]: PlaidCommands::append_step
+    fn append_optional_step(
+        &mut self,
+        build: impl Fn(&rusqlite::Transaction<'_>) -> Result<PlaidStep, EventStoreError>,
+    ) -> Result<Option<StoredEvent>, PlaidCommandError> {
         let user_id = self.user_id.clone();
+        let nothing = std::cell::Cell::new(false);
         loop {
+            nothing.set(false);
             let head = self.store.latest_id()?.unwrap_or(0);
             let outcome = self.store.append_checked(
                 head,
@@ -198,6 +308,16 @@ impl<'a> PlaidCommands<'a> {
                         Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
                     }
                     PlaidStep::Reject(e) => Ok(Verdict::Reject(e)),
+                    // Nothing to append, and not an error. Reported through
+                    // `Reject` because that is the only way out of the closure
+                    // that does not write, then turned back into `Ok(None)` below
+                    // — the flag is what tells the two apart.
+                    PlaidStep::Nothing => {
+                        nothing.set(true);
+                        Ok(Verdict::Reject(PlaidCommandError::ItemNotFound(
+                            "nothing to record".to_string(),
+                        )))
+                    }
                 },
                 |tx, stored| {
                     Projector::new(tx)
@@ -206,8 +326,9 @@ impl<'a> PlaidCommands<'a> {
                 },
             )?;
             match outcome {
-                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::Appended(stored) => return Ok(Some(stored)),
                 CheckedOutcome::HeadMismatch { .. } => continue,
+                CheckedOutcome::Rejected(_) if nothing.get() => return Ok(None),
                 CheckedOutcome::Rejected(e) => return Err(e),
             }
         }
@@ -1325,6 +1446,147 @@ mod tests {
             Event::AccountCreated { account_id, .. } => account_id.clone(),
             _ => panic!("expected AccountCreated"),
         }
+    }
+
+    fn acct(id: &str, name: &str) -> PlaidAccountInfo {
+        PlaidAccountInfo {
+            plaid_account_id: id.to_string(),
+            name: name.to_string(),
+            official_name: None,
+            account_type: "depository".to_string(),
+            mask: Some("0000".to_string()),
+        }
+    }
+
+    fn recorded_accounts(store: &EventStore) -> Vec<(String, Option<String>)> {
+        let conn = store.connection();
+        let mut stmt = conn
+            .prepare(
+                "SELECT plaid_account_id, local_account_id FROM plaid_local_accounts
+                  WHERE item_id = 'item1' ORDER BY plaid_account_id",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// The accounts a bank reports later are added to the ones already known.
+    ///
+    /// This is the repair path for connections made while the account list came
+    /// from the browser — which for an OAuth bank could be most of the accounts
+    /// missing, with nothing anywhere that could have noticed.
+    #[test]
+    fn a_refresh_adds_accounts_the_connection_did_not_have() {
+        let (mut store, _local) = setup();
+
+        let stored = PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts("item1", vec![acct("pa1", "Checking"), acct("pa2", "Card 2")])
+            .expect("refresh")
+            .expect("something to record");
+        assert!(matches!(
+            stored.event,
+            Event::PlaidAccountsRefreshed { .. }
+        ));
+
+        let rows = recorded_accounts(&store);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1].0, "pa2");
+    }
+
+    /// The mapping survives.
+    ///
+    /// `local_account_id` lives on the same row as the bank's own fields, so a
+    /// projection written as `INSERT OR REPLACE` — the obvious way, and what the
+    /// neighbouring `PlaidItemConnected` arm does — would blank it. The visible
+    /// result would be a connection that quietly stopped importing into the
+    /// account it was mapped to, on the one action a user takes *because* they
+    /// want the connection to be more complete.
+    #[test]
+    fn a_refresh_does_not_disturb_an_existing_mapping() {
+        let (mut store, local) = setup();
+
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts(
+                "item1",
+                vec![acct("pa1", "Checking renamed"), acct("pa2", "Card 2")],
+            )
+            .expect("refresh");
+
+        let rows = recorded_accounts(&store);
+        assert_eq!(
+            rows[0],
+            ("pa1".to_string(), Some(local)),
+            "the mapping was lost: {rows:?}"
+        );
+        assert_eq!(rows[1], ("pa2".to_string(), None), "{rows:?}");
+
+        // The bank's own fields do follow the bank.
+        let name: String = store
+            .connection()
+            .query_row(
+                "SELECT name FROM plaid_local_accounts WHERE plaid_account_id = 'pa1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Checking renamed");
+    }
+
+    /// A refresh that finds nothing new writes nothing.
+    ///
+    /// Refresh is what somebody presses when they are not sure, so it gets
+    /// pressed a lot and mostly finds nothing. An event per press is a log nobody
+    /// can read afterwards.
+    #[test]
+    fn a_refresh_that_finds_nothing_new_appends_nothing() {
+        let (mut store, _local) = setup();
+        let found = vec![acct("pa1", "Checking"), acct("pa2", "Card 2")];
+
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts("item1", found.clone())
+            .expect("first refresh")
+            .expect("the first one has something to say");
+        let settled = store.latest_id().unwrap();
+
+        let outcome = PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts("item1", found)
+            .expect("second refresh");
+
+        assert!(outcome.is_none(), "an event was appended for no change");
+        assert_eq!(store.latest_id().unwrap(), settled, "the log moved");
+    }
+
+    /// A renamed account is a change worth recording.
+    ///
+    /// The name is what a person picks from when mapping, so one that silently
+    /// disagrees with the bank's is worse than one a day out of date — and a
+    /// comparison on ids alone would never notice.
+    #[test]
+    fn a_renamed_account_counts_as_a_change() {
+        let (mut store, _local) = setup();
+        PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts("item1", vec![acct("pa1", "Checking")])
+            .expect("first refresh");
+
+        let outcome = PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts("item1", vec![acct("pa1", "Operating account")])
+            .expect("second refresh");
+
+        assert!(outcome.is_some(), "a rename went unrecorded");
+    }
+
+    /// An unknown connection is refused rather than creating one.
+    #[test]
+    fn a_refresh_of_an_unknown_connection_is_refused() {
+        let (mut store, _local) = setup();
+        let err = PlaidCommands::new(&mut store, "u".to_string())
+            .refresh_accounts("no-such-item", vec![acct("pa9", "Ghost")])
+            .expect_err("an unknown item must be refused");
+        assert!(matches!(err, PlaidCommandError::ItemNotFound(_)), "{err:?}");
     }
 
     /// Store with a local asset account mapped to Plaid account 'pa1' on item

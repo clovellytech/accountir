@@ -26,7 +26,8 @@
 //! account id rather than taking one.
 
 use crate::commands::plaid_commands::{
-    build_map_account_in_txn, build_unmap_account_in_txn, PlaidCommandError, PlaidStep,
+    build_map_account_in_txn, build_refresh_accounts_in_txn, build_unmap_account_in_txn,
+    PlaidCommandError, PlaidStep,
 };
 use crate::events::types::{Event, PlaidAccountInfo};
 use crate::store::event_store::{CheckedOutcome, Verdict};
@@ -39,6 +40,10 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/connect-plaid-item",
             post(submit_connect_plaid_item),
+        )
+        .route(
+            "/sync/commands/refresh-plaid-accounts",
+            post(submit_refresh_accounts),
         )
         .route("/sync/commands/map-plaid-account", post(submit_map_account))
         .route(
@@ -359,6 +364,95 @@ mod tests {
         assert_eq!(unmap.status(), reqwest::StatusCode::OK);
     }
 
+    /// A member finds accounts the group's books never had, and records them.
+    ///
+    /// The situation this is for: a connection made when the account list came
+    /// from Plaid Link's browser metadata, which for an OAuth bank can omit most
+    /// of the accounts. The member's own machine asks the proxy — it holds the
+    /// API key, the group never does — and hands the answer here.
+    #[tokio::test]
+    async fn a_member_can_record_accounts_the_group_did_not_know_about() {
+        let base = serve().await;
+        let (item, _account) = connected(&base).await;
+        let http = reqwest::Client::new();
+
+        let found = serde_json::json!([
+            {
+                "plaid_account_id": "acc-business",
+                "name": "Business Checking",
+                "official_name": null,
+                "account_type": "depository",
+                "mask": "1187",
+            },
+            {
+                "plaid_account_id": "acc-card-2",
+                "name": "Employee Card 2",
+                "official_name": null,
+                "account_type": "credit",
+                "mask": "4402",
+            },
+        ]);
+
+        let r = http
+            .post(format!("{base}/sync/commands/refresh-plaid-accounts"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "item_id": item,
+                "plaid_accounts": found.clone(),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["recorded"], true, "{v}");
+
+        // Pressed again with the same answer: success, and the log does not move.
+        // Refresh is what somebody presses when they are unsure, so it gets
+        // pressed repeatedly and must not leave a trail of identical events.
+        let head = head_of(&base).await;
+        let again = http
+            .post(format!("{base}/sync/commands/refresh-plaid-accounts"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head,
+                "item_id": item,
+                "plaid_accounts": found,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), reqwest::StatusCode::OK);
+        let v: serde_json::Value = again.json().await.unwrap();
+        assert_eq!(v["recorded"], false, "a second identical refresh wrote: {v}");
+        assert_eq!(head_of(&base).await, head, "the shared log moved for nothing");
+    }
+
+    /// An empty list is refused rather than recorded.
+    ///
+    /// "The bank has nothing behind this login" is far more likely to be a fault
+    /// upstream than the truth, and recording it would say the connection had
+    /// been checked and found empty.
+    #[tokio::test]
+    async fn a_refresh_carrying_no_accounts_is_refused() {
+        let base = serve().await;
+        let (item, _account) = connected(&base).await;
+
+        let r = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/refresh-plaid-accounts"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "item_id": item,
+                "plaid_accounts": [],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
     /// A typo'd ledger account used to be accepted and then blow up inside the
     /// projector as a foreign-key failure — an internal error where the honest
     /// answer is "no such account".
@@ -472,11 +566,84 @@ async fn submit_map_account(
             )? {
                 PlaidStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
                 PlaidStep::Reject(e) => Ok(Verdict::Reject(e)),
+                // Unreachable for map/unmap: both decide, they never abstain.
+                PlaidStep::Nothing => unreachable!("mapping always appends or refuses"),
             },
             project,
         )
         .map_err(ApiError::store)?;
     outcome_to_response(outcome, ApiError::domain::<PlaidCommandError>)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RefreshPlaidAccountsRequest {
+    pub expected_head_seq: i64,
+    pub item_id: String,
+    /// Every account the bank reports behind this connection.
+    pub plaid_accounts: Vec<PlaidAccountInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RefreshPlaidAccountsResponse {
+    pub head: i64,
+    /// `false` when the group's books already agreed with the bank, in which case
+    /// `head` did not move. Success either way — a member pressing refresh on a
+    /// connection nobody has touched should not see a failure.
+    pub recorded: bool,
+}
+
+/// Record what a member's bank reports behind a shared connection.
+///
+/// The member's machine does the talking to the proxy — it holds the API key, and
+/// the group never does — so the account list arrives here already fetched. What
+/// the server keeps for itself is the decision about whether it is news: the
+/// same in-txn comparison the local command makes, under the write lock, so two
+/// members refreshing at once append one event rather than two.
+async fn submit_refresh_accounts(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<RefreshPlaidAccountsRequest>,
+) -> Result<Json<RefreshPlaidAccountsResponse>, ApiError> {
+    if req.plaid_accounts.is_empty() {
+        return Err(ApiError::bad_request(
+            "a refresh must carry the accounts the bank reported",
+        ));
+    }
+
+    let nothing = std::cell::Cell::new(false);
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            |tx| match build_refresh_accounts_in_txn(tx, &req.item_id, &req.plaid_accounts)? {
+                PlaidStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PlaidStep::Reject(e) => Ok(Verdict::Reject(e)),
+                PlaidStep::Nothing => {
+                    nothing.set(true);
+                    Ok(Verdict::Reject(PlaidCommandError::ItemNotFound(
+                        "nothing to record".to_string(),
+                    )))
+                }
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+
+    match outcome {
+        CheckedOutcome::Appended(stored) => Ok(Json(RefreshPlaidAccountsResponse {
+            head: stored.id,
+            recorded: true,
+        })),
+        CheckedOutcome::HeadMismatch { actual, .. } => Err(ApiError::conflict(actual)),
+        CheckedOutcome::Rejected(_) if nothing.get() => {
+            // The head the caller sent is still the head — nothing was appended.
+            Ok(Json(RefreshPlaidAccountsResponse {
+                head: req.expected_head_seq,
+                recorded: false,
+            }))
+        }
+        CheckedOutcome::Rejected(e) => Err(ApiError::domain(e)),
+    }
 }
 
 /// Unmap a bank account, validated server-side. A mapping that is not there is a
@@ -499,6 +666,8 @@ async fn submit_unmap_account(
             )? {
                 PlaidStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
                 PlaidStep::Reject(e) => Ok(Verdict::Reject(e)),
+                // Unreachable for map/unmap: both decide, they never abstain.
+                PlaidStep::Nothing => unreachable!("mapping always appends or refuses"),
             },
             project,
         )

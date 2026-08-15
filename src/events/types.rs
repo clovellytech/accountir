@@ -228,6 +228,26 @@ pub enum Event {
         institution_name: String,
         plaid_accounts: Vec<PlaidAccountInfo>,
     },
+    /// Accounts found behind a connection that were not known when it was made.
+    ///
+    /// A separate event rather than a second `PlaidItemConnected`, because that is
+    /// what happened: the connection is the same connection, and re-announcing it
+    /// would rewrite its institution name and its `proxy_item_id` from whatever
+    /// the refreshing client happened to hold.
+    ///
+    /// Carries the **whole** list the bank now reports, not a delta. The projector
+    /// upserts, so a list is idempotent where a delta is a thing that can be
+    /// applied twice; and a log of full lists can answer "what did we think was
+    /// behind this login in March", which a log of deltas can only reconstruct.
+    ///
+    /// Nothing is ever removed by this. An account the bank stops reporting keeps
+    /// its row and its mapping — a closed card's history is still the business's,
+    /// and dropping the mapping would strand the transactions already posted
+    /// through it.
+    PlaidAccountsRefreshed {
+        item_id: String,
+        plaid_accounts: Vec<PlaidAccountInfo>,
+    },
     PlaidItemDisconnected {
         item_id: String,
         reason: String,
@@ -370,6 +390,7 @@ impl Event {
             Event::CurrencyEnabled { .. } => "currency_enabled",
             Event::ExchangeRateRecorded { .. } => "exchange_rate_recorded",
             Event::PlaidItemConnected { .. } => "plaid_item_connected",
+            Event::PlaidAccountsRefreshed { .. } => "plaid_accounts_refreshed",
             Event::PlaidItemDisconnected { .. } => "plaid_item_disconnected",
             Event::PlaidAccountMapped { .. } => "plaid_account_mapped",
             Event::PlaidAccountUnmapped { .. } => "plaid_account_unmapped",
@@ -415,6 +436,7 @@ impl Event {
             Event::CurrencyEnabled { code, .. } => Some(code),
             Event::ExchangeRateRecorded { .. } => None,
             Event::PlaidItemConnected { item_id, .. } => Some(item_id),
+            Event::PlaidAccountsRefreshed { item_id, .. } => Some(item_id),
             Event::PlaidItemDisconnected { item_id, .. } => Some(item_id),
             Event::PlaidAccountMapped { item_id, .. } => Some(item_id),
             Event::PlaidAccountUnmapped { item_id, .. } => Some(item_id),

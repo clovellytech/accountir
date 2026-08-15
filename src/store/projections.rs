@@ -341,6 +341,43 @@ impl<'a> Projector<'a> {
                     )?;
                 }
             }
+            Event::PlaidAccountsRefreshed {
+                item_id,
+                plaid_accounts,
+            } => {
+                // Upsert, and deliberately no delete of rows this list omits.
+                // `local_account_id` lives on these rows: dropping one because the
+                // bank stopped reporting a closed card would unmap transactions
+                // already posted through it, and the mapping is not the bank's to
+                // decide. `INSERT OR REPLACE` would also blank it, so the columns
+                // the bank owns are updated by name and the mapping is left alone.
+                for acct in plaid_accounts {
+                    let updated = self.conn.execute(
+                        "UPDATE plaid_local_accounts SET name = ?3, account_type = ?4, mask = ?5
+                         WHERE item_id = ?1 AND plaid_account_id = ?2",
+                        params![
+                            item_id,
+                            acct.plaid_account_id,
+                            acct.name,
+                            acct.account_type,
+                            acct.mask
+                        ],
+                    )?;
+                    if updated == 0 {
+                        self.conn.execute(
+                            "INSERT INTO plaid_local_accounts (item_id, plaid_account_id, name, account_type, mask)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            params![
+                                item_id,
+                                acct.plaid_account_id,
+                                acct.name,
+                                acct.account_type,
+                                acct.mask
+                            ],
+                        )?;
+                    }
+                }
+            }
             Event::PlaidItemDisconnected { item_id, reason: _ } => {
                 self.conn.execute(
                     "UPDATE plaid_items SET status = 'disconnected' WHERE id = ?1",

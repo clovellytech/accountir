@@ -391,6 +391,9 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 plaid_accounts.len()
             )
         }
+        Event::PlaidAccountsRefreshed { plaid_accounts, .. } => {
+            format!("Refreshed connection accounts ({})", plaid_accounts.len())
+        }
         Event::PlaidItemDisconnected { item_id, reason } => {
             format!(
                 "Disconnected {} - {}",

@@ -37,6 +37,37 @@ pub struct PendingLink {
     pub institution_name: String,
     pub proxy_item_id: String,
     pub accounts: Vec<crate::events::types::PlaidAccountInfo>,
+    /// `"plaid"` when `accounts` is the Item's real list, `"link"` when the proxy
+    /// could not reach Plaid and fell back to what the browser reported — which
+    /// may be a subset. The desktop says so rather than presenting a possibly
+    /// short list as complete.
+    pub account_source: String,
+}
+
+/// The account list the proxy read back from Plaid, if it managed to.
+///
+/// `None` when the response carries no usable list at all — an older proxy, or a
+/// shape we do not recognise. The caller falls back to the browser's list, which
+/// is what this whole function exists to avoid depending on.
+fn plaid_accounts_from_proxy(body: &serde_json::Value) -> Option<Vec<crate::events::types::PlaidAccountInfo>> {
+    let accounts = body["accounts"].as_array()?;
+    Some(
+        accounts
+            .iter()
+            .filter_map(|a| {
+                Some(crate::events::types::PlaidAccountInfo {
+                    plaid_account_id: a["plaid_account_id"].as_str()?.to_string(),
+                    name: a["name"].as_str().unwrap_or_default().to_string(),
+                    official_name: a["official_name"].as_str().map(str::to_string),
+                    account_type: a["account_type"]
+                        .as_str()
+                        .unwrap_or("depository")
+                        .to_string(),
+                    mask: a["mask"].as_str().map(str::to_string),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Shared server state — the database may or may not be open.
@@ -664,6 +695,7 @@ pub async fn start_server_task() -> Option<ServerDb> {
         .route("/plaid/config", get(plaid_config))
         .route("/plaid/link-token", post(plaid_link_token))
         .route("/plaid/exchange-token", post(plaid_exchange_token))
+        .route("/plaid/refresh-accounts", post(plaid_refresh_accounts))
         .route("/plaid/sync", post(plaid_sync))
         .route("/plaid/balances", post(plaid_balances))
         .route("/plaid/staged", get(plaid_staged_list))
@@ -846,16 +878,23 @@ async fn plaid_exchange_token(
         .ok_or_else(|| proxy_error("Missing item_id".to_string()))?
         .to_string();
 
-    // No ledger attached means these are group-hosted books: the replica is
-    // deliberately kept off this server (see `attachable`), so there is nothing
-    // here to append to. Park the result for the desktop, which submits it to the
-    // group server under the member's own session.
+    // The proxy's list, not the browser's.
     //
-    // Checked before taking the write path rather than after failing it, so the
-    // browser gets a clean success instead of "No database open" at the end of an
-    // OAuth flow the user cannot repeat without re-authenticating at their bank.
-    if state.db.lock().unwrap().is_none() {
-        let accounts: Vec<crate::events::types::PlaidAccountInfo> = req
+    // `req.accounts` is Plaid Link's `onSuccess` metadata: what the *browser* was
+    // handed at the end of the flow. For an OAuth institution the account choice
+    // happens at the bank, and that metadata has been seen to carry a subset — a
+    // Chase login with a checking account and three employee cards arrived with
+    // two of the four, and the two it omitted then existed nowhere. The proxy now
+    // reads the Item's real account list from Plaid and returns it, so that is
+    // what goes into the ledger.
+    //
+    // Falls back to the browser's list only when the proxy could not verify one
+    // either (`account_source == "link"`), which it reports rather than hides.
+    let discovered = plaid_accounts_from_proxy(&body);
+    let account_source = body["account_source"].as_str().unwrap_or("link").to_string();
+    let plaid_accounts = match discovered {
+        Some(accounts) if !accounts.is_empty() => accounts,
+        _ => req
             .accounts
             .iter()
             .map(|a| crate::events::types::PlaidAccountInfo {
@@ -865,11 +904,23 @@ async fn plaid_exchange_token(
                 account_type: a.account_type.clone(),
                 mask: a.mask.clone(),
             })
-            .collect();
+            .collect(),
+    };
+
+    // No ledger attached means these are group-hosted books: the replica is
+    // deliberately kept off this server (see `attachable`), so there is nothing
+    // here to append to. Park the result for the desktop, which submits it to the
+    // group server under the member's own session.
+    //
+    // Checked before taking the write path rather than after failing it, so the
+    // browser gets a clean success instead of "No database open" at the end of an
+    // OAuth flow the user cannot repeat without re-authenticating at their bank.
+    if state.db.lock().unwrap().is_none() {
         *state.pending_link.lock().unwrap() = Some(PendingLink {
             institution_name: req.institution.name.clone(),
             proxy_item_id: proxy_item_id.clone(),
-            accounts,
+            accounts: plaid_accounts,
+            account_source: account_source.clone(),
         });
         // The id the ledger will use is minted by the group server when the
         // desktop submits, so there is none to report yet. The browser only needs
@@ -902,18 +953,6 @@ async fn plaid_exchange_token(
             error: "No database open".to_string(),
         }),
     ))?;
-
-    let plaid_accounts: Vec<crate::events::types::PlaidAccountInfo> = req
-        .accounts
-        .iter()
-        .map(|a| crate::events::types::PlaidAccountInfo {
-            plaid_account_id: a.id.clone(),
-            name: a.name.clone(),
-            official_name: a.official_name.clone(),
-            account_type: a.account_type.clone(),
-            mask: a.mask.clone(),
-        })
-        .collect();
 
     let item_id = uuid::Uuid::new_v4().to_string();
     let event = crate::events::types::Event::PlaidItemConnected {
@@ -969,6 +1008,143 @@ struct BalanceDiscrepancy {
     plaid_balance_cents: i64,
     ledger_balance_cents: i64,
     difference_cents: i64,
+}
+
+#[derive(Serialize)]
+struct PlaidRefreshAccountsResponse {
+    /// Every account the bank reports behind this connection.
+    accounts: Vec<crate::events::types::PlaidAccountInfo>,
+    /// How many of them the books had never seen.
+    added: usize,
+    /// Whether anything was written. `false` means the books already agreed.
+    recorded: bool,
+}
+
+/// Re-read a connection's accounts from the bank and record what is new.
+///
+/// The reason this exists: an account list captured when the connection was made
+/// goes stale in two ways. A connection made before discovery was authoritative
+/// is short of whatever Plaid Link's metadata omitted — which for an OAuth bank
+/// can be most of them — and an account opened at the bank afterwards never
+/// appears at all, because nothing was asking.
+///
+/// Re-linking is not the answer to either: it means re-authenticating at the bank
+/// and it resets the transaction cursor.
+///
+/// Books held by a group are refused here, as linking is, and for the same
+/// mechanical reason: this appends, and on a replica the event ids belong to the
+/// group's server. The desktop submits those through
+/// `/sync/commands/refresh-plaid-accounts` instead, having asked the proxy itself.
+async fn plaid_refresh_accounts(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<PlaidSyncRequest>,
+) -> Result<Json<PlaidRefreshAccountsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let plaid_cfg = get_plaid_config(&state)?;
+
+    let proxy_item_id = {
+        let guard = state.db.lock().unwrap();
+        let active = guard.as_ref().ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                success: false,
+                error: "No database open".to_string(),
+            }),
+        ))?;
+        active
+            .store
+            .connection()
+            .query_row(
+                "SELECT proxy_item_id FROM plaid_items WHERE id = ?1 AND status = 'active'",
+                [&req.item_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|_| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        success: false,
+                        error: "Item not found".to_string(),
+                    }),
+                )
+            })?
+            .ok_or((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    success: false,
+                    error: "This connection has no proxy handle, so these books \
+                            cannot refresh it themselves."
+                        .to_string(),
+                }),
+            ))?
+    };
+
+    let mut req_builder = state.http_client.post(format!(
+        "{}/plaid/items/{}/accounts/refresh",
+        plaid_cfg.proxy_url, proxy_item_id
+    ));
+    if let Some(ref key) = plaid_cfg.api_key {
+        req_builder = req_builder.bearer_auth(key);
+    }
+    let resp = req_builder
+        .send()
+        .await
+        .map_err(|e| proxy_error(format!("Failed to contact proxy: {}", e)))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(proxy_error(
+            "The bank-sync proxy does not support refreshing a connection's \
+             accounts yet. Nothing was changed."
+                .to_string(),
+        ));
+    }
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(proxy_error(format!("Proxy error: {}", text)));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| proxy_error(format!("Parse error: {}", e)))?;
+
+    let accounts = plaid_accounts_from_proxy(&body).unwrap_or_default();
+    if accounts.is_empty() {
+        return Err(proxy_error(
+            "The bank reported no accounts behind this connection. Nothing was \
+             changed — an empty answer is far more likely to be a fault than a \
+             bank with nothing in it."
+                .to_string(),
+        ));
+    }
+    let added = body["added"].as_u64().unwrap_or(0) as usize;
+
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            success: false,
+            error: "No database open".to_string(),
+        }),
+    ))?;
+    let recorded = crate::commands::plaid_commands::PlaidCommands::new(
+        &mut active.store,
+        "plaid-refresh".to_string(),
+    )
+    .refresh_accounts(&req.item_id, accounts.clone())
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("recording the refresh: {}", e),
+            }),
+        )
+    })?
+    .is_some();
+
+    Ok(Json(PlaidRefreshAccountsResponse {
+        accounts,
+        added,
+        recorded,
+    }))
 }
 
 async fn plaid_sync(
@@ -2691,6 +2867,7 @@ mod pending_link_tests {
                     institution_name: "Chase".into(),
                     proxy_item_id: "p-1".into(),
                     accounts: vec![],
+                    account_source: "plaid".into(),
                 })),
             }),
         };
@@ -2717,6 +2894,7 @@ mod pending_link_tests {
                     institution_name: "Abandoned".into(),
                     proxy_item_id: "p-x".into(),
                     accounts: vec![],
+                    account_source: "plaid".into(),
                 })),
             }),
         };

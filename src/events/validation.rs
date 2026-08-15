@@ -244,6 +244,21 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             }
             validate_non_empty(institution_name, "institution_name")?;
         }
+        Event::PlaidAccountsRefreshed {
+            item_id,
+            plaid_accounts,
+        } => {
+            validate_non_empty(item_id, "item_id")?;
+            // A refresh that found nothing is a no-op somebody has to reason
+            // about later; the caller knows it found nothing and should not
+            // append. An empty list here is a bug in that caller, not a state.
+            if plaid_accounts.is_empty() {
+                return Err(ValidationError::EmptyField("plaid_accounts".to_string()));
+            }
+            for acct in plaid_accounts {
+                validate_non_empty(&acct.plaid_account_id, "plaid_account_id")?;
+            }
+        }
         Event::PlaidItemDisconnected { item_id, reason } => {
             validate_non_empty(item_id, "item_id")?;
             validate_non_empty(reason, "reason")?;

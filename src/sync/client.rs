@@ -23,6 +23,7 @@ use super::commands::event_service::{
 };
 use super::commands::plaid::{
     ConnectPlaidItemRequest, ConnectPlaidItemResponse, MapPlaidAccountRequest,
+    RefreshPlaidAccountsRequest, RefreshPlaidAccountsResponse,
 };
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
 use crate::domain::{AccountType, PaymentTerms};
@@ -529,6 +530,68 @@ impl SyncClient {
                 reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
                 reqwest::StatusCode::NOT_FOUND => {
                     return Err(SyncClientError::ServerTooOld("connect a bank".to_string()))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Tell the group what the bank now reports behind a connection.
+    ///
+    /// The member's own machine has already asked the proxy — it holds the API
+    /// key — so this carries the answer rather than a request to go and find out.
+    /// The server decides whether it is news, under its write lock, which is what
+    /// makes two members refreshing at once append one event instead of two.
+    ///
+    /// Blind retry on `409` is safe here for the reason `submit_retrying`
+    /// requires: the payload is the bank's list and the ids in it, none of it
+    /// derived from a projection that a competing write could have moved.
+    pub async fn refresh_plaid_accounts(
+        &mut self,
+        item_id: impl Into<String>,
+        plaid_accounts: Vec<crate::events::types::PlaidAccountInfo>,
+    ) -> Result<RefreshPlaidAccountsResponse, SyncClientError> {
+        let item_id = item_id.into();
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = RefreshPlaidAccountsRequest {
+                expected_head_seq: self.head,
+                item_id: item_id.clone(),
+                plaid_accounts: plaid_accounts.clone(),
+            };
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/refresh-plaid-accounts"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let r: RefreshPlaidAccountsResponse = resp.json().await?;
+                    self.head = r.head;
+                    return Ok(r);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld(
+                        "refresh a connection's accounts".to_string(),
+                    ))
+                }
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                    let v: serde_json::Value = resp.json().await?;
+                    return Err(SyncClientError::Rejected(
+                        v["error"].as_str().unwrap_or("refused").to_string(),
+                    ));
                 }
                 s => {
                     let body = resp.text().await.unwrap_or_default();
