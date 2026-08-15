@@ -59,6 +59,22 @@ pub enum SyncClientError {
     Unexpected(u16, String),
 }
 
+/// What a chunked import did, including when it did not finish.
+///
+/// A large import is several appends, so "it failed" and "nothing happened" are
+/// different answers and this is the type that can tell them apart. Everything in
+/// `posted` and `skipped` is already in the ledger whatever `stopped_by` says.
+pub struct BatchOutcome {
+    /// The log head after the last chunk that landed.
+    pub head: i64,
+    pub posted: usize,
+    /// Indices are positions in the batch the caller passed, not in any chunk.
+    pub skipped: Vec<crate::sync::commands::entries::SkippedEntry>,
+    /// Set when a chunk failed and the run stopped there. The entries after it
+    /// were never sent, and are the caller's to retry.
+    pub stopped_by: Option<SyncClientError>,
+}
+
 /// A client for one group server, authenticated with a bearer token. Caches the
 /// last-known log head so submits carry the right `expected_head_seq`.
 pub struct SyncClient {
@@ -98,6 +114,13 @@ impl SyncClient {
     /// silently reset `head` to 0 and turn the next write into a guaranteed 409.
     pub fn set_token(&mut self, token: impl Into<String>) {
         self.token = token.into();
+    }
+
+    /// Where this client points. For tests that need to reach the same server by
+    /// hand.
+    #[cfg(test)]
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base
     }
 
     /// The last head this client knows about (advanced by every successful call).
@@ -278,17 +301,113 @@ impl SyncClient {
         Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
     }
 
-    /// Post many entries in one call — a reviewed bank import, typically.
+    /// How many entries go in one request.
     ///
-    /// Unlike every other command here this does not return a bare head: entries
-    /// that fail their fences are **skipped and reported**, not fatal. See
-    /// [`crate::sync::commands::entries`] for why an import wants that and a seed
-    /// does not.
+    /// Below the server's own cap, not at it. The server builds the whole batch in
+    /// memory and appends it in a single transaction, so the batch size is how
+    /// long one import holds the group's write lock — every other member is
+    /// waiting behind it. Smaller chunks also mean a failure part-way costs less
+    /// and progress is reportable.
+    const CHUNK: usize = 250;
+
+    /// Post many entries — a reviewed bank import, typically.
     ///
-    /// Retries on 409 like the others. Safe to retry because the batch is atomic
-    /// and every entry carries an idempotency `reference`: whatever landed before
-    /// the conflict is seen as a duplicate on the way back through and skipped.
+    /// Split into requests of [`CHUNK`] behind the caller's back, because a real
+    /// import is routinely larger than any single request should be: a first sync
+    /// of a year's bank history is thousands of transactions, and the alternative
+    /// on offer was "split it" to somebody looking at a list they would have to
+    /// tick one row at a time.
+    ///
+    /// Each chunk is its own append, so a large import is not atomic. That is the
+    /// honest trade and it is safe to make here: every entry carries its bank
+    /// transaction id as an idempotency `reference`, so re-running an import that
+    /// stopped half way skips what already landed rather than doubling it. What
+    /// would not be safe is the other direction — one transaction spanning
+    /// thousands of entries, holding the write lock for as long as it takes.
+    ///
+    /// Indices in [`PostEntriesResponse::skipped`] are remapped to positions in
+    /// the batch **the caller passed**, so the result is indistinguishable from a
+    /// single request that succeeded. Callers match those indices against their
+    /// own rows; chunk-local indices would silently mark the wrong ones.
+    ///
+    /// Entries that fail their fences are skipped and reported, not fatal. See
+    /// [`crate::sync::commands::entries`] for why an import wants that.
+    ///
+    /// [`CHUNK`]: SyncClient::CHUNK
     pub async fn post_entries(
+        &mut self,
+        entries: Vec<BatchEntry>,
+    ) -> Result<PostEntriesResponse, SyncClientError> {
+        let out = self.post_entries_reporting(entries, |_, _| {}).await;
+        match out.stopped_by {
+            // Callers of this simpler form have nowhere to put a partial result,
+            // so a failure is a failure. Retrying is safe — every entry carries an
+            // idempotency reference — and what landed is skipped on the way back
+            // through. Use `post_entries_reporting` where the partial matters.
+            Some(e) => Err(e),
+            None => Ok(PostEntriesResponse {
+                head: out.head,
+                posted: out.posted,
+                skipped: out.skipped,
+            }),
+        }
+    }
+
+    /// The same, reporting progress and surviving a failure part-way.
+    ///
+    /// Never returns `Err`. A chunk that fails stops the run and is reported in
+    /// [`BatchOutcome::stopped_by`], with everything the earlier chunks did
+    /// already accounted for — because it *is* already in the ledger, and throwing
+    /// that away is how a caller marks nothing as imported, retries, and gets its
+    /// rows back as "already exists" skips it will never resolve. The rows that
+    /// landed are the caller's to record before it retries the rest.
+    ///
+    /// `progress(done, total)` is called after each chunk. An import of a few
+    /// thousand entries takes long enough that silence reads as a hang.
+    pub async fn post_entries_reporting(
+        &mut self,
+        entries: Vec<BatchEntry>,
+        mut progress: impl FnMut(usize, usize),
+    ) -> BatchOutcome {
+        let total = entries.len();
+        let mut out = BatchOutcome {
+            head: self.head,
+            posted: 0,
+            skipped: Vec::new(),
+            stopped_by: None,
+        };
+
+        for (chunk_index, chunk) in entries.chunks(Self::CHUNK).enumerate() {
+            let offset = chunk_index * Self::CHUNK;
+            match self.post_one_batch(chunk.to_vec()).await {
+                Ok(one) => {
+                    out.head = one.head;
+                    out.posted += one.posted;
+                    // Back into the caller's numbering. A chunk-local index would
+                    // point at whichever of the caller's rows happened to sit
+                    // there, and the caller uses these to decide which of its rows
+                    // were imported.
+                    out.skipped.extend(one.skipped.into_iter().map(|mut s| {
+                        s.index += offset;
+                        s
+                    }));
+                    progress(out.posted + out.skipped.len(), total);
+                }
+                Err(e) => {
+                    out.stopped_by = Some(e);
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
+    /// One request's worth, with the 409 retry.
+    ///
+    /// Retries are safe because the batch is atomic and every entry carries an
+    /// idempotency `reference`: whatever landed before the conflict is seen as a
+    /// duplicate on the way back through and skipped.
+    async fn post_one_batch(
         &mut self,
         entries: Vec<BatchEntry>,
     ) -> Result<PostEntriesResponse, SyncClientError> {
@@ -341,6 +460,35 @@ impl SyncClient {
     ///
     /// [`post_entries`]: SyncClient::post_entries
     pub async fn reassign_lines(
+        &mut self,
+        assignments: Vec<LineAssignment>,
+    ) -> Result<ReassignLinesResponse, SyncClientError> {
+        // Chunked for the same reason `post_entries` is, and it is the same
+        // import: everything a bank feed brings in lands in Uncategorized, so
+        // filing a first import is a reassignment of however many transactions
+        // that import had. Skip indices are remapped to the caller's numbering —
+        // they are how it decides which lines it still has to file.
+        let mut combined = ReassignLinesResponse {
+            head: self.head,
+            moved: 0,
+            skipped: Vec::new(),
+        };
+        for (chunk_index, chunk) in assignments.chunks(Self::CHUNK).enumerate() {
+            let offset = chunk_index * Self::CHUNK;
+            let one = self.reassign_one_batch(chunk.to_vec()).await?;
+            combined.head = one.head;
+            combined.moved += one.moved;
+            combined
+                .skipped
+                .extend(one.skipped.into_iter().map(|mut s| {
+                    s.index += offset;
+                    s
+                }));
+        }
+        Ok(combined)
+    }
+
+    async fn reassign_one_batch(
         &mut self,
         assignments: Vec<LineAssignment>,
     ) -> Result<ReassignLinesResponse, SyncClientError> {

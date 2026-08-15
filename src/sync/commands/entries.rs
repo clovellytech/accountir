@@ -254,7 +254,7 @@ mod tests {
 
     const TOKEN: &str = "tok-1";
 
-    async fn serve(state: SyncState) -> String {
+    pub(super) async fn serve(state: SyncState) -> String {
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -262,7 +262,7 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn mk_account(store: &mut EventStore, num: &str, ty: AccountType) -> String {
+    pub(super) fn mk_account(store: &mut EventStore, num: &str, ty: AccountType) -> String {
         let stored = AccountCommands::new(store, "seed".to_string())
             .create_account(CreateAccountCommand {
                 account_type: ty,
@@ -585,5 +585,211 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(empty.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+}
+
+/// Importing more entries than one request may carry.
+///
+/// The server caps a batch to bound how long one append holds the group's write
+/// lock, which is right — but a first sync of a year's bank history is thousands
+/// of transactions, and the cap surfaced as "too many entries in one batch; split
+/// it" to somebody looking at a list they would have had to tick one row at a
+/// time. The client splits it instead.
+#[cfg(test)]
+mod chunked_import {
+    use super::tests::{mk_account, serve};
+    use super::*;
+    use crate::domain::AccountType;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+    use crate::sync::client::SyncClient;
+    use crate::sync::{PostEntryLine, SyncState};
+    use std::collections::HashMap;
+
+    const TOKEN: &str = "tok-import";
+
+    fn batch_entry(cash: &str, income: &str, reference: &str, amount: i64) -> BatchEntry {
+        BatchEntry {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            memo: format!("Import {reference}"),
+            lines: vec![
+                PostEntryLine {
+                    account_id: cash.to_string(),
+                    amount,
+                    currency: "USD".to_string(),
+                    memo: None,
+                },
+                PostEntryLine {
+                    account_id: income.to_string(),
+                    amount: -amount,
+                    currency: "USD".to_string(),
+                    memo: None,
+                },
+            ],
+            reference: Some(reference.to_string()),
+        }
+    }
+
+    async fn fixture(entries: usize) -> (SyncClient, Vec<BatchEntry>) {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let cash = mk_account(&mut store, "1000", AccountType::Asset);
+        let income = mk_account(&mut store, "4000", AccountType::Revenue);
+        let base = serve(SyncState::new(
+            store,
+            HashMap::from([(TOKEN.to_string(), "member".to_string())]),
+        ))
+        .await;
+
+        let batch = (0..entries)
+            .map(|i| batch_entry(&cash, &income, &format!("feed:{i}"), 100 + i as i64))
+            .collect();
+        (SyncClient::new(base, TOKEN), batch)
+    }
+
+    /// Two thousand transactions, which is what a real first import looked like.
+    #[tokio::test]
+    async fn an_import_larger_than_one_request_still_posts_all_of_it() {
+        let (mut client, batch) = fixture(2_000).await;
+
+        let mut seen: Vec<(usize, usize)> = Vec::new();
+        let out = client
+            .post_entries_reporting(batch, |done, total| seen.push((done, total)))
+            .await;
+
+        assert!(out.stopped_by.is_none(), "the import did not finish");
+        assert_eq!(out.posted, 2_000, "skipped: {:?}", out.skipped);
+        assert!(out.skipped.is_empty());
+        assert_eq!(
+            seen.last(),
+            Some(&(2_000, 2_000)),
+            "progress never reached the end: {seen:?}"
+        );
+        assert!(seen.len() > 1, "an import this size reported no progress");
+    }
+
+    /// The half of chunking that fails silently if it is wrong.
+    ///
+    /// A skip's index is how the caller decides which of *its* rows was not
+    /// imported. Report a chunk-local index and the caller marks whichever row
+    /// happened to sit at that position — so a bank transaction that never posted
+    /// is recorded as imported, and one that did posts again on the next run.
+    #[tokio::test]
+    async fn a_skip_reports_its_position_in_the_batch_the_caller_passed() {
+        let (mut client, mut batch) = fixture(600).await;
+        // Duplicate references, chosen to land in the second and third chunks:
+        // the server skips the later of the pair.
+        batch[300].reference = batch[7].reference.clone();
+        batch[550].reference = batch[9].reference.clone();
+
+        let out = client.post_entries_reporting(batch, |_, _| {}).await;
+
+        assert!(out.stopped_by.is_none());
+        assert_eq!(out.posted, 598);
+        let mut skipped: Vec<usize> = out.skipped.iter().map(|s| s.index).collect();
+        skipped.sort();
+        assert_eq!(
+            skipped,
+            vec![300, 550],
+            "indices were reported per chunk, not per batch — the caller would \
+             mark the wrong rows as imported"
+        );
+    }
+
+    /// Filing an import is the same size as the import.
+    ///
+    /// Everything a bank feed brings in posts to Uncategorized, so the reassign
+    /// that follows carries one line per transaction — the same thousands, and
+    /// the same cap. Fixing one and leaving the other would move the wall by one
+    /// step.
+    #[tokio::test]
+    async fn filing_a_large_import_is_chunked_too() {
+        let (mut client, batch) = fixture(1_500).await;
+        let out = client.post_entries_reporting(batch, |_, _| {}).await;
+        assert!(out.stopped_by.is_none());
+        assert_eq!(out.posted, 1_500);
+
+        // Every line that landed in the revenue account, moved somewhere else.
+        let base = client.base_url().to_string();
+        let http = reqwest::Client::new();
+        let mut assignments = Vec::new();
+        let mut target = String::new();
+        // Paged, because the events endpoint caps a page — the same bound this
+        // whole test is about, seen from the read side.
+        let mut since = 0i64;
+        loop {
+            let page: serde_json::Value = http
+                .get(format!("{base}/sync/events?since={since}&limit=500"))
+                .bearer_auth(TOKEN)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let events = page["events"].as_array().unwrap().clone();
+            if events.is_empty() {
+                break;
+            }
+            for e in &events {
+                since = e["seq"].as_i64().unwrap();
+                let p = &e["event"];
+                if p["type"] == "account_created" && p["account_number"] == "4000" {
+                    target = p["account_id"].as_str().unwrap().to_string();
+                }
+                if p["type"] == "journal_entry_posted" {
+                    let line = &p["lines"][0];
+                    assignments.push(crate::sync::commands::entry_ops::LineAssignment {
+                        entry_id: p["entry_id"].as_str().unwrap().to_string(),
+                        line_id: line["line_id"].as_str().unwrap().to_string(),
+                        new_account_id: target.clone(),
+                    });
+                }
+            }
+        }
+        assert_eq!(
+            assignments.len(),
+            1_500,
+            "the fixture did not post what it said"
+        );
+
+        let r = client
+            .reassign_lines(assignments)
+            .await
+            .expect("filing 1500 lines must not be refused as one oversized batch");
+        assert_eq!(r.moved + r.skipped.len(), 1_500, "skipped: {:?}", r.skipped);
+    }
+
+    /// The server's own cap is still the cap.
+    ///
+    /// The client splits below it; nothing here relaxes what the server accepts,
+    /// because the reason for the cap — one append, one write lock, held for as
+    /// long as the batch takes — is unchanged.
+    #[tokio::test]
+    async fn the_server_still_refuses_an_oversized_single_request() {
+        let (client, batch) = fixture(1).await;
+        let base = client.base_url().to_string();
+        let entries: Vec<serde_json::Value> = (0..MAX_BATCH + 1)
+            .map(|i| {
+                serde_json::json!({
+                    "date": "2026-03-04",
+                    "memo": format!("e{i}"),
+                    "lines": batch[0].lines.iter().map(|l| serde_json::json!({
+                        "account_id": l.account_id,
+                        "amount": l.amount,
+                        "currency": l.currency,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let r = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/post-entries"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({"expected_head_seq": 2, "entries": entries}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 }
