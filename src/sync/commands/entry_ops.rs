@@ -35,6 +35,7 @@ pub fn router() -> Router<SyncState> {
         .route("/sync/commands/void-entry", post(submit_void_entry))
         .route("/sync/commands/unvoid-entry", post(submit_unvoid_entry))
         .route("/sync/commands/reassign-lines", post(submit_reassign_lines))
+        .route("/sync/commands/void-entries", post(submit_void_entries))
 }
 
 /// Void a journal entry over the wire. Serde-reusable DTO (the client half can
@@ -127,14 +128,14 @@ mod tests {
     use crate::sync::router;
     use std::collections::HashMap;
 
-    const TOKEN: &str = "tok-1";
+    pub(super) const TOKEN: &str = "tok-1";
     const ACTOR: &str = "user-1";
 
-    fn tokens() -> HashMap<String, String> {
+    pub(super) fn tokens() -> HashMap<String, String> {
         HashMap::from([(TOKEN.to_string(), ACTOR.to_string())])
     }
 
-    async fn serve(state: SyncState) -> String {
+    pub(super) async fn serve(state: SyncState) -> String {
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -149,7 +150,7 @@ mod tests {
     }
 
     /// Seed an account directly (local handler), returning its id.
-    fn mk_account(store: &mut EventStore, num: &str, ty: AccountType) -> String {
+    pub(super) fn mk_account(store: &mut EventStore, num: &str, ty: AccountType) -> String {
         let stored = AccountCommands::new(store, "seed".to_string())
             .create_account(CreateAccountCommand {
                 account_type: ty,
@@ -168,7 +169,7 @@ mod tests {
 
     /// Seed two accounts + a balanced posted entry (local handlers). Returns the
     /// posted entry's id.
-    fn seed_posted_entry(store: &mut EventStore) -> String {
+    pub(super) fn seed_posted_entry(store: &mut EventStore) -> String {
         let cash = mk_account(store, "1000", AccountType::Asset);
         let expense = mk_account(store, "5000", AccountType::Expense);
         let stored = EntryCommands::new(store, "seed".to_string())
@@ -764,5 +765,308 @@ mod reassign_tests {
             .status(),
             reqwest::StatusCode::CONFLICT
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Voiding many entries
+// ---------------------------------------------------------------------------
+
+/// Void many entries in one call.
+///
+/// # Why this exists
+///
+/// The desktop's sync engine holds one pending write at a time, so voiding a
+/// selection of entries on hosted books was refused outright: "each void has to be
+/// sent and confirmed on its own. Select one entry and void it, then the next."
+/// Correct about the engine and useless to anyone who had just imported a month of
+/// transactions and wanted a bad batch gone.
+///
+/// Firing N single voids instead would have been worse than the refusal — a
+/// partial failure halfway through leaves a selection nobody can reconstruct, some
+/// voided and some not, with no record of which.
+///
+/// # Why it is not all-or-nothing
+///
+/// Same reasoning as [`ReassignLinesRequest`]: the rejections are individually
+/// meaningful and expected. An entry somebody else voided a second ago, or one
+/// inside a period that has since closed, should not cost the other thirty-nine
+/// their void. Every entry that passes its fences is voided, in ONE transaction;
+/// every entry that does not is reported by index.
+#[derive(Serialize, Deserialize)]
+pub struct VoidEntriesRequest {
+    pub expected_head_seq: i64,
+    pub entry_ids: Vec<String>,
+    /// One reason for the batch. Voiding a selection is one decision, and asking
+    /// for a reason per entry would produce forty copies of the same sentence.
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SkippedVoid {
+    /// Index into the submitted `entry_ids`, so the caller can leave exactly that
+    /// row selected and clear the rest.
+    pub index: usize,
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct VoidEntriesResponse {
+    pub head: i64,
+    pub voided: usize,
+    pub skipped: Vec<SkippedVoid>,
+}
+
+/// The cap on one batch, matching its neighbours: a bound rather than a limit
+/// anyone should hit, so an unbounded request cannot hold the group's write lock
+/// for as long as the caller likes. The client splits below it.
+const MAX_VOIDS: usize = 1000;
+
+async fn submit_void_entries(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<VoidEntriesRequest>,
+) -> Result<Json<VoidEntriesResponse>, ApiError> {
+    if req.entry_ids.is_empty() {
+        return Err(ApiError::bad_request("no entries to void"));
+    }
+    if req.entry_ids.len() > MAX_VOIDS {
+        return Err(ApiError::bad_request(
+            "too many entries in one batch; split it",
+        ));
+    }
+    if req.reason.trim().is_empty() {
+        // Required for the same purpose a single void's is: six months on, the
+        // only person who knew why has left.
+        return Err(ApiError::bad_request("a reason is required"));
+    }
+
+    let expected = req.expected_head_seq;
+    let entry_ids = req.entry_ids;
+    let reason = req.reason;
+    let skips: std::cell::RefCell<Vec<SkippedVoid>> = std::cell::RefCell::new(Vec::new());
+
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            expected,
+            |tx| {
+                let mut events: Vec<Event> = Vec::new();
+                // Entries already voided by an earlier position in THIS batch.
+                //
+                // The fence reads the projection, and nothing in this batch is
+                // projected until the whole closure has run — so the same id twice
+                // would pass `check_entry_not_voided_in_txn` twice and append two
+                // voids for one entry. A selection can contain a duplicate for
+                // ordinary reasons, so this is refused here rather than left to be
+                // puzzled over in the log.
+                //
+                // The same blind spot cost a 368-entry import its entire batch on
+                // `post-entries`.
+                let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                for (index, entry_id) in entry_ids.iter().enumerate() {
+                    if !seen.insert(entry_id.as_str()) {
+                        skips.borrow_mut().push(SkippedVoid {
+                            index,
+                            reason: "This entry was already voided earlier in the same request"
+                                .to_string(),
+                        });
+                        continue;
+                    }
+                    let cmd = VoidEntryCommand {
+                        entry_id: entry_id.clone(),
+                        reason: reason.clone(),
+                    };
+                    match build_void_entry_in_txn(tx, &cmd)? {
+                        PostEntryStep::Append(event) => events.push(event),
+                        PostEntryStep::Reject(e) => skips.borrow_mut().push(SkippedVoid {
+                            index,
+                            reason: e.to_string(),
+                        }),
+                    }
+                }
+                Ok(Verdict::<Vec<_>, EntryCommandError>::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                ))
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+
+    // Derived from the append, not from `entry_ids.len() - skipped.len()`. They
+    // should agree, and taking it from what was actually appended is what makes it
+    // true rather than hoped — see the same note on `reassign-lines`.
+    use crate::store::event_store::CheckedOutcome;
+    let (head, voided) = match outcome {
+        CheckedOutcome::Appended(stored) => {
+            (stored.last().map_or(expected, |e| e.id), stored.len())
+        }
+        CheckedOutcome::HeadMismatch { actual, .. } => return Err(ApiError::conflict(actual)),
+        CheckedOutcome::Rejected(e) => return Err(ApiError::domain(e)),
+    };
+
+    Ok(Json(VoidEntriesResponse {
+        head,
+        voided,
+        skipped: skips.into_inner(),
+    }))
+}
+
+/// Voiding a selection on group-hosted books.
+///
+/// Refused outright before this — "each void has to be sent and confirmed on its
+/// own" — because the desktop's sync engine holds one pending write and firing N
+/// single voids would leave a partial failure nobody could reconstruct. Correct
+/// about the engine, and useless to somebody looking at a bad import they wanted
+/// gone.
+#[cfg(test)]
+mod batch_void {
+    use super::tests::{mk_account, seed_posted_entry, serve, tokens, TOKEN};
+    use super::*;
+    use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
+    use crate::domain::AccountType;
+    use crate::events::types::Event;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+    use crate::sync::client::SyncClient;
+
+    /// `count` posted entries, plus the accounts they use.
+    fn seed_many(store: &mut EventStore, count: usize) -> Vec<String> {
+        let cash = mk_account(store, "1000", AccountType::Asset);
+        let expense = mk_account(store, "5000", AccountType::Expense);
+        (0..count)
+            .map(|i| {
+                let stored = EntryCommands::new(store, "seed".to_string())
+                    .post_entry(PostEntryCommand {
+                        date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                        memo: format!("seed {i}"),
+                        lines: vec![
+                            EntryLine::debit(&expense, 100 + i as i64, "USD"),
+                            EntryLine::credit(&cash, 100 + i as i64, "USD"),
+                        ],
+                        reference: Some(format!("seed-{i}")),
+                        source: None,
+                    })
+                    .unwrap();
+                match stored.event {
+                    Event::JournalEntryPosted { entry_id, .. } => entry_id,
+                    _ => unreachable!(),
+                }
+            })
+            .collect()
+    }
+
+    /// The thing the desktop could not do.
+    #[tokio::test]
+    async fn a_selection_is_voided_in_one_call() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let ids = seed_many(&mut store, 40);
+        let head = store.latest_id().unwrap().unwrap_or(0);
+        let base = serve(SyncState::new(store, tokens())).await;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+
+        let r = client
+            .void_entries(ids.clone(), "bulk void from UI")
+            .await
+            .expect("voiding a selection must not be refused");
+
+        assert_eq!(r.voided, 40, "skipped: {:?}", r.skipped);
+        assert!(r.skipped.is_empty());
+        assert_eq!(r.head, head + 40, "one event per void");
+    }
+
+    /// One entry already voided does not cost the rest theirs.
+    ///
+    /// The reason this is a batch of skips rather than a batch that fails: a
+    /// colleague voiding one row a second before you press the button is ordinary,
+    /// and it must not undo the other thirty-nine.
+    #[tokio::test]
+    async fn an_entry_that_cannot_be_voided_is_skipped_by_index() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let ids = seed_many(&mut store, 5);
+        // Somebody got to the third one first.
+        EntryCommands::new(&mut store, "colleague".to_string())
+            .void_entry(crate::commands::entry_commands::VoidEntryCommand {
+                entry_id: ids[2].clone(),
+                reason: "already dealt with".to_string(),
+            })
+            .unwrap();
+        let head = store.latest_id().unwrap().unwrap_or(0);
+        let base = serve(SyncState::new(store, tokens())).await;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+
+        let r = client.void_entries(ids, "bulk void").await.unwrap();
+
+        assert_eq!(r.voided, 4);
+        assert_eq!(r.skipped.len(), 1, "{:?}", r.skipped);
+        assert_eq!(
+            r.skipped[0].index, 2,
+            "the caller uses this to leave exactly that row selected: {:?}",
+            r.skipped
+        );
+    }
+
+    /// The same id twice in one selection.
+    ///
+    /// The fence reads the projection, which is not updated until the whole
+    /// closure has run — so without an in-batch guard both positions pass and the
+    /// log gets two voids for one entry. This is the failure that cost a 368-entry
+    /// import everything on `post-entries`, applied before it can happen again.
+    #[tokio::test]
+    async fn the_same_entry_twice_in_one_selection_is_voided_once() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let ids = seed_many(&mut store, 3);
+        let head = store.latest_id().unwrap().unwrap_or(0);
+        let base = serve(SyncState::new(store, tokens())).await;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+
+        let mut with_dup = ids.clone();
+        with_dup.push(ids[1].clone());
+
+        let r = client.void_entries(with_dup, "bulk void").await.unwrap();
+
+        assert_eq!(r.voided, 3, "an entry was voided twice: {:?}", r.skipped);
+        assert_eq!(r.skipped.len(), 1);
+        assert_eq!(r.skipped[0].index, 3);
+    }
+
+    /// A selection larger than one request still goes through.
+    #[tokio::test]
+    async fn a_selection_larger_than_one_batch_is_split() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let ids = seed_many(&mut store, 1_200);
+        let head = store.latest_id().unwrap().unwrap_or(0);
+        let base = serve(SyncState::new(store, tokens())).await;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+
+        let r = client.void_entries(ids, "bulk void").await.unwrap();
+        assert_eq!(r.voided, 1_200, "skipped: {:?}", r.skipped);
+    }
+
+    /// A reason is required, as it is for a single void.
+    #[tokio::test]
+    async fn a_batch_void_without_a_reason_is_refused() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let entry_id = seed_posted_entry(&mut store);
+        let head = store.latest_id().unwrap().unwrap_or(0);
+        let base = serve(SyncState::new(store, tokens())).await;
+
+        let r = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/void-entries"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head,
+                "entry_ids": [entry_id],
+                "reason": "  ",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 }

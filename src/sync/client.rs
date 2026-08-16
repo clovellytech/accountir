@@ -15,7 +15,7 @@ use super::commands::bill_ops::{
 use super::commands::entries::{BatchEntry, PostEntriesRequest, PostEntriesResponse};
 use super::commands::entry_ops::{
     LineAssignment, ReassignLinesRequest, ReassignLinesResponse, UnvoidEntryRequest,
-    VoidEntryRequest,
+    VoidEntriesRequest, VoidEntriesResponse, VoidEntryRequest,
 };
 use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
@@ -965,6 +965,87 @@ impl SyncClient {
             reason: reason.clone(),
         })
         .await
+    }
+
+    /// Void many entries in one call.
+    ///
+    /// Chunked like `post_entries`, and for the same reason: the server bounds a
+    /// batch so one append cannot hold the group's write lock indefinitely, and a
+    /// selection can be larger than that bound. Skip indices are remapped to the
+    /// caller's numbering — they are how it decides which entries are still
+    /// selected.
+    ///
+    /// Entries that fail their fences are skipped and reported, not fatal. An
+    /// entry somebody else voided a second ago should not cost the rest theirs.
+    pub async fn void_entries(
+        &mut self,
+        entry_ids: Vec<String>,
+        reason: impl Into<String>,
+    ) -> Result<VoidEntriesResponse, SyncClientError> {
+        let reason = reason.into();
+        let mut combined = VoidEntriesResponse {
+            head: self.head,
+            voided: 0,
+            skipped: Vec::new(),
+        };
+        for (chunk_index, chunk) in entry_ids.chunks(Self::CHUNK).enumerate() {
+            let offset = chunk_index * Self::CHUNK;
+            let one = self.void_one_batch(chunk.to_vec(), reason.clone()).await?;
+            combined.head = one.head;
+            combined.voided += one.voided;
+            combined
+                .skipped
+                .extend(one.skipped.into_iter().map(|mut s| {
+                    s.index += offset;
+                    s
+                }));
+        }
+        Ok(combined)
+    }
+
+    async fn void_one_batch(
+        &mut self,
+        entry_ids: Vec<String>,
+        reason: String,
+    ) -> Result<VoidEntriesResponse, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = VoidEntriesRequest {
+                expected_head_seq: self.head,
+                entry_ids: entry_ids.clone(),
+                reason: reason.clone(),
+            };
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/void-entries"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let r: VoidEntriesResponse = resp.json().await?;
+                    self.head = r.head;
+                    return Ok(r);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld(
+                        "void several entries at once".to_string(),
+                    ))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
     }
 
     /// Unvoid a journal entry. The server re-runs the reference-reclamation guard
