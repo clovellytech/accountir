@@ -824,7 +824,7 @@ pub fn plan_goods_received(
         issue_date: date,
         terms,
         memo: Some(memo),
-        expense_account_id: inventory_account,
+        debit_account_id: inventory_account,
         ap_account_id,
         // Carry the source event's reference so a re-sync is idempotent.
         reference: data.reference.clone(),

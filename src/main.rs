@@ -1293,7 +1293,7 @@ fn handle_bill_command(store: &mut EventStore, cmd: BillCliCommands) -> Result<(
                 issue_date,
                 terms: payment_terms.clone(),
                 memo,
-                expense_account_id: expense_account,
+                debit_account_id: expense_account,
                 ap_account_id: ap_account,
                 reference: None,
             })?;

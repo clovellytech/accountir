@@ -1095,7 +1095,7 @@ impl SyncClient {
         issue_date: NaiveDate,
         terms: PaymentTerms,
         memo: Option<String>,
-        expense_account_id: String,
+        debit_account_id: String,
         ap_account_id: String,
         reference: Option<String>,
     ) -> Result<i64, SyncClientError> {
@@ -1107,7 +1107,7 @@ impl SyncClient {
             issue_date,
             terms: terms.clone(),
             memo: memo.clone(),
-            expense_account_id: expense_account_id.clone(),
+            debit_account_id: debit_account_id.clone(),
             ap_account_id: ap_account_id.clone(),
             reference: reference.clone(),
         })

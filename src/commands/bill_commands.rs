@@ -47,7 +47,16 @@ pub struct ReceiveBillCommand {
     pub issue_date: NaiveDate,
     pub terms: PaymentTerms,
     pub memo: Option<String>,
-    pub expense_account_id: String,
+    /// The debit side of the bill: what was received.
+    ///
+    /// **Not necessarily an expense.** A bill for inventory, equipment or a
+    /// prepaid service debits an asset, and the ledger has always allowed it —
+    /// the only fences are that the account exists, is active, and the period is
+    /// open. It was called `expense_account_id` for a while and the desktop's
+    /// picker filtered to expense accounts *because of the name*, so a shop could
+    /// not enter a stock purchase at all. The wire keeps the old spelling; the
+    /// code should not repeat the suggestion.
+    pub debit_account_id: String,
     pub ap_account_id: String,
     /// Idempotency/reference key stored on the journal entry. When `None`, a
     /// fresh `BILL:<uuid>` is used. Ingest flows pass the source event's
@@ -124,7 +133,7 @@ pub(crate) fn build_receive_bill_in_txn(
     }
 
     // Journal-entry fences for the bill entry we're about to emit.
-    let account_ids = [cmd.expense_account_id.as_str(), cmd.ap_account_id.as_str()];
+    let account_ids = [cmd.debit_account_id.as_str(), cmd.ap_account_id.as_str()];
     if let Some(e) = check_entry_invariants_in_txn(tx, &account_ids, cmd.issue_date)? {
         return Ok(BillStep::Reject(BillCommandError::from(e)));
     }
@@ -142,11 +151,13 @@ pub(crate) fn build_receive_bill_in_txn(
     let lines = vec![
         JournalLineData {
             line_id: format!("{}-line-1", entry_id),
-            account_id: cmd.expense_account_id.clone(),
+            account_id: cmd.debit_account_id.clone(),
             amount: cmd.amount,
             currency: cmd.currency.clone(),
             exchange_rate: None,
-            memo: Some(format!("Expense: {}", cmd.vendor)),
+            // Neutral: this line is an expense on most bills and an asset on
+            // a stock purchase, and the memo is read by people.
+            memo: Some(format!("Bill: {}", cmd.vendor)),
         },
         JournalLineData {
             line_id: format!("{}-line-2", entry_id),
@@ -515,7 +526,7 @@ mod tests {
                 issue_date: NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
                 terms: PaymentTerms::Net { days: 30 },
                 memo: None,
-                expense_account_id: inv,
+                debit_account_id: inv,
                 ap_account_id: ap,
                 reference: Some("Bugbear pos:evt-1".to_string()),
             })
@@ -544,7 +555,7 @@ mod tests {
                 issue_date: NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
                 terms: PaymentTerms::Net { days: 30 },
                 memo: None,
-                expense_account_id: expense,
+                debit_account_id: expense,
                 ap_account_id: ap,
                 reference: None,
             })
@@ -599,7 +610,7 @@ mod tests {
                 issue_date: NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
                 terms: PaymentTerms::Net { days: 30 },
                 memo: None,
-                expense_account_id: expense.clone(),
+                debit_account_id: expense.clone(),
                 ap_account_id: ap,
                 reference: None,
             })
@@ -634,7 +645,7 @@ mod tests {
                 issue_date: NaiveDate::from_ymd_opt(2026, 7, 3).unwrap(),
                 terms: PaymentTerms::Net { days: 30 },
                 memo: None,
-                expense_account_id: expense,
+                debit_account_id: expense,
                 ap_account_id: ap.clone(),
                 reference: None,
             })

@@ -329,7 +329,7 @@ mod tests {
                 issue_date: date,
                 terms: PaymentTerms::Net { days: 30 },
                 memo: None,
-                expense_account_id: expense,
+                debit_account_id: expense,
                 ap_account_id: ap.clone(),
                 reference: None,
             })

@@ -67,7 +67,17 @@ pub struct ReceiveBillRequest {
     pub terms: PaymentTerms,
     #[serde(default)]
     pub memo: Option<String>,
-    pub expense_account_id: String,
+    /// The debit side: what the bill was for. An expense, or an asset such as
+    /// inventory — see [`ReceiveBillCommand::debit_account_id`].
+    ///
+    /// Still `expense_account_id` on the wire. Renaming it would mean a desktop
+    /// and an instance disagreeing about a field name for however long it takes
+    /// every group to upgrade, which is a real outage to buy a better spelling.
+    ///
+    /// [`ReceiveBillCommand::debit_account_id`]:
+    /// crate::commands::bill_commands::ReceiveBillCommand::debit_account_id
+    #[serde(rename = "expense_account_id")]
+    pub debit_account_id: String,
     pub ap_account_id: String,
     #[serde(default)]
     pub reference: Option<String>,
@@ -90,7 +100,7 @@ async fn submit_receive_bill(
         issue_date: req.issue_date,
         terms: req.terms,
         memo: req.memo,
-        expense_account_id: req.expense_account_id,
+        debit_account_id: req.debit_account_id,
         ap_account_id: req.ap_account_id,
         reference: req.reference,
     };
@@ -185,14 +195,14 @@ mod tests {
     use crate::sync::router;
     use std::collections::HashMap;
 
-    const TOKEN: &str = "tok-1";
+    pub(super) const TOKEN: &str = "tok-1";
     const ACTOR: &str = "user-1";
 
-    fn tokens() -> HashMap<String, String> {
+    pub(super) fn tokens() -> HashMap<String, String> {
         HashMap::from([(TOKEN.to_string(), ACTOR.to_string())])
     }
 
-    async fn serve(state: SyncState) -> String {
+    pub(super) async fn serve(state: SyncState) -> String {
         let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -202,7 +212,7 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn mk_account(store: &mut EventStore, num: &str, ty: AccountType) -> String {
+    pub(super) fn mk_account(store: &mut EventStore, num: &str, ty: AccountType) -> String {
         let stored = AccountCommands::new(store, "seed".to_string())
             .create_account(CreateAccountCommand {
                 account_type: ty,
@@ -432,5 +442,78 @@ mod tests {
             .await
             .expect("issue-invoice");
         assert_eq!(after_invoice, head + 4);
+    }
+}
+
+/// The debit side of a bill is not always an expense.
+#[cfg(test)]
+mod bill_debit_side {
+    use super::tests::{mk_account, serve, tokens, TOKEN};
+    use super::*;
+    use crate::domain::AccountType;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+
+    /// A stock purchase: the money owed is a payable, and what arrived is an
+    /// asset.
+    ///
+    /// The ledger has always allowed this — the only fences on either account are
+    /// that it exists, is active, and the period is open. What stopped it was the
+    /// desktop filtering its picker to expense accounts, which it did because the
+    /// field was called `expense_account_id`. A shop could not enter a bill for
+    /// inventory at all.
+    #[tokio::test]
+    async fn a_bill_can_debit_an_asset_such_as_inventory() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let inventory = mk_account(&mut store, "1300", AccountType::Asset);
+        let ap = mk_account(&mut store, "2000", AccountType::Liability);
+        let head = store.latest_id().unwrap().unwrap_or(0);
+        let base = serve(SyncState::new(store, tokens())).await;
+
+        let r = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/receive-bill"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head,
+                "vendor": "Quality Bicycle Products",
+                "amount": 125_000,
+                "currency": "USD",
+                "issue_date": "2026-07-03",
+                "terms": { "type": "net", "days": 30 },
+                "expense_account_id": inventory,
+                "ap_account_id": ap,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            r.status().is_success(),
+            "a bill for inventory was refused: HTTP {}",
+            r.status()
+        );
+    }
+
+    /// The wire field is still spelled `expense_account_id`.
+    ///
+    /// Only the *code* was renamed. A desktop sending a new spelling to an
+    /// instance that has not been upgraded — or the reverse — is an outage lasting
+    /// as long as the slowest group takes to update, bought for a better field
+    /// name. Asserted so a future rename has to be deliberate.
+    #[test]
+    fn the_wire_still_says_expense_account_id() {
+        let body = serde_json::json!({
+            "expected_head_seq": 0,
+            "vendor": "V",
+            "amount": 1,
+            "currency": "USD",
+            "issue_date": "2026-07-03",
+            "terms": { "type": "net", "days": 30 },
+            "expense_account_id": "acct-1",
+            "ap_account_id": "acct-2",
+        });
+        let parsed: ReceiveBillRequest =
+            serde_json::from_value(body).expect("the server must still accept the old spelling");
+        assert_eq!(parsed.debit_account_id, "acct-1");
     }
 }

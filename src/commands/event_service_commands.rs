@@ -1156,7 +1156,7 @@ mod planning_tests {
             Ok(PlannedIngest::Bill(cmd)) => {
                 assert_eq!(cmd.amount, 3000);
                 assert_eq!(cmd.reference.as_deref(), Some("Bugbear:e-4"));
-                assert_eq!(cmd.expense_account_id, "inv");
+                assert_eq!(cmd.debit_account_id, "inv");
                 assert_eq!(cmd.ap_account_id, "ap");
             }
             _ => panic!("goods_received must plan as a bill"),

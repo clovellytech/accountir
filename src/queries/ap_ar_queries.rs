@@ -392,7 +392,7 @@ mod vendor_payable_tests {
                 issue_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
                 terms: PaymentTerms::Net { days: 30 },
                 memo: None,
-                expense_account_id: expense,
+                debit_account_id: expense,
                 ap_account_id: ap.clone(),
                 reference: None,
             })
@@ -474,7 +474,7 @@ mod vendor_payable_tests {
                 issue_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
                 terms: PaymentTerms::Net { days: 30 },
                 memo: None,
-                expense_account_id: expense,
+                debit_account_id: expense,
                 ap_account_id: ap.clone(),
                 reference: None,
             })
@@ -563,7 +563,7 @@ mod vendor_payable_tests {
                     issue_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
                     terms: PaymentTerms::Net { days: 30 },
                     memo: None,
-                    expense_account_id: expense.clone(),
+                    debit_account_id: expense.clone(),
                     ap_account_id: ap_id.to_string(),
                     reference: Some(format!("{vendor}-{amount}")),
                 })
