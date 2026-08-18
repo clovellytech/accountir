@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use crate::commands::event_service_commands::ServiceDisplay;
+use crate::domain::ReportingFrequency;
 use crate::tui::theme::Theme;
 
 pub enum ServiceAction {
@@ -16,6 +17,12 @@ pub enum ServiceAction {
     Sync(String),
     Review(String),
     Remove(String),
+    /// Step this service to the next reporting frequency.
+    ///
+    /// A cycle rather than a menu because the list is four long and fixed, and a
+    /// modal to pick one of four would be more keystrokes than pressing `f`
+    /// until the right one shows.
+    CycleReporting(String, ReportingFrequency),
 }
 
 pub struct ServicesView {
@@ -63,6 +70,13 @@ impl ServicesView {
                     ServiceAction::None
                 }
             }
+            KeyCode::Char('f') => {
+                if let Some(svc) = self.services.get(self.selected) {
+                    ServiceAction::CycleReporting(svc.id.clone(), next_frequency(svc.reporting))
+                } else {
+                    ServiceAction::None
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(svc) = self.services.get(self.selected) {
                     ServiceAction::Remove(svc.id.clone())
@@ -89,7 +103,7 @@ impl ServicesView {
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Event Services (a: add, s: sync, r: review staged, d: remove) ")
+            .title(" Event Services (a: add, s: sync, r: review staged, f: how sales post, d: remove) ")
             .title_style(Style::default().fg(theme.accent));
 
         if self.services.is_empty() {
@@ -110,6 +124,7 @@ impl ServicesView {
         let header = Row::new(vec![
             Cell::from("Name"),
             Cell::from("URL"),
+            Cell::from("Sales posted as"),
             Cell::from("Status"),
             Cell::from("Last Synced"),
             Cell::from("Events"),
@@ -134,14 +149,12 @@ impl ServicesView {
                     Style::default().fg(theme.fg)
                 };
 
-                let last_synced = svc
-                    .last_synced_at
-                    .as_deref()
-                    .unwrap_or("never");
+                let last_synced = svc.last_synced_at.as_deref().unwrap_or("never");
 
                 Row::new(vec![
                     Cell::from(svc.name.clone()),
                     Cell::from(svc.root_url.clone()),
+                    Cell::from(svc.reporting.label()),
                     Cell::from(svc.status.clone()),
                     Cell::from(last_synced.to_string()),
                     Cell::from(svc.events_processed.to_string()),
@@ -153,16 +166,15 @@ impl ServicesView {
 
         let widths = [
             Constraint::Length(20),
-            Constraint::Min(30),
+            Constraint::Min(24),
+            Constraint::Length(16),
             Constraint::Length(10),
             Constraint::Length(20),
             Constraint::Length(8),
             Constraint::Length(8),
         ];
 
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(block);
+        let table = Table::new(rows, widths).header(header).block(block);
 
         frame.render_widget(table, area);
 
@@ -180,5 +192,35 @@ impl ServicesView {
             )));
             frame.render_widget(status, status_area);
         }
+    }
+}
+
+/// The next frequency in the cycle, wrapping.
+///
+/// Ordered as an escalation — every sale, then daily, weekly, monthly — so that
+/// holding `f` walks from most detail to least, which is the direction somebody
+/// is going when they press it.
+fn next_frequency(current: ReportingFrequency) -> ReportingFrequency {
+    let all = ReportingFrequency::ALL;
+    let at = all.iter().position(|f| *f == current).unwrap_or(0);
+    all[(at + 1) % all.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cycle_visits_every_frequency_and_returns() {
+        let mut seen = Vec::new();
+        let mut f = ReportingFrequency::PerEvent;
+        for _ in 0..ReportingFrequency::ALL.len() {
+            seen.push(f);
+            f = next_frequency(f);
+        }
+        assert_eq!(f, ReportingFrequency::PerEvent, "the cycle must wrap");
+        assert_eq!(seen.len(), ReportingFrequency::ALL.len());
+        let unique: std::collections::HashSet<_> = seen.iter().collect();
+        assert_eq!(unique.len(), seen.len(), "a frequency was visited twice");
     }
 }

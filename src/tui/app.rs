@@ -40,6 +40,7 @@ use super::views::{
     account_form::{AccountForm, AccountFormResult},
     accounts::AccountsView,
     bank_import::{BankImportModal, BankImportResult, ParsedTransaction, PendingImport},
+    business_picker::{BusinessPickerView, PickerAction},
     csv_import::{CsvImportModal, ImportConfig},
     dashboard::DashboardView,
     entry_detail::{EntryDetail, EntryDetailModal, EntryLineDetail},
@@ -60,9 +61,8 @@ use super::views::{
     services::{ServiceAction, ServicesView},
     settings::{SettingsModal, SettingsResult},
     staged_events::{ServiceStagedAction, StagedEventsView},
-    business_picker::{BusinessPickerView, PickerAction},
-    sync_results::SyncResultsModal,
     subscriptions::SubscriptionsModal,
+    sync_results::SyncResultsModal,
     welcome::{should_show_welcome, WelcomeView},
 };
 
@@ -587,9 +587,8 @@ impl App {
     }
 
     fn load_service_staged(&mut self, conn: &rusqlite::Connection, service_id: &str) {
-        let events =
-            crate::commands::event_service_commands::load_staged_events(conn, service_id)
-                .unwrap_or_default();
+        let events = crate::commands::event_service_commands::load_staged_events(conn, service_id)
+            .unwrap_or_default();
         self.staged_events_view.set_events(events);
     }
 
@@ -2221,12 +2220,10 @@ pub fn run_app(server_db: Option<crate::server::ServerDb>) -> io::Result<TuiResu
                     ) {
                         Ok(_) => {
                             app.load_event_services(s.connection());
-                            app.status_message =
-                                Some(format!("Registered service '{}'", name));
+                            app.status_message = Some(format!("Registered service '{}'", name));
                         }
                         Err(e) => {
-                            app.status_message =
-                                Some(format!("Failed to register service: {}", e));
+                            app.status_message = Some(format!("Failed to register service: {}", e));
                         }
                     }
                 }
@@ -2920,12 +2917,10 @@ pub fn run_app_with_database(
                 ) {
                     Ok(_) => {
                         app.load_event_services(store.connection());
-                        app.status_message =
-                            Some(format!("Registered service '{}'", name));
+                        app.status_message = Some(format!("Registered service '{}'", name));
                     }
                     Err(e) => {
-                        app.status_message =
-                            Some(format!("Failed to register service: {}", e));
+                        app.status_message = Some(format!("Failed to register service: {}", e));
                     }
                 }
             }
@@ -3341,6 +3336,28 @@ fn handle_service_action(app: &mut App, store: &mut EventStore, action: ServiceA
                 app.staged_events_view.show(service_id, svc_name);
             }
         }
+        ServiceAction::CycleReporting(service_id, frequency) => {
+            // From today, so days already in the books keep the shape they were
+            // posted with. Re-totalling them would post the same money again
+            // under a key nothing recognises as a duplicate.
+            let effective_from = chrono::Local::now().date_naive();
+            match crate::commands::event_service_commands::set_reporting(
+                store,
+                "tui-user",
+                &service_id,
+                frequency,
+                effective_from,
+            ) {
+                Ok(_) => {
+                    app.load_event_services(store.connection());
+                    app.status_message =
+                        Some(format!("Sales now posted as: {}", frequency.label()));
+                }
+                Err(e) => {
+                    app.status_message = Some(format!("Couldn't change reporting: {}", e));
+                }
+            }
+        }
         ServiceAction::Remove(service_id) => {
             match crate::commands::event_service_commands::remove_service(
                 store,
@@ -3388,16 +3405,21 @@ fn handle_service_action(app: &mut App, store: &mut EventStore, action: ServiceA
             app.status_message = Some(format!("Syncing '{}'...", svc_name));
 
             // Fetch events on a background thread (reqwest::blocking can't run on tokio runtime)
-            let fetch_result: Result<(Vec<crate::commands::event_service_commands::RemoteEvent>, Option<String>), String> =
-                std::thread::spawn(move || {
-                    crate::commands::event_service_commands::fetch_all_remote_events(
-                        &root_url,
-                        &api_key,
-                        cursor.as_deref(),
-                    )
-                })
-                .join()
-                .unwrap_or_else(|_| Err("Sync thread panicked".to_string()));
+            let fetch_result: Result<
+                (
+                    Vec<crate::commands::event_service_commands::RemoteEvent>,
+                    Option<String>,
+                ),
+                String,
+            > = std::thread::spawn(move || {
+                crate::commands::event_service_commands::fetch_all_remote_events(
+                    &root_url,
+                    &api_key,
+                    cursor.as_deref(),
+                )
+            })
+            .join()
+            .unwrap_or_else(|_| Err("Sync thread panicked".to_string()));
 
             match fetch_result {
                 Ok((events, new_cursor)) => {
@@ -3465,8 +3487,7 @@ fn handle_service_staged_action(
                         Some("Event imported successfully".to_string());
                 }
                 Err(e) => {
-                    app.staged_events_view.status_message =
-                        Some(format!("Import failed: {}", e));
+                    app.staged_events_view.status_message = Some(format!("Import failed: {}", e));
                 }
             }
             app.load_service_staged(store.connection(), &service_id);
@@ -3543,9 +3564,7 @@ fn handle_service_staged_action(
                     return;
                 }
                 let accounts = app.accounts.accounts.clone();
-                app.staged_events_view
-                    .mapping_editor
-                    .open(keys, accounts);
+                app.staged_events_view.mapping_editor.open(keys, accounts);
             }
         }
         ServiceStagedAction::SaveMapping { key, account_id } => {
@@ -4169,11 +4188,9 @@ fn ensure_company(store: &mut EventStore, db_path: &std::path::Path) -> Option<S
 fn read_company_name(store: &EventStore, db_path: &std::path::Path) -> String {
     store
         .connection()
-        .query_row(
-            "SELECT name FROM company WHERE id = 'default'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
+        .query_row("SELECT name FROM company WHERE id = 'default'", [], |row| {
+            row.get::<_, String>(0)
+        })
         .unwrap_or_else(|_| {
             db_path
                 .file_stem()
