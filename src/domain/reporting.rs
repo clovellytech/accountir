@@ -98,6 +98,13 @@ impl ReportingFrequency {
     }
 }
 
+/// Shown in a picker, so it reads as a choice rather than as a wire value.
+impl std::fmt::Display for ReportingFrequency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 fn last_day_of_month(date: NaiveDate) -> NaiveDate {
     let (y, m) = (date.year(), date.month());
     let first_of_next = if m == 12 {

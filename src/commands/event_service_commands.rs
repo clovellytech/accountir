@@ -91,13 +91,17 @@ pub struct ServiceDisplay {
     pub last_synced_at: Option<String>,
     pub events_processed: u32,
     pub entries_created: u32,
+    /// How this service's sales reach the books, and from when.
+    pub reporting: ReportingFrequency,
+    pub reporting_from: Option<NaiveDate>,
 }
 
 // --- Queries ---
 
 pub fn list_services(conn: &Connection) -> Result<Vec<ServiceDisplay>, EventServiceError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, root_url, status, last_synced_at, events_processed, entries_created
+        "SELECT id, name, root_url, status, last_synced_at, events_processed, entries_created,
+                reporting_frequency, reporting_from
          FROM event_services WHERE status = 'active' ORDER BY name",
     )?;
 
@@ -111,6 +115,10 @@ pub fn list_services(conn: &Connection) -> Result<Vec<ServiceDisplay>, EventServ
                 last_synced_at: row.get(4)?,
                 events_processed: row.get::<_, i64>(5)? as u32,
                 entries_created: row.get::<_, i64>(6)? as u32,
+                reporting: ReportingFrequency::parse(&row.get::<_, String>(7)?).unwrap_or_default(),
+                reporting_from: row
+                    .get::<_, Option<String>>(8)?
+                    .and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
