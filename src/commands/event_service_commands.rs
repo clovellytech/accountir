@@ -4,7 +4,7 @@ use crate::commands::ingest_commands::{
     self as ingest_commands, IngestError, IngestGoodsReceivedData, IngestInventoryAdjustmentData,
     IngestPurchaseOrderData, IngestRefundData, IngestSaleData,
 };
-use crate::domain::{Period, ReportingFrequency};
+use crate::domain::{rollup_reference, Period, ReportingFrequency};
 use crate::events::types::{Event, EventEnvelope, JournalEntrySource, StoredEvent};
 use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::{ProjectionStore, Projector};
@@ -428,6 +428,21 @@ pub fn process_remote_events(
     let mut errors: u32 = 0;
     let events_processed = events.len() as u32;
     let mut event_results: Vec<SyncEventResult> = Vec::new();
+
+    // A service reporting by period takes a different path entirely: the batch
+    // becomes one entry per closed period, and the cursor stops short of any
+    // period still running so those events are fetched again once it closes.
+    let (frequency, effective_from) = reporting_of(store.connection(), service_id)?;
+    if frequency != ReportingFrequency::PerEvent {
+        return post_rollups(
+            store,
+            service_id,
+            service_name,
+            frequency,
+            effective_from,
+            events,
+        );
+    }
 
     for remote_event in &events {
         let event_id = remote_event.id.clone();
@@ -1750,4 +1765,466 @@ mod rollup_tests {
         };
         assert_eq!(ids(&a), ids(&b));
     }
+}
+
+/// What one sync of a service should post, and how far its cursor may move.
+#[derive(Debug, Default)]
+pub struct ServiceSyncPlan {
+    /// Journal entries, oldest first — rollups for closed periods and individual
+    /// entries for everything the rollup does not absorb.
+    pub entries: Vec<PostEntryCommand>,
+    /// Bills, which are never rolled up.
+    pub bills: Vec<ReceiveBillCommand>,
+    /// The cursor to record: the id of the last event actually consumed.
+    ///
+    /// `None` when nothing was consumed, which leaves the cursor exactly where
+    /// it was so the same events arrive again.
+    pub cursor: Option<String>,
+    /// Events left for a later sync because their period is still running.
+    pub held: usize,
+    /// Events that could not be planned, with why.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Decide what a fetched batch posts.
+///
+/// # Why the cursor may stop short
+///
+/// A period still running must not be totalled — the figure would change with
+/// the next sale, and every one after it would cost a correcting entry. But the
+/// events are already in hand, and the feed's cursor is a **prefix** marker
+/// (`since=<last event id>`), so the only way to see them again is not to
+/// acknowledge them. So the plan consumes a prefix and stops at the first event
+/// whose period has not closed; tomorrow's sync fetches from there and the
+/// period, now closed, posts in one piece.
+///
+/// That is also why the stop is at the first such event rather than skipping past
+/// it: a cursor that jumped over an event would never bring it back, and a day's
+/// sales would be missing with nothing to say so.
+///
+/// # Why `effective_from` matters here
+///
+/// Sales dated before the frequency took effect keep the shape they were posted
+/// with — individually. Otherwise switching a service to daily would re-total
+/// history that is already in the books under per-sale references, and every one
+/// of those days would post a second time.
+pub fn plan_service_sync(
+    conn: &Connection,
+    service_name: &str,
+    frequency: ReportingFrequency,
+    effective_from: Option<NaiveDate>,
+    today: NaiveDate,
+    events: &[RemoteEvent],
+) -> ServiceSyncPlan {
+    let mut plan = ServiceSyncPlan::default();
+
+    // Which events are absorbed by a rollup, in the order they arrived.
+    let rolled_up: Vec<&RemoteEvent> = events
+        .iter()
+        .filter(|e| rolls_up(frequency, effective_from, e))
+        .collect();
+
+    // Where the prefix has to stop: the first event whose period is still open.
+    let stop_at = events.iter().position(|e| {
+        rolls_up(frequency, effective_from, e)
+            && event_date(e)
+                .and_then(|d| frequency.period_of(d))
+                .map(|p| !p.is_closed_on(today))
+                .unwrap_or(false)
+    });
+    let consumed = stop_at.unwrap_or(events.len());
+    plan.held = events.len() - consumed;
+
+    // Everything the rollup does not absorb still posts one event at a time.
+    for event in &events[..consumed] {
+        if rolls_up(frequency, effective_from, event) {
+            continue;
+        }
+        match plan_remote_event(conn, service_name, event) {
+            Ok(PlannedIngest::Entry(cmd)) => plan.entries.push(*cmd),
+            Ok(PlannedIngest::Bill(cmd)) => plan.bills.push(*cmd),
+            Ok(PlannedIngest::Nothing { .. }) => {}
+            Err(e) => plan.failed.push((event.id.clone(), e.to_string())),
+        }
+    }
+
+    // One entry per closed period.
+    let absorbed: Vec<RemoteEvent> = rolled_up
+        .into_iter()
+        .take_while(|e| stop_at.is_none() || events.iter().position(|x| x.id == e.id) < stop_at)
+        .cloned()
+        .collect();
+    for (period, group) in group_by_period(frequency, absorbed) {
+        let reference = rollup_reference(service_name, &period);
+        match plan_sales_rollup(conn, service_name, &period, &group, reference) {
+            Ok(Some(cmd)) => plan.entries.push(cmd),
+            Ok(None) => {}
+            Err(e) => plan.failed.push((period.label(), e.to_string())),
+        }
+    }
+
+    // Oldest first, so a run that stops half way leaves the books in date order.
+    plan.entries.sort_by_key(|c| c.date);
+    plan.cursor = events.get(consumed.saturating_sub(1)).and_then(|e| {
+        if consumed == 0 {
+            None
+        } else {
+            Some(e.id.clone())
+        }
+    });
+    plan
+}
+
+/// Whether this event is absorbed into a period total rather than posted alone.
+fn rolls_up(
+    frequency: ReportingFrequency,
+    effective_from: Option<NaiveDate>,
+    event: &RemoteEvent,
+) -> bool {
+    if frequency == ReportingFrequency::PerEvent || !is_rollup_event(&event.event_type) {
+        return false;
+    }
+    match (event_date(event), effective_from) {
+        // Dated before the frequency took effect: it belongs to the era of
+        // per-sale entries and may already be in the books as one.
+        (Some(date), Some(from)) => date >= from,
+        (Some(_), None) => true,
+        // Undatable events cannot be put in a period at all.
+        (None, _) => false,
+    }
+}
+
+/// What a sync posts, and how far it may acknowledge.
+#[cfg(test)]
+mod sync_plan_tests {
+    use super::planning_tests::{books, remote};
+    use super::*;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn sale_on(id: &str, date: &str) -> RemoteEvent {
+        remote(
+            id,
+            "sale",
+            serde_json::json!({
+                "date": date,
+                "payment_method": "cash",
+                "items": [{"name": "Tube", "qty": 1, "unit_price_cents": 800, "unit_cost_cents": 300}],
+            }),
+        )
+    }
+
+    /// Two closed days become two entries, and the cursor moves to the end.
+    #[test]
+    fn closed_days_post_one_entry_each() {
+        let store = books();
+        let events = vec![
+            sale_on("e-1", "2026-08-16"),
+            sale_on("e-2", "2026-08-16"),
+            sale_on("e-3", "2026-08-17"),
+        ];
+        let plan = plan_service_sync(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            None,
+            day(2026, 8, 19),
+            &events,
+        );
+
+        assert_eq!(plan.entries.len(), 2, "one per day: {:?}", plan.entries);
+        assert_eq!(plan.held, 0);
+        assert_eq!(
+            plan.cursor.as_deref(),
+            Some("e-3"),
+            "acknowledge everything"
+        );
+        assert_eq!(plan.entries[0].date, day(2026, 8, 16));
+        assert_eq!(plan.entries[1].date, day(2026, 8, 17));
+    }
+
+    /// **The property that keeps a day from being lost.**
+    ///
+    /// Today's sales must not post — the total would change with the next one —
+    /// but the feed's cursor is a prefix marker, so the only way to see them
+    /// again is not to acknowledge them. The cursor therefore stops at the last
+    /// event of the last closed period, and tomorrow's sync starts there.
+    ///
+    /// Get this wrong by acknowledging everything and today's sales are never
+    /// fetched again: a day of revenue missing, with nothing in the books to say
+    /// so.
+    #[test]
+    fn an_open_period_holds_the_cursor_back() {
+        let store = books();
+        let today = day(2026, 8, 18);
+        let events = vec![
+            sale_on("e-1", "2026-08-16"),
+            sale_on("e-2", "2026-08-17"),
+            sale_on("e-3", "2026-08-18"), // today — still running
+            sale_on("e-4", "2026-08-18"),
+        ];
+        let plan = plan_service_sync(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            None,
+            today,
+            &events,
+        );
+
+        // The 16th and the 17th have both ended and settled a day; the 18th is
+        // still running.
+        assert_eq!(plan.entries.len(), 2, "{:?}", plan.entries);
+        assert_eq!(plan.entries[0].date, day(2026, 8, 16));
+        assert_eq!(plan.entries[1].date, day(2026, 8, 17));
+        assert_eq!(plan.held, 2, "today's two sales are held");
+        assert_eq!(
+            plan.cursor.as_deref(),
+            Some("e-2"),
+            "the cursor must stop before the open period, or today is lost"
+        );
+    }
+
+    /// Nothing closed yet means nothing posts and the cursor does not move.
+    #[test]
+    fn a_batch_entirely_inside_an_open_period_acknowledges_nothing() {
+        let store = books();
+        let events = vec![sale_on("e-1", "2026-08-18"), sale_on("e-2", "2026-08-18")];
+        let plan = plan_service_sync(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            None,
+            day(2026, 8, 18),
+            &events,
+        );
+
+        assert!(plan.entries.is_empty());
+        assert_eq!(plan.held, 2);
+        assert_eq!(
+            plan.cursor, None,
+            "acknowledging here would drop both sales for good"
+        );
+    }
+
+    /// Sales from before the switch keep posting one at a time.
+    ///
+    /// They may already be in the books as individual entries under per-sale
+    /// references. Re-totalling them would post the same money a second time
+    /// under a key nothing recognises as a duplicate.
+    #[test]
+    fn sales_before_the_cut_over_are_not_re_totalled() {
+        let store = books();
+        let events = vec![
+            sale_on("e-1", "2026-08-15"), // before
+            sale_on("e-2", "2026-08-17"), // after
+        ];
+        let plan = plan_service_sync(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            Some(day(2026, 8, 16)),
+            day(2026, 8, 19),
+            &events,
+        );
+
+        assert_eq!(plan.entries.len(), 2, "{:?}", plan.entries);
+        // The pre-cut-over sale keeps its own per-event reference; the later one
+        // is a rollup.
+        let refs: Vec<String> = plan
+            .entries
+            .iter()
+            .map(|e| e.reference.clone().unwrap_or_default())
+            .collect();
+        assert!(
+            refs.iter().any(|r| r == "Bugbear:e-1"),
+            "the old sale lost its per-event reference: {refs:?}"
+        );
+        assert!(
+            refs.iter().any(|r| r.contains("rollup:daily:2026-08-17")),
+            "the new sale was not rolled up: {refs:?}"
+        );
+    }
+
+    /// A bill passes straight through, whatever the frequency.
+    #[test]
+    fn a_goods_receipt_still_posts_on_its_own() {
+        let store = books();
+        let events = vec![
+            sale_on("e-1", "2026-08-16"),
+            remote(
+                "b-1",
+                "goods_received",
+                serde_json::json!({
+                    "date": "2026-08-16",
+                    "vendor": "Quality Bicycle Products",
+                    "items": [{"name": "Tube", "qty": 10, "unit_cost_cents": 300}],
+                }),
+            ),
+        ];
+        let plan = plan_service_sync(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            None,
+            day(2026, 8, 19),
+            &events,
+        );
+
+        assert_eq!(plan.bills.len(), 1, "the bill must stay a bill");
+        assert_eq!(plan.entries.len(), 1, "and the sale is still totalled");
+    }
+
+    /// `per_event` is exactly what it always was.
+    #[test]
+    fn per_event_posts_every_sale_as_before() {
+        let store = books();
+        let events = vec![sale_on("e-1", "2026-08-18"), sale_on("e-2", "2026-08-18")];
+        let plan = plan_service_sync(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::PerEvent,
+            None,
+            day(2026, 8, 18),
+            &events,
+        );
+
+        assert_eq!(plan.entries.len(), 2, "one entry per sale");
+        assert_eq!(plan.held, 0, "nothing is ever held back per-event");
+        assert_eq!(plan.cursor.as_deref(), Some("e-2"));
+    }
+}
+
+/// Post a period-reporting service's batch.
+///
+/// The cursor is written from the plan, not from the fetch: acknowledging past a
+/// period that has not closed would mean never seeing those events again, and a
+/// day of sales would simply be missing.
+fn post_rollups(
+    store: &mut EventStore,
+    service_id: &str,
+    service_name: &str,
+    frequency: ReportingFrequency,
+    effective_from: Option<NaiveDate>,
+    events: Vec<RemoteEvent>,
+) -> Result<SyncResult, EventServiceError> {
+    let events_processed = events.len() as u32;
+    let plan = plan_service_sync(
+        store.connection(),
+        service_name,
+        frequency,
+        effective_from,
+        chrono::Local::now().date_naive(),
+        &events,
+    );
+
+    let mut entries_created = 0u32;
+    let mut errors = plan.failed.len() as u32;
+    let mut event_results: Vec<SyncEventResult> = plan
+        .failed
+        .iter()
+        .map(|(id, message)| SyncEventResult {
+            event_id: id.clone(),
+            event_type: "rollup".to_string(),
+            status: SyncEventStatus::Error {
+                message: message.clone(),
+            },
+        })
+        .collect();
+
+    for cmd in plan.entries {
+        let reference = cmd.reference.clone().unwrap_or_default();
+        match crate::commands::entry_commands::EntryCommands::new(
+            store,
+            "event-service-sync".to_string(),
+        )
+        .post_entry(cmd)
+        {
+            Ok(stored) => {
+                entries_created += 1;
+                event_results.push(SyncEventResult {
+                    event_id: reference,
+                    event_type: "rollup".to_string(),
+                    status: SyncEventStatus::Created {
+                        entry_id: stored.event.entity_id().unwrap_or_default().to_string(),
+                    },
+                });
+            }
+            Err(e) => {
+                // A period already posted comes back as a duplicate reference,
+                // which is the idempotency working rather than a failure — it is
+                // how a re-run of the same batch stays a no-op.
+                let message = e.to_string();
+                if message.to_lowercase().contains("reference") {
+                    event_results.push(SyncEventResult {
+                        event_id: reference,
+                        event_type: "rollup".to_string(),
+                        status: SyncEventStatus::Skipped {
+                            reason: "This period is already posted".to_string(),
+                        },
+                    });
+                } else {
+                    errors += 1;
+                    event_results.push(SyncEventResult {
+                        event_id: reference,
+                        event_type: "rollup".to_string(),
+                        status: SyncEventStatus::Error { message },
+                    });
+                }
+            }
+        }
+    }
+
+    for bill in plan.bills {
+        match crate::commands::bill_commands::BillCommands::new(
+            store,
+            "event-service-sync".to_string(),
+        )
+        .receive_bill(bill)
+        {
+            Ok(_) => entries_created += 1,
+            Err(e) => {
+                let message = e.to_string();
+                if !message.to_lowercase().contains("duplicate") {
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    // Only when nothing failed, and only as far as the plan consumed.
+    if errors == 0 {
+        if let Some(ref cursor) = plan.cursor {
+            store.connection().execute(
+                "UPDATE event_services SET cursor = ?1 WHERE id = ?2",
+                params![cursor, service_id],
+            )?;
+        }
+    }
+
+    let sync_event = Event::EventServiceSynced {
+        service_id: service_id.to_string(),
+        events_processed,
+        entries_created,
+        errors,
+    };
+    let stored = store
+        .append(EventEnvelope::new(
+            sync_event,
+            "event-service-sync".to_string(),
+        ))
+        .map_err(|e| EventServiceError::StoreError(e.to_string()))?;
+    store
+        .apply_projection(&stored)
+        .map_err(|e| EventServiceError::StoreError(e.to_string()))?;
+
+    Ok(SyncResult {
+        events_processed,
+        entries_created,
+        errors,
+        new_cursor: plan.cursor,
+        event_results,
+    })
 }
