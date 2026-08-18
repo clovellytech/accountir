@@ -2236,3 +2236,383 @@ fn post_rollups(
         event_results,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Rolling up what is already posted
+// ---------------------------------------------------------------------------
+
+/// What one period's existing entries add up to, while they are being gathered.
+#[derive(Default)]
+struct PeriodHistory {
+    entry_ids: Vec<String>,
+    /// Keyed by (account, currency), summed as the ledger holds them.
+    totals: BTreeMap<(String, String), i64>,
+}
+
+/// One period's worth of history, and what replacing it would do.
+#[derive(Debug, Clone)]
+pub struct HistoryRollup {
+    pub period: Period,
+    /// The individual entries this would void.
+    pub entry_ids: Vec<String>,
+    /// The single entry that would replace them.
+    pub replacement: PostEntryCommand,
+}
+
+/// Plan replacing a service's individual entries with period totals.
+///
+/// # Where the numbers come from
+///
+/// The posted entries themselves, summed by account — **not** re-fetched from the
+/// service. Two reasons, and the second is the important one. The feed may no
+/// longer serve events that old; and summing what is actually in the books makes
+/// the replacement equal to what it replaces *by construction*, so the account
+/// balances cannot move. Re-planning from source events would re-derive them
+/// through today's account mappings, and a mapping changed since would silently
+/// restate a year of history.
+///
+/// # What it does not do
+///
+/// It plans. Nothing here voids or posts, so the caller can show the user exactly
+/// what would happen — how many entries, over which periods, to what totals —
+/// before any of it is written. Voiding hundreds of entries is not something to
+/// discover after the fact.
+///
+/// Voided entries are skipped: they are already not in the balances, and voiding
+/// them again would be refused anyway.
+pub fn plan_history_rollup(
+    conn: &Connection,
+    service_name: &str,
+    frequency: ReportingFrequency,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Result<Vec<HistoryRollup>, EventServiceError> {
+    if frequency == ReportingFrequency::PerEvent {
+        return Ok(Vec::new());
+    }
+
+    // This service's per-event entries in the range. The `:rollup:` exclusion
+    // keeps a period that has already been totalled from being folded into
+    // another one — which would double it.
+    let like = format!("{service_name}:%");
+    let mut stmt = conn.prepare(
+        "SELECT je.id, je.date, jl.account_id, jl.amount, jl.currency
+           FROM journal_entries je
+           JOIN journal_lines jl ON jl.entry_id = je.id
+          WHERE je.reference LIKE ?1
+            AND je.reference NOT LIKE ?2
+            AND je.is_void = 0
+            AND je.date >= ?3 AND je.date <= ?4
+          ORDER BY je.date, je.id",
+    )?;
+    let rows = stmt.query_map(
+        params![
+            like,
+            format!("{service_name}:rollup:%"),
+            start.to_string(),
+            end.to_string()
+        ],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        },
+    )?;
+
+    let mut by_period: BTreeMap<Period, PeriodHistory> = BTreeMap::new();
+    for row in rows {
+        let (entry_id, date, account_id, amount, currency) = row?;
+        let Ok(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d") else {
+            continue;
+        };
+        let Some(period) = frequency.period_of(date) else {
+            continue;
+        };
+        let slot = by_period.entry(period).or_default();
+        if !slot.entry_ids.contains(&entry_id) {
+            slot.entry_ids.push(entry_id);
+        }
+        *slot.totals.entry((account_id, currency)).or_insert(0) += amount;
+    }
+
+    let mut out = Vec::new();
+    for (period, PeriodHistory { entry_ids, totals }) in by_period {
+        let lines: Vec<EntryLine> = totals
+            .into_iter()
+            .filter(|(_, amount)| *amount != 0)
+            .map(|((account_id, currency), amount)| EntryLine {
+                account_id,
+                amount,
+                currency,
+                exchange_rate: None,
+                memo: None,
+            })
+            .collect();
+        // A period whose entries cancel out entirely — every sale refunded —
+        // leaves nothing to post, and an entry of no lines would not balance.
+        if lines.is_empty() {
+            continue;
+        }
+        out.push(HistoryRollup {
+            period,
+            replacement: PostEntryCommand {
+                date: period.end,
+                memo: format!(
+                    "{} sales — {} ({} entries rolled up)",
+                    service_name,
+                    period.label(),
+                    entry_ids.len()
+                ),
+                lines,
+                // The same key a live rollup would use, on purpose: once history
+                // is totalled, a re-sync of those events must find the period
+                // already posted rather than posting it a second time.
+                reference: Some(rollup_reference(service_name, &period)),
+                source: Some(JournalEntrySource::EventService),
+            },
+            entry_ids,
+        });
+    }
+    Ok(out)
+}
+
+/// Replacing history that is already posted.
+#[cfg(test)]
+mod history_rollup_tests {
+    use super::planning_tests::{books, remote};
+    use super::*;
+    use crate::commands::entry_commands::EntryCommands;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn sale_on(id: &str, date: &str, qty: u32, price: i64) -> RemoteEvent {
+        remote(
+            id,
+            "sale",
+            serde_json::json!({
+                "date": date,
+                "payment_method": "cash",
+                "items": [{
+                    "name": "Tube",
+                    "qty": qty,
+                    "unit_price_cents": price,
+                    "unit_cost_cents": 300,
+                }],
+            }),
+        )
+    }
+
+    /// Books with `count` individual sales posted, as they are today.
+    fn with_history(dates: &[&str]) -> EventStore {
+        let mut store = books();
+        for (i, date) in dates.iter().enumerate() {
+            let event = sale_on(&format!("e-{i}"), date, 2, 800);
+            let cmd = match plan_remote_event(store.connection(), "Bugbear", &event).unwrap() {
+                PlannedIngest::Entry(cmd) => *cmd,
+                _ => unreachable!(),
+            };
+            EntryCommands::new(&mut store, "seed".to_string())
+                .post_entry(cmd)
+                .unwrap();
+        }
+        store
+    }
+
+    /// Every account's balance, so the replacement can be checked against it.
+    fn balances(store: &EventStore) -> BTreeMap<String, i64> {
+        let mut stmt = store
+            .connection()
+            .prepare(
+                "SELECT jl.account_id, COALESCE(SUM(jl.amount), 0)
+                   FROM journal_lines jl
+                   JOIN journal_entries je ON jl.entry_id = je.id
+                  WHERE je.is_void = 0
+                  GROUP BY jl.account_id",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<BTreeMap<String, i64>, _>>()
+            .unwrap()
+    }
+
+    /// **The property that makes this safe to run on a year of books.**
+    ///
+    /// Voiding the individual entries and posting the totals must leave every
+    /// account exactly where it was. If it does not, somebody tidying up their
+    /// register has silently restated their revenue — and the register they were
+    /// tidying is the thing they would have checked.
+    ///
+    /// It holds because the totals are summed from the posted entries themselves
+    /// rather than re-planned from the source events: re-planning would run them
+    /// through today's account mappings, and a mapping changed since would move
+    /// money.
+    #[test]
+    fn rolling_up_history_leaves_every_balance_where_it_was() {
+        let mut store = with_history(&["2026-08-17", "2026-08-17", "2026-08-18"]);
+        let before = balances(&store);
+
+        let plans = plan_history_rollup(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            day(2026, 8, 1),
+            day(2026, 8, 31),
+        )
+        .expect("plan");
+        assert_eq!(plans.len(), 2, "two days");
+
+        // Apply it exactly as a caller would: void, then post.
+        for plan in plans {
+            for entry_id in &plan.entry_ids {
+                EntryCommands::new(&mut store, "u".to_string())
+                    .void_entry(crate::commands::entry_commands::VoidEntryCommand {
+                        entry_id: entry_id.clone(),
+                        reason: "replaced by a period total".to_string(),
+                    })
+                    .expect("void");
+            }
+            EntryCommands::new(&mut store, "u".to_string())
+                .post_entry(plan.replacement)
+                .expect("post the total");
+        }
+
+        assert_eq!(
+            balances(&store),
+            before,
+            "rolling up history moved money, which it must never do"
+        );
+    }
+
+    /// The register really does get shorter.
+    #[test]
+    fn three_entries_become_one_per_day() {
+        let store = with_history(&["2026-08-17", "2026-08-17", "2026-08-17"]);
+        let plans = plan_history_rollup(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            day(2026, 8, 1),
+            day(2026, 8, 31),
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].entry_ids.len(), 3, "all three are replaced");
+    }
+
+    /// A period already totalled is not folded into another one.
+    ///
+    /// Its entry carries a `:rollup:` reference, and counting it as history would
+    /// add a day's sales to a month that already contains them — doubling it.
+    #[test]
+    fn an_existing_rollup_is_not_rolled_up_again() {
+        let mut store = with_history(&["2026-08-17"]);
+        // Total the day, as a live sync would have.
+        let plans = plan_history_rollup(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            day(2026, 8, 1),
+            day(2026, 8, 31),
+        )
+        .unwrap();
+        for plan in plans {
+            for entry_id in &plan.entry_ids {
+                EntryCommands::new(&mut store, "u".to_string())
+                    .void_entry(crate::commands::entry_commands::VoidEntryCommand {
+                        entry_id: entry_id.clone(),
+                        reason: "replaced".to_string(),
+                    })
+                    .unwrap();
+            }
+            EntryCommands::new(&mut store, "u".to_string())
+                .post_entry(plan.replacement)
+                .unwrap();
+        }
+        let after_first = balances(&store);
+
+        // Now ask for monthly. The daily total must not be swept into it.
+        let monthly = plan_history_rollup(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Monthly,
+            day(2026, 8, 1),
+            day(2026, 8, 31),
+        )
+        .unwrap();
+        assert!(
+            monthly.is_empty(),
+            "a period already totalled was going to be totalled again: {monthly:?}"
+        );
+        assert_eq!(balances(&store), after_first);
+    }
+
+    /// Entries outside the range are left alone.
+    #[test]
+    fn the_range_is_respected() {
+        let store = with_history(&["2026-07-31", "2026-08-17", "2026-09-01"]);
+        let plans = plan_history_rollup(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            day(2026, 8, 1),
+            day(2026, 8, 31),
+        )
+        .unwrap();
+
+        assert_eq!(plans.len(), 1, "only August: {plans:?}");
+        assert_eq!(plans[0].period.start, day(2026, 8, 17));
+    }
+
+    /// Nothing is planned for `per_event`, which is what "leave it alone" means.
+    #[test]
+    fn per_event_plans_no_rollup_at_all() {
+        let store = with_history(&["2026-08-17"]);
+        let plans = plan_history_rollup(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::PerEvent,
+            day(2026, 8, 1),
+            day(2026, 8, 31),
+        )
+        .unwrap();
+        assert!(plans.is_empty());
+    }
+
+    /// Another service's entries are not touched.
+    #[test]
+    fn only_this_services_entries_are_rolled_up() {
+        let mut store = with_history(&["2026-08-17"]);
+        // A second service's sale on the same day.
+        let event = sale_on("x-1", "2026-08-17", 1, 500);
+        let cmd = match plan_remote_event(store.connection(), "OtherShop", &event).unwrap() {
+            PlannedIngest::Entry(cmd) => *cmd,
+            _ => unreachable!(),
+        };
+        EntryCommands::new(&mut store, "seed".to_string())
+            .post_entry(cmd)
+            .unwrap();
+
+        let plans = plan_history_rollup(
+            store.connection(),
+            "Bugbear",
+            ReportingFrequency::Daily,
+            day(2026, 8, 1),
+            day(2026, 8, 31),
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0].entry_ids.len(),
+            1,
+            "another service's sale was swept in"
+        );
+    }
+}

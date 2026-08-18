@@ -682,7 +682,6 @@ mod tests {
 #[cfg(test)]
 mod reporting_frequency {
     use super::tests::{head_of, register, serve, TOKEN};
-    use super::*;
 
     async fn set(base: &str, head: i64, service_id: &str, frequency: &str) -> reqwest::Response {
         reqwest::Client::new()
