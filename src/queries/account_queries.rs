@@ -1,6 +1,6 @@
 use crate::domain::{Account, AccountType};
 use chrono::NaiveDate;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -9,6 +9,27 @@ pub enum AccountQueryError {
     DatabaseError(#[from] rusqlite::Error),
     #[error("Account not found: {0}")]
     NotFound(String),
+}
+
+/// A reconciliation that is open on an account.
+#[derive(Debug, Clone)]
+pub struct OpenReconciliation {
+    pub id: String,
+    pub statement_date: NaiveDate,
+    pub statement_ending_balance: i64,
+}
+
+/// Where a reconciliation stands, in the terms the completion event records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconciliationProgress {
+    /// Lines cleared by earlier reconciliations on this account.
+    pub beginning_balance: i64,
+    /// Lines cleared by this one.
+    pub cleared_total: i64,
+    /// What the statement says the account should hold.
+    pub statement_balance: i64,
+    /// `statement_balance - (beginning_balance + cleared_total)`. Zero is done.
+    pub difference: i64,
 }
 
 /// Account balance information
@@ -361,6 +382,99 @@ impl<'a> AccountQueries<'a> {
             .collect();
 
         Ok(entries)
+    }
+
+    /// The reconciliation currently open on an account, if any.
+    ///
+    /// How a client learns the id of a reconciliation it just started: the server
+    /// mints it and returns only the new log head, so the id arrives with the next
+    /// pull rather than in the response. There is at most one — enforced in the
+    /// append transaction and by a partial unique index — so this is a lookup and
+    /// not a choice.
+    ///
+    /// It is also how a screen finds out that a reconciliation is *already* open,
+    /// which it must do before offering to start another.
+    pub fn in_progress_reconciliation(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<OpenReconciliation>, AccountQueryError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, statement_date, statement_ending_balance
+                   FROM reconciliations
+                  WHERE account_id = ?1 AND status = 'in_progress'",
+                [account_id],
+                |row| {
+                    Ok(OpenReconciliation {
+                        id: row.get(0)?,
+                        statement_date: NaiveDate::parse_from_str(
+                            &row.get::<_, String>(1)?,
+                            "%Y-%m-%d",
+                        )
+                        .unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+                        statement_ending_balance: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// What a reconciliation's difference would be if it were completed now.
+    ///
+    /// **The same arithmetic `build_complete_reconciliation_in_txn` runs**, and
+    /// deliberately the same SQL: the number a screen shows while somebody ticks
+    /// lines has to be the number the server records when they finish, or the
+    /// reconciliation "balances" on screen and completes with a residual.
+    ///
+    /// Advisory all the same — the server recomputes it under the write lock, so a
+    /// colleague clearing a line in between moves it. That is a reason to keep the
+    /// formula identical, not a reason to skip showing it.
+    pub fn reconciliation_progress(
+        &self,
+        reconciliation_id: &str,
+    ) -> Result<ReconciliationProgress, AccountQueryError> {
+        let (account_id, statement_balance): (String, i64) = self.conn.query_row(
+            "SELECT account_id, statement_ending_balance FROM reconciliations WHERE id = ?1",
+            [reconciliation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let cleared_total: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(cleared_amount), 0) FROM cleared_transactions
+                  WHERE reconciliation_id = ?1",
+                [reconciliation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
+        // Lines cleared by *earlier* reconciliations on this account. Excluding
+        // this one's is what makes the two sums disjoint rather than overlapping.
+        let beginning_balance: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(jl.amount), 0)
+                   FROM journal_lines jl
+                   JOIN journal_entries je ON jl.entry_id = je.id
+                  WHERE jl.account_id = ?1 AND jl.is_cleared = 1
+                    AND jl.id NOT IN (SELECT line_id FROM cleared_transactions WHERE reconciliation_id = ?2)
+                    AND je.is_void = 0",
+                params![&account_id, reconciliation_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+
+        Ok(ReconciliationProgress {
+            beginning_balance,
+            cleared_total,
+            statement_balance,
+            difference: statement_balance - (beginning_balance + cleared_total),
+        })
     }
 
     /// Get uncleared transactions for an account (for reconciliation)

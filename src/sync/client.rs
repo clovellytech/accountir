@@ -25,6 +25,10 @@ use super::commands::plaid::{
     ConnectPlaidItemRequest, ConnectPlaidItemResponse, DisconnectPlaidItemRequest,
     MapPlaidAccountRequest, RefreshPlaidAccountsRequest, RefreshPlaidAccountsResponse,
 };
+use super::commands::reconciliation::{
+    AbandonReconciliationRequest, ClearTransactionRequest, CompleteReconciliationRequest,
+    StartReconciliationRequest, UnclearTransactionRequest,
+};
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
 use crate::domain::{AccountType, PaymentTerms};
 use chrono::NaiveDate;
@@ -768,6 +772,117 @@ impl SyncClient {
                 expected_head_seq: head,
                 item_id: item_id.clone(),
                 reason: reason.clone(),
+            }
+        })
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Reconciliation
+    //
+    // The engine and the server endpoints have existed for a while; these are the
+    // client half, without which a group-hosted book could not reconcile at all —
+    // a replica may not append, so there was no path from the desktop to a
+    // reconciliation on the very books most likely to need one.
+    //
+    // All five are self-contained (an account id and a statement figure the user
+    // typed, or an id the server minted), so `submit_retrying`'s blind 409 retry
+    // is sound: nothing here is derived from a projection a competing write could
+    // have moved, and every fence is re-run inside the server's append.
+    // -----------------------------------------------------------------------
+
+    /// Open a reconciliation against an account and a statement.
+    ///
+    /// Returns the new log head, **not** the reconciliation's id — the server
+    /// mints that and it arrives with the next pull. Read it back with
+    /// `AccountQueries::in_progress_reconciliation`, which is the same query the
+    /// local path uses, so both halves of the app find it the same way.
+    pub async fn start_reconciliation(
+        &mut self,
+        account_id: impl Into<String>,
+        statement_date: NaiveDate,
+        statement_ending_balance: i64,
+    ) -> Result<i64, SyncClientError> {
+        let account_id = account_id.into();
+        self.submit_retrying("/sync/commands/start-reconciliation", |head| {
+            StartReconciliationRequest {
+                expected_head_seq: head,
+                account_id: account_id.clone(),
+                statement_date,
+                statement_ending_balance,
+            }
+        })
+        .await
+    }
+
+    /// Mark one line as cleared against the statement.
+    pub async fn clear_transaction(
+        &mut self,
+        reconciliation_id: impl Into<String>,
+        entry_id: impl Into<String>,
+        line_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (reconciliation_id, entry_id, line_id) =
+            (reconciliation_id.into(), entry_id.into(), line_id.into());
+        self.submit_retrying("/sync/commands/clear-transaction", |head| {
+            ClearTransactionRequest {
+                expected_head_seq: head,
+                reconciliation_id: reconciliation_id.clone(),
+                entry_id: entry_id.clone(),
+                line_id: line_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Take a line back out of the cleared set.
+    pub async fn unclear_transaction(
+        &mut self,
+        reconciliation_id: impl Into<String>,
+        entry_id: impl Into<String>,
+        line_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (reconciliation_id, entry_id, line_id) =
+            (reconciliation_id.into(), entry_id.into(), line_id.into());
+        self.submit_retrying("/sync/commands/unclear-transaction", |head| {
+            UnclearTransactionRequest {
+                expected_head_seq: head,
+                reconciliation_id: reconciliation_id.clone(),
+                entry_id: entry_id.clone(),
+                line_id: line_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Close a reconciliation, recording whatever difference remains.
+    ///
+    /// The difference is recomputed server-side inside the append transaction, so
+    /// whatever the screen was showing is advisory until this returns.
+    pub async fn complete_reconciliation(
+        &mut self,
+        reconciliation_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let reconciliation_id = reconciliation_id.into();
+        self.submit_retrying("/sync/commands/complete-reconciliation", |head| {
+            CompleteReconciliationRequest {
+                expected_head_seq: head,
+                reconciliation_id: reconciliation_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Give up on a reconciliation, freeing the account's in-progress slot.
+    pub async fn abandon_reconciliation(
+        &mut self,
+        reconciliation_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let reconciliation_id = reconciliation_id.into();
+        self.submit_retrying("/sync/commands/abandon-reconciliation", |head| {
+            AbandonReconciliationRequest {
+                expected_head_seq: head,
+                reconciliation_id: reconciliation_id.clone(),
             }
         })
         .await

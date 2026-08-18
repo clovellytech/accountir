@@ -351,7 +351,7 @@ mod tests {
     /// Serve a freshly seeded store, returning the base URL, a probe handle to the
     /// same store (to read the server-generated reconciliation id), and the seeded
     /// ids + starting head.
-    async fn serve_seeded() -> (String, SyncState, String, String, String, i64) {
+    pub(super) async fn serve_seeded() -> (String, SyncState, String, String, String, i64) {
         let mut store = EventStore::in_memory().unwrap();
         init_schema(store.connection()).unwrap();
         let (checking, entry_id, line_id) = seed(&mut store);
@@ -364,7 +364,7 @@ mod tests {
 
     /// The single in-progress reconciliation id for an account, read from the
     /// projected `reconciliations` table via the probe handle.
-    fn recon_id_of(st: &SyncState, account_id: &str) -> String {
+    pub(super) fn recon_id_of(st: &SyncState, account_id: &str) -> String {
         st.store
             .lock()
             .unwrap()
@@ -551,5 +551,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+}
+
+/// The client half, and the number it shows while you work.
+///
+/// A group-hosted book could not be reconciled at all until these existed: a
+/// replica may not append, so the endpoints above had no caller. Which is the
+/// wrong way round — a shared book is the one most likely to need reconciling.
+#[cfg(test)]
+mod client_round_trip {
+    use super::tests::{recon_id_of, serve_seeded};
+    use super::*;
+    use crate::queries::account_queries::AccountQueries;
+    use crate::sync::client::SyncClient;
+
+    const TOKEN: &str = "tok-1";
+
+    /// Start, clear, complete — from the client, against the real router.
+    #[tokio::test]
+    async fn a_replica_can_run_a_reconciliation_end_to_end() {
+        let (base, probe, checking, entry_id, line_id, head) = serve_seeded().await;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+
+        // The seeded entry credits checking 10000, so a statement saying -10000
+        // is a reconciliation that balances exactly once that line is cleared.
+        client
+            .start_reconciliation(
+                &checking,
+                NaiveDate::from_ymd_opt(2024, 1, 31).unwrap(),
+                -10000,
+            )
+            .await
+            .expect("start");
+
+        // The id was minted server-side and is not in the response; it is read
+        // back from the projection, which is what the desktop does after its pull.
+        let recon_id = recon_id_of(&probe, &checking);
+        {
+            let store = probe.store.lock().unwrap();
+            let found = AccountQueries::new(store.connection())
+                .in_progress_reconciliation(&checking)
+                .expect("lookup")
+                .expect("a reconciliation is open");
+            assert_eq!(
+                found.id, recon_id,
+                "the shared lookup found a different one"
+            );
+            assert_eq!(found.statement_ending_balance, -10000);
+        }
+
+        client
+            .clear_transaction(&recon_id, &entry_id, &line_id)
+            .await
+            .expect("clear");
+        client
+            .complete_reconciliation(&recon_id)
+            .await
+            .expect("complete");
+
+        let store = probe.store.lock().unwrap();
+        let status: String = store
+            .connection()
+            .query_row(
+                "SELECT status FROM reconciliations WHERE id = ?1",
+                [&recon_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    /// The advisory number on screen and the one the server records must agree.
+    ///
+    /// They are computed in two places — `reconciliation_progress` for the view,
+    /// `build_complete_reconciliation_in_txn` for the event — and a formula that
+    /// drifts means a reconciliation that reads as balanced and completes with a
+    /// residual, which is exactly the thing a reconciliation exists to rule out.
+    #[tokio::test]
+    async fn the_difference_on_screen_is_the_difference_recorded() {
+        let (base, probe, checking, entry_id, line_id, head) = serve_seeded().await;
+        let mut client = SyncClient::with_head(base, TOKEN, head);
+
+        // A statement 2500 away from what clearing that one line accounts for, so
+        // a difference of zero cannot pass by accident.
+        client
+            .start_reconciliation(
+                &checking,
+                NaiveDate::from_ymd_opt(2024, 1, 31).unwrap(),
+                -7500,
+            )
+            .await
+            .expect("start");
+        let recon_id = recon_id_of(&probe, &checking);
+        client
+            .clear_transaction(&recon_id, &entry_id, &line_id)
+            .await
+            .expect("clear");
+
+        let advisory = {
+            let store = probe.store.lock().unwrap();
+            AccountQueries::new(store.connection())
+                .reconciliation_progress(&recon_id)
+                .expect("progress")
+        };
+        assert_eq!(advisory.cleared_total, -10000);
+        assert_eq!(advisory.beginning_balance, 0, "nothing was cleared before");
+        assert_eq!(advisory.difference, 2500, "{advisory:?}");
+
+        client
+            .complete_reconciliation(&recon_id)
+            .await
+            .expect("complete");
+
+        // What the ledger actually recorded.
+        let store = probe.store.lock().unwrap();
+        let recorded: i64 = store
+            .connection()
+            .query_row(
+                "SELECT json_extract(payload, '$.difference') FROM events
+                  WHERE event_type = 'reconciliation_completed'
+                  ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, advisory.difference,
+            "the screen said {} and the ledger recorded {recorded}",
+            advisory.difference
+        );
     }
 }
