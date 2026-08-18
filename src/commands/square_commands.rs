@@ -55,9 +55,9 @@ use crate::commands::ingest_commands::{
 };
 use crate::events::types::JournalEntrySource;
 use crate::store::event_store::EventStore;
-use rusqlite::Connection;
 use calamine::{open_workbook, Data, Reader, Xlsx};
 use chrono::NaiveDate;
+use rusqlite::Connection;
 use std::collections::HashMap;
 
 // ===========================================================================
@@ -254,8 +254,10 @@ pub fn plan_square_sales(
     // Net change to the Square balance (matches the report's "Net total").
     let net_to_balance = s.revenue + s.tax + s.tips - s.fees;
 
-    let mut lines = vec![EntryLine::debit(&mappings["pos_square"], net_to_balance, "USD")
-        .with_memo("Square net deposit")];
+    let mut lines = vec![
+        EntryLine::debit(&mappings["pos_square"], net_to_balance, "USD")
+            .with_memo("Square net deposit"),
+    ];
     if s.fees != 0 {
         lines.push(
             EntryLine::debit(&mappings["square_fees"], s.fees, "USD")
@@ -273,8 +275,7 @@ pub fn plan_square_sales(
     }
     if s.tips > 0 {
         lines.push(
-            EntryLine::credit(&mappings["tips_payable"], s.tips, "USD")
-                .with_memo("Tips collected"),
+            EntryLine::credit(&mappings["tips_payable"], s.tips, "USD").with_memo("Tips collected"),
         );
     }
 
@@ -288,13 +289,16 @@ pub fn plan_square_sales(
         )
     };
 
-    Ok((Some(PostEntryCommand {
-        date: end,
-        memo,
-        lines,
-        reference: Some(reference),
-        source: Some(JournalEntrySource::Pos),
-    }), summary))
+    Ok((
+        Some(PostEntryCommand {
+            date: end,
+            memo,
+            lines,
+            reference: Some(reference),
+            source: Some(JournalEntrySource::Pos),
+        }),
+        summary,
+    ))
 }
 
 pub fn ingest_square_sales(
@@ -365,9 +369,7 @@ fn parse_company_totals_xlsx(path: &str) -> Result<PayrollTotals, IngestError> {
     let total = rows
         .iter()
         .find(|r| r.iter().any(|c| c.trim().eq_ignore_ascii_case("total")))
-        .ok_or_else(|| {
-            IngestError::MissingMapping("payroll xlsx: no 'Total' row".to_string())
-        })?;
+        .ok_or_else(|| IngestError::MissingMapping("payroll xlsx: no 'Total' row".to_string()))?;
 
     // Columns that carry a label in the header row, in order.
     let header_cols: Vec<usize> = header
@@ -481,7 +483,8 @@ pub fn plan_square_payroll(
     let taxes_payable = t.gross - t.net_pay + t.employer_taxes;
 
     let mut lines = vec![
-        EntryLine::debit(&mappings["payroll_wages_expense"], t.gross, "USD").with_memo("Gross wages"),
+        EntryLine::debit(&mappings["payroll_wages_expense"], t.gross, "USD")
+            .with_memo("Gross wages"),
     ];
     if t.employer_taxes != 0 {
         lines.push(
@@ -571,13 +574,11 @@ mod tests {
 
     #[test]
     fn extracts_period_from_filename() {
-        let (start, end) =
-            extract_period("sales-summary-2026-06-26-2026-06-26.csv").unwrap();
+        let (start, end) = extract_period("sales-summary-2026-06-26-2026-06-26.csv").unwrap();
         assert_eq!(start, NaiveDate::from_ymd_opt(2026, 6, 26).unwrap());
         assert_eq!(end, NaiveDate::from_ymd_opt(2026, 6, 26).unwrap());
 
-        let (s2, e2) =
-            extract_period("Company-Totals-2026-06-01-2026-06-30-.xlsx").unwrap();
+        let (s2, e2) = extract_period("Company-Totals-2026-06-01-2026-06-30-.xlsx").unwrap();
         assert_eq!(s2, NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
         assert_eq!(e2, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
     }
@@ -603,5 +604,298 @@ mod tests {
             t.gross - t.net_pay + t.employer_taxes,
             t.employee_taxes + t.employer_taxes
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The monthly settlement, when the POS already booked the sales
+// ---------------------------------------------------------------------------
+
+/// What a Square summary says, against what the books already hold for the
+/// period.
+///
+/// The two arrive from different directions and neither is the other's check by
+/// accident: the POS knows what was sold, Square knows what it settled and what
+/// it charged for doing so. Showing both is what makes a disagreement findable —
+/// a till left open, a sale voided at one end and not the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SquareSettlement {
+    pub start: NaiveDate,
+    pub end: NaiveDate,
+    /// Gross sales Square reports for the period.
+    pub reported_revenue: i64,
+    pub reported_tax: i64,
+    pub reported_tips: i64,
+    pub fees: i64,
+    /// What the books already posted to the revenue account over the period.
+    pub books_revenue: i64,
+    /// `reported_revenue - books_revenue`. Zero means the two agree.
+    pub revenue_difference: i64,
+}
+
+/// Post only Square's fees for a period, leaving the sales to the POS.
+///
+/// # Why this exists
+///
+/// [`plan_square_sales`] posts the whole picture — revenue, tax, tips, fees and
+/// the net to the Square balance. That is right when Square is the only source.
+/// It is wrong the moment a POS is publishing daily sales totals into the same
+/// books, because then the revenue is already there and posting it again doubles
+/// it.
+///
+/// So this posts the one thing the POS cannot know: what Square kept.
+///
+/// ```text
+///   Dr  Processing fees      fees
+///   Cr  Square balance       fees
+/// ```
+///
+/// The Square balance is credited because the POS rollups debited it with the
+/// gross, and Square only ever deposited the net. After both, the balance equals
+/// what Square actually holds — which is the figure a reconciliation against
+/// their statement can then be run on.
+///
+/// Returns the entry and the comparison. A period with no fees posts nothing and
+/// still reports the comparison: "Square charged nothing" is an answer, and the
+/// revenue check is the reason to look.
+pub fn plan_square_fees(
+    conn: &Connection,
+    content: &str,
+    file_name: &str,
+) -> Result<(Option<PostEntryCommand>, SquareSettlement), IngestError> {
+    let (start, end) = extract_period(file_name).ok_or_else(|| {
+        IngestError::InvalidDate(format!(
+            "no YYYY-MM-DD period found in filename '{}'",
+            file_name
+        ))
+    })?;
+    let s = parse_sales_summary(content);
+
+    let required = ["pos_square", "square_fees", "pos_revenue"];
+    let mappings = load_ingest_mappings(conn, &required)?;
+
+    // What the books already hold for the period, on the revenue account the POS
+    // posts to. Voided entries excluded — they are not revenue.
+    let books_revenue: i64 = conn
+        .query_row(
+            "SELECT COALESCE(-SUM(jl.amount), 0)
+               FROM journal_lines jl
+               JOIN journal_entries je ON jl.entry_id = je.id
+              WHERE jl.account_id = ?1 AND je.is_void = 0
+                AND je.date >= ?2 AND je.date <= ?3",
+            rusqlite::params![&mappings["pos_revenue"], start.to_string(), end.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let settlement = SquareSettlement {
+        start,
+        end,
+        reported_revenue: s.revenue,
+        reported_tax: s.tax,
+        reported_tips: s.tips,
+        fees: s.fees,
+        books_revenue,
+        revenue_difference: s.revenue - books_revenue,
+    };
+
+    if s.fees == 0 {
+        return Ok((None, settlement));
+    }
+
+    // Its own key space. A fees-only entry and a full summary for the same
+    // period are different postings, and sharing a reference would let one be
+    // mistaken for the other — silently leaving the revenue unposted or posted
+    // twice, depending which came first.
+    let reference = format!(
+        "square-fees-{}_{}",
+        start.format("%Y-%m-%d"),
+        end.format("%Y-%m-%d")
+    );
+    if check_idempotent(conn, &reference).is_some() {
+        return Ok((None, settlement));
+    }
+
+    let lines = vec![
+        EntryLine::debit(&mappings["square_fees"], s.fees, "USD")
+            .with_memo("Square processing fees"),
+        EntryLine::credit(&mappings["pos_square"], s.fees, "USD")
+            .with_memo("Kept by Square from settlements"),
+    ];
+
+    Ok((
+        Some(PostEntryCommand {
+            date: end,
+            memo: format!(
+                "Square fees {} – {}",
+                start.format("%Y-%m-%d"),
+                end.format("%Y-%m-%d")
+            ),
+            lines,
+            reference: Some(reference),
+            source: Some(JournalEntrySource::Pos),
+        }),
+        settlement,
+    ))
+}
+
+/// The monthly settlement, when a POS is already posting the sales.
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use crate::commands::event_service_commands::planning_tests::books;
+    use crate::commands::ingest_commands::set_account_mapping;
+
+    const SUMMARY: &str = "\"Sales summary - Summary\",\" \"\n\
+\"Gross sales\",\"$1,498.28\"\n\
+\"Net sales\",\"$1,489.43\"\n\
+\"Taxes\",\"$152.68\"\n\
+\"Tips\",\"$0.00\"\n\
+\"Fees\",\"($44.26)\"\n\
+\"Net total\",\"$1,597.85\"\n";
+
+    fn ready() -> EventStore {
+        let store = books();
+        let conn = store.connection();
+        // `books()` maps pos_revenue and the rest; Square needs its own two.
+        set_account_mapping(conn, "pos_square", "cash").unwrap();
+        set_account_mapping(conn, "square_fees", "cogs").unwrap();
+        // The full-summary planner needs these two as well; the fees-only one
+        // deliberately does not, which is part of what makes it lighter to run.
+        set_account_mapping(conn, "sales_tax_payable", "ap").unwrap();
+        set_account_mapping(conn, "tips_payable", "ap").unwrap();
+        store
+    }
+
+    /// **The point of the whole fees-only mode.**
+    ///
+    /// The POS rollups already posted the revenue. A full Square summary would
+    /// post it again, and a month's sales would appear twice with nothing on
+    /// either entry to say the other existed. Fees-only posts the one figure the
+    /// POS cannot know.
+    #[test]
+    fn a_fees_only_entry_does_not_touch_revenue() {
+        let store = ready();
+        let (cmd, settlement) = plan_square_fees(
+            store.connection(),
+            SUMMARY,
+            "sales-summary-2026-06-01-2026-06-30.csv",
+        )
+        .expect("plan");
+
+        let cmd = cmd.expect("fees were charged, so there is an entry");
+        assert_eq!(cmd.lines.len(), 2, "fees and the balance, nothing else");
+        assert_eq!(settlement.fees, 4426);
+
+        // The revenue account must not appear at all.
+        let revenue_account = crate::commands::ingest_commands::load_ingest_mappings(
+            store.connection(),
+            &["pos_revenue"],
+        )
+        .unwrap()["pos_revenue"]
+            .clone();
+        assert!(
+            cmd.lines.iter().all(|l| l.account_id != revenue_account),
+            "a fees-only entry posted revenue, which the POS already booked"
+        );
+
+        // And it balances, which a two-line entry only does if the signs are right.
+        assert_eq!(cmd.lines.iter().map(|l| l.amount).sum::<i64>(), 0);
+    }
+
+    /// The Square balance is credited, not debited.
+    ///
+    /// The POS rollups debited it with the gross; Square only ever deposited the
+    /// net. Crediting the difference is what leaves the account equal to what
+    /// Square actually holds — get the sign wrong and the balance is off by twice
+    /// the fees, which reconciles against nothing.
+    #[test]
+    fn the_fees_come_out_of_the_square_balance() {
+        let store = ready();
+        let (cmd, _) = plan_square_fees(
+            store.connection(),
+            SUMMARY,
+            "sales-summary-2026-06-01-2026-06-30.csv",
+        )
+        .unwrap();
+        let cmd = cmd.unwrap();
+
+        let square = crate::commands::ingest_commands::load_ingest_mappings(
+            store.connection(),
+            &["pos_square"],
+        )
+        .unwrap()["pos_square"]
+            .clone();
+        let square_line = cmd
+            .lines
+            .iter()
+            .find(|l| l.account_id == square)
+            .expect("the Square balance must be on the entry");
+        assert!(
+            square_line.amount < 0,
+            "the Square balance must be credited: {square_line:?}"
+        );
+        assert_eq!(square_line.amount, -4426);
+    }
+
+    /// It reports what Square says against what the books hold, which is the
+    /// check the user actually runs each month.
+    #[test]
+    fn the_settlement_compares_square_against_the_books() {
+        let store = ready();
+        let (_, settlement) = plan_square_fees(
+            store.connection(),
+            SUMMARY,
+            "sales-summary-2026-06-01-2026-06-30.csv",
+        )
+        .unwrap();
+
+        assert_eq!(settlement.reported_revenue, 148943);
+        // Nothing posted in this period yet, so the whole of it is the gap — and
+        // saying so is the point: it is how a missing day of POS totals shows up.
+        assert_eq!(settlement.books_revenue, 0);
+        assert_eq!(settlement.revenue_difference, 148943);
+    }
+
+    /// A fees-only entry and a full summary must not be mistaken for each other.
+    ///
+    /// They post different things for the same period. Sharing an idempotency key
+    /// would mean whichever ran second was silently skipped — leaving the revenue
+    /// either unposted or posted twice, depending on the order.
+    #[test]
+    fn fees_and_a_full_summary_do_not_share_a_key() {
+        let store = ready();
+        let (fees, _) = plan_square_fees(
+            store.connection(),
+            SUMMARY,
+            "sales-summary-2026-06-01-2026-06-30.csv",
+        )
+        .unwrap();
+        let (full, _) = plan_square_sales(
+            store.connection(),
+            SUMMARY,
+            "sales-summary-2026-06-01-2026-06-30.csv",
+        )
+        .unwrap();
+
+        let fees_ref = fees.unwrap().reference.unwrap();
+        let full_ref = full.unwrap().reference.unwrap();
+        assert_ne!(fees_ref, full_ref, "one would swallow the other");
+    }
+
+    /// A month Square charged nothing for posts nothing, and still reports.
+    #[test]
+    fn a_period_with_no_fees_posts_nothing_but_still_compares() {
+        let store = ready();
+        let no_fees = SUMMARY.replace("\"Fees\",\"($44.26)\"", "\"Fees\",\"$0.00\"");
+        let (cmd, settlement) = plan_square_fees(
+            store.connection(),
+            &no_fees,
+            "sales-summary-2026-06-01-2026-06-30.csv",
+        )
+        .unwrap();
+
+        assert!(cmd.is_none(), "no fees, no entry");
+        assert_eq!(settlement.reported_revenue, 148943, "still worth comparing");
     }
 }
