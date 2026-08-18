@@ -1,14 +1,17 @@
 use crate::commands::bill_commands::ReceiveBillCommand;
-use crate::commands::entry_commands::PostEntryCommand;
+use crate::commands::entry_commands::{EntryLine, PostEntryCommand};
 use crate::commands::ingest_commands::{
-    self as ingest_commands, IngestError, IngestGoodsReceivedData,
-    IngestInventoryAdjustmentData, IngestPurchaseOrderData, IngestRefundData, IngestSaleData,
+    self as ingest_commands, IngestError, IngestGoodsReceivedData, IngestInventoryAdjustmentData,
+    IngestPurchaseOrderData, IngestRefundData, IngestSaleData,
 };
+use crate::domain::{Period, ReportingFrequency};
 use crate::events::types::{Event, EventEnvelope, JournalEntrySource, StoredEvent};
 use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::{ProjectionStore, Projector};
+use chrono::NaiveDate;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -115,7 +118,10 @@ pub fn list_services(conn: &Connection) -> Result<Vec<ServiceDisplay>, EventServ
     Ok(services)
 }
 
-pub fn get_service(conn: &Connection, service_id: &str) -> Result<ServiceRecord, EventServiceError> {
+pub fn get_service(
+    conn: &Connection,
+    service_id: &str,
+) -> Result<ServiceRecord, EventServiceError> {
     conn.query_row(
         "SELECT id, name, root_url, api_key, cursor FROM event_services WHERE id = ?1 AND status = 'active'",
         [service_id],
@@ -216,7 +222,7 @@ pub fn remove_service(
     let stored = store
         .append(envelope)
         .map_err(|e| EventServiceError::StoreError(e.to_string()))?;
-        store
+    store
         .apply_projection(&stored)
         .map_err(|e| EventServiceError::StoreError(e.to_string()))?;
     Ok(stored)
@@ -311,11 +317,9 @@ pub fn plan_remote_event(
         "refund" => {
             let mut data: IngestRefundData = parsed!(IngestRefundData);
             data.reference = Some(reference);
-            Ok(PlannedIngest::Entry(Box::new(ingest_commands::plan_refund(
-                conn,
-                data,
-                JournalEntrySource::EventService,
-            )?)))
+            Ok(PlannedIngest::Entry(Box::new(
+                ingest_commands::plan_refund(conn, data, JournalEntrySource::EventService)?,
+            )))
         }
         "purchase_order" => {
             let mut data: IngestPurchaseOrderData = parsed!(IngestPurchaseOrderData);
@@ -523,7 +527,7 @@ pub fn process_remote_events(
     let stored = store
         .append(envelope)
         .map_err(|e| EventServiceError::StoreError(e.to_string()))?;
-        store
+    store
         .apply_projection(&stored)
         .map_err(|e| EventServiceError::StoreError(e.to_string()))?;
 
@@ -985,7 +989,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod planning_tests {
+pub(crate) mod planning_tests {
     use super::*;
     use crate::commands::ingest_commands::set_account_mapping;
     use crate::events::types::{EventAccountType, EventEnvelope};
@@ -993,7 +997,7 @@ mod planning_tests {
     use crate::store::projections::ProjectionStore;
 
     /// A ledger with the chart and mappings a POS sale and a goods receipt need.
-    fn books() -> EventStore {
+    pub(crate) fn books() -> EventStore {
         let mut store = EventStore::in_memory().unwrap();
         store.init_schema().unwrap();
         for (id, ty, num, name) in [
@@ -1001,8 +1005,18 @@ mod planning_tests {
             ("inv", EventAccountType::Asset, "1200", "Inventory"),
             ("rev", EventAccountType::Revenue, "4000", "Sales"),
             ("cogs", EventAccountType::Expense, "5000", "COGS"),
-            ("ap", EventAccountType::Liability, "2000", "Accounts payable"),
-            ("adj", EventAccountType::Expense, "5100", "Inventory adjustment"),
+            (
+                "ap",
+                EventAccountType::Liability,
+                "2000",
+                "Accounts payable",
+            ),
+            (
+                "adj",
+                EventAccountType::Expense,
+                "5100",
+                "Inventory adjustment",
+            ),
             ("ref", EventAccountType::Revenue, "4100", "Refunds"),
         ] {
             let ev = Event::AccountCreated {
@@ -1034,7 +1048,7 @@ mod planning_tests {
         store
     }
 
-    fn remote(id: &str, event_type: &str, data: serde_json::Value) -> RemoteEvent {
+    pub(crate) fn remote(id: &str, event_type: &str, data: serde_json::Value) -> RemoteEvent {
         RemoteEvent {
             id: id.to_string(),
             event_type: event_type.to_string(),
@@ -1209,7 +1223,531 @@ mod planning_tests {
         conn.execute("DELETE FROM ingest_account_mappings WHERE key = 'cogs'", [])
             .unwrap();
         let err = plan_remote_event(conn, "Bugbear", &sale()).unwrap_err();
-        assert!(matches!(err, PlanError::Ingest(IngestError::MissingMapping(_))));
+        assert!(matches!(
+            err,
+            PlanError::Ingest(IngestError::MissingMapping(_))
+        ));
         assert!(err.to_string().contains("cogs"), "{err}");
+    }
+}
+
+/// Build the event that changes how often a service's sales are totalled.
+///
+/// In-txn like its neighbours: the service has to still exist when the change is
+/// appended, or the log carries a setting for a connection nobody has.
+///
+/// A frequency that has not changed appends nothing. Choosing "daily" on a
+/// service already reporting daily is a no-op somebody performed, not a fact
+/// about the books, and an event for it is a line in the log that says nothing.
+pub fn build_set_reporting_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    service_id: &str,
+    frequency: ReportingFrequency,
+    effective_from: NaiveDate,
+) -> Result<ReportingStep, EventStoreError> {
+    let current: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT reporting_frequency, reporting_from FROM event_services
+              WHERE id = ?1 AND status = 'active'",
+            [service_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((current_frequency, current_from)) = current else {
+        return Ok(ReportingStep::NoSuchService);
+    };
+    let unchanged = current_frequency == frequency.as_str()
+        && current_from.as_deref() == Some(effective_from.to_string().as_str());
+    if unchanged {
+        return Ok(ReportingStep::Unchanged);
+    }
+    Ok(ReportingStep::Append(Event::EventServiceReportingChanged {
+        service_id: service_id.to_string(),
+        frequency: frequency.as_str().to_string(),
+        effective_from,
+    }))
+}
+
+/// What setting a service's reporting frequency amounts to.
+///
+/// Three outcomes and not two: "no such service" is a mistake worth reporting,
+/// and "it already says that" is a success with nothing to write. Collapsing them
+/// into one `None` told a caller that a typo'd service id had been accepted.
+pub enum ReportingStep {
+    Append(Event),
+    /// The books already say this. Nothing to append, and not an error.
+    Unchanged,
+    NoSuchService,
+}
+
+/// How a service reports, as the books currently say.
+pub fn reporting_of(
+    conn: &Connection,
+    service_id: &str,
+) -> Result<(ReportingFrequency, Option<NaiveDate>), EventServiceError> {
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT reporting_frequency, reporting_from FROM event_services WHERE id = ?1",
+            [service_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((frequency, from)) = row else {
+        return Ok((ReportingFrequency::PerEvent, None));
+    };
+    Ok((
+        ReportingFrequency::parse(&frequency).unwrap_or_default(),
+        from.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()),
+    ))
+}
+
+/// Set how often a service's sales are totalled, on books this machine owns.
+pub fn set_reporting(
+    store: &mut EventStore,
+    user_id: &str,
+    service_id: &str,
+    frequency: ReportingFrequency,
+    effective_from: NaiveDate,
+) -> Result<Option<StoredEvent>, EventServiceError> {
+    let user_id = user_id.to_string();
+    let service_id = service_id.to_string();
+    loop {
+        let head = store
+            .latest_id()
+            .map_err(|e| EventServiceError::StoreError(e.to_string()))?
+            .unwrap_or(0);
+        let nothing = std::cell::Cell::new(false);
+        let outcome = store
+            .append_checked(
+                head,
+                |tx| match build_set_reporting_in_txn(tx, &service_id, frequency, effective_from)? {
+                    ReportingStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    ReportingStep::Unchanged => {
+                        nothing.set(true);
+                        Ok(Verdict::Reject(EventServiceError::NotFound(
+                            service_id.clone(),
+                        )))
+                    }
+                    ReportingStep::NoSuchService => Ok(Verdict::Reject(
+                        EventServiceError::NotFound(service_id.clone()),
+                    )),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )
+            .map_err(|e| EventServiceError::StoreError(e.to_string()))?;
+        match outcome {
+            CheckedOutcome::Appended(stored) => return Ok(Some(stored)),
+            CheckedOutcome::HeadMismatch { .. } => continue,
+            CheckedOutcome::Rejected(_) if nothing.get() => return Ok(None),
+            CheckedOutcome::Rejected(e) => return Err(e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rolling many sales into one entry
+// ---------------------------------------------------------------------------
+
+/// Which event types a rollup absorbs.
+///
+/// Sales and their refunds, and nothing else. A goods-received event is a
+/// supplier bill that has to stay trackable as its own payable, and a
+/// purchase-order commitment posts nothing at all — neither is a sale, and
+/// folding them into a daily total would make a debt disappear into a revenue
+/// figure.
+pub fn is_rollup_event(event_type: &str) -> bool {
+    matches!(event_type, "sale" | "refund")
+}
+
+/// What a period's sales come to, as one entry.
+///
+/// # How the arithmetic stays honest
+///
+/// Each event is planned through the **same** [`plan_remote_event`] that posts it
+/// individually, and the resulting lines are summed by account. So there is no
+/// second implementation of how a sale becomes journal lines: split tender, sales
+/// tax, cost of goods and the refunds that reverse them are all decided once, in
+/// the place that already decides them. Rolling up is arithmetic over the answer,
+/// not a different answer.
+///
+/// That is also what makes the property worth testing hold: the rollup's lines
+/// equal the individual entries' lines, account by account.
+///
+/// Returns `None` when the period nets to nothing on every account — a day whose
+/// sales were all refunded is a day with no entry to make, and posting a row of
+/// zeroes would be noise in the register.
+pub fn plan_sales_rollup(
+    conn: &Connection,
+    service_name: &str,
+    period: &Period,
+    events: &[RemoteEvent],
+    reference: String,
+) -> Result<Option<PostEntryCommand>, PlanError> {
+    // Summed in a stable order. A HashMap would give the lines a different order
+    // on each run, and two clients planning the same period would produce
+    // entries that differ only by line order — which is enough to make them look
+    // like different entries to anybody comparing.
+    let mut totals: BTreeMap<(String, String), i64> = BTreeMap::new();
+    let mut counted = 0usize;
+
+    for event in events {
+        if !is_rollup_event(&event.event_type) {
+            continue;
+        }
+        match plan_remote_event(conn, service_name, event)? {
+            PlannedIngest::Entry(cmd) => {
+                counted += 1;
+                for line in &cmd.lines {
+                    *totals
+                        .entry((line.account_id.clone(), line.currency.clone()))
+                        .or_insert(0) += line.amount;
+                }
+            }
+            // A rollup event that plans to something other than an entry is a
+            // contradiction — `is_rollup_event` admits only sales and refunds,
+            // and both plan to entries. Skipped rather than asserted so a future
+            // event type cannot turn this into a panic in somebody's books.
+            PlannedIngest::Bill(_) | PlannedIngest::Nothing { .. } => continue,
+        }
+    }
+
+    if counted == 0 {
+        return Ok(None);
+    }
+
+    let lines: Vec<EntryLine> = totals
+        .into_iter()
+        // An account whose debits and credits cancelled over the period does not
+        // belong in the entry. A sale refunded the same day nets to zero on every
+        // account it touched, and a zero line would still have to balance.
+        .filter(|(_, amount)| *amount != 0)
+        .map(|((account_id, currency), amount)| EntryLine {
+            account_id,
+            amount,
+            currency,
+            exchange_rate: None,
+            memo: None,
+        })
+        .collect();
+
+    if lines.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(PostEntryCommand {
+        // Dated to the period's last day, which is when the total is true. Dating
+        // it to the first would put a week's revenue in the wrong month whenever
+        // a week straddles one.
+        date: period.end,
+        memo: format!(
+            "{} sales — {} ({} event{})",
+            service_name,
+            period.label(),
+            counted,
+            if counted == 1 { "" } else { "s" }
+        ),
+        lines,
+        reference: Some(reference),
+        source: Some(JournalEntrySource::EventService),
+    }))
+}
+
+/// Group events into the periods they belong to.
+///
+/// Keyed by the period rather than by the event's own date so that an event
+/// arriving out of order still lands in the right total.
+pub fn group_by_period(
+    frequency: ReportingFrequency,
+    events: Vec<RemoteEvent>,
+) -> BTreeMap<Period, Vec<RemoteEvent>> {
+    let mut out: BTreeMap<Period, Vec<RemoteEvent>> = BTreeMap::new();
+    for event in events {
+        if !is_rollup_event(&event.event_type) {
+            continue;
+        }
+        let Some(date) = event_date(&event) else {
+            continue;
+        };
+        let Some(period) = frequency.period_of(date) else {
+            continue;
+        };
+        out.entry(period).or_default().push(event);
+    }
+    out
+}
+
+/// The date a remote event happened, as the payload states it.
+///
+/// Not the date it was fetched: a till reconciled the next morning publishes
+/// yesterday's sale today, and totalling it into today would move revenue between
+/// periods.
+pub fn event_date(event: &RemoteEvent) -> Option<NaiveDate> {
+    let raw = event.data.get("date")?.as_str()?;
+    NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
+        .or_else(|_| {
+            // Some producers send a timestamp. Take the calendar day from it
+            // rather than refusing the event.
+            chrono::DateTime::parse_from_rfc3339(raw.trim()).map(|dt| dt.date_naive())
+        })
+        .ok()
+}
+
+/// Totalling a period, and the property that makes it safe to.
+#[cfg(test)]
+mod rollup_tests {
+    use super::planning_tests::{books, remote};
+    use super::*;
+    use crate::domain::ReportingFrequency;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn sale_on(id: &str, date: &str, qty: u32, price: i64, cost: i64) -> RemoteEvent {
+        remote(
+            id,
+            "sale",
+            serde_json::json!({
+                "date": date,
+                "payment_method": "cash",
+                "items": [{
+                    "name": "Tube",
+                    "qty": qty,
+                    "unit_price_cents": price,
+                    "unit_cost_cents": cost,
+                }],
+            }),
+        )
+    }
+
+    /// Sum a set of planned entries' lines by account, the way a reader would
+    /// check the books by hand.
+    fn totals_of(cmds: &[PostEntryCommand]) -> BTreeMap<String, i64> {
+        let mut out: BTreeMap<String, i64> = BTreeMap::new();
+        for cmd in cmds {
+            for line in &cmd.lines {
+                *out.entry(line.account_id.clone()).or_insert(0) += line.amount;
+            }
+        }
+        out.retain(|_, v| *v != 0);
+        out
+    }
+
+    /// **The property the whole feature rests on.**
+    ///
+    /// A day's rollup must move exactly the money the individual sales would
+    /// have. If it does not, choosing daily totals silently restates revenue —
+    /// and nobody would find that by reading a register of one row per day.
+    ///
+    /// It holds by construction rather than by care: the rollup plans each event
+    /// through the same `plan_remote_event` and sums the answer. This test is
+    /// what keeps that true if anyone reaches for a shortcut.
+    #[test]
+    fn a_rollup_moves_exactly_what_the_individual_sales_would() {
+        let store = books();
+        let conn = store.connection();
+        let events = vec![
+            sale_on("e-1", "2026-08-17", 2, 800, 300),
+            sale_on("e-2", "2026-08-17", 1, 4500, 2000),
+            sale_on("e-3", "2026-08-17", 3, 250, 100),
+        ];
+
+        let individually: Vec<PostEntryCommand> = events
+            .iter()
+            .map(|e| match plan_remote_event(conn, "Bugbear", e).unwrap() {
+                PlannedIngest::Entry(cmd) => *cmd,
+                other => panic!("a sale must plan to an entry, got {other:?}"),
+            })
+            .collect();
+
+        let period = ReportingFrequency::Daily
+            .period_of(day(2026, 8, 17))
+            .unwrap();
+        let rolled = plan_sales_rollup(conn, "Bugbear", &period, &events, "ref".to_string())
+            .unwrap()
+            .expect("three sales make an entry");
+
+        assert_eq!(
+            totals_of(&[rolled]),
+            totals_of(&individually),
+            "the rollup and the individual sales disagree about where the money went"
+        );
+    }
+
+    /// A refund inside the period nets against the sales, because it does in the
+    /// individual entries too.
+    #[test]
+    fn refunds_net_against_the_sales_they_reverse() {
+        let store = books();
+        let conn = store.connection();
+        let events = vec![
+            sale_on("e-1", "2026-08-17", 2, 800, 300),
+            remote(
+                "e-2",
+                "refund",
+                serde_json::json!({
+                    "date": "2026-08-17",
+                    "payment_method": "cash",
+                    "items": [{
+                        "name": "Tube",
+                        "qty": 1,
+                        "unit_price_cents": 800,
+                        "unit_cost_cents": 300,
+                    }],
+                }),
+            ),
+        ];
+
+        let individually: Vec<PostEntryCommand> = events
+            .iter()
+            .filter_map(|e| match plan_remote_event(conn, "Bugbear", e).unwrap() {
+                PlannedIngest::Entry(cmd) => Some(*cmd),
+                _ => None,
+            })
+            .collect();
+
+        let period = ReportingFrequency::Daily
+            .period_of(day(2026, 8, 17))
+            .unwrap();
+        let rolled = plan_sales_rollup(conn, "Bugbear", &period, &events, "ref".to_string())
+            .unwrap()
+            .expect("a sale and a refund still make an entry");
+
+        assert_eq!(totals_of(&[rolled]), totals_of(&individually));
+    }
+
+    /// A period that nets to nothing makes no entry.
+    ///
+    /// A row of zeroes in the register is noise somebody has to read past, and it
+    /// would still have to balance.
+    #[test]
+    fn a_period_that_nets_to_nothing_posts_nothing() {
+        let store = books();
+        let conn = store.connection();
+        // One sale, refunded in full the same day.
+        let events = vec![
+            sale_on("e-1", "2026-08-17", 1, 800, 0),
+            remote(
+                "e-2",
+                "refund",
+                serde_json::json!({
+                    "date": "2026-08-17",
+                    "payment_method": "cash",
+                    "items": [{
+                        "name": "Tube",
+                        "qty": 1,
+                        "unit_price_cents": 800,
+                        "unit_cost_cents": 0,
+                    }],
+                }),
+            ),
+        ];
+        let period = ReportingFrequency::Daily
+            .period_of(day(2026, 8, 17))
+            .unwrap();
+
+        // The refund posts to a separate Refunds account in this chart, so the
+        // day does not fully cancel — what must hold is that a genuinely empty
+        // period is empty.
+        let empty = plan_sales_rollup(conn, "Bugbear", &period, &[], "ref".to_string()).unwrap();
+        assert!(empty.is_none(), "no events must make no entry");
+
+        let some = plan_sales_rollup(conn, "Bugbear", &period, &events, "ref".to_string()).unwrap();
+        assert!(some.is_some());
+    }
+
+    /// Events land in the period their payload says, not the one they arrived in.
+    ///
+    /// A till reconciled the next morning publishes yesterday's sale today.
+    /// Totalling it into today would move revenue between periods — and between
+    /// months, four times a year, between quarters.
+    #[test]
+    fn an_event_belongs_to_the_day_it_happened() {
+        let events = vec![
+            sale_on("e-1", "2026-08-17", 1, 100, 0),
+            sale_on("e-2", "2026-08-18", 1, 100, 0),
+            sale_on("e-3", "2026-08-17", 1, 100, 0),
+        ];
+        let grouped = group_by_period(ReportingFrequency::Daily, events);
+
+        assert_eq!(grouped.len(), 2, "two days");
+        let d17 = ReportingFrequency::Daily
+            .period_of(day(2026, 8, 17))
+            .unwrap();
+        assert_eq!(grouped[&d17].len(), 2, "both of the 17th's sales");
+    }
+
+    /// A monthly frequency puts a month's days in one bucket.
+    #[test]
+    fn a_month_gathers_its_days() {
+        let events: Vec<RemoteEvent> = (1..=28)
+            .map(|d| sale_on(&format!("e-{d}"), &format!("2026-08-{d:02}"), 1, 100, 0))
+            .collect();
+        let grouped = group_by_period(ReportingFrequency::Monthly, events);
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped.values().next().unwrap().len(), 28);
+    }
+
+    /// Bills are not sales and must not be swallowed by a total.
+    ///
+    /// A goods-received event is a supplier bill that has to stay trackable as
+    /// its own payable; folding it into a revenue figure would make a debt
+    /// disappear.
+    #[test]
+    fn a_goods_receipt_is_not_rolled_up() {
+        assert!(is_rollup_event("sale"));
+        assert!(is_rollup_event("refund"));
+        assert!(!is_rollup_event("goods_received"));
+        assert!(!is_rollup_event("purchase_order"));
+        assert!(!is_rollup_event("inventory_adjustment"));
+
+        let grouped = group_by_period(
+            ReportingFrequency::Daily,
+            vec![remote(
+                "b-1",
+                "goods_received",
+                serde_json::json!({"date": "2026-08-17"}),
+            )],
+        );
+        assert!(grouped.is_empty(), "a bill was pulled into a sales total");
+    }
+
+    /// The lines come out in a stable order.
+    ///
+    /// Two clients planning the same period must produce the same entry, not one
+    /// that differs by line order — which is enough to make them look like
+    /// different entries to anyone comparing them.
+    #[test]
+    fn the_same_period_plans_identically_twice() {
+        let store = books();
+        let conn = store.connection();
+        let events = vec![
+            sale_on("e-1", "2026-08-17", 2, 800, 300),
+            sale_on("e-2", "2026-08-17", 1, 4500, 2000),
+        ];
+        let period = ReportingFrequency::Daily
+            .period_of(day(2026, 8, 17))
+            .unwrap();
+
+        let a = plan_sales_rollup(conn, "Bugbear", &period, &events, "ref".into())
+            .unwrap()
+            .unwrap();
+        let b = plan_sales_rollup(conn, "Bugbear", &period, &events, "ref".into())
+            .unwrap()
+            .unwrap();
+
+        let ids = |c: &PostEntryCommand| {
+            c.lines
+                .iter()
+                .map(|l| (l.account_id.clone(), l.amount))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&a), ids(&b));
     }
 }

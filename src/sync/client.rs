@@ -19,7 +19,7 @@ use super::commands::entry_ops::{
 };
 use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
-    RemoveEventServiceRequest,
+    RemoveEventServiceRequest, SetServiceReportingRequest, SetServiceReportingResponse,
 };
 use super::commands::plaid::{
     ConnectPlaidItemRequest, ConnectPlaidItemResponse, DisconnectPlaidItemRequest,
@@ -682,6 +682,66 @@ impl SyncClient {
                 reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
                 reqwest::StatusCode::NOT_FOUND => {
                     return Err(SyncClientError::ServerTooOld("connect a bank".to_string()))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Set how often a service's sales are totalled into the group's books.
+    ///
+    /// A shared fact rather than each member's setting: a rollup's idempotency
+    /// key carries its period, so two members aggregating one service at
+    /// different frequencies produce keys that do not collide, and the same sales
+    /// post twice with nothing to catch it.
+    pub async fn set_service_reporting(
+        &mut self,
+        service_id: impl Into<String>,
+        frequency: crate::domain::ReportingFrequency,
+        effective_from: NaiveDate,
+    ) -> Result<SetServiceReportingResponse, SyncClientError> {
+        let service_id = service_id.into();
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = SetServiceReportingRequest {
+                expected_head_seq: self.head,
+                service_id: service_id.clone(),
+                frequency: frequency.as_str().to_string(),
+                effective_from,
+            };
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/set-service-reporting"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let r: SetServiceReportingResponse = resp.json().await?;
+                    self.head = r.head;
+                    return Ok(r);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld(
+                        "choose how often a service reports".to_string(),
+                    ))
+                }
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                    let v: serde_json::Value = resp.json().await?;
+                    return Err(SyncClientError::Rejected(
+                        v["error"].as_str().unwrap_or("refused").to_string(),
+                    ));
                 }
                 s => {
                     let body = resp.text().await.unwrap_or_default();

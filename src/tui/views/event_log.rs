@@ -437,6 +437,11 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::EventServiceRegistered { name, root_url, .. } => {
             format!("Registered service '{}' ({})", name, widgets::truncate(root_url, 30))
         }
+        Event::EventServiceReportingChanged {
+            frequency,
+            effective_from,
+            ..
+        } => format!("Sales reporting set to {frequency} from {effective_from}"),
         Event::EventServiceRemoved { service_id } => {
             format!("Removed service {}", widgets::truncate(service_id, 8))
         }

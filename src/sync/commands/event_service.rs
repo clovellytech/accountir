@@ -43,6 +43,10 @@ pub fn router() -> Router<SyncState> {
         )
         .route("/sync/commands/remove-event-service", post(submit_remove))
         .route(
+            "/sync/commands/set-service-reporting",
+            post(submit_set_reporting),
+        )
+        .route(
             "/sync/commands/record-event-service-sync",
             post(submit_record_sync),
         )
@@ -177,6 +181,87 @@ pub struct RemoveEventServiceRequest {
 /// and no transaction spans them. The desktop makes both; a key left behind for a
 /// service nobody can see is inert, whereas a service visible with no key is a
 /// button that cannot work.
+#[derive(Serialize, Deserialize)]
+pub struct SetServiceReportingRequest {
+    pub expected_head_seq: i64,
+    pub service_id: String,
+    /// "per_event", "daily", "weekly", "monthly".
+    pub frequency: String,
+    pub effective_from: chrono::NaiveDate,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SetServiceReportingResponse {
+    pub head: i64,
+    /// `false` when the group's books already said this. Success either way — a
+    /// member choosing the frequency it already has should not see a failure.
+    pub recorded: bool,
+}
+
+/// Set how often a service's sales are totalled into the group's books.
+///
+/// This has to be a shared fact, which is why it is a command and not a setting
+/// on each member's machine. A rollup's idempotency key carries its period, so
+/// two members aggregating the same service at different frequencies produce keys
+/// that do not collide — nothing catches the overlap and the sales post twice.
+async fn submit_set_reporting(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetServiceReportingRequest>,
+) -> Result<Json<SetServiceReportingResponse>, ApiError> {
+    let Some(frequency) = crate::domain::ReportingFrequency::parse(&req.frequency) else {
+        return Err(ApiError::bad_request(
+            "frequency must be per_event, daily, weekly or monthly",
+        ));
+    };
+
+    let nothing = std::cell::Cell::new(false);
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            |tx| {
+                use crate::commands::event_service_commands::ReportingStep;
+                match crate::commands::event_service_commands::build_set_reporting_in_txn(
+                    tx,
+                    &req.service_id,
+                    frequency,
+                    req.effective_from,
+                )? {
+                    ReportingStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                    ReportingStep::Unchanged => {
+                        nothing.set(true);
+                        Ok(Verdict::Reject(EventServiceCommandError::NotFound(
+                            req.service_id.clone(),
+                        )))
+                    }
+                    // A service id nobody has is a mistake, not a no-op, and a
+                    // caller told "recorded: false" would read it as agreement.
+                    ReportingStep::NoSuchService => Ok(Verdict::Reject(
+                        EventServiceCommandError::NotFound(req.service_id.clone()),
+                    )),
+                }
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+
+    match outcome {
+        CheckedOutcome::Appended(stored) => Ok(Json(SetServiceReportingResponse {
+            head: stored.id,
+            recorded: true,
+        })),
+        CheckedOutcome::HeadMismatch { actual, .. } => Err(ApiError::conflict(actual)),
+        // Set only when the books already said this, so a missing service still
+        // reaches the arm below as the 422 it is.
+        CheckedOutcome::Rejected(_) if nothing.get() => Ok(Json(SetServiceReportingResponse {
+            head: req.expected_head_seq,
+            recorded: false,
+        })),
+        CheckedOutcome::Rejected(e) => Err(ApiError::domain(e)),
+    }
+}
+
 async fn submit_remove(
     AuthedUser(actor): AuthedUser,
     State(st): State<SyncState>,
@@ -277,9 +362,9 @@ mod tests {
     use crate::sync::router;
     use std::collections::HashMap;
 
-    const TOKEN: &str = "tok-1";
+    pub(super) const TOKEN: &str = "tok-1";
 
-    async fn serve() -> String {
+    pub(super) async fn serve() -> String {
         let store = {
             let s = EventStore::in_memory().unwrap();
             init_schema(s.connection()).unwrap();
@@ -297,7 +382,7 @@ mod tests {
         format!("http://{addr}")
     }
 
-    async fn head_of(base: &str) -> i64 {
+    pub(super) async fn head_of(base: &str) -> i64 {
         reqwest::Client::new()
             .get(format!("{base}/sync/head"))
             .bearer_auth(TOKEN)
@@ -311,7 +396,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn register(base: &str, name: &str, url: &str) -> reqwest::Response {
+    pub(super) async fn register(base: &str, name: &str, url: &str) -> reqwest::Response {
         reqwest::Client::new()
             .post(format!("{base}/sync/commands/register-event-service"))
             .bearer_auth(TOKEN)
@@ -585,5 +670,90 @@ mod tests {
                 .status(),
             reqwest::StatusCode::BAD_REQUEST
         );
+    }
+}
+
+/// Choosing how often a service reports, on group books.
+///
+/// A shared fact and therefore a command: a rollup's idempotency key carries its
+/// period, so two members aggregating one service at different frequencies
+/// produce keys that do not collide, and the same sales post twice with nothing
+/// to catch it.
+#[cfg(test)]
+mod reporting_frequency {
+    use super::tests::{head_of, register, serve, TOKEN};
+    use super::*;
+
+    async fn set(base: &str, head: i64, service_id: &str, frequency: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{base}/sync/commands/set-service-reporting"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head,
+                "service_id": service_id,
+                "frequency": frequency,
+                "effective_from": "2026-08-18",
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn a_service(base: &str) -> String {
+        let r = register(base, "Bugbear Bikes", "https://bugbearbikes.test").await;
+        let v: serde_json::Value = r.json().await.unwrap();
+        v["service_id"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn a_member_can_choose_daily_totals() {
+        let base = serve().await;
+        let service = a_service(&base).await;
+
+        let r = set(&base, head_of(&base).await, &service, "daily").await;
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["recorded"], true, "{v}");
+    }
+
+    /// Choosing the frequency it already has is success with nothing written.
+    ///
+    /// It is what happens when two members open the page and both pick daily. An
+    /// event for it would be a line in the log that says nothing changed.
+    #[tokio::test]
+    async fn choosing_the_same_frequency_again_records_nothing() {
+        let base = serve().await;
+        let service = a_service(&base).await;
+        set(&base, head_of(&base).await, &service, "daily").await;
+
+        let head = head_of(&base).await;
+        let r = set(&base, head, &service, "daily").await;
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+        let v: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(v["recorded"], false, "{v}");
+        assert_eq!(head_of(&base).await, head, "the log moved for nothing");
+    }
+
+    /// A service id nobody has is a mistake, not a no-op.
+    ///
+    /// The two share a code path — neither appends — and reporting both as
+    /// success would tell somebody who typed the id wrong that it had been set.
+    #[tokio::test]
+    async fn setting_the_frequency_of_a_service_that_does_not_exist_is_refused() {
+        let base = serve().await;
+        let r = set(&base, head_of(&base).await, "no-such-service", "daily").await;
+        assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// A frequency nothing can aggregate on is refused at the door.
+    ///
+    /// Stored, it would leave the projection holding a value no rollup knows what
+    /// to do with, and the symptom would be sales quietly not posting.
+    #[tokio::test]
+    async fn a_frequency_nobody_recognises_is_refused() {
+        let base = serve().await;
+        let service = a_service(&base).await;
+        let r = set(&base, head_of(&base).await, &service, "fortnightly").await;
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 }

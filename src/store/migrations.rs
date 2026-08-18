@@ -85,6 +85,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             21,
             include_str!("../../migrations/021_plaid_persistent_account_id.sql"),
         ),
+        (
+            22,
+            include_str!("../../migrations/022_event_service_reporting.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -457,7 +461,11 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             last_synced_at TEXT,
             events_processed INTEGER DEFAULT 0,
             entries_created INTEGER DEFAULT 0,
-            connected_at_event INTEGER REFERENCES events(id)
+            connected_at_event INTEGER REFERENCES events(id),
+            -- See migration 022: a ledger fact, not a preference, because two
+            -- members aggregating differently would post the same sales twice.
+            reporting_frequency TEXT NOT NULL DEFAULT 'per_event',
+            reporting_from TEXT
         );
 
         -- At most one active event service per root_url. DB backstop for the

@@ -305,6 +305,21 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                 validate_non_empty(api_key, "api_key")?;
             }
         }
+        Event::EventServiceReportingChanged {
+            service_id,
+            frequency,
+            ..
+        } => {
+            validate_non_empty(service_id, "service_id")?;
+            // Parsed rather than accepted: an unrecognised frequency would leave
+            // the projection holding a value nothing knows how to aggregate on,
+            // and the failure would surface as sales quietly not posting.
+            if crate::domain::ReportingFrequency::parse(frequency).is_none() {
+                return Err(ValidationError::InvalidValue(format!(
+                    "reporting frequency {frequency:?}"
+                )));
+            }
+        }
         Event::EventServiceRemoved { service_id } => {
             validate_non_empty(service_id, "service_id")?;
         }

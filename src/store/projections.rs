@@ -476,6 +476,17 @@ impl<'a> Projector<'a> {
                     params![service_id, name, root_url, api_key, stored_event.id],
                 )?;
             }
+            Event::EventServiceReportingChanged {
+                service_id,
+                frequency,
+                effective_from,
+            } => {
+                self.conn.execute(
+                    "UPDATE event_services SET reporting_frequency = ?2, reporting_from = ?3
+                      WHERE id = ?1",
+                    params![service_id, frequency, effective_from.to_string()],
+                )?;
+            }
             Event::EventServiceRemoved { service_id } => {
                 self.conn.execute(
                     "UPDATE event_services SET status = 'removed' WHERE id = ?1",

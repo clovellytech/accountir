@@ -303,6 +303,23 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_key: Option<String>,
     },
+    /// How often a service's sales are totalled into the books, from when.
+    ///
+    /// An event rather than a setting, because the alternative silently
+    /// double-counts revenue: a rollup's idempotency key carries its period, so
+    /// two members syncing one service at different frequencies produce keys that
+    /// do not collide and the same sales post twice. One value in the log means
+    /// every member aggregates on the same boundary.
+    ///
+    /// `effective_from` because switching mid-period would re-total days already
+    /// posted under a key that does not match them. What came before keeps the
+    /// shape it was posted with.
+    EventServiceReportingChanged {
+        service_id: String,
+        /// "per_event", "daily", "weekly", "monthly".
+        frequency: String,
+        effective_from: NaiveDate,
+    },
     EventServiceRemoved {
         service_id: String,
     },
@@ -411,6 +428,7 @@ impl Event {
             Event::PlaidAccountUnmapped { .. } => "plaid_account_unmapped",
             Event::PlaidTransactionsSynced { .. } => "plaid_transactions_synced",
             Event::EventServiceRegistered { .. } => "event_service_registered",
+            Event::EventServiceReportingChanged { .. } => "event_service_reporting_changed",
             Event::EventServiceRemoved { .. } => "event_service_removed",
             Event::EventServiceSynced { .. } => "event_service_synced",
             Event::BillReceived { .. } => "bill_received",
@@ -457,6 +475,7 @@ impl Event {
             Event::PlaidAccountUnmapped { item_id, .. } => Some(item_id),
             Event::PlaidTransactionsSynced { item_id, .. } => Some(item_id),
             Event::EventServiceRegistered { service_id, .. } => Some(service_id),
+            Event::EventServiceReportingChanged { service_id, .. } => Some(service_id),
             Event::EventServiceRemoved { service_id } => Some(service_id),
             Event::EventServiceSynced { service_id, .. } => Some(service_id),
             Event::BillReceived { bill_id, .. } => Some(bill_id),
