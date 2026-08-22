@@ -627,10 +627,19 @@ pub struct SquareSettlement {
     pub reported_tax: i64,
     pub reported_tips: i64,
     pub fees: i64,
-    /// What the books already posted to the revenue account over the period.
-    pub books_revenue: i64,
-    /// `reported_revenue - books_revenue`. Zero means the two agree.
-    pub revenue_difference: i64,
+    /// Everything Square collected: revenue + tax + tips, before it kept its cut.
+    pub reported_gross: i64,
+    /// What the books show arriving in the Square balance over the period —
+    /// debits only, so this crate's own fee credit does not net against it.
+    pub books_square_in: i64,
+    /// `reported_gross - books_square_in`. Zero means the two agree.
+    ///
+    /// Compared on the **tender** side rather than on revenue, because revenue
+    /// cannot be attributed to a payment method: every sale credits one revenue
+    /// account whatever it was paid with, and a split-tender sale credits it once
+    /// for a total that arrived partly in cash. Comparing Square's report against
+    /// that account showed every cash sale as a discrepancy.
+    pub difference: i64,
 }
 
 /// Post only Square's fees for a period, leaving the sales to the POS.
@@ -671,22 +680,30 @@ pub fn plan_square_fees(
     })?;
     let s = parse_sales_summary(content);
 
-    let required = ["pos_square", "square_fees", "pos_revenue"];
+    let required = ["pos_square", "square_fees"];
     let mappings = load_ingest_mappings(conn, &required)?;
 
-    // What the books already hold for the period, on the revenue account the POS
-    // posts to. Voided entries excluded — they are not revenue.
-    let books_revenue: i64 = conn
+    // What arrived in the Square balance over the period, from the books.
+    //
+    // Debits only, and deliberately: a credit to this account is money leaving
+    // it — this crate's own fee entry, or a transfer out to the bank — and
+    // netting those against what came in would compare Square's gross to
+    // something else entirely. Voided entries are excluded; they are not money.
+    let books_square_in: i64 = conn
         .query_row(
-            "SELECT COALESCE(-SUM(jl.amount), 0)
+            "SELECT COALESCE(SUM(jl.amount), 0)
                FROM journal_lines jl
                JOIN journal_entries je ON jl.entry_id = je.id
-              WHERE jl.account_id = ?1 AND je.is_void = 0
+              WHERE jl.account_id = ?1 AND jl.amount > 0 AND je.is_void = 0
                 AND je.date >= ?2 AND je.date <= ?3",
-            rusqlite::params![&mappings["pos_revenue"], start.to_string(), end.to_string()],
+            rusqlite::params![&mappings["pos_square"], start.to_string(), end.to_string()],
             |row| row.get(0),
         )
         .unwrap_or(0);
+
+    // Everything Square collected before its cut — which is what the POS booked
+    // as arriving in the Square balance.
+    let reported_gross = s.revenue + s.tax + s.tips;
 
     let settlement = SquareSettlement {
         start,
@@ -695,8 +712,9 @@ pub fn plan_square_fees(
         reported_tax: s.tax,
         reported_tips: s.tips,
         fees: s.fees,
-        books_revenue,
-        revenue_difference: s.revenue - books_revenue,
+        reported_gross,
+        books_square_in,
+        difference: reported_gross - books_square_in,
     };
 
     if s.fees == 0 {
@@ -755,10 +773,30 @@ mod settlement_tests {
 \"Net total\",\"$1,597.85\"\n";
 
     fn ready() -> EventStore {
-        let store = books();
+        let mut store = books();
+        // A Square balance account of its own. Mapping it onto the cash account —
+        // which `books()` already uses for `pos_cash` — would make a cash sale and
+        // a Square sale land in the same place, and every test about telling the
+        // two apart would pass for the wrong reason.
+        let created = crate::events::types::Event::AccountCreated {
+            account_id: "sq".to_string(),
+            account_type: crate::events::types::EventAccountType::Asset,
+            account_number: "1100".to_string(),
+            name: "Square balance".to_string(),
+            parent_id: None,
+            currency: None,
+            description: None,
+        };
+        let stored = store
+            .append(crate::events::types::EventEnvelope::new(
+                created,
+                "test".to_string(),
+            ))
+            .unwrap();
+        crate::store::projections::ProjectionStore::apply_projection(&mut store, &stored).unwrap();
+
         let conn = store.connection();
-        // `books()` maps pos_revenue and the rest; Square needs its own two.
-        set_account_mapping(conn, "pos_square", "cash").unwrap();
+        set_account_mapping(conn, "pos_square", "sq").unwrap();
         set_account_mapping(conn, "square_fees", "cogs").unwrap();
         // The full-summary planner needs these two as well; the fees-only one
         // deliberately does not, which is part of what makes it lighter to run.
@@ -851,10 +889,132 @@ mod settlement_tests {
         .unwrap();
 
         assert_eq!(settlement.reported_revenue, 148943);
+        assert_eq!(
+            settlement.reported_gross,
+            148943 + 15268,
+            "revenue plus tax"
+        );
         // Nothing posted in this period yet, so the whole of it is the gap — and
         // saying so is the point: it is how a missing day of POS totals shows up.
-        assert_eq!(settlement.books_revenue, 0);
-        assert_eq!(settlement.revenue_difference, 148943);
+        assert_eq!(settlement.books_square_in, 0);
+        assert_eq!(settlement.difference, 164211);
+    }
+
+    /// **A shop that also takes cash must still reconcile.**
+    ///
+    /// The first version of this compared Square's reported revenue against the
+    /// whole revenue account — and every sale credits that account whatever it
+    /// was paid with. So a shop taking cash saw its cash sales as a discrepancy,
+    /// every month, with nothing wrong.
+    ///
+    /// Revenue cannot be attributed to a payment method at all: a split-tender
+    /// sale credits revenue once for a total that arrived partly in cash. The
+    /// tender side can, because that is where the split lives — so the comparison
+    /// is Square's gross against what actually landed in the Square balance.
+    #[test]
+    fn cash_sales_are_not_counted_as_a_square_discrepancy() {
+        let mut store = ready();
+        let conn_accounts = crate::commands::ingest_commands::load_ingest_mappings(
+            store.connection(),
+            &["pos_square", "pos_cash", "pos_revenue"],
+        )
+        .unwrap();
+
+        // A day's takings: 1,000.00 through Square and 500.00 in cash. One
+        // revenue credit for the lot, as a real rollup posts it.
+        crate::commands::entry_commands::EntryCommands::new(&mut store, "t".to_string())
+            .post_entry(PostEntryCommand {
+                date: NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+                memo: "POS daily total".to_string(),
+                lines: vec![
+                    EntryLine::debit(&conn_accounts["pos_square"], 100_000, "USD"),
+                    EntryLine::debit(&conn_accounts["pos_cash"], 50_000, "USD"),
+                    EntryLine::credit(&conn_accounts["pos_revenue"], 150_000, "USD"),
+                ],
+                reference: Some("pos:2026-06-15".to_string()),
+                source: None,
+            })
+            .unwrap();
+
+        // Square reports only what went through Square: 1,000.00, no tax or tips.
+        let summary = "\"Sales summary - Summary\",\" \"\n\
+\"Net sales\",\"$1,000.00\"\n\
+\"Taxes\",\"$0.00\"\n\
+\"Tips\",\"$0.00\"\n\
+\"Fees\",\"($30.00)\"\n";
+
+        let (_, settlement) = plan_square_fees(
+            store.connection(),
+            summary,
+            "sales-summary-2026-06-01-2026-06-30.csv",
+        )
+        .unwrap();
+
+        assert_eq!(
+            settlement.books_square_in, 100_000,
+            "only the Square tender"
+        );
+        assert_eq!(settlement.reported_gross, 100_000);
+        assert_eq!(
+            settlement.difference, 0,
+            "the cash sales were counted as a Square discrepancy"
+        );
+    }
+
+    /// The fee entry does not net against what came in.
+    ///
+    /// It credits the Square balance, so summing the account's movement would
+    /// subtract the fees from the gross and show a difference of exactly the
+    /// fees — every month, once the entry had posted.
+    #[test]
+    fn the_fee_entry_does_not_skew_the_comparison() {
+        let mut store = ready();
+        let accounts = crate::commands::ingest_commands::load_ingest_mappings(
+            store.connection(),
+            &["pos_square", "pos_revenue", "square_fees"],
+        )
+        .unwrap();
+
+        crate::commands::entry_commands::EntryCommands::new(&mut store, "t".to_string())
+            .post_entry(PostEntryCommand {
+                date: NaiveDate::from_ymd_opt(2026, 6, 15).unwrap(),
+                memo: "POS daily total".to_string(),
+                lines: vec![
+                    EntryLine::debit(&accounts["pos_square"], 100_000, "USD"),
+                    EntryLine::credit(&accounts["pos_revenue"], 100_000, "USD"),
+                ],
+                reference: Some("pos:2026-06-15".to_string()),
+                source: None,
+            })
+            .unwrap();
+        // And the fees, as this module would post them.
+        crate::commands::entry_commands::EntryCommands::new(&mut store, "t".to_string())
+            .post_entry(PostEntryCommand {
+                date: NaiveDate::from_ymd_opt(2026, 6, 30).unwrap(),
+                memo: "Square fees".to_string(),
+                lines: vec![
+                    EntryLine::debit(&accounts["square_fees"], 3_000, "USD"),
+                    EntryLine::credit(&accounts["pos_square"], 3_000, "USD"),
+                ],
+                reference: Some("square-fees-already".to_string()),
+                source: None,
+            })
+            .unwrap();
+
+        let summary = "\"Sales summary - Summary\",\" \"\n\
+\"Net sales\",\"$1,000.00\"\n\
+\"Taxes\",\"$0.00\"\n\
+\"Tips\",\"$0.00\"\n\
+\"Fees\",\"($30.00)\"\n";
+        let (_, settlement) = plan_square_fees(
+            store.connection(),
+            summary,
+            "sales-summary-2026-06-01-2026-06-30.csv",
+        )
+        .unwrap();
+
+        assert_eq!(settlement.books_square_in, 100_000, "debits only");
+        assert_eq!(settlement.difference, 0);
     }
 
     /// A fees-only entry and a full summary must not be mistaken for each other.
