@@ -734,7 +734,7 @@ impl SyncClient {
                 reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
                 reqwest::StatusCode::NOT_FOUND => {
                     return Err(SyncClientError::ServerTooOld(
-                        "choose how often a service reports".to_string(),
+                        "set how often a service reports".to_string(),
                     ))
                 }
                 reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
