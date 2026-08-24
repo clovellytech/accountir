@@ -31,7 +31,11 @@ pub fn list_rules(conn: &Connection) -> Vec<VendorRule> {
     out
 }
 
-pub fn add_rule(conn: &Connection, pattern: &str, account_id: &str) -> Result<String, rusqlite::Error> {
+pub fn add_rule(
+    conn: &Connection,
+    pattern: &str,
+    account_id: &str,
+) -> Result<String, rusqlite::Error> {
     let id = Uuid::new_v4().to_string();
     conn.execute(
         "INSERT INTO vendor_account_rules (id, pattern, account_id, updated_at)
@@ -72,18 +76,30 @@ pub fn delete_rule(conn: &Connection, id: &str) -> Result<(), rusqlite::Error> {
 /// The payable account for a counterparty `name`: the longest rule pattern that
 /// appears (case-insensitively) within `name`, or `None` if nothing matches.
 pub fn match_account(conn: &Connection, name: &str) -> Option<String> {
+    match_in(&list_rules(conn), name).map(|r| r.account_id.clone())
+}
+
+/// The rule that would route a bill from `name`, given a set of rules.
+///
+/// Split out from [`match_account`] so a screen showing "where this vendor's next
+/// bill goes" can answer with the rule that will actually be used, rather than
+/// with a second opinion written to look the same. The payables page reimplemented
+/// this once; the two agreed until they wouldn't have.
+///
+/// Longest pattern wins. A rule for "Quality Bicycle" and one for "Quality Bicycle
+/// Products" both match a QBP bill, and the more specific one is the one somebody
+/// wrote on purpose.
+pub fn match_in<'a>(rules: &'a [VendorRule], name: &str) -> Option<&'a VendorRule> {
     let name_lc = name.to_lowercase();
-    let mut best: Option<(usize, String)> = None;
-    for rule in list_rules(conn) {
-        let p = rule.pattern.trim().to_lowercase();
-        if !p.is_empty() && name_lc.contains(&p) {
-            let len = p.chars().count();
-            if best.as_ref().map(|(l, _)| len > *l).unwrap_or(true) {
-                best = Some((len, rule.account_id));
-            }
-        }
-    }
-    best.map(|(_, id)| id)
+    rules
+        .iter()
+        .filter(|rule| {
+            let p = rule.pattern.trim().to_lowercase();
+            // An empty pattern is `contains`-true against everything. It should
+            // not exist, and it must not match if it does.
+            !p.is_empty() && name_lc.contains(&p)
+        })
+        .max_by_key(|rule| rule.pattern.trim().chars().count())
 }
 
 #[cfg(test)]
@@ -111,7 +127,10 @@ mod tests {
             match_account(conn, "Quality Bicycle Products Co #4471").as_deref(),
             Some("acct-qbp-specific")
         );
-        assert_eq!(match_account(conn, "BTI Supplier").as_deref(), Some("acct-bti"));
+        assert_eq!(
+            match_account(conn, "BTI Supplier").as_deref(),
+            Some("acct-bti")
+        );
         assert_eq!(match_account(conn, "Some Other Vendor"), None);
     }
 }
@@ -173,5 +192,122 @@ mod set_rule_tests {
             match_account(store.connection(), "Shimano").as_deref(),
             Some("acct-shimano")
         );
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::{init_schema, run_migrations};
+
+    /// A rule set in one session is there in the next.
+    ///
+    /// Written to a file and read back through a second connection, because the
+    /// question is about durability and an in-memory store cannot answer it. The
+    /// report that prompted this was "I linked some vendors, restarted, and the
+    /// links were gone".
+    #[test]
+    fn a_rule_survives_closing_and_reopening_the_book() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("books.db").to_string_lossy().to_string();
+
+        {
+            let store = EventStore::open(&path).expect("open");
+            init_schema(store.connection()).expect("schema");
+            run_migrations(store.connection()).expect("migrations");
+            set_rule_for(store.connection(), "Quality Bicycle Products", "ap-qbp")
+                .expect("set the rule");
+        }
+
+        let store = EventStore::open(&path).expect("reopen");
+        // Migrations run on every open, as they do when the app starts. A
+        // migration that dropped or recreated this table would take the rules
+        // with it, and the symptom would be exactly the one reported.
+        run_migrations(store.connection()).expect("migrations");
+
+        let rules = list_rules(store.connection());
+        assert_eq!(rules.len(), 1, "the rule did not survive the restart");
+        assert_eq!(rules[0].pattern, "Quality Bicycle Products");
+        assert_eq!(rules[0].account_id, "ap-qbp");
+    }
+
+    /// And it survives a projection rebuild.
+    ///
+    /// The rebuild wipes and replays every projected table. This one is plain
+    /// config — nothing in the log produces it — so it is deliberately not on
+    /// that list, and if it ever were, every link a user had made would vanish
+    /// the next time a replica caught up.
+    #[test]
+    fn a_rule_survives_a_projection_rebuild() {
+        let mut store = EventStore::in_memory().expect("store");
+        init_schema(store.connection()).expect("schema");
+        set_rule_for(store.connection(), "Quality Bicycle Products", "ap-qbp").expect("rule");
+
+        let events = store.get_all().expect("events");
+        crate::store::projections::ProjectionStore::rebuild_projections(&mut store, &events)
+            .expect("rebuild");
+
+        assert_eq!(
+            list_rules(store.connection()).len(),
+            1,
+            "a projection rebuild wiped the vendor links"
+        );
+    }
+
+    /// Linking the same vendor twice leaves one rule, not two.
+    #[test]
+    fn re_linking_a_vendor_replaces_rather_than_appends() {
+        let store = EventStore::in_memory().expect("store");
+        init_schema(store.connection()).expect("schema");
+
+        set_rule_for(store.connection(), "QBP", "ap-one").expect("first");
+        set_rule_for(store.connection(), "qbp", "ap-two").expect("second, different case");
+
+        let rules = list_rules(store.connection());
+        assert_eq!(rules.len(), 1, "two rules for one vendor: {rules:?}");
+        assert_eq!(rules[0].account_id, "ap-two", "the later link must win");
+    }
+}
+
+#[cfg(test)]
+mod matching_tests {
+    use super::*;
+
+    fn rule(pattern: &str, account: &str) -> VendorRule {
+        VendorRule {
+            id: pattern.to_string(),
+            pattern: pattern.to_string(),
+            account_id: account.to_string(),
+        }
+    }
+
+    /// The more specific rule wins, wherever it is asked.
+    ///
+    /// Both the posting path and the payables page ask through this, so a page
+    /// promising one account and the ledger using another is not a state the two
+    /// can get into.
+    #[test]
+    fn the_longest_matching_pattern_wins() {
+        let rules = vec![
+            rule("Quality Bicycle", "ap-general"),
+            rule("Quality Bicycle Products", "ap-qbp"),
+        ];
+        let hit = match_in(&rules, "QUALITY BICYCLE PRODUCTS INC").expect("a match");
+        assert_eq!(hit.account_id, "ap-qbp");
+    }
+
+    /// An empty pattern matches everything under `contains`. It should not exist,
+    /// and it must not route a bill if it does.
+    #[test]
+    fn an_empty_pattern_never_matches() {
+        let rules = vec![rule("   ", "ap-wrong")];
+        assert!(match_in(&rules, "Anybody At All").is_none());
+    }
+
+    #[test]
+    fn a_vendor_with_no_rule_has_no_match() {
+        let rules = vec![rule("Quality Bicycle", "ap-qbp")];
+        assert!(match_in(&rules, "Shimano").is_none());
     }
 }
