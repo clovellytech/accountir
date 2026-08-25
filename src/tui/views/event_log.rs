@@ -221,6 +221,34 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         } => {
             format!("Updated {} to '{}'", field, new_value)
         }
+        Event::BusinessProfileSet(d) => {
+            format!("Set partnership details for '{}' ({})", d.legal_name, d.ein)
+        }
+        Event::PartnerAdmitted(d) => {
+            format!(
+                "Admitted {} partner '{}' at {}% of profit",
+                d.partner_type,
+                d.name,
+                crate::domain::format_ppm(d.shares.profit_ppm)
+            )
+        }
+        Event::PartnerDetailsUpdated(d) => {
+            format!(
+                "Updated partner '{}' to {}% of profit",
+                d.name,
+                crate::domain::format_ppm(d.shares.profit_ppm)
+            )
+        }
+        Event::PartnerWithdrawn {
+            partner_id,
+            end_date,
+        } => {
+            format!(
+                "Partner {} left on {}",
+                widgets::truncate(partner_id, 8),
+                end_date
+            )
+        }
         Event::UserAdded { username, role, .. } => {
             format!("Added user '{}' as {:?}", username, role)
         }

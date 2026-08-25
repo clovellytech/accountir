@@ -45,6 +45,66 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             validate_non_empty(field, "field")?;
             validate_non_empty(new_value, "new_value")?;
         }
+        Event::BusinessProfileSet(d) => {
+            let (legal_name, address, ein, naics_code) = (&d.legal_name, &d.address, &d.ein, &d.naics_code);
+            validate_non_empty(legal_name, "legal_name")?;
+            // Checked for shape, not for existence: a mistyped EIN is a rejected
+            // return weeks later, and the shape is the only half of that we can
+            // catch here.
+            if !crate::domain::is_valid_ein(ein) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "EIN {ein:?} is not NN-NNNNNNN"
+                )));
+            }
+            if !crate::domain::is_valid_naics(naics_code) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "NAICS code {naics_code:?} is not six digits"
+                )));
+            }
+            validate_address(address)?;
+        }
+        Event::PartnerAdmitted(d) => {
+            let (partner_id, name, partner_type, residency, entity_type, address, shares) = (
+                &d.partner_id,
+                &d.name,
+                &d.partner_type,
+                &d.residency,
+                &d.entity_type,
+                &d.address,
+                &d.shares,
+            );
+            validate_non_empty(partner_id, "partner_id")?;
+            validate_non_empty(name, "partner name")?;
+            validate_non_empty(entity_type, "entity_type")?;
+            validate_partner_type(partner_type)?;
+            validate_residency(residency)?;
+            validate_shares(shares)?;
+            validate_address(address)?;
+        }
+        Event::PartnerDetailsUpdated(d) => {
+            let (partner_id, name, partner_type, residency, entity_type, address, shares) = (
+                &d.partner_id,
+                &d.name,
+                &d.partner_type,
+                &d.residency,
+                &d.entity_type,
+                &d.address,
+                &d.shares,
+            );
+            validate_non_empty(partner_id, "partner_id")?;
+            validate_non_empty(name, "partner name")?;
+            validate_non_empty(entity_type, "entity_type")?;
+            validate_partner_type(partner_type)?;
+            validate_residency(residency)?;
+            validate_shares(shares)?;
+            validate_address(address)?;
+        }
+        Event::PartnerWithdrawn {
+            partner_id,
+            end_date: _,
+        } => {
+            validate_non_empty(partner_id, "partner_id")?;
+        }
         Event::UserAdded {
             user_id,
             username,
@@ -478,6 +538,48 @@ fn validate_journal_lines(lines: &[JournalLineData]) -> Result<(), ValidationErr
         }
     }
 
+    Ok(())
+}
+
+/// A partner is general or limited; the K-1 offers no third box.
+fn validate_partner_type(s: &str) -> Result<(), ValidationError> {
+    crate::domain::PartnerType::parse(s)
+        .map(|_| ())
+        .ok_or_else(|| ValidationError::InvalidValue(format!("partner type {s:?}")))
+}
+
+fn validate_residency(s: &str) -> Result<(), ValidationError> {
+    crate::domain::Residency::parse(s)
+        .map(|_| ())
+        .ok_or_else(|| ValidationError::InvalidValue(format!("residency {s:?}")))
+}
+
+/// A share is between nothing and the whole.
+///
+/// Whether a partnership's shares *sum* to the whole is not checked here: a
+/// partnership passes through states where they do not — the moment after the
+/// first partner is admitted, most obviously — and refusing those would make the
+/// books unbuildable. The sum is checked when a return is generated, which is
+/// the point at which it has to be true.
+fn validate_shares(s: &crate::events::types::ShareData) -> Result<(), ValidationError> {
+    // The bounds live on `Shares` and are not restated here: this is the check
+    // guarding the log, and it is the one that must not drift from the domain's.
+    let shares = crate::domain::Shares {
+        profit_ppm: s.profit_ppm,
+        loss_ppm: s.loss_ppm,
+        capital_ppm: s.capital_ppm,
+    };
+    match shares.out_of_range() {
+        Some((name, ppm)) => Err(ValidationError::InvalidValue(format!(
+            "{name} share {ppm} ppm is outside 0..=100%"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn validate_address(a: &crate::events::types::AddressData) -> Result<(), ValidationError> {
+    validate_non_empty(&a.street, "street")?;
+    validate_non_empty(&a.city, "city")?;
     Ok(())
 }
 

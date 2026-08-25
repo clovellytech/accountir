@@ -100,6 +100,134 @@ enum Commands {
     /// Import an Amazon Business export by hand (order history CSV)
     #[command(subcommand)]
     Amazon(AmazonCliCommands),
+
+    /// The partnership's own details, and its partners
+    #[command(subcommand)]
+    Partnership(PartnershipCliCommands),
+
+    /// Generate tax forms from the books
+    #[command(subcommand)]
+    Tax(TaxCliCommands),
+}
+
+#[derive(Subcommand)]
+enum PartnershipCliCommands {
+    /// Set the partnership's details, as they appear at the head of Form 1065
+    Profile {
+        /// The name on the SS-4 — what the IRS matches the EIN against
+        #[arg(long)]
+        legal_name: String,
+        #[arg(long)]
+        street: String,
+        #[arg(long)]
+        suite: Option<String>,
+        #[arg(long)]
+        city: String,
+        /// State, or province for a foreign address
+        #[arg(long)]
+        state: String,
+        /// ZIP, or foreign postal code
+        #[arg(long)]
+        postal_code: String,
+        /// Left blank for a US address, which is what the form expects
+        #[arg(long)]
+        country: Option<String>,
+        /// Employer identification number, NN-NNNNNNN
+        #[arg(long)]
+        ein: String,
+        /// Six-digit NAICS code (Form 1065 box C)
+        #[arg(long)]
+        naics: String,
+        /// Date business started, YYYY-MM-DD (box E)
+        #[arg(long)]
+        started: String,
+        /// Principal business activity (box A)
+        #[arg(long)]
+        activity: Option<String>,
+        /// Principal product or service (box B)
+        #[arg(long)]
+        product: Option<String>,
+    },
+
+    /// Show the partnership's details and its partners
+    Show,
+
+    /// Add a partner
+    AddPartner {
+        #[arg(long)]
+        name: String,
+        /// "general" (or LLC member-manager) or "limited" — K-1 item G
+        #[arg(long, default_value = "general")]
+        r#type: String,
+        /// "domestic" or "foreign" — K-1 item H1
+        #[arg(long, default_value = "domestic")]
+        residency: String,
+        /// K-1 item I1, e.g. "Individual", "S Corporation", "Estate"
+        #[arg(long, default_value = "Individual")]
+        entity_type: String,
+        #[arg(long)]
+        street: String,
+        #[arg(long)]
+        suite: Option<String>,
+        #[arg(long)]
+        city: String,
+        #[arg(long)]
+        state: String,
+        #[arg(long)]
+        postal_code: String,
+        #[arg(long)]
+        country: Option<String>,
+        /// YYYY-MM-DD. Defaults to the date the business started
+        #[arg(long)]
+        started: Option<String>,
+        /// Share of profit, as a percentage
+        #[arg(long)]
+        profit: f64,
+        /// Share of loss, as a percentage. Defaults to the profit share
+        #[arg(long)]
+        loss: Option<f64>,
+        /// Share of capital, as a percentage. Defaults to the profit share
+        #[arg(long)]
+        capital: Option<f64>,
+        /// SSN (NNN-NN-NNNN) or EIN (NN-NNNNNNN). Stored on this machine only,
+        /// never in the replicated event log
+        #[arg(long)]
+        tin: Option<String>,
+    },
+
+    /// List the partners
+    Partners {
+        /// Only those who held an interest during this tax year
+        #[arg(long)]
+        year: Option<i32>,
+    },
+
+    /// Record that a partner has left
+    RemovePartner {
+        partner_id: String,
+        /// The day they left, YYYY-MM-DD
+        #[arg(long)]
+        on: String,
+    },
+
+    /// Set a partner's TIN on this machine. Never written to the event log
+    SetTin {
+        partner_id: String,
+        tin: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaxCliCommands {
+    /// Build Form 1065 with a Schedule K-1 per partner, as one fillable PDF
+    Form1065 {
+        /// Tax year to file
+        #[arg(long)]
+        year: i32,
+        /// Where to write the PDF
+        #[arg(short, long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -496,6 +624,17 @@ async fn main() -> Result<()> {
             let mut store = EventStore::open(&cli.database)?;
             accountir::store::migrations::run_migrations(store.connection())?;
             handle_amazon_command(&mut store, cmd)?;
+        }
+
+        Commands::Partnership(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            accountir::store::migrations::run_migrations(store.connection())?;
+            handle_partnership_command(&mut store, cmd)?;
+        }
+
+        Commands::Tax(cmd) => {
+            let store = EventStore::open(&cli.database)?;
+            handle_tax_command(&store, cmd)?;
         }
     }
 
@@ -1519,6 +1658,258 @@ fn handle_invoice_command(store: &mut EventStore, cmd: InvoiceCliCommands) -> Re
             println!("  Over 90 days:          {}", format_amount(aging.days_over_90));
             println!("{}", "-".repeat(60));
             println!("  Total:                 {}", format_amount(aging.total));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Partnership & tax forms
+// ---------------------------------------------------------------------------
+
+fn parse_cli_date(s: &str, what: &str) -> Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("{what} must be YYYY-MM-DD, got {s:?}"))
+}
+
+fn handle_partnership_command(
+    store: &mut EventStore,
+    cmd: PartnershipCliCommands,
+) -> Result<()> {
+    use accountir::commands::partnership_commands as pc;
+    use accountir::domain::{Address, BusinessProfile, PartnerType, Residency, Shares};
+
+    match cmd {
+        PartnershipCliCommands::Profile {
+            legal_name,
+            street,
+            suite,
+            city,
+            state,
+            postal_code,
+            country,
+            ein,
+            naics,
+            started,
+            activity,
+            product,
+        } => {
+            let profile = BusinessProfile {
+                legal_name,
+                address: Address {
+                    street,
+                    suite,
+                    city,
+                    state,
+                    postal_code,
+                    country,
+                },
+                ein,
+                naics_code: naics,
+                formation_date: parse_cli_date(&started, "--started")?,
+                principal_activity: activity,
+                principal_product: product,
+            };
+            pc::set_profile(store, "cli-user", &profile)?;
+            println!("Partnership details saved for {}", profile.legal_name);
+        }
+
+        PartnershipCliCommands::Show => {
+            match pc::get_profile(store.connection()) {
+                Some(p) => {
+                    println!("{}", p.legal_name);
+                    println!("  EIN:        {}", p.ein);
+                    println!("  NAICS:      {}", p.naics_code);
+                    println!("  Started:    {}", p.formation_date);
+                    for line in p.address.as_block("").lines() {
+                        println!("  {line}");
+                    }
+                }
+                None => println!("No partnership details yet — run `partnership profile`."),
+            }
+            let partners = pc::list_partners(store.connection());
+            println!("\n{} partner(s):", partners.len());
+            for p in &partners {
+                print_partner(store.connection(), p);
+            }
+        }
+
+        PartnershipCliCommands::AddPartner {
+            name,
+            r#type,
+            residency,
+            entity_type,
+            street,
+            suite,
+            city,
+            state,
+            postal_code,
+            country,
+            started,
+            profit,
+            loss,
+            capital,
+            tin,
+        } => {
+            let partner_type = PartnerType::parse(&r#type)
+                .ok_or_else(|| anyhow::anyhow!("--type must be general or limited"))?;
+            let residency = Residency::parse(&residency)
+                .ok_or_else(|| anyhow::anyhow!("--residency must be domestic or foreign"))?;
+            let start_date = started
+                .as_deref()
+                .map(|d| parse_cli_date(d, "--started"))
+                .transpose()?;
+
+            let cmd = pc::AdmitPartner {
+                name,
+                partner_type,
+                residency,
+                entity_type,
+                address: Address {
+                    street,
+                    suite,
+                    city,
+                    state,
+                    postal_code,
+                    country,
+                },
+                start_date,
+                // Loss and capital default to the profit share: equal is the
+                // common case, and making somebody type it three times is how
+                // they end up differing by a typo nobody notices until a K-1.
+                shares: Shares::from_percents(
+                    profit,
+                    loss.unwrap_or(profit),
+                    capital.unwrap_or(profit),
+                ),
+                tin,
+            };
+            let (id, _) = pc::admit_partner(store, "cli-user", &cmd)?;
+            println!("Added partner {} ({})", cmd.name, id);
+            report_share_totals(store.connection());
+        }
+
+        PartnershipCliCommands::Partners { year } => {
+            let partners = match year {
+                Some(y) => pc::partners_for_year(store.connection(), y),
+                None => pc::list_partners(store.connection()),
+            };
+            if partners.is_empty() {
+                println!("No partners.");
+            }
+            for p in &partners {
+                print_partner(store.connection(), p);
+            }
+            report_share_totals(store.connection());
+        }
+
+        PartnershipCliCommands::RemovePartner { partner_id, on } => {
+            let end = parse_cli_date(&on, "--on")?;
+            pc::withdraw_partner(store, "cli-user", &partner_id, end)?;
+            println!("Partner {partner_id} left on {end}");
+        }
+
+        PartnershipCliCommands::SetTin { partner_id, tin } => {
+            pc::set_tin(store.connection(), &partner_id, &tin)?;
+            println!("TIN stored on this machine only — it is not in the event log.");
+        }
+    }
+
+    fn print_partner(conn: &rusqlite::Connection, p: &accountir::domain::Partner) {
+        use accountir::commands::partnership_commands as pc;
+        use accountir::domain::format_ppm;
+        let tin = match pc::get_tin(conn, &p.partner_id) {
+            Some(_) => "TIN on file",
+            None => "no TIN on this machine",
+        };
+        let until = match p.end_date {
+            Some(e) => format!(" until {e}"),
+            None => String::new(),
+        };
+        println!(
+            "  {}  {}\n     {} / {}, {} — from {}{}, {}",
+            &p.partner_id[..8.min(p.partner_id.len())],
+            p.name,
+            p.partner_type.label(),
+            p.residency.label(),
+            p.entity_type,
+            p.start_date,
+            until,
+            tin
+        );
+        println!(
+            "     profit {}%  loss {}%  capital {}%",
+            format_ppm(p.shares.profit_ppm),
+            format_ppm(p.shares.loss_ppm),
+            format_ppm(p.shares.capital_ppm)
+        );
+    }
+
+    /// Say so the moment the shares stop adding up, rather than at filing time.
+    fn report_share_totals(conn: &rusqlite::Connection) {
+        use accountir::commands::partnership_commands as pc;
+        use accountir::domain::Shares;
+        let shares: Vec<Shares> = pc::list_partners(conn).iter().map(|p| p.shares).collect();
+        if shares.is_empty() {
+            return;
+        }
+        let totals = Shares::sums_to_whole(&shares);
+        if !totals.is_whole() {
+            println!("\nwarning: {}", totals.discrepancies().join(", "));
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_tax_command(store: &EventStore, cmd: TaxCliCommands) -> Result<()> {
+    use accountir::commands::partnership_commands as pc;
+    use accountir::tax::{PartnerFiling, ReturnRequest, build_return_from_ledger};
+
+    match cmd {
+        TaxCliCommands::Form1065 { year, output } => {
+            let conn = store.connection();
+            let profile = pc::get_profile(conn).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No partnership details yet. Run `accountir partnership profile ...` first."
+                )
+            })?;
+
+            let partners: Vec<PartnerFiling> = pc::partners_for_year(conn, year)
+                .into_iter()
+                .map(|partner| PartnerFiling {
+                    tin: pc::get_tin(conn, &partner.partner_id),
+                    partner,
+                })
+                .collect();
+
+            // The ledger entry point, not `build_return`: the latter fills identity
+            // only and leaves every money line blank.
+            let partner_count = partners.len();
+            let bundle = build_return_from_ledger(
+                conn,
+                &ReturnRequest {
+                    year,
+                    profile,
+                    partners,
+                },
+            )?;
+
+            std::fs::write(&output, &bundle.pdf)?;
+            println!(
+                "Wrote {} ({} pages, {} Schedule K-1s)",
+                output.display(),
+                bundle.page_count,
+                partner_count
+            );
+            for w in &bundle.warnings {
+                println!("warning: {w}");
+            }
+            println!(
+                "\nThe form is prefilled but still editable. Income and deduction lines \
+                 come from the books via the Form 1065 line mappings; Schedule K, the \
+                 capital accounts, and Schedule B are deliberately left blank."
+            );
         }
     }
     Ok(())

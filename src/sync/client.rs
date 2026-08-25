@@ -21,6 +21,11 @@ use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
     RemoveEventServiceRequest, SetServiceReportingRequest, SetServiceReportingResponse,
 };
+use crate::commands::partnership_commands::UpdatePartner;
+use super::commands::partnership::{
+    AdmitPartnerRequest, AdmitPartnerResponse, SetBusinessProfileRequest, UpdatePartnerRequest,
+    WithdrawPartnerRequest,
+};
 use super::commands::plaid::{
     ConnectPlaidItemRequest, ConnectPlaidItemResponse, DisconnectPlaidItemRequest,
     MapPlaidAccountRequest, RefreshPlaidAccountsRequest, RefreshPlaidAccountsResponse,
@@ -30,7 +35,7 @@ use super::commands::reconciliation::{
     StartReconciliationRequest, UnclearTransactionRequest,
 };
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
-use crate::domain::{AccountType, PaymentTerms};
+use crate::domain::{AccountType, Address, BusinessProfile, PartnerType, PaymentTerms, Residency, Shares};
 use chrono::NaiveDate;
 use thiserror::Error;
 
@@ -1408,6 +1413,154 @@ impl SyncClient {
             expected_head_seq: head,
             invoice_id: invoice_id.clone(),
             reason: reason.clone(),
+        })
+        .await
+    }
+
+    // --- the partnership, and its partners -------------------------------
+
+    /// Record the group's partnership details — the head of its Form 1065.
+    ///
+    /// Last-writer-wins; see [`crate::sync::commands::partnership`] for why that
+    /// is the right answer for a header rather than a shortcut.
+    pub async fn set_business_profile(
+        &mut self,
+        profile: &BusinessProfile,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-business-profile", |head| {
+            SetBusinessProfileRequest {
+                expected_head_seq: head,
+                legal_name: profile.legal_name.clone(),
+                address: profile.address.clone(),
+                ein: profile.ein.clone(),
+                naics_code: profile.naics_code.clone(),
+                formation_date: profile.formation_date,
+                principal_activity: profile.principal_activity.clone(),
+                principal_product: profile.principal_product.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Admit a partner to the group's books, returning the id the **server**
+    /// minted for them.
+    ///
+    /// Its own retry loop rather than [`submit_retrying`], because that helper
+    /// returns only the new head and the id is the half the caller actually needs:
+    /// it is what a TIN is filed against locally, and there is no second call that
+    /// would tell them what it was.
+    ///
+    /// Carries no TIN — see [`crate::sync::commands::partnership`]. Whoever
+    /// prepares the return records TINs on their own machine, against the ids this
+    /// returns.
+    ///
+    /// Deliberately **not** taking the local [`AdmitPartner`] struct, despite the
+    /// argument count: that struct carries a `tin`, and a method that accepted one
+    /// and silently dropped it is a trap set for whoever writes the next caller.
+    /// Spelled out, the absence of a TIN is visible at every call site.
+    ///
+    /// [`submit_retrying`]: SyncClient::submit_retrying
+    /// [`AdmitPartner`]: crate::commands::partnership_commands::AdmitPartner
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admit_partner(
+        &mut self,
+        name: impl Into<String>,
+        partner_type: PartnerType,
+        residency: Residency,
+        entity_type: impl Into<String>,
+        address: &Address,
+        start_date: Option<chrono::NaiveDate>,
+        shares: Shares,
+    ) -> Result<AdmitPartnerResponse, SyncClientError> {
+        const MAX_RETRIES: u32 = 5;
+        let (name, entity_type) = (name.into(), entity_type.into());
+
+        for _ in 0..=MAX_RETRIES {
+            let body = AdmitPartnerRequest {
+                expected_head_seq: self.head,
+                name: name.clone(),
+                partner_type: partner_type.as_str().to_string(),
+                residency: residency.as_str().to_string(),
+                entity_type: entity_type.clone(),
+                address: address.clone(),
+                start_date,
+                shares,
+            };
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/admit-partner"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let r: AdmitPartnerResponse = resp.json().await?;
+                    self.head = r.head;
+                    return Ok(r);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY | reqwest::StatusCode::BAD_REQUEST => {
+                    let v: serde_json::Value = resp.json().await?;
+                    return Err(SyncClientError::Rejected(
+                        v["error"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld("admit a partner".to_string()));
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Change a partner's details or shares on the group's books.
+    ///
+    /// Their start and end dates are not arguments — joining and leaving are their
+    /// own commands, and letting an edit move them would quietly change which tax
+    /// years that partner gets a K-1 for.
+    /// Takes the same [`UpdatePartner`] the local path takes, so a caller that
+    /// branches on `is_replica()` builds one command and sends it either way.
+    /// Safe to share here where [`admit_partner`] is not: `UpdatePartner` has no
+    /// TIN field to leak.
+    ///
+    /// [`admit_partner`]: SyncClient::admit_partner
+    pub async fn update_partner(&mut self, cmd: &UpdatePartner) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/update-partner", |head| UpdatePartnerRequest {
+            expected_head_seq: head,
+            partner_id: cmd.partner_id.clone(),
+            name: cmd.name.clone(),
+            partner_type: cmd.partner_type.as_str().to_string(),
+            residency: cmd.residency.as_str().to_string(),
+            entity_type: cmd.entity_type.clone(),
+            address: cmd.address.clone(),
+            shares: cmd.shares,
+        })
+        .await
+    }
+
+    /// Record that a partner has left the group's partnership.
+    pub async fn withdraw_partner(
+        &mut self,
+        partner_id: impl Into<String>,
+        end_date: chrono::NaiveDate,
+    ) -> Result<i64, SyncClientError> {
+        let partner_id = partner_id.into();
+        self.submit_retrying("/sync/commands/withdraw-partner", |head| {
+            WithdrawPartnerRequest {
+                expected_head_seq: head,
+                partner_id: partner_id.clone(),
+                end_date,
+            }
         })
         .await
     }

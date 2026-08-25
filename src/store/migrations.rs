@@ -89,6 +89,12 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             22,
             include_str!("../../migrations/022_event_service_reporting.sql"),
         ),
+        (23, include_str!("../../migrations/023_partnership.sql")),
+        (24, include_str!("../../migrations/024_tax_line_mappings.sql")),
+        (
+            25,
+            include_str!("../../migrations/025_config_tables_have_no_projection_fk.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -472,6 +478,72 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         -- in-txn check in register_service.
         CREATE UNIQUE INDEX IF NOT EXISTS idx_event_services_active_root_url
             ON event_services(root_url) WHERE status = 'active';
+
+        -- The partnership header and its partners (migration 023). Kept in step
+        -- with the migration so a database built by `init_schema` alone is
+        -- complete; see 023_partnership.sql for why TINs are not in the log.
+        CREATE TABLE IF NOT EXISTS business_profile (
+            id TEXT PRIMARY KEY CHECK (id = 'default'),
+            legal_name TEXT NOT NULL,
+            street TEXT NOT NULL,
+            suite TEXT,
+            city TEXT NOT NULL,
+            state TEXT NOT NULL,
+            postal_code TEXT NOT NULL,
+            country TEXT,
+            ein TEXT NOT NULL,
+            naics_code TEXT NOT NULL,
+            formation_date TEXT NOT NULL,
+            principal_activity TEXT,
+            principal_product TEXT,
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS partners (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            partner_type TEXT NOT NULL,
+            residency TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            street TEXT NOT NULL,
+            suite TEXT,
+            city TEXT NOT NULL,
+            state TEXT NOT NULL,
+            postal_code TEXT NOT NULL,
+            country TEXT,
+            start_date TEXT NOT NULL,
+            end_date TEXT,
+            profit_ppm INTEGER NOT NULL,
+            loss_ppm INTEGER NOT NULL,
+            capital_ppm INTEGER NOT NULL,
+            admitted_at_event INTEGER REFERENCES events(id),
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_partners_start ON partners(start_date);
+
+        -- Which Form 1065 line each account is reported on (migration 024).
+        -- Keyed by account because many accounts share one line, and because
+        -- "which accounts have no line" is the question that catches money
+        -- going missing from a return.
+        -- No foreign key to `accounts`, deliberately — see migration 025.
+        CREATE TABLE IF NOT EXISTS tax_line_mappings (
+            account_id TEXT PRIMARY KEY,
+            line_key TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tax_line_mappings_line ON tax_line_mappings(line_key);
+
+        -- Local only, never replicated — see migration 023.
+        -- No foreign key to `partners`, deliberately — see migration 025. This
+        -- config outlives the projection it points at, and `rebuild` truncates
+        -- that projection.
+        CREATE TABLE IF NOT EXISTS partner_tins (
+            partner_id TEXT PRIMARY KEY,
+            tin TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
 
         -- Which group server this ledger is a replica of (migration 017).
         -- Kept in step with the migration so a database built by `init_schema`

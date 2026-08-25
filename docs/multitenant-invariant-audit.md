@@ -90,6 +90,37 @@ read-then-append being atomic (would two concurrent writers break it)?
 | TransactionUncleared | idempotent-toggle | recon in-progress; line cleared | `reconciliation_commands.rs:189` | MED | idempotent / re-check |
 | ReconciliationCompleted | barrier-fence | in-progress; `difference` snapshot of cleared-set | `reconciliation_commands.rs:243` reads cleared_total+balance then appends | **HIGH** | freeze recon + recompute difference under head_seq |
 | ReconciliationAbandoned | idempotent-toggle | recon in-progress | `reconciliation_commands.rs:311` | MED | re-check status under head_seq |
+| BusinessProfileSet | configuration | singleton header; EIN `NN-NNNNNNN`; NAICS six digits | singleton by `CHECK (id = 'default')` (`023_partnership.sql:6`); shapes `partnership_commands.rs:133` pure + `validation.rs` | NONE | last-writer-wins — **done** (`sync/commands/partnership.rs:122`) |
+| PartnerAdmitted | configuration | id must not already exist; `start_date` defaults to the header's formation date | id `partnership_commands.rs:232` in-txn; date read in the **same** txn | MED (date) / **trust** (id) | server mints the id **and** in-txn refuses a taken one — **done** (`sync/commands/partnership.rs:187`) |
+| PartnerDetailsUpdated | configuration | partner exists | `partnership_commands.rs:281` in-txn | MED | re-check exists under head_seq; last-writer-wins on the record — **done** (`sync/commands/partnership.rs:249`) |
+| PartnerWithdrawn | stateful-exclusive | partner exists AND has not already left | `partnership_commands.rs:310` in-txn | **HIGH** | re-check `end_date IS NULL` under head_seq — **done** (`sync/commands/partnership.rs:293`) |
+
+### Note on the partnership variants
+
+Three of the four are ordinary configuration; `PartnerWithdrawn` is the one with
+teeth. Two things are worth more than their table row:
+
+**`PartnerAdmitted`'s id is a trust problem, not a concurrency one.** The `SW-dep`
+column asks whether two concurrent writers break the invariant, and for a UUID the
+answer is no. The exposure is different in kind: the projector writes
+`INSERT OR REPLACE INTO partners (id, …)`, so *any* caller who names an existing id
+replaces that partner's name, dates and shares. Nothing rejects it, nothing logs an
+anomaly, and the first sign is a K-1 allocating somebody else's income. Hence two
+independent locks — the server mints the id (`sync/commands/partnership.rs`), and
+`build_admit_partner_in_txn` refuses an id that is already taken regardless of who
+minted it.
+
+**`PartnerDetailsUpdated`'s exists-check is not a formality.** The projector's
+`UPDATE partners SET … WHERE id = ?1` matches no rows for an id nobody has, so
+without the in-txn check the append *succeeds*, the log gains an event, and nothing
+changes — a write that reports success and did nothing. That is worse than a
+refusal, because a client has no way to tell the difference.
+
+**What is deliberately not in the log at all:** partner taxpayer identification
+numbers. They live in `partner_tins` (migration 023), a local table that is not a
+projection of any event, for the reason that keeps event-service API keys out —
+this log reaches every member's laptop and every backup, permanently. No
+partnership event has a TIN field and no sync request accepts one.
 
 ## Latent risks, ranked (the ones that will actually bite)
 

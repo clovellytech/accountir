@@ -14,6 +14,91 @@ pub struct JournalLineData {
     pub memo: Option<String>,
 }
 
+/// A postal address as an event carries it.
+///
+/// Its own type rather than six loose fields on three events, and deliberately
+/// not `domain::Address`: the log is permanent and the domain is not, so the
+/// wire shape is fixed here and converted at the edge — the same reason
+/// [`JournalLineData`] exists alongside the domain's journal line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddressData {
+    pub street: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
+    pub city: String,
+    pub state: String,
+    pub postal_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+}
+
+/// A partner's share of profit, loss, and capital, in parts per million.
+///
+/// Integers, not percentages: three partners at a third each must sum to a
+/// number somebody can check, and in floating point they do not. 100% is
+/// 1_000_000.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ShareData {
+    pub profit_ppm: i64,
+    pub loss_ppm: i64,
+    pub capital_ppm: i64,
+}
+
+/// The partnership header, as one event's payload.
+///
+/// Boxed into its variant rather than spelled out inline: these fields together
+/// are larger than every other event in the log, and an enum is as big as its
+/// largest variant. Inline, they nearly doubled [`Event`] — 160 bytes to 296 —
+/// which is paid by every event the system moves, not just this one.
+///
+/// The wire format is unaffected. Serde's internally tagged representation
+/// flattens a newtype variant's struct into the same object the equivalent
+/// struct variant produces, so events already in a log deserialize unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BusinessProfileData {
+    pub legal_name: String,
+    pub address: AddressData,
+    /// `NN-NNNNNNN`.
+    pub ein: String,
+    /// Six digits — Form 1065 box C.
+    pub naics_code: String,
+    /// Form 1065 box E, "Date business started".
+    pub formation_date: NaiveDate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_product: Option<String>,
+}
+
+/// A partner joining. Boxed for the same reason as [`BusinessProfileData`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartnerAdmittedData {
+    pub partner_id: String,
+    pub name: String,
+    /// "general" or "limited" — K-1 item G.
+    pub partner_type: String,
+    /// "domestic" or "foreign" — K-1 item H1.
+    pub residency: String,
+    /// K-1 item I1, free text because the form's own answer is free text.
+    pub entity_type: String,
+    pub address: AddressData,
+    pub start_date: NaiveDate,
+    pub shares: ShareData,
+}
+
+/// A partner's details changing. Carries the whole record, not a diff, so the
+/// state after any event is readable without replaying the ones before it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartnerDetailsData {
+    pub partner_id: String,
+    pub name: String,
+    pub partner_type: String,
+    pub residency: String,
+    pub entity_type: String,
+    pub address: AddressData,
+    pub shares: ShareData,
+}
+
 /// Source of a journal entry
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +203,34 @@ pub enum Event {
         old_value: String,
         new_value: String,
     },
+
+    // Partnership identity and partners — what a Form 1065 and its K-1s are about.
+    /// The whole partnership header in one event.
+    ///
+    /// Set as a unit rather than field by field because the fields are checked
+    /// against each other by the IRS, not individually: an EIN that belongs to a
+    /// different legal name is a rejected return, and a log of independent field
+    /// edits makes "what did we file under" a question you answer by replaying.
+    BusinessProfileSet(Box<BusinessProfileData>),
+    /// A partner joins.
+    ///
+    /// No taxpayer identification number here, on purpose. This log is
+    /// replicated in full to every member's laptop, so a partner's SSN written
+    /// here is that SSN on every other partner's machine, permanently, in an
+    /// append-only file that cannot be redacted. The number is needed only where
+    /// a return is actually prepared, so it is held in a local table on that
+    /// machine instead — see `partner_tins` in migration 023. Same reasoning as
+    /// the event-service API key, which is absent from
+    /// [`Event::EventServiceRegistered`] for the same reason.
+    PartnerAdmitted(Box<PartnerAdmittedData>),
+    /// A partner's details or shares change.
+    PartnerDetailsUpdated(Box<PartnerDetailsData>),
+    /// A partner leaves. Their K-1 for the year containing `end_date` is final.
+    PartnerWithdrawn {
+        partner_id: String,
+        end_date: NaiveDate,
+    },
+
     UserAdded {
         user_id: String,
         username: String,
@@ -403,6 +516,10 @@ impl Event {
         match self {
             Event::CompanyCreated { .. } => "company_created",
             Event::CompanySettingsUpdated { .. } => "company_settings_updated",
+            Event::BusinessProfileSet(_) => "business_profile_set",
+            Event::PartnerAdmitted(_) => "partner_admitted",
+            Event::PartnerDetailsUpdated(_) => "partner_details_updated",
+            Event::PartnerWithdrawn { .. } => "partner_withdrawn",
             Event::UserAdded { .. } => "user_added",
             Event::UserModified { .. } => "user_modified",
             Event::UserRemoved { .. } => "user_removed",
@@ -450,6 +567,10 @@ impl Event {
         match self {
             Event::CompanyCreated { .. } => None,
             Event::CompanySettingsUpdated { .. } => None,
+            Event::BusinessProfileSet(_) => None,
+            Event::PartnerAdmitted(d) => Some(&d.partner_id),
+            Event::PartnerDetailsUpdated(d) => Some(&d.partner_id),
+            Event::PartnerWithdrawn { partner_id, .. } => Some(partner_id),
             Event::UserAdded { user_id, .. } => Some(user_id),
             Event::UserModified { user_id, .. } => Some(user_id),
             Event::UserRemoved { user_id } => Some(user_id),
@@ -891,6 +1012,80 @@ mod tests {
         for event in events {
             let json = serde_json::to_string(&event).unwrap();
             let _parsed: Event = serde_json::from_str(&json).unwrap();
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod partnership_event_shape {
+    use super::*;
+
+    /// An enum is as big as its largest variant, and every event in the system
+    /// pays for it. The partnership header inline made `Event` 296 bytes where
+    /// it had been 160; boxed, it is back to the size the rest of the log sets.
+    ///
+    /// The bound is deliberately a bound and not the exact number — it is here
+    /// to catch a variant that quietly doubles the enum, not to be updated
+    /// every time a field moves.
+    #[test]
+    fn boxing_the_partnership_payloads_keeps_the_event_enum_small() {
+        assert!(
+            std::mem::size_of::<Event>() <= 176,
+            "Event grew to {} bytes — box the payload of whichever variant did it",
+            std::mem::size_of::<Event>()
+        );
+    }
+
+    /// Boxing must not have changed what reaches the log.
+    ///
+    /// Serde's internally tagged representation flattens a newtype variant's
+    /// struct into the same object a struct variant produces. If that ever
+    /// stopped being true, every partnership event already written would stop
+    /// deserializing — silently, since an event log is only read on replay.
+    #[test]
+    fn a_boxed_payload_serializes_flat_exactly_as_a_struct_variant_would() {
+        let event = Event::PartnerWithdrawn {
+            partner_id: "p1".into(),
+            end_date: chrono::NaiveDate::from_ymd_opt(2025, 6, 30).unwrap(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "partner_withdrawn");
+        assert_eq!(json["partner_id"], "p1", "a struct variant is flat");
+
+        let boxed = Event::BusinessProfileSet(Box::new(BusinessProfileData {
+            legal_name: "Example LLC".into(),
+            address: AddressData {
+                street: "1 A St".into(),
+                suite: None,
+                city: "Town".into(),
+                state: "TX".into(),
+                postal_code: "78701".into(),
+                country: None,
+            },
+            ein: "12-3456789".into(),
+            naics_code: "541511".into(),
+            formation_date: chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+            principal_activity: None,
+            principal_product: None,
+        }));
+        let json = serde_json::to_value(&boxed).unwrap();
+        assert_eq!(json["type"], "business_profile_set");
+        assert_eq!(
+            json["legal_name"], "Example LLC",
+            "the boxed payload must be flat too, not nested under a field"
+        );
+        assert_eq!(json["address"]["city"], "Town");
+        assert!(
+            json.get("principal_activity").is_none(),
+            "absent options stay off the wire"
+        );
+
+        // And it reads back.
+        let back: Event = serde_json::from_value(json).unwrap();
+        match back {
+            Event::BusinessProfileSet(d) => assert_eq!(d.ein, "12-3456789"),
+            other => panic!("round-tripped into {other:?}"),
         }
     }
 }

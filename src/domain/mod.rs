@@ -3,6 +3,7 @@ pub mod ap_ar;
 pub mod fiscal_period;
 pub mod journal_entry;
 pub mod money;
+pub mod partnership;
 pub mod reconciliation;
 pub mod reporting;
 
@@ -11,5 +12,6 @@ pub use ap_ar::*;
 pub use fiscal_period::*;
 pub use journal_entry::*;
 pub use money::*;
+pub use partnership::*;
 pub use reconciliation::*;
 pub use reporting::*;

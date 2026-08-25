@@ -7,6 +7,7 @@ pub mod fiscal_period_commands;
 pub mod import_commands;
 pub mod ingest_commands;
 pub mod invoice_commands;
+pub mod partnership_commands;
 pub mod plaid_commands;
 pub mod reconciliation_commands;
 pub mod recurring_transfers;

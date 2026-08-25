@@ -8,6 +8,7 @@ pub mod registry;
 pub mod server;
 pub mod store;
 pub mod sync;
+pub mod tax;
 pub mod tui;
 
 pub use domain::*;

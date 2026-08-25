@@ -47,6 +47,123 @@ impl<'a> Projector<'a> {
                 let sql = format!("UPDATE company SET {} = ?1 WHERE id = 'default'", field);
                 self.conn.execute(&sql, [new_value])?;
             }
+            Event::BusinessProfileSet(d) => {
+                let (legal_name, address, ein, naics_code, formation_date) = (
+                    &d.legal_name,
+                    &d.address,
+                    &d.ein,
+                    &d.naics_code,
+                    &d.formation_date,
+                );
+                let (principal_activity, principal_product) =
+                    (&d.principal_activity, &d.principal_product);
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO business_profile
+                        (id, legal_name, street, suite, city, state, postal_code, country,
+                         ein, naics_code, formation_date, principal_activity, principal_product,
+                         updated_at_event)
+                     VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    params![
+                        legal_name,
+                        address.street,
+                        address.suite,
+                        address.city,
+                        address.state,
+                        address.postal_code,
+                        address.country,
+                        ein,
+                        naics_code,
+                        formation_date.to_string(),
+                        principal_activity,
+                        principal_product,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::PartnerAdmitted(d) => {
+                let (partner_id, name, partner_type, residency, entity_type) = (
+                    &d.partner_id,
+                    &d.name,
+                    &d.partner_type,
+                    &d.residency,
+                    &d.entity_type,
+                );
+                let (address, start_date, shares) = (&d.address, &d.start_date, &d.shares);
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO partners
+                        (id, name, partner_type, residency, entity_type,
+                         street, suite, city, state, postal_code, country,
+                         start_date, end_date, profit_ppm, loss_ppm, capital_ppm,
+                         admitted_at_event, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL,
+                             ?13, ?14, ?15, ?16, ?16)",
+                    params![
+                        partner_id,
+                        name,
+                        partner_type,
+                        residency,
+                        entity_type,
+                        address.street,
+                        address.suite,
+                        address.city,
+                        address.state,
+                        address.postal_code,
+                        address.country,
+                        start_date.to_string(),
+                        shares.profit_ppm,
+                        shares.loss_ppm,
+                        shares.capital_ppm,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::PartnerDetailsUpdated(d) => {
+                let (partner_id, name, partner_type, residency, entity_type) = (
+                    &d.partner_id,
+                    &d.name,
+                    &d.partner_type,
+                    &d.residency,
+                    &d.entity_type,
+                );
+                let (address, shares) = (&d.address, &d.shares);
+                // Start and end dates are deliberately untouched: joining and
+                // leaving are their own events, and letting an edit move them
+                // would silently change which years a partner gets a K-1 for.
+                self.conn.execute(
+                    "UPDATE partners SET
+                        name = ?2, partner_type = ?3, residency = ?4, entity_type = ?5,
+                        street = ?6, suite = ?7, city = ?8, state = ?9, postal_code = ?10,
+                        country = ?11, profit_ppm = ?12, loss_ppm = ?13, capital_ppm = ?14,
+                        updated_at_event = ?15
+                     WHERE id = ?1",
+                    params![
+                        partner_id,
+                        name,
+                        partner_type,
+                        residency,
+                        entity_type,
+                        address.street,
+                        address.suite,
+                        address.city,
+                        address.state,
+                        address.postal_code,
+                        address.country,
+                        shares.profit_ppm,
+                        shares.loss_ppm,
+                        shares.capital_ppm,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::PartnerWithdrawn {
+                partner_id,
+                end_date,
+            } => {
+                self.conn.execute(
+                    "UPDATE partners SET end_date = ?2, updated_at_event = ?3 WHERE id = ?1",
+                    params![partner_id, end_date.to_string(), stored_event.id],
+                )?;
+            }
             Event::UserAdded {
                 user_id,
                 username,
@@ -721,7 +838,15 @@ impl<'a> Projector<'a> {
              DELETE FROM journal_entries;
              DELETE FROM accounts;
              DELETE FROM users;
-             DELETE FROM company;",
+             DELETE FROM company;
+             -- Projections like the rest. Their absence here made a rebuild a
+             -- merge for these two tables: a partner deleted from the log, or a
+             -- header replaced, would survive a replay that should have derived
+             -- the state from the log alone. `partner_tins` is deliberately NOT
+             -- cleared — it is local configuration, not derived from anything,
+             -- and is exactly what a replay must leave alone.
+             DELETE FROM partners;
+             DELETE FROM business_profile;",
         )?;
 
         // Replay all events
@@ -1124,5 +1249,85 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count_after, 2);
+    }
+}
+
+#[cfg(test)]
+mod rebuild_survives_local_config {
+    use super::*;
+    use crate::events::types::{EventAccountType, EventEnvelope};
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::SchemaStore;
+
+    fn store() -> EventStore {
+        let mut s = EventStore::in_memory().unwrap();
+        s.init_schema().unwrap();
+        s
+    }
+
+    /// A rebuild must survive an ordinary act of configuration.
+    ///
+    /// `rebuild` truncates every projection to replay the log from nothing, and
+    /// the store runs with `PRAGMA foreign_keys = ON`. When `tax_line_mappings`
+    /// and `partner_tins` still carried `REFERENCES`, a single mapped account or
+    /// one partner's TIN made `DELETE FROM accounts` fail outright — so mapping
+    /// an account to a Form 1065 line disabled the ledger's own recovery path.
+    /// Migration 025 removed those keys; this is the test that says why they
+    /// must not come back.
+    #[test]
+    fn a_rebuild_still_runs_with_tax_mappings_and_a_tin_on_file() {
+        let mut s = store();
+
+        let account = Event::AccountCreated {
+            account_id: "rent".into(),
+            account_type: EventAccountType::Expense,
+            account_number: "6100".into(),
+            name: "Rent".into(),
+            parent_id: None,
+            currency: Some("USD".into()),
+            description: None,
+        };
+        let stored = s.append(EventEnvelope::new(account, "u".into())).unwrap();
+        s.apply_projection(&stored).unwrap();
+
+        // The two rows that used to make recovery impossible.
+        s.connection()
+            .execute(
+                "INSERT INTO tax_line_mappings (account_id, line_key) VALUES ('rent', 'l13')",
+                [],
+            )
+            .unwrap();
+        s.connection()
+            .execute(
+                "INSERT INTO partner_tins (partner_id, tin) VALUES ('p1', '123-45-6789')",
+                [],
+            )
+            .unwrap();
+
+        let events = s.get_all().unwrap();
+        Projector::new(s.connection())
+            .rebuild(&events)
+            .expect("a rebuild must not be blocked by local configuration");
+
+        // The projection came back from the log.
+        let accounts: i64 = s
+            .connection()
+            .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accounts, 1, "the replay did not restore the account");
+
+        // And the configuration, which is derived from nothing, is untouched.
+        // This is the whole point of keeping it out of the log: it survives the
+        // log being replayed.
+        let mappings: i64 = s
+            .connection()
+            .query_row("SELECT COUNT(*) FROM tax_line_mappings", [], |r| r.get(0))
+            .unwrap();
+        let tins: i64 = s
+            .connection()
+            .query_row("SELECT COUNT(*) FROM partner_tins", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mappings, 1, "a rebuild discarded the Form 1065 line mappings");
+        assert_eq!(tins, 1, "a rebuild discarded the partner TINs");
     }
 }
