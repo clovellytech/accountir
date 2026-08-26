@@ -1892,6 +1892,11 @@ fn handle_tax_command(store: &EventStore, cmd: TaxCliCommands) -> Result<()> {
                     year,
                     profile,
                     partners,
+                    schedule_b: accountir::tax::schedule_b::load(conn, year),
+                    // Both left to `build_return_from_ledger`, which has the
+                    // connection and reads them from the books.
+                    schedule_l: None,
+                    detail: Default::default(),
                 },
             )?;
 

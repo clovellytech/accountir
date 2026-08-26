@@ -1442,6 +1442,61 @@ impl SyncClient {
         .await
     }
 
+    /// Point an account at a Form 1065 line on the group's books.
+    ///
+    /// Blind retry on a stale head is safe: the command carries no id the server
+    /// minted and no figure derived from the state it read, so re-sending it
+    /// against a newer head means the same thing it meant against the old one.
+    pub async fn set_tax_line_mapping(
+        &mut self,
+        account_id: &str,
+        line_key: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-tax-line-mapping", |head| {
+            crate::sync::commands::tax_setup::SetTaxLineMappingRequest {
+                expected_head_seq: head,
+                account_id: account_id.to_string(),
+                line_key: line_key.to_string(),
+            }
+        })
+        .await
+    }
+
+    /// Take an account off the return on the group's books.
+    pub async fn clear_tax_line_mapping(
+        &mut self,
+        account_id: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/clear-tax-line-mapping", |head| {
+            crate::sync::commands::tax_setup::ClearTaxLineMappingRequest {
+                expected_head_seq: head,
+                account_id: account_id.to_string(),
+            }
+        })
+        .await
+    }
+
+    /// Answer one Schedule B question on the group's books.
+    ///
+    /// An empty `value` clears the answer — the server turns that into its own
+    /// event, because unanswered and "No" are different states on this form.
+    pub async fn set_schedule_b_answer(
+        &mut self,
+        tax_year: i32,
+        answer_key: &str,
+        value: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-schedule-b-answer", |head| {
+            crate::sync::commands::tax_setup::SetScheduleBAnswerRequest {
+                expected_head_seq: head,
+                tax_year,
+                answer_key: answer_key.to_string(),
+                value: value.to_string(),
+            }
+        })
+        .await
+    }
+
     /// Admit a partner to the group's books, returning the id the **server**
     /// minted for them.
     ///

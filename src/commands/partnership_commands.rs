@@ -812,6 +812,22 @@ fn parse_stored_date(s: &str) -> Option<NaiveDate> {
 /// books are single-writer, because the predicate has to run against
 /// write-locked state either way and having one code path is worth more than
 /// the microsecond.
+/// Append one event with the same head-check-and-retry the partnership commands
+/// use.
+///
+/// Public within the crate so `tax_setup_commands` appends the same way rather
+/// than growing its own loop — the retry on a head mismatch is easy to leave out
+/// and its absence only shows up under concurrent writers.
+pub(crate) fn append_event_locally(
+    store: &mut EventStore,
+    user_id: &str,
+    event: Event,
+) -> Result<StoredEvent, PartnershipError> {
+    append_checked_locally(store, user_id, move |_tx| {
+        Ok(PartnerStep::Append(event.clone()))
+    })
+}
+
 fn append_checked_locally(
     store: &mut EventStore,
     user_id: &str,

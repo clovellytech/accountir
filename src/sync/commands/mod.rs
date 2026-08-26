@@ -18,6 +18,7 @@ pub mod event_service;
 pub mod partnership;
 pub mod plaid;
 pub mod reconciliation;
+pub mod tax_setup;
 
 pub fn router() -> Router<SyncState> {
     Router::new()
@@ -30,4 +31,5 @@ pub fn router() -> Router<SyncState> {
         .merge(partnership::router())
         .merge(plaid::router())
         .merge(reconciliation::router())
+        .merge(tax_setup::router())
 }

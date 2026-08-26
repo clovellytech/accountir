@@ -249,6 +249,44 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 end_date
             )
         }
+        Event::TaxLineMappingSet {
+            account_id,
+            line_key,
+        } => {
+            let line = crate::tax::lines::line_def(line_key)
+                .map(|d| d.number)
+                .unwrap_or(line_key);
+            format!(
+                "Account {} reports on line {}",
+                widgets::truncate(account_id, 8),
+                line
+            )
+        }
+        Event::TaxLineMappingCleared { account_id } => {
+            format!(
+                "Account {} taken off the return",
+                widgets::truncate(account_id, 8)
+            )
+        }
+        Event::ScheduleBAnswerSet {
+            tax_year,
+            answer_key,
+            value,
+        } => {
+            let q = crate::tax::schedule_b::question(answer_key)
+                .map(|q| q.number)
+                .unwrap_or(answer_key);
+            format!("Schedule B {tax_year} question {q}: {value}")
+        }
+        Event::ScheduleBAnswerCleared {
+            tax_year,
+            answer_key,
+        } => {
+            let q = crate::tax::schedule_b::question(answer_key)
+                .map(|q| q.number)
+                .unwrap_or(answer_key);
+            format!("Schedule B {tax_year} question {q} back to unanswered")
+        }
         Event::UserAdded { username, role, .. } => {
             format!("Added user '{}' as {:?}", username, role)
         }

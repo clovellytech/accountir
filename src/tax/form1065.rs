@@ -142,6 +142,35 @@ mod f1065 {
     pub const L22_TOTAL_DEDUCTIONS: &str = "f1_44[0]";
     /// "23. Ordinary business income (loss). Subtract line 22 from line 8." — derived.
     pub const L23_ORDINARY_INCOME: &str = "f1_45[0]";
+
+    /// "Paid Preparer Use Only. Enter preparer's name."
+    pub const PREPARER_NAME: &str = "f1_57[0]";
+}
+
+/// What goes in the paid preparer's name box.
+///
+/// A return prepared by the partnership itself has no paid preparer, and the box
+/// is not left blank: the IRS convention is to say so in words, and a blank box
+/// on a return that somebody clearly prepared reads as an omission rather than as
+/// an answer. Nothing about this program can produce a *paid* preparer — there is
+/// no PTIN to enter and no firm to name — so the phrase is written unconditionally
+/// rather than offered as a setting nobody could correctly turn off.
+pub const SELF_PREPARED: &str = "SELF PREPARED";
+
+// --- Schedule K, page 5 -----------------------------------------------------
+//
+// Only the *derived* boxes are named here. Every mapped Schedule K line carries
+// its own field in `lines::MAPPABLE_LINES`, so there is one table rather than
+// two lists that can drift apart.
+mod sched_k {
+    /// "1. Ordinary business income (loss) (page 1, line 23)."
+    pub const L1_ORDINARY: &str = "f5_01[0]";
+    /// "3c. Other net rental income (loss). Subtract line 3b from line 3a."
+    pub const L3C_NET_RENTAL: &str = "f5_05[0]";
+    /// "4c. Total. Add lines 4a and 4b."
+    pub const L4C_TOTAL_GUARANTEED: &str = "f5_08[0]";
+    /// "Analysis of Net Income (Loss) per Return, line 1."
+    pub const ANALYSIS: &str = "f6_01[0]";
 }
 
 // --- Schedule K-1 -----------------------------------------------------------
@@ -179,6 +208,67 @@ mod k1 {
     pub const ON: &str = "1";
     /// The second box of a pair — "limited", "foreign" — has its own state.
     pub const ON_SECOND: &str = "2";
+
+    /// Part III: this partner's share of each Schedule K line.
+    ///
+    /// Pairs a Schedule K line key with the K-1 box that carries that partner's
+    /// share of it. Derived Schedule K lines appear here too — a partner's share
+    /// of line 1 is on their K-1 even though nothing is mapped to line 1.
+    ///
+    /// The lines the IRS reports by *code* (11, 13, 14, 17 through 20) are not in
+    /// this table; see `CODED_BOXES`.
+    pub const PART_III: &[(&str, &str)] = &[
+        ("k1", "f1_34[0]"),
+        ("k2", "f1_35[0]"),
+        ("k3c", "f1_36[0]"),
+        ("k4a", "f1_37[0]"),
+        ("k4b", "f1_38[0]"),
+        ("k4c", "f1_39[0]"),
+        ("k5", "f1_40[0]"),
+        ("k6a", "f1_41[0]"),
+        ("k6b", "f1_42[0]"),
+        ("k6c", "f1_43[0]"),
+        ("k7", "f1_44[0]"),
+        ("k8", "f1_45[0]"),
+        ("k9a", "f1_46[0]"),
+        ("k9b", "f1_47[0]"),
+        ("k9c", "f1_48[0]"),
+        ("k10", "f1_49[0]"),
+        ("k12", "f1_54[0]"),
+        ("k21", "f1_66[0]"),
+    ];
+
+    /// Lines the K-1 reports as a code plus an amount.
+    ///
+    /// `code` is the letter the IRS assigns, or `None` where the letter depends
+    /// on facts this program does not have — which of the charitable-contribution
+    /// limits applies, what kind of "other" item it is. A guessed code on a
+    /// signed return is worse than a blank one: blank is visibly unfinished,
+    /// wrong is not. Every `None` produces a warning naming the box, so nobody
+    /// has to notice the gap themselves.
+    pub const CODED_BOXES: &[CodedBox] = &[
+        CodedBox { line_key: "k11",  number: "11",  code: None,      code_field: "f1_50[0]",  amount_field: "f1_51[0]" },
+        CodedBox { line_key: "k13a", number: "13a", code: None,      code_field: "Line13[0]", amount_field: "f1_55[0]" },
+        CodedBox { line_key: "k13b", number: "13b", code: None,      code_field: "f1_56[0]",  amount_field: "f1_57[0]" },
+        CodedBox { line_key: "k13c", number: "13c", code: None,      code_field: "f1_58[0]",  amount_field: "f1_59[0]" },
+        CodedBox { line_key: "k14a", number: "14a", code: Some("A"), code_field: "Line14[0]", amount_field: "f1_60[0]" },
+        CodedBox { line_key: "k14b", number: "14b", code: Some("B"), code_field: "f1_61[0]",  amount_field: "f1_62[0]" },
+        CodedBox { line_key: "k18a", number: "18a", code: Some("A"), code_field: "Line18[0]", amount_field: "f1_84[0]" },
+        CodedBox { line_key: "k18b", number: "18b", code: Some("B"), code_field: "f1_85[0]",  amount_field: "f1_86[0]" },
+        CodedBox { line_key: "k18c", number: "18c", code: Some("C"), code_field: "f1_87[0]",  amount_field: "f1_88[0]" },
+        CodedBox { line_key: "k19a", number: "19a", code: Some("A"), code_field: "Line19[0]", amount_field: "f1_89[0]" },
+        CodedBox { line_key: "k19b", number: "19b", code: None,      code_field: "f1_90[0]",  amount_field: "f1_91[0]" },
+        CodedBox { line_key: "k20a", number: "20a", code: Some("A"), code_field: "Line20[0]", amount_field: "f1_92[0]" },
+        CodedBox { line_key: "k20b", number: "20b", code: Some("B"), code_field: "f1_93[0]",  amount_field: "f1_94[0]" },
+    ];
+
+    pub struct CodedBox {
+        pub line_key: &'static str,
+        pub number: &'static str,
+        pub code: Option<&'static str>,
+        pub code_field: &'static str,
+        pub amount_field: &'static str,
+    }
 }
 
 /// A partner and the TIN this machine holds for them, if any.
@@ -197,6 +287,24 @@ pub struct ReturnRequest {
     pub year: i32,
     pub profile: BusinessProfile,
     pub partners: Vec<PartnerFiling>,
+    /// Schedule B, as answered for `year`. Defaulted rather than optional: an
+    /// unanswered schedule and an absent one produce the same blank boxes, and
+    /// the warnings say which questions were left.
+    pub schedule_b: super::schedule_b::ScheduleB,
+    /// Which accounts made up each line, from [`super::lines::compute`].
+    ///
+    /// Only used to build the "attach statement" pages, so a caller with no
+    /// ledger leaves it empty and gets a return with no statements — which is
+    /// correct, because it also has no figures to support.
+    pub detail: std::collections::BTreeMap<&'static str, Vec<super::lines::LineDetail>>,
+    /// Schedule L, when the books were read for it.
+    ///
+    /// Optional, unlike Schedule B, because a balance sheet needs two dates of
+    /// ledger history and [`build_return`] has no ledger to ask. `None` means
+    /// "nobody computed one", which leaves the page blank and editable; a
+    /// present-but-empty one means "computed, and nothing was mapped", which is
+    /// worth a warning.
+    pub schedule_l: Option<super::schedule_l::ScheduleL>,
 }
 
 /// A built return, and everything about it somebody should see before filing.
@@ -235,7 +343,22 @@ pub fn build_return_from_ledger(
     let statement = crate::queries::reports::Reports::new(conn)
         .income_statement(year_start, year_end)
         .map_err(|e| FormError::Malformed(format!("income statement: {e}")))?;
-    let computed = super::lines::compute(&statement, &super::lines::load_mapping(conn));
+    let mapping = super::lines::load_mapping(conn);
+    let computed = super::lines::compute(&statement, &mapping);
+
+    // Schedule L comes from the ledger too, and this is the only entry point
+    // that has one. Computed here rather than demanded from the caller: every
+    // caller with a connection would write the same three lines, and the one
+    // that forgot would ship a return with a blank balance sheet and no warning.
+    // An explicitly-supplied schedule wins, so a caller can still override it.
+    let mut owned = req.clone();
+    if owned.schedule_l.is_none() {
+        owned.schedule_l = super::schedule_l::compute(conn, req.year, &mapping).ok();
+    }
+    // The statements are built from this, and only this path knows it.
+    owned.detail = computed.detail;
+    let req = &owned;
+
     let mut bundle = build_return_inner(req, &computed.lines, computed.warnings)?;
 
     // Shares carry no effective date, so a partner edited since the year ended is
@@ -251,6 +374,19 @@ pub fn build_return_from_ledger(
         ));
     }
     Ok(bundle)
+}
+
+/// Build a return from figures supplied directly, bypassing the ledger.
+///
+/// Exists for previews and for eyeballing a form revision without standing up a
+/// set of books. Not the filing path: [`build_return_from_ledger`] is, and it is
+/// the only one that computes the figures from anything real.
+#[doc(hidden)]
+pub fn build_for_preview(
+    req: &ReturnRequest,
+    lines: &Form1065Lines,
+) -> Result<Bundle, FormError> {
+    build_return_inner(req, lines, Vec::new())
 }
 
 fn build_return_inner(
@@ -302,6 +438,20 @@ fn build_return_inner(
     strip_xfa(&mut doc);
     let map = field_map(&doc);
     warnings.extend(fill_1065(&mut doc, &map, &req.profile, filed.len(), lines)?);
+    warnings.extend(fill_schedule_k(&mut doc, &map, lines)?);
+    warnings.extend(super::schedule_b::fill(&mut doc, &map, &req.schedule_b)?);
+
+    // Schedule L, when the books have been mapped for it. Filled even under the
+    // question-4 exemption — see `schedule_l::fill` for why.
+    if let Some(sched_l) = req.schedule_l.as_ref() {
+        let exempt = req.schedule_b.get("b4") == Some(super::schedule_b::YES);
+        warnings.extend(super::schedule_l::fill(&mut doc, &map, sched_l, !exempt)?);
+    }
+
+    // Split Schedule K before any K-1 is built, so every partner's share comes
+    // out of one apportionment and the shares add back to the totals above.
+    let (shares, split_warnings) = split_across_partners(lines, &filed);
+    warnings.extend(split_warnings);
 
     // --- one K-1 per partner ---
     for (i, filing) in filed.iter().enumerate() {
@@ -311,15 +461,114 @@ fn build_return_inner(
         // two's boxes are not partner one's under another name.
         namespace_fields(&mut sched, &k1_namespace(i + 1));
         let smap = field_map(&sched);
-        fill_k1(
+        warnings.extend(fill_k1(
             &mut sched,
             &smap,
             &req.profile,
             filing,
+            &shares[i],
             year_start,
             year_end,
-        )?;
+        )?);
         append_document(&mut doc, sched)?;
+    }
+
+    // --- Schedule B-1 and B-2 ---
+    //
+    // Before the statements, because they are IRS schedules and the statements
+    // are ours: the return reads form, K-1s, official schedules, then the
+    // supporting pages we composed.
+    if super::schedule_b1::is_required(&req.schedule_b) {
+        let owners: Vec<super::schedule_b1::Owner> = req
+            .partners
+            .iter()
+            .map(|f| super::schedule_b1::Owner {
+                partner: &f.partner,
+                tin: f.tin.as_deref(),
+            })
+            .collect();
+        let (sched, b1_warnings) =
+            super::schedule_b1::build(&req.profile.legal_name, &req.profile.ein, &owners)?;
+        warnings.extend(b1_warnings);
+        match sched {
+            Some(sched) => {
+                append_document(&mut doc, sched)?;
+                warnings.push(super::schedule_b1::CONSTRUCTIVE_OWNERSHIP_CAVEAT.to_string());
+            }
+            // Declared on Schedule B but nobody in the books crosses 50%. The
+            // two are not the same claim — the form's own instructions attribute
+            // ownership from family and related entities — so this is a mismatch
+            // to resolve, not a schedule to quietly omit.
+            None => warnings.push(
+                "Schedule B question 2a or 2b is Yes, but no partner in the books owns 50% or                  more, so no Schedule B-1 was produced. Either the answer is wrong or the owner                  holds their interest indirectly — the schedule has to be attached by hand in                  that case."
+                    .to_string(),
+            ),
+        }
+    }
+
+    if super::schedule_b2::is_required(&req.schedule_b) {
+        let eligible: Vec<super::schedule_b2::Eligible> = filed
+            .iter()
+            .map(|f| super::schedule_b2::Eligible {
+                partner: &f.partner,
+                tin: f.tin.as_deref(),
+            })
+            .collect();
+        let (sched, count, b2_warnings) =
+            super::schedule_b2::build(&req.profile.legal_name, &req.profile.ein, &eligible)?;
+        warnings.extend(b2_warnings);
+        if let Some(sched) = sched {
+            append_document(&mut doc, sched)?;
+        }
+
+        // Question 31's follow-up is the total from Schedule B-2, Part III, line
+        // 3. Checked rather than assumed: a hand-typed figure that disagrees with
+        // the schedule attached behind it is the kind of mismatch that invalidates
+        // the election.
+        match req.schedule_b.get("b31_total") {
+            Some(typed) if typed != count.to_string() => warnings.push(format!(
+                "Question 31 says the Schedule B-2 total is {typed}, but the schedule produced                  lists {count} partner(s). The two have to agree."
+            )),
+            _ => {}
+        }
+    }
+
+    // --- "attach statement" pages ---
+    //
+    // After the K-1s, so the return reads front to back: the form, then each
+    // partner's schedule, then the schedules that support a box on the form.
+    for def in super::lines::MAPPABLE_LINES
+        .iter()
+        .filter(|d| d.attachment.is_some_and(|a| a.generated))
+    {
+        let Some(rows) = req.detail.get(def.key) else {
+            continue;
+        };
+        let statement = super::statement::build(&super::statement::StatementRequest {
+            legal_name: &req.profile.legal_name,
+            ein: &req.profile.ein,
+            year: req.year,
+            line: def,
+            rows,
+        })?;
+        if let Some(statement) = statement {
+            append_document(&mut doc, statement)?;
+        }
+    }
+
+    // A line that needs a statement, carries a figure, and has no detail to
+    // build one from — a caller that skipped the ledger. Said out loud, because
+    // an unsupported "other deductions" figure is what draws a letter.
+    for def in super::lines::MAPPABLE_LINES
+        .iter()
+        .filter(|d| d.attachment.is_some_and(|a| a.generated))
+    {
+        if lines.is_mapped(def.key) && req.detail.get(def.key).is_none_or(|r| r.is_empty()) {
+            warnings.push(format!(
+                "Line {} carries a figure and the form asks for a statement of what is in it, but                  no account detail was supplied, so none was produced. Attach one before filing.",
+                def.number
+            ));
+        }
     }
 
     let page_count = doc.get_pages().len();
@@ -408,6 +657,14 @@ fn fill_1065(
     // "For calendar year 2025, or tax year beginning ___", so a calendar-year
     // filer fills in nothing; writing the dates in would assert a fiscal year
     // that was never chosen.
+
+    set_text(doc, map, f1065::PREPARER_NAME, SELF_PREPARED)?;
+
+    // The PTIN, firm name, firm EIN, firm address and phone beside it stay blank,
+    // and the "check if self-employed" box stays unticked: all of them describe a
+    // paid preparer, and there is not one. So does "May the IRS discuss this
+    // return with the preparer shown below?" — a question about somebody who does
+    // not exist here, and one whose answer is the signer's to give.
 
     fill_income_lines(doc, map, lines)
 }
@@ -503,14 +760,140 @@ fn write_money(
     }
 }
 
+/// Write Schedule K — the partnership's totals, before they are split.
+///
+/// The mapped lines come straight from the catalogue; the derived ones are
+/// computed here for the same reason page one's are, and line 1 in particular is
+/// never mappable: it *is* page one's line 23, and a line 1 somebody could map
+/// separately is a return whose two pages disagree about one number.
+fn fill_schedule_k(
+    doc: &mut Document,
+    map: &FieldMap,
+    lines: &Form1065Lines,
+) -> Result<Vec<String>, FormError> {
+    let mut warnings = Vec::new();
+
+    for def in super::lines::MAPPABLE_LINES
+        .iter()
+        .filter(|d| d.schedule == super::lines::Schedule::K)
+    {
+        let super::lines::Field::One(field) = def.field else {
+            continue;
+        };
+        if !lines.is_mapped(def.key) {
+            continue;
+        }
+        write_money(doc, map, field, lines.get(def.key), &mut warnings)?;
+    }
+
+    // Line 1 is always written, even at zero: it is the figure every reader of a
+    // K-1 reconciles against, and a blank reads as an unfinished return rather
+    // than as a nil result. The other derived lines follow page one's rule and
+    // are written only when they carry something.
+    set_text(
+        doc,
+        map,
+        sched_k::L1_ORDINARY,
+        &super::lines::format_dollars(lines.k_line_1()),
+    )?;
+    write_money(doc, map, sched_k::L3C_NET_RENTAL, lines.k_line_3c(), &mut warnings)?;
+    write_money(doc, map, sched_k::L4C_TOTAL_GUARANTEED, lines.k_line_4c(), &mut warnings)?;
+    set_text(
+        doc,
+        map,
+        sched_k::ANALYSIS,
+        &super::lines::format_dollars(lines.k_analysis()),
+    )?;
+
+    // The credits (15a-15f) and AMT items (17a-17f) are left blank and editable.
+    // Neither is an account balance: a credit is computed on its own form and an
+    // AMT item is a recomputation of a figure already reported, so there is
+    // nothing in the chart of accounts to point at them.
+    if !lines.any_schedule_k() {
+        warnings.push(
+            "Nothing is mapped to a Schedule K line, so every separately stated item is blank.              Charitable contributions, section 179, investment interest and capital gains belong              there rather than in page 1, line 21."
+                .to_string(),
+        );
+    }
+
+    Ok(warnings)
+}
+
+/// One partner's share of every Schedule K figure, in whole dollars.
+struct PartnerShares {
+    by_line: std::collections::BTreeMap<&'static str, i64>,
+}
+
+impl PartnerShares {
+    fn get(&self, key: &str) -> i64 {
+        self.by_line.get(key).copied().unwrap_or(0)
+    }
+}
+
+/// Split every Schedule K figure across the partners.
+///
+/// Returns one [`PartnerShares`] per entry of `filed`, in the same order, and a
+/// warning when the profit and loss percentages differ — at which point *which*
+/// share an item travelled on becomes visible on the return and is worth
+/// checking against the partnership agreement.
+fn split_across_partners(
+    lines: &Form1065Lines,
+    filed: &[&PartnerFiling],
+) -> (Vec<PartnerShares>, Vec<String>) {
+    use super::allocate::{allocate, profit_and_loss_shares_differ, Basis};
+
+    let partners: Vec<&Partner> = filed.iter().map(|f| &f.partner).collect();
+    let mut out: Vec<PartnerShares> = (0..filed.len())
+        .map(|_| PartnerShares {
+            by_line: std::collections::BTreeMap::new(),
+        })
+        .collect();
+
+    // Every figure a K-1 carries, derived ones included. Line 1 is here because
+    // a partner's share of ordinary business income is the single most important
+    // number on their K-1, and it is derived rather than mapped.
+    let mut figures: Vec<(&'static str, i64)> = vec![
+        ("k1", lines.k_line_1()),
+        ("k3c", lines.k_line_3c()),
+        ("k4c", lines.k_line_4c()),
+    ];
+    for def in super::lines::MAPPABLE_LINES
+        .iter()
+        .filter(|d| d.schedule == super::lines::Schedule::K)
+    {
+        if lines.is_mapped(def.key) {
+            figures.push((def.key, lines.get(def.key)));
+        }
+    }
+
+    for (key, total) in figures {
+        if total == 0 {
+            continue;
+        }
+        for share in allocate(total, &partners, Basis::ProfitOrLoss) {
+            out[share.partner].by_line.insert(key, share.dollars);
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if profit_and_loss_shares_differ(&partners) {
+        warnings.push(
+            "Profit and loss percentages differ for at least one partner, so income items and              loss items were split on different percentages. Check each K-1 against the              partnership agreement."
+                .to_string(),
+        );
+    }
+    (out, warnings)
+}
+
 fn fill_k1(
     doc: &mut Document,
     map: &FieldMap,
     profile: &BusinessProfile,
     filing: &PartnerFiling,
+    shares: &PartnerShares,
     year_start: NaiveDate,
     year_end: NaiveDate,
-) -> Result<(), FormError> {
+) -> Result<Vec<String>, FormError> {
     let p = &filing.partner;
 
     set_text(doc, map, k1::PARTNERSHIP_EIN, &profile.ein)?;
@@ -551,7 +934,44 @@ fn fill_k1(
     ] {
         set_text(doc, map, field, &format_ppm(ppm))?;
     }
-    Ok(())
+
+    // --- Part III: this partner's share of each Schedule K line ---
+    let mut warnings = Vec::new();
+
+    for (line_key, field) in k1::PART_III {
+        // Line 1 is written even at zero, matching Schedule K: it is the figure
+        // the partner reconciles their own return against.
+        let amount = shares.get(line_key);
+        if *line_key == "k1" {
+            set_text(doc, map, field, &super::lines::format_dollars(amount))?;
+        } else {
+            write_money(doc, map, field, amount, &mut warnings)?;
+        }
+    }
+
+    let mut needs_a_code: Vec<&str> = Vec::new();
+    for b in k1::CODED_BOXES {
+        let amount = shares.get(b.line_key);
+        if amount == 0 {
+            continue;
+        }
+        write_money(doc, map, b.amount_field, amount, &mut warnings)?;
+        match b.code {
+            Some(code) => set_text(doc, map, b.code_field, code)?,
+            None => needs_a_code.push(b.number),
+        }
+    }
+    if !needs_a_code.is_empty() {
+        warnings.push(format!(
+            "{}: box(es) {} carry an amount with no code. Which letter applies depends on facts the \
+             books do not hold — which charitable limit, what kind of \"other\" item — so the code \
+             is left for you to enter rather than guessed.",
+            p.name,
+            needs_a_code.join(", ")
+        ));
+    }
+
+    Ok(warnings)
 }
 
 /// The date format the IRS forms use.
@@ -623,6 +1043,9 @@ mod tests {
                     tin: Some("987-65-4321".into()),
                 },
             ],
+            schedule_b: Default::default(),
+            schedule_l: None,
+            detail: Default::default(),
         }
     }
 
@@ -684,6 +1107,30 @@ mod tests {
 
         let sched = Document::load_mem(F1065_SK1).unwrap();
         let smap = field_map(&sched);
+
+        // Part III: every box a partner's share is written into. Catches the
+        // revision that renumbers the K-1 independently of the 1065, which has
+        // happened before and which nothing else here would notice.
+        for (line_key, field) in k1::PART_III {
+            assert!(
+                smap.find(field).is_some(),
+                "f1065sk1.pdf has no field {field} for Schedule K line {line_key}"
+            );
+        }
+        for b in k1::CODED_BOXES {
+            assert!(
+                smap.find(b.amount_field).is_some(),
+                "f1065sk1.pdf has no amount box {} for line {}",
+                b.amount_field,
+                b.number
+            );
+            assert!(
+                smap.find(b.code_field).is_some(),
+                "f1065sk1.pdf has no code box {} for line {}",
+                b.code_field,
+                b.number
+            );
+        }
         for name in [
             k1::FINAL,
             k1::PARTNERSHIP_EIN,
@@ -1085,6 +1532,9 @@ mod tests {
                 .into_iter()
                 .map(|partner| PartnerFiling { partner, tin: None })
                 .collect(),
+            schedule_b: Default::default(),
+            schedule_l: None,
+            detail: Default::default(),
         };
 
         // Admitted during the year, so nothing to say yet.
@@ -1231,9 +1681,14 @@ mod tests {
             build_return_from_ledger(store.connection(), &two_partner_request()).unwrap();
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
+        // The separators come off before parsing: the box carries "4,001" now, and
+        // reading the arithmetic back is what this test is about, not the
+        // punctuation — which `lines::figures_are_grouped_in_threes_and_keep_their_sign`
+        // covers on its own.
         let get = |n: &str| {
             acroform::get_value_in(&doc, &map, FORM_ROOT, n)
                 .unwrap_or_default()
+                .replace(',', "")
                 .parse::<i64>()
                 .unwrap_or_else(|_| panic!("{n} is not a number"))
         };
@@ -1351,12 +1806,12 @@ mod tests {
         let map = field_map(&doc);
         let get = |n: &str| acroform::get_value_in(&doc, &map, FORM_ROOT, n).unwrap_or_default();
 
-        assert_eq!(get(f1065::L1A_GROSS_RECEIPTS), "987654321");
-        assert_eq!(get(f1065::L9_SALARIES), "123456789");
+        assert_eq!(get(f1065::L1A_GROSS_RECEIPTS), "987,654,321");
+        assert_eq!(get(f1065::L9_SALARIES), "123,456,789");
         assert_eq!(
             get(f1065::L23_ORDINARY_INCOME),
-            "864197532",
-            "987654321 - 123456789"
+            "864,197,532",
+            "987,654,321 - 123,456,789"
         );
     }
 
@@ -1430,6 +1885,366 @@ mod tests {
             acroform::get_value_in(&doc, &map, FORM_ROOT, f1065::EIN),
             None,
             "the box must be untouched, not holding a shortened EIN"
+        );
+    }
+
+    /// Scratch: writes a sample return to $SAMPLE_OUT for eyeballing. Ignored,
+    /// so it only runs when asked for by name.
+    #[test]
+    #[ignore]
+    fn zz_write_sample_return() {
+        use crate::tax::lines::LineDetail;
+        use crate::tax::schedule_b::{self, ScheduleB};
+
+        let mut sb = ScheduleB::default();
+        sb.set("b1", "llp");
+        for q in ["b3a","b3b","b5","b6","b7","b8","b9","b12","b16a","b19","b20","b21","b23","b27","b30","b4"] {
+            sb.set(q, schedule_b::NO);
+        }
+        // Both attachments, so the sample shows them.
+        sb.set("b2b", schedule_b::YES);
+        sb.set("b31", schedule_b::YES);
+        sb.set("b31_total", "2");
+        sb.set("pr_first", "Dana");
+        sb.set("pr_last", "Whitlock");
+        sb.set("pr_street", "1200 Harbor Way");
+        sb.set("pr_city", "Corpus Christi");
+        sb.set("pr_state", "TX");
+        sb.set("pr_zip", "78401");
+        sb.set("pr_phone", "361-555-0142");
+
+        let mut req = two_partner_request();
+        req.schedule_b = sb;
+        req.detail.insert("l21", vec![
+            LineDetail { account_id:"1".into(), account_number:"6100".into(), account_name:"Advertising and promotion".into(), cents: 12_450_00 },
+            LineDetail { account_id:"2".into(), account_number:"6200".into(), account_name:"Professional fees".into(), cents: 8_900_00 },
+            LineDetail { account_id:"3".into(), account_number:"6300".into(), account_name:"Software subscriptions".into(), cents: 4_215_00 },
+            LineDetail { account_id:"4".into(), account_number:"6400".into(), account_name:"Bank and merchant charges".into(), cents: 1_980_50 },
+            LineDetail { account_id:"5".into(), account_number:"6500".into(), account_name:"Office supplies".into(), cents: 2_104_50 },
+        ]);
+
+        // A Schedule L with both columns and a paired gross/contra row, which is
+        // the placement worth looking at on paper.
+        let mut sl = crate::tax::schedule_l::ScheduleL::default();
+        sl.set_for_test("sl1", 84_300, 96_150);
+        sl.set_for_test("sl2a", 41_000, 52_400);
+        sl.set_for_test("sl2b", 3_000, 4_200);
+        sl.set_for_test("sl9a", 220_000, 220_000);
+        sl.set_for_test("sl9b", 66_000, 88_000);
+        sl.set_for_test("sl15", 19_300, 24_150);
+        sl.set_for_test("sl21", 257_000, 272_200);
+        req.schedule_l = Some(sl);
+
+        let mut lines = crate::tax::lines::Form1065Lines::default();
+        for (k, v) in [("l1a", 480_000i64), ("l2", 150_000), ("l9", 120_000), ("l13", 36_000),
+                       ("l14", 18_400), ("l16a", 22_000), ("l21", 29_650),
+                       ("k5", 3_200), ("k13a", 5_000), ("k12", 14_000), ("k19a", 60_000)] {
+            lines.set_for_test(k, v);
+        }
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let out = std::env::var("SAMPLE_OUT").unwrap_or_else(|_| "sample-1065.pdf".into());
+        std::fs::write(&out, &bundle.pdf).unwrap();
+        println!("WROTE {out} ({} pages)", bundle.page_count);
+        for w in &bundle.warnings {
+            println!("WARN {w}");
+        }
+    }
+
+    /// A Yes on 2a has to produce a real Schedule B-1 in the bundle, filled from
+    /// the partners the books already hold.
+    #[test]
+    fn question_2a_puts_a_filled_schedule_b1_in_the_bundle() {
+        use crate::domain::Shares;
+        use crate::tax::schedule_b::{ScheduleB, YES};
+
+        let mut req = two_partner_request();
+        let mut owner = partner("Holdings LLC", PartnerType::General, Residency::Domestic, 60.0);
+        owner.entity_type = "Partnership".to_string();
+        owner.shares = Shares::from_percents(60.0, 60.0, 60.0);
+        req.partners = vec![PartnerFiling { partner: owner, tin: Some("98-7654321".into()) }];
+
+        let mut sb = ScheduleB::default();
+        sb.set("b2a", YES);
+        req.schedule_b = sb;
+
+        let before = build_return_inner(&two_partner_request(), &Default::default(), Vec::new())
+            .unwrap()
+            .page_count;
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        assert!(
+            bundle.page_count > before,
+            "the bundle gained no pages: {} vs {before}",
+            bundle.page_count
+        );
+
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("49842K"), "Schedule B-1 is not in the bundle");
+        // And the constructive-ownership caveat travels with it.
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("family members")),
+            "{:?}",
+            bundle.warnings
+        );
+    }
+
+    /// Declared on Schedule B but nobody in the books crosses the threshold. The
+    /// two claims are different and the mismatch has to surface.
+    #[test]
+    fn a_declared_owner_the_books_do_not_have_is_reported_not_ignored() {
+        use crate::tax::schedule_b::{ScheduleB, YES};
+        let mut req = two_partner_request();
+        // Both partners are at 50%… which is over the line. Push them under it.
+        for f in &mut req.partners {
+            f.partner.shares = crate::domain::Shares::from_percents(25.0, 25.0, 25.0);
+        }
+        let mut sb = ScheduleB::default();
+        sb.set("b2b", YES);
+        req.schedule_b = sb;
+
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("no partner in the books owns 50%")),
+            "{:?}",
+            bundle.warnings
+        );
+    }
+
+    /// A Yes on 31 produces Schedule B-2, and question 31's own figure has to
+    /// agree with the schedule behind it.
+    #[test]
+    fn question_31_puts_schedule_b2_in_the_bundle_and_checks_its_total() {
+        use crate::tax::schedule_b::{ScheduleB, YES};
+
+        let mut req = two_partner_request();
+        for f in &mut req.partners {
+            f.partner.entity_type = "Individual".to_string();
+        }
+        let mut sb = ScheduleB::default();
+        sb.set("b31", YES);
+        sb.set("b31_total", "7"); // wrong on purpose: there are two partners
+        req.schedule_b = sb;
+
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("69658K"), "Schedule B-2 is not in the bundle");
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("have to agree")),
+            "the mismatch must be reported: {:?}",
+            bundle.warnings
+        );
+    }
+
+    /// No Yes, no extra schedules — the common case must not gain pages.
+    #[test]
+    fn a_return_with_no_b_schedule_answers_gains_no_b_schedules() {
+        let req = two_partner_request();
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+        // Matched on catalogue number, not on wording: Form 1065's own question
+        // 2a says "Owning 50% or More" in the course of asking, so the phrase is
+        // no evidence the schedule is attached.
+        assert!(!text.contains("49842K"), "an unrequested Schedule B-1 was attached");
+        assert!(!text.contains("69658K"), "an unrequested Schedule B-2 was attached");
+    }
+
+    /// End to end: a ledger with several accounts on line 21 produces a bundle
+    /// that actually carries the statement page supporting it, itemising them,
+    /// and totalling to the figure in the box.
+    #[test]
+    fn line_21_gets_a_statement_page_listing_what_is_in_it() {
+        use crate::tax::lines::LineDetail;
+
+        let mut req = two_partner_request();
+        req.detail.insert(
+            "l21",
+            vec![
+                LineDetail { account_id: "a".into(), account_number: "6100".into(), account_name: "Advertising".into(), cents: 1_200_00 },
+                LineDetail { account_id: "b".into(), account_number: "6200".into(), account_name: "Professional fees".into(), cents: 3_400_00 },
+                LineDetail { account_id: "c".into(), account_number: "6300".into(), account_name: "Software subscriptions".into(), cents: 900_00 },
+            ],
+        );
+        let mut lines = crate::tax::lines::Form1065Lines::default();
+        lines.set_for_test("l21", 5500);
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(text.contains("Advertising"), "statement page missing from the bundle");
+        assert!(text.contains("Professional fees"));
+        assert!(text.contains("Software subscriptions"));
+        assert!(text.contains("5,500"), "the statement must total to the box");
+    }
+
+    /// A figure on line 21 with no detail behind it cannot be supported, and has
+    /// to say so rather than ship an unsupported deduction quietly.
+    #[test]
+    fn a_line_21_figure_with_no_detail_warns_instead_of_going_quiet() {
+        let req = two_partner_request();
+        let mut lines = crate::tax::lines::Form1065Lines::default();
+        lines.set_for_test("l21", 5500);
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("statement")),
+            "{:?}",
+            bundle.warnings
+        );
+    }
+
+    /// The invariant the whole allocation exists for: what the K-1s say the
+    /// partners got must equal what Schedule K says the partnership had. A
+    /// mismatch here is the first thing an examiner sees, and rounding each
+    /// share independently produces one.
+    #[test]
+    fn the_k1_shares_add_back_to_the_schedule_k_totals() {
+        use crate::tax::lines::Form1065Lines;
+
+        // Thirds, which is where independent rounding loses a dollar.
+        let mut req = two_partner_request();
+        req.partners = vec![
+            PartnerFiling {
+                partner: partner("Alice", PartnerType::General, Residency::Domestic, 33.3333),
+                tin: None,
+            },
+            PartnerFiling {
+                partner: partner("Bob", PartnerType::General, Residency::Domestic, 33.3333),
+                tin: None,
+            },
+            PartnerFiling {
+                partner: partner("Carol", PartnerType::General, Residency::Domestic, 33.3334),
+                tin: None,
+            },
+        ];
+
+        let mut lines = Form1065Lines::default();
+        // An income item and a loss item, both awkward to divide.
+        lines.set_for_test("l1a", 100);
+        lines.set_for_test("k5", 100);
+        lines.set_for_test("k13a", -101);
+
+        let filed: Vec<&PartnerFiling> = req.partners.iter().collect();
+        let (shares, _) = split_across_partners(&lines, &filed);
+
+        for key in ["k1", "k5", "k13a"] {
+            let total: i64 = shares.iter().map(|s| s.get(key)).sum();
+            assert_eq!(
+                total,
+                match key {
+                    "k1" => lines.k_line_1(),
+                    other => lines.get(other),
+                },
+                "the three K-1s do not add back to Schedule K line {key}"
+            );
+        }
+    }
+
+    /// Income travels on the profit share and losses on the loss share, per item
+    /// and on the item's own sign — so one return can split two figures two ways.
+    #[test]
+    fn income_and_loss_items_travel_on_different_percentages() {
+        use crate::tax::lines::Form1065Lines;
+        use crate::domain::Shares;
+
+        let mut a = partner("Alice", PartnerType::General, Residency::Domestic, 50.0);
+        a.shares = Shares { profit_ppm: 100_000, loss_ppm: 900_000, capital_ppm: 500_000 };
+        let mut b = partner("Bob", PartnerType::General, Residency::Domestic, 50.0);
+        b.shares = Shares { profit_ppm: 900_000, loss_ppm: 100_000, capital_ppm: 500_000 };
+
+        let filings = vec![
+            PartnerFiling { partner: a, tin: None },
+            PartnerFiling { partner: b, tin: None },
+        ];
+        let filed: Vec<&PartnerFiling> = filings.iter().collect();
+
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k5", 1000);      // income
+        lines.set_for_test("k10", -1000);    // loss
+
+        let (shares, warnings) = split_across_partners(&lines, &filed);
+        assert_eq!(shares[0].get("k5"), 100, "Alice takes 10% of the income");
+        assert_eq!(shares[1].get("k5"), 900);
+        assert_eq!(shares[0].get("k10"), -900, "Alice takes 90% of the loss");
+        assert_eq!(shares[1].get("k10"), -100);
+        assert!(
+            warnings.iter().any(|w| w.contains("differ")),
+            "differing percentages must be called out: {warnings:?}"
+        );
+    }
+
+    /// Schedule K line 1 is page one's line 23, not a second mappable figure.
+    /// Two pages disagreeing about one number is the failure this prevents.
+    #[test]
+    fn schedule_k_line_1_is_page_ones_bottom_line() {
+        use crate::tax::lines::Form1065Lines;
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l1a", 5000);
+        lines.set_for_test("l13", 2000);
+        assert_eq!(lines.k_line_1(), lines.line_23());
+        assert_eq!(lines.k_line_1(), 3000);
+
+        let mut doc = Document::load_mem(F1065).unwrap();
+        strip_xfa(&mut doc);
+        let map = field_map(&doc);
+        fill_schedule_k(&mut doc, &map, &lines).unwrap();
+        assert_eq!(
+            crate::tax::acroform::get_value(&doc, &map, sched_k::L1_ORDINARY).as_deref(),
+            Some("3,000")
+        );
+    }
+
+    /// A separately stated item must reach Schedule K and stay off page one's
+    /// deductions — the double-deduction the catalogue is arranged to prevent.
+    #[test]
+    fn a_charitable_contribution_reaches_schedule_k_and_not_line_21() {
+        use crate::tax::lines::Form1065Lines;
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l1a", 10_000);
+        lines.set_for_test("k13a", 500);
+
+        // Page one's total deductions are untouched by the contribution.
+        assert_eq!(lines.line_22(), 0);
+        assert_eq!(lines.line_23(), 10_000);
+
+        let mut doc = Document::load_mem(F1065).unwrap();
+        strip_xfa(&mut doc);
+        let map = field_map(&doc);
+        fill_schedule_k(&mut doc, &map, &lines).unwrap();
+
+        assert_eq!(
+            crate::tax::acroform::get_value(&doc, &map, "f5_22[0]").as_deref(),
+            Some("500"),
+            "13a cash contributions"
+        );
+        assert_eq!(
+            crate::tax::acroform::get_value(&doc, &map, f1065::L21_OTHER_DEDUCTIONS),
+            None,
+            "line 21 must stay empty"
         );
     }
 

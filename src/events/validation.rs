@@ -23,6 +23,21 @@ pub enum ValidationError {
     InvalidPeriod(u8),
 }
 
+/// A tax year a return could plausibly be filed for.
+///
+/// Bounded rather than accepted as any `i32` because the year is half the key
+/// of every Schedule B answer: a typo puts an answer in a year nobody will ever
+/// open again, where it is neither visible nor obviously missing.
+fn validate_tax_year(year: i32) -> Result<(), ValidationError> {
+    if (1900..=2200).contains(&year) {
+        Ok(())
+    } else {
+        Err(ValidationError::InvalidValue(format!(
+            "{year} is not a tax year"
+        )))
+    }
+}
+
 /// Validate an event before storing
 pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
     match event {
@@ -104,6 +119,49 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             end_date: _,
         } => {
             validate_non_empty(partner_id, "partner_id")?;
+        }
+        Event::TaxLineMappingSet {
+            account_id,
+            line_key,
+        } => {
+            validate_non_empty(account_id, "account_id")?;
+            // Checked against the catalogue, not merely for emptiness: a key
+            // nothing recognises is an account whose balance silently reaches no
+            // line on the return, which is the failure `tax::lines` exists to
+            // prevent. Refusing it here keeps it out of the log, where it would
+            // replay onto every member's machine.
+            if crate::tax::lines::line_def(line_key).is_none() {
+                return Err(ValidationError::InvalidValue(format!(
+                    "no Form 1065 line has key {line_key:?}"
+                )));
+            }
+        }
+        Event::TaxLineMappingCleared { account_id } => {
+            validate_non_empty(account_id, "account_id")?;
+        }
+        Event::ScheduleBAnswerSet {
+            tax_year,
+            answer_key,
+            value,
+        } => {
+            validate_tax_year(*tax_year)?;
+            validate_non_empty(value, "value")?;
+            if !crate::tax::schedule_b::known_key(answer_key) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "Schedule B has no answer keyed {answer_key:?}"
+                )));
+            }
+        }
+        Event::ScheduleBAnswerCleared {
+            tax_year,
+            answer_key,
+        } => {
+            validate_tax_year(*tax_year)?;
+            if !crate::tax::schedule_b::known_key(answer_key) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "Schedule B has no answer keyed {answer_key:?}"
+                )));
+            }
         }
         Event::UserAdded {
             user_id,

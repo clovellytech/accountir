@@ -225,6 +225,44 @@ pub enum Event {
     PartnerAdmitted(Box<PartnerAdmittedData>),
     /// A partner's details or shares change.
     PartnerDetailsUpdated(Box<PartnerDetailsData>),
+    // Preparing the return: which account reports where, and what Schedule B was
+    // answered. Both are events rather than local rows because a return is
+    // prepared from one member's machine but is *about* the partnership, and a
+    // colleague opening the same books has to see the same return taking shape.
+    // Contrast `partner_tins`, which stays local: a TIN is a secret, and these
+    // are not.
+    /// An account is pointed at a Form 1065 line.
+    ///
+    /// Carries the line *key* rather than the number: the IRS renumbers lines
+    /// between revisions, and a log that recorded "line 13" would silently mean
+    /// a different line after a renumbering. `tax::lines::MAPPABLE_LINES` owns
+    /// what a key means.
+    TaxLineMappingSet {
+        account_id: String,
+        line_key: String,
+    },
+    /// An account is taken off the return.
+    TaxLineMappingCleared {
+        account_id: String,
+    },
+    /// One Schedule B answer is given, for one tax year.
+    ///
+    /// Keyed by year as well as question because the schedule asks about "the
+    /// tax year" — see `migrations/026_schedule_b_answers.sql`.
+    ScheduleBAnswerSet {
+        tax_year: i32,
+        answer_key: String,
+        value: String,
+    },
+    /// One Schedule B answer goes back to unanswered.
+    ///
+    /// Its own event rather than a set-to-empty, because unanswered and "No" are
+    /// different states on this form and a log that could not tell them apart
+    /// would replay one as the other.
+    ScheduleBAnswerCleared {
+        tax_year: i32,
+        answer_key: String,
+    },
     /// A partner leaves. Their K-1 for the year containing `end_date` is final.
     PartnerWithdrawn {
         partner_id: String,
@@ -519,6 +557,10 @@ impl Event {
             Event::BusinessProfileSet(_) => "business_profile_set",
             Event::PartnerAdmitted(_) => "partner_admitted",
             Event::PartnerDetailsUpdated(_) => "partner_details_updated",
+            Event::TaxLineMappingSet { .. } => "tax_line_mapping_set",
+            Event::TaxLineMappingCleared { .. } => "tax_line_mapping_cleared",
+            Event::ScheduleBAnswerSet { .. } => "schedule_b_answer_set",
+            Event::ScheduleBAnswerCleared { .. } => "schedule_b_answer_cleared",
             Event::PartnerWithdrawn { .. } => "partner_withdrawn",
             Event::UserAdded { .. } => "user_added",
             Event::UserModified { .. } => "user_modified",
@@ -570,6 +612,11 @@ impl Event {
             Event::BusinessProfileSet(_) => None,
             Event::PartnerAdmitted(d) => Some(&d.partner_id),
             Event::PartnerDetailsUpdated(d) => Some(&d.partner_id),
+            Event::TaxLineMappingSet { account_id, .. } => Some(account_id),
+            Event::TaxLineMappingCleared { account_id } => Some(account_id),
+            // Keyed by (year, question), so no single id names the thing changed.
+            Event::ScheduleBAnswerSet { .. } => None,
+            Event::ScheduleBAnswerCleared { .. } => None,
             Event::PartnerWithdrawn { partner_id, .. } => Some(partner_id),
             Event::UserAdded { user_id, .. } => Some(user_id),
             Event::UserModified { user_id, .. } => Some(user_id),

@@ -47,6 +47,47 @@ impl<'a> Projector<'a> {
                 let sql = format!("UPDATE company SET {} = ?1 WHERE id = 'default'", field);
                 self.conn.execute(&sql, [new_value])?;
             }
+            Event::TaxLineMappingSet {
+                account_id,
+                line_key,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO tax_line_mappings (account_id, line_key, updated_at, updated_at_event)
+                     VALUES (?1, ?2, datetime('now'), ?3)
+                     ON CONFLICT(account_id) DO UPDATE SET
+                       line_key = ?2, updated_at = datetime('now'), updated_at_event = ?3",
+                    params![account_id, line_key, stored_event.id],
+                )?;
+            }
+            Event::TaxLineMappingCleared { account_id } => {
+                self.conn.execute(
+                    "DELETE FROM tax_line_mappings WHERE account_id = ?1",
+                    params![account_id],
+                )?;
+            }
+            Event::ScheduleBAnswerSet {
+                tax_year,
+                answer_key,
+                value,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO schedule_b_answers
+                        (tax_year, answer_key, value, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4)
+                     ON CONFLICT(tax_year, answer_key) DO UPDATE SET
+                       value = ?3, updated_at = datetime('now'), updated_at_event = ?4",
+                    params![tax_year, answer_key, value, stored_event.id],
+                )?;
+            }
+            Event::ScheduleBAnswerCleared {
+                tax_year,
+                answer_key,
+            } => {
+                self.conn.execute(
+                    "DELETE FROM schedule_b_answers WHERE tax_year = ?1 AND answer_key = ?2",
+                    params![tax_year, answer_key],
+                )?;
+            }
             Event::BusinessProfileSet(d) => {
                 let (legal_name, address, ein, naics_code, formation_date) = (
                     &d.legal_name,
@@ -846,7 +887,13 @@ impl<'a> Projector<'a> {
              -- cleared — it is local configuration, not derived from anything,
              -- and is exactly what a replay must leave alone.
              DELETE FROM partners;
-             DELETE FROM business_profile;",
+             DELETE FROM business_profile;
+             -- Fed by events since migration 027. Truncated like any other
+             -- projection: a row no event justifies is a mapping one machine has
+             -- and its colleagues do not, which is the divergence that made these
+             -- events necessary in the first place.
+             DELETE FROM tax_line_mappings;
+             DELETE FROM schedule_b_answers;",
         )?;
 
         // Replay all events
@@ -1274,6 +1321,10 @@ mod rebuild_survives_local_config {
     /// an account to a Form 1065 line disabled the ledger's own recovery path.
     /// Migration 025 removed those keys; this is the test that says why they
     /// must not come back.
+    ///
+    /// Since migration 027 the mappings are a projection, so the rebuild is
+    /// *expected* to clear them — what must not happen is the rebuild being
+    /// blocked. The TIN stays local and still survives.
     #[test]
     fn a_rebuild_still_runs_with_tax_mappings_and_a_tin_on_file() {
         let mut s = store();
@@ -1316,18 +1367,68 @@ mod rebuild_survives_local_config {
             .unwrap();
         assert_eq!(accounts, 1, "the replay did not restore the account");
 
-        // And the configuration, which is derived from nothing, is untouched.
-        // This is the whole point of keeping it out of the log: it survives the
-        // log being replayed.
-        let mappings: i64 = s
-            .connection()
-            .query_row("SELECT COUNT(*) FROM tax_line_mappings", [], |r| r.get(0))
-            .unwrap();
+        // The TIN, which is still local config and derived from nothing, is
+        // untouched. That is the point of keeping it out of the log: a secret
+        // that lives on one machine survives that machine replaying its log.
         let tins: i64 = s
             .connection()
             .query_row("SELECT COUNT(*) FROM partner_tins", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(mappings, 1, "a rebuild discarded the Form 1065 line mappings");
         assert_eq!(tins, 1, "a rebuild discarded the partner TINs");
+
+        // The mapping written by hand is *gone*, and that is the intended
+        // behaviour since migration 027. It is a projection now: a row no event
+        // justifies is a mapping this machine has and its colleagues do not, and
+        // a rebuild is exactly where that divergence should be resolved in
+        // favour of the log. `adopt_pending` is what rescues rows that predate
+        // the change; anything written directly afterwards is a bug in the
+        // caller.
+        let mappings: i64 = s
+            .connection()
+            .query_row("SELECT COUNT(*) FROM tax_line_mappings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            mappings, 0,
+            "a hand-written mapping must not survive a rebuild — it is a projection now"
+        );
+    }
+
+    /// The other half of the same change: a mapping that *is* in the log comes
+    /// back from it, which is what makes a second machine show the same return.
+    #[test]
+    fn a_mapping_in_the_log_is_restored_by_a_rebuild() {
+        let mut s = store();
+
+        let account = Event::AccountCreated {
+            account_id: "rent".into(),
+            account_type: EventAccountType::Expense,
+            account_number: "6100".into(),
+            name: "Rent".into(),
+            parent_id: None,
+            currency: Some("USD".into()),
+            description: None,
+        };
+        let stored = s.append(EventEnvelope::new(account, "u".into())).unwrap();
+        s.apply_projection(&stored).unwrap();
+
+        crate::commands::tax_setup_commands::set_account_line(&mut s, "u", "rent", "l13").unwrap();
+        crate::commands::tax_setup_commands::set_schedule_b_answer(&mut s, "u", 2025, "b5", "no")
+            .unwrap();
+
+        let events = s.get_all().unwrap();
+        Projector::new(s.connection()).rebuild(&events).unwrap();
+
+        assert_eq!(
+            crate::tax::lines::load_mapping(s.connection())
+                .get("rent")
+                .map(String::as_str),
+            Some("l13"),
+            "the log did not restore the mapping"
+        );
+        assert_eq!(
+            crate::tax::schedule_b::load(s.connection(), 2025).get("b5"),
+            Some("no"),
+            "the log did not restore the Schedule B answer"
+        );
     }
 }

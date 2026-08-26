@@ -95,6 +95,14 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             25,
             include_str!("../../migrations/025_config_tables_have_no_projection_fk.sql"),
         ),
+        (
+            26,
+            include_str!("../../migrations/026_schedule_b_answers.sql"),
+        ),
+        (
+            27,
+            include_str!("../../migrations/027_tax_setup_is_event_sourced.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -527,10 +535,13 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         -- "which accounts have no line" is the question that catches money
         -- going missing from a return.
         -- No foreign key to `accounts`, deliberately — see migration 025.
+        -- Event-sourced since migration 027 — `updated_at_event` names the event
+        -- that put the row here, exactly as `business_profile` does.
         CREATE TABLE IF NOT EXISTS tax_line_mappings (
             account_id TEXT PRIMARY KEY,
             line_key TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id)
         );
 
         CREATE INDEX IF NOT EXISTS idx_tax_line_mappings_line ON tax_line_mappings(line_key);
@@ -543,6 +554,35 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             partner_id TEXT PRIMARY KEY,
             tin TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        -- Schedule B, "Other Information" (migration 026). Keyed by tax year
+        -- as well as question, because the schedule asks about "the tax year"
+        -- and a carried-over answer is last year's fact on this year's signed
+        -- return. Local config, like the two tables above, and with no foreign
+        -- key for the same reason.
+        CREATE TABLE IF NOT EXISTS schedule_b_answers (
+            tax_year INTEGER NOT NULL,
+            answer_key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (tax_year, answer_key)
+        );
+
+        -- Rows that predate migration 027, held until the store adopts them into
+        -- the log. Empty on a database built by `init_schema`, which has no
+        -- pre-event rows to rescue.
+        CREATE TABLE IF NOT EXISTS tax_line_mappings_pending_adoption (
+            account_id TEXT PRIMARY KEY,
+            line_key TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS schedule_b_answers_pending_adoption (
+            tax_year INTEGER NOT NULL,
+            answer_key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (tax_year, answer_key)
         );
 
         -- Which group server this ledger is a replica of (migration 017).
