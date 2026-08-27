@@ -162,3 +162,193 @@ fn append(
         .map_err(ApiError::store)?;
     outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::{init_schema, run_migrations};
+    use crate::sync::router;
+    use std::collections::HashMap;
+
+    const TOKEN: &str = "tok-1";
+
+    async fn serve() -> (String, std::sync::Arc<std::sync::Mutex<EventStore>>) {
+        let store = {
+            let s = EventStore::in_memory().unwrap();
+            init_schema(s.connection()).unwrap();
+            run_migrations(s.connection()).unwrap();
+            s
+        };
+        let state = SyncState::new(
+            store,
+            HashMap::from([(TOKEN.to_string(), "alice@example.com".to_string())]),
+        );
+        let handle = state.store.clone();
+        let app = router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn head_of(base: &str) -> i64 {
+        reqwest::Client::new()
+            .get(format!("{base}/sync/head"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()["head"]
+            .as_i64()
+            .unwrap()
+    }
+
+    async fn post(base: &str, path: &str, body: serde_json::Value) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{base}/sync/commands/{path}"))
+            .bearer_auth(TOKEN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The round trip a member on group-hosted books actually makes. Without
+    /// these routes working, the mapping editor is dead on a replica — which is
+    /// exactly how it shipped before this test existed.
+    #[tokio::test]
+    async fn a_replica_can_map_an_account_to_a_schedule_l_line() {
+        let (base, store) = serve().await;
+        let head = head_of(&base).await;
+
+        let r = post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({
+                "expected_head_seq": head,
+                "account_id": "checking",
+                "line_key": "sl1",
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), 200, "{:?}", r.text().await);
+
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            crate::tax::lines::load_mapping(guard.connection())
+                .get("checking")
+                .map(String::as_str),
+            Some("sl1"),
+            "the instance did not project the mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replica_can_take_an_account_off_the_return() {
+        let (base, store) = serve().await;
+        let head = head_of(&base).await;
+        post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({"expected_head_seq": head, "account_id": "checking", "line_key": "sl1"}),
+        )
+        .await;
+        let head = head_of(&base).await;
+        let r = post(
+            &base,
+            "clear-tax-line-mapping",
+            serde_json::json!({"expected_head_seq": head, "account_id": "checking"}),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+
+        let guard = store.lock().unwrap();
+        assert!(crate::tax::lines::load_mapping(guard.connection()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_replica_can_answer_and_unanswer_schedule_b() {
+        let (base, store) = serve().await;
+        let head = head_of(&base).await;
+        let r = post(
+            &base,
+            "set-schedule-b-answer",
+            serde_json::json!({"expected_head_seq": head, "tax_year": 2025, "answer_key": "b5", "value": "no"}),
+        )
+        .await;
+        assert_eq!(r.status(), 200, "{:?}", r.text().await);
+        {
+            let guard = store.lock().unwrap();
+            assert_eq!(
+                crate::tax::schedule_b::load(guard.connection(), 2025).get("b5"),
+                Some("no")
+            );
+        }
+
+        // Empty clears, and unanswered is not the same as No.
+        let head = head_of(&base).await;
+        let r = post(
+            &base,
+            "set-schedule-b-answer",
+            serde_json::json!({"expected_head_seq": head, "tax_year": 2025, "answer_key": "b5", "value": ""}),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            crate::tax::schedule_b::load(guard.connection(), 2025).get("b5"),
+            None
+        );
+    }
+
+    /// A key the catalogue does not have is the caller's mistake, not the books
+    /// refusing — 400, so a client does not go looking at the ledger for a typo.
+    #[tokio::test]
+    async fn a_line_key_the_catalogue_does_not_have_is_a_bad_request() {
+        let (base, _) = serve().await;
+        let head = head_of(&base).await;
+        let r = post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({"expected_head_seq": head, "account_id": "x", "line_key": "l99"}),
+        )
+        .await;
+        assert_eq!(r.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn a_schedule_b_key_the_catalogue_does_not_have_is_a_bad_request() {
+        let (base, _) = serve().await;
+        let head = head_of(&base).await;
+        let r = post(
+            &base,
+            "set-schedule-b-answer",
+            serde_json::json!({"expected_head_seq": head, "tax_year": 2025, "answer_key": "b99", "value": "yes"}),
+        )
+        .await;
+        assert_eq!(r.status(), 400);
+    }
+
+    /// A stale head is a 409, which is what makes the client's blind retry safe.
+    #[tokio::test]
+    async fn a_stale_head_is_refused_rather_than_applied() {
+        let (base, _) = serve().await;
+        let head = head_of(&base).await;
+        post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({"expected_head_seq": head, "account_id": "a", "line_key": "sl1"}),
+        )
+        .await;
+        let r = post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({"expected_head_seq": head, "account_id": "b", "line_key": "sl3"}),
+        )
+        .await;
+        assert_eq!(r.status(), 409);
+    }
+}
