@@ -1019,33 +1019,40 @@ async fn plaid_exchange_token(
         }));
     }
 
-    let item_id = uuid::Uuid::new_v4().to_string();
-    let event = crate::events::types::Event::PlaidItemConnected {
-        item_id: item_id.clone(),
-        proxy_item_id: Some(proxy_item_id.clone()),
-        institution_name: req.institution.name.clone(),
-        plaid_accounts,
-    };
+    // Through the command, exactly as the reconnect branch above does.
+    //
+    // This block called `store.append` directly, under a comment claiming that
+    // append "folds the event into projections through `Projector`". It does not
+    // — it hashes, validates and writes to `events`, and projecting is a separate
+    // step. So the very first bank connection on a ledger wrote its event and
+    // left `plaid_items` empty: the browser reported success, the connection was
+    // genuinely recorded in the log, and the app showed nothing, because the app
+    // reads the projection.
+    //
+    // Only the *first* connection, which is what made it hard to see. A reconnect
+    // takes the branch above, which goes through `PlaidCommands` and projects
+    // correctly, so a ledger that had ever linked a bank kept working.
+    let stored = crate::commands::plaid_commands::PlaidCommands::new(
+        &mut active.store,
+        "plaid-link".to_string(),
+    )
+    .connect_item(&proxy_item_id, &req.institution.name, plaid_accounts)
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                success: false,
+                error: format!("recording the connection: {}", e),
+            }),
+        )
+    })?;
 
-    // `append` hashes with `compute_event_hash`, validates, and folds the event
-    // into projections through `Projector` — so `plaid_items` and
-    // `plaid_local_accounts` are written by the same code that would rebuild them
-    // from the log, rather than by a second copy that can drift from it.
-    active
-        .store
-        .append(crate::events::types::EventEnvelope::new(
-            event,
-            "plaid-link".to_string(),
-        ))
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    success: false,
-                    error: format!("recording the connection: {}", e),
-                }),
-            )
-        })?;
+    // The id the command minted, not one made here — writing a second uuid into
+    // the response would name a connection the ledger does not have.
+    let item_id = match &stored.event {
+        crate::events::types::Event::PlaidItemConnected { item_id, .. } => item_id.clone(),
+        _ => String::new(),
+    };
 
     Ok(Json(PlaidExchangeTokenResponse {
         success: true,

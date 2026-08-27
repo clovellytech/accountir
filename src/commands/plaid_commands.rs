@@ -1463,6 +1463,46 @@ mod tests {
         }
     }
 
+    /// Connecting a bank has to reach `plaid_items`, not only `events`.
+    ///
+    /// The app reads the projection; the log is what it is rebuilt from. An
+    /// append that skipped the projection is invisible until something replays,
+    /// which is exactly how the first bank connection on a ledger came out as
+    /// "the browser said it worked and nothing appeared" — the event was there
+    /// the whole time.
+    #[test]
+    fn connecting_a_bank_reaches_the_table_the_app_reads() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+
+        PlaidCommands::new(&mut store, "plaid-link".to_string())
+            .connect_item(
+                "proxy-item-1",
+                "First National",
+                vec![acct("plaid-acc-1", "Checking")],
+            )
+            .unwrap();
+
+        let items: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM plaid_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(items, 1, "the connection never reached plaid_items");
+
+        let accounts: i64 = store
+            .connection()
+            .query_row("SELECT COUNT(*) FROM plaid_local_accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accounts, 1, "the bank's accounts never reached the projection");
+
+        // And the institution is the one that was linked, so the page can name it.
+        let name: String = store
+            .connection()
+            .query_row("SELECT institution_name FROM plaid_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "First National");
+    }
+
     fn acct(id: &str, name: &str) -> PlaidAccountInfo {
         PlaidAccountInfo {
             plaid_account_id: id.to_string(),
