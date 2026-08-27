@@ -1897,6 +1897,8 @@ fn handle_tax_command(store: &EventStore, cmd: TaxCliCommands) -> Result<()> {
                     // connection and reads them from the books.
                     schedule_l: None,
                     detail: Default::default(),
+                    options: Default::default(),
+                    book_income_cents: 0,
                 },
             )?;
 

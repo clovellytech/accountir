@@ -247,13 +247,20 @@ pub fn fill(
     let mut warnings = Vec::new();
 
     if sched.is_empty() {
-        if required {
-            warnings.push(
-                "Schedule L is blank: no balance-sheet account is mapped to a Schedule L line, and \
-                 Schedule B question 4 does not exempt this partnership. Map them and regenerate."
-                    .to_string(),
-            );
-        }
+        // Said whether or not the schedule is required. Reaching this function at
+        // all means somebody asked for the page — either because it is owed or
+        // because they chose to complete it anyway — and "you asked for a balance
+        // sheet and got a blank one" needs the same explanation in both cases.
+        // Warning only when required was the reason this looked like it silently
+        // did nothing.
+        warnings.push(format!(
+            "Schedule L is blank: no balance-sheet account is mapped to a Schedule L line{}. Map              your cash, receivable, payable and capital accounts on the Form 1065 page — the              picker offers Schedule L lines for every asset, liability and equity account — then              regenerate.",
+            if required {
+                ", and Schedule B question 4 does not exempt this partnership"
+            } else {
+                ""
+            }
+        ));
         return Ok(warnings);
     }
 
@@ -538,6 +545,24 @@ mod tests {
             warnings.iter().any(|w| w.contains("does not balance")),
             "{warnings:?}"
         );
+    }
+
+    /// An empty Schedule L has to explain itself whether or not it was required.
+    /// Warning only in the required case is what made this look like it silently
+    /// did nothing.
+    #[test]
+    fn an_empty_schedule_l_says_why_in_both_cases() {
+        for required in [true, false] {
+            let mut doc =
+                lopdf::Document::load_mem(include_bytes!("../../assets/irs/f1065.pdf")).unwrap();
+            crate::tax::acroform::strip_xfa(&mut doc);
+            let map = crate::tax::acroform::field_map(&doc);
+            let warnings = fill(&mut doc, &map, &ScheduleL::default(), required).unwrap();
+            assert!(
+                warnings.iter().any(|w| w.contains("no balance-sheet account is mapped")),
+                "required={required} produced {warnings:?}"
+            );
+        }
     }
 
     #[test]

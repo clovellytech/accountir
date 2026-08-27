@@ -287,6 +287,8 @@ pub struct ReturnRequest {
     pub year: i32,
     pub profile: BusinessProfile,
     pub partners: Vec<PartnerFiling>,
+    /// What to do about the schedules a small partnership may skip.
+    pub options: ReturnOptions,
     /// Schedule B, as answered for `year`. Defaulted rather than optional: an
     /// unanswered schedule and an absent one produce the same blank boxes, and
     /// the warnings say which questions were left.
@@ -297,6 +299,12 @@ pub struct ReturnRequest {
     /// ledger leaves it empty and gets a return with no statements — which is
     /// correct, because it also has no figures to support.
     pub detail: std::collections::BTreeMap<&'static str, Vec<super::lines::LineDetail>>,
+    /// Net income per the books for `year`, in cents.
+    ///
+    /// Schedule M-1 line 1, and nothing else uses it. In cents because it comes
+    /// straight off the income statement and is rounded once, here, the same way
+    /// every other figure on the return is.
+    pub book_income_cents: i64,
     /// Schedule L, when the books were read for it.
     ///
     /// Optional, unlike Schedule B, because a balance sheet needs two dates of
@@ -305,6 +313,33 @@ pub struct ReturnRequest {
     /// present-but-empty one means "computed, and nothing was mapped", which is
     /// worth a warning.
     pub schedule_l: Option<super::schedule_l::ScheduleL>,
+}
+
+/// Choices about the return that are not facts about the partnership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnOptions {
+    /// Complete Schedules L, M-1 and M-2 even when Schedule B question 4 excuses
+    /// them.
+    ///
+    /// On by default, and that is the considered position rather than a
+    /// convenience. Question 4 excuses the *filing*; it does not make the
+    /// arithmetic less true. M-1 is the only check the return has that the book
+    /// profit and the taxable figure differ by an amount somebody can name, and
+    /// M-2 is the only check that year-end capital is opening capital plus income
+    /// less draws. A return that fails either is wrong in a way page one cannot
+    /// show, because page one foots regardless.
+    ///
+    /// Turning it off leaves all three blank, which is what the exemption
+    /// permits — but it should be a decision somebody made, not the default.
+    pub complete_optional_schedules: bool,
+}
+
+impl Default for ReturnOptions {
+    fn default() -> Self {
+        Self {
+            complete_optional_schedules: true,
+        }
+    }
 }
 
 /// A built return, and everything about it somebody should see before filing.
@@ -357,6 +392,10 @@ pub fn build_return_from_ledger(
     }
     // The statements are built from this, and only this path knows it.
     owned.detail = computed.detail;
+    // Schedule M-1 line 1. Read here rather than demanded from the caller, for
+    // the same reason Schedule L is: this is the only entry point with a ledger,
+    // and a caller that forgot would ship an M-1 opening at zero.
+    owned.book_income_cents = statement.net_income;
     let req = &owned;
 
     let mut bundle = build_return_inner(req, &computed.lines, computed.warnings)?;
@@ -441,11 +480,37 @@ fn build_return_inner(
     warnings.extend(fill_schedule_k(&mut doc, &map, lines)?);
     warnings.extend(super::schedule_b::fill(&mut doc, &map, &req.schedule_b)?);
 
-    // Schedule L, when the books have been mapped for it. Filled even under the
-    // question-4 exemption — see `schedule_l::fill` for why.
-    if let Some(sched_l) = req.schedule_l.as_ref() {
-        let exempt = req.schedule_b.get("b4") == Some(super::schedule_b::YES);
-        warnings.extend(super::schedule_l::fill(&mut doc, &map, sched_l, !exempt)?);
+    // Schedules L, M-1 and M-2. Question 4 excuses them; the option decides
+    // whether to take the excuse, and it defaults to no — see `ReturnOptions`.
+    let exempt = req.schedule_b.get("b4") == Some(super::schedule_b::YES);
+    let do_optional = !exempt || req.options.complete_optional_schedules;
+
+    if do_optional {
+        match req.schedule_l.as_ref() {
+            Some(sched_l) => {
+                warnings.extend(super::schedule_l::fill(&mut doc, &map, sched_l, !exempt)?)
+            }
+            // Nobody computed one. Previously this arm was silent, so a Schedule
+            // L that never ran and a Schedule L with nothing mapped produced the
+            // same blank page and the same absence of explanation.
+            None => warnings.push(
+                "Schedule L is blank because no balance sheet was computed for this return.                  `build_return_from_ledger` reads one from the books; `build_return` has no                  ledger to read."
+                    .to_string(),
+            ),
+        }
+
+        let m = super::schedule_m::reconcile(
+            req.book_income_cents,
+            lines,
+            req.schedule_l.as_ref(),
+        );
+        warnings.extend(super::schedule_m::fill(&mut doc, &map, &m, !exempt)?);
+    } else {
+        warnings.push(
+            "Schedules L, M-1 and M-2 are blank: question 4 excuses them, and completing them \
+             anyway is switched off. Nothing then checks that the books and the return agree."
+                .to_string(),
+        );
     }
 
     // Split Schedule K before any K-1 is built, so every partner's share comes
@@ -1046,6 +1111,8 @@ mod tests {
             schedule_b: Default::default(),
             schedule_l: None,
             detail: Default::default(),
+            options: Default::default(),
+            book_income_cents: 0,
         }
     }
 
@@ -1535,6 +1602,8 @@ mod tests {
             schedule_b: Default::default(),
             schedule_l: None,
             detail: Default::default(),
+            options: Default::default(),
+            book_income_cents: 0,
         };
 
         // Admitted during the year, so nothing to say yet.
@@ -1934,6 +2003,7 @@ mod tests {
         sl.set_for_test("sl15", 19_300, 24_150);
         sl.set_for_test("sl21", 257_000, 272_200);
         req.schedule_l = Some(sl);
+        req.book_income_cents = 133_950_00;
 
         let mut lines = crate::tax::lines::Form1065Lines::default();
         for (k, v) in [("l1a", 480_000i64), ("l2", 150_000), ("l9", 120_000), ("l13", 36_000),
@@ -2064,6 +2134,100 @@ mod tests {
         // no evidence the schedule is attached.
         assert!(!text.contains("49842K"), "an unrequested Schedule B-1 was attached");
         assert!(!text.contains("69658K"), "an unrequested Schedule B-2 was attached");
+    }
+
+    /// The default: question 4 excuses L, M-1 and M-2, and they are completed
+    /// regardless — because the exemption is about filing, not about whether the
+    /// arithmetic is true.
+    #[test]
+    fn the_optional_schedules_are_completed_under_the_exemption_by_default() {
+        use crate::tax::schedule_b::{ScheduleB, YES};
+
+        let mut req = two_partner_request();
+        let mut sb = ScheduleB::default();
+        sb.set("b4", YES);
+        req.schedule_b = sb;
+        req.book_income_cents = 40_000_00;
+        assert!(req.options.complete_optional_schedules, "on by default");
+
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+
+        assert_eq!(
+            acroform::get_value_in(&doc, &map, FORM_ROOT, "f6_126[0]").as_deref(),
+            Some("40,000"),
+            "M-1 line 1 should carry book income"
+        );
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("not required")),
+            "the exemption should be noted rather than acted on: {:?}",
+            bundle.warnings
+        );
+    }
+
+    /// Switched off, they are left blank — which is what the exemption permits,
+    /// and the return says nothing is checking it.
+    #[test]
+    fn switching_the_option_off_leaves_the_optional_schedules_blank() {
+        use crate::tax::schedule_b::{ScheduleB, YES};
+
+        let mut req = two_partner_request();
+        let mut sb = ScheduleB::default();
+        sb.set("b4", YES);
+        req.schedule_b = sb;
+        req.book_income_cents = 40_000_00;
+        req.options.complete_optional_schedules = false;
+
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+
+        assert_eq!(
+            acroform::get_value_in(&doc, &map, FORM_ROOT, "f6_126[0]"),
+            None,
+            "M-1 must be blank when the option is off"
+        );
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("Nothing then checks")),
+            "{:?}",
+            bundle.warnings
+        );
+    }
+
+    /// Question 4 unanswered or No means they are required, and the option is
+    /// irrelevant — they get completed either way.
+    #[test]
+    fn the_option_cannot_skip_a_schedule_that_is_actually_required() {
+        let mut req = two_partner_request();
+        req.book_income_cents = 40_000_00;
+        req.options.complete_optional_schedules = false;
+
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        assert_eq!(
+            acroform::get_value_in(&doc, &map, FORM_ROOT, "f6_126[0]").as_deref(),
+            Some("40,000"),
+            "the option only applies where the exemption does"
+        );
+    }
+
+    /// A Schedule L that was never computed used to produce the same blank page
+    /// as one with nothing mapped, and said nothing either way.
+    #[test]
+    fn a_schedule_l_that_was_never_computed_says_so() {
+        let mut req = two_partner_request();
+        req.schedule_l = None;
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        assert!(
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("no balance sheet was computed")),
+            "{:?}",
+            bundle.warnings
+        );
     }
 
     /// End to end: a ledger with several accounts on line 21 produces a bundle

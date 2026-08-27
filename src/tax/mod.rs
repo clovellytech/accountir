@@ -15,10 +15,14 @@ pub mod schedule_b;
 pub mod schedule_b1;
 pub mod schedule_b2;
 pub mod schedule_l;
+pub mod schedule_m;
 pub mod statement;
 
-pub use form1065::{Bundle, PartnerFiling, ReturnRequest, build_return, build_return_from_ledger};
+pub use form1065::{
+    Bundle, PartnerFiling, ReturnOptions, ReturnRequest, build_return, build_return_from_ledger,
+};
 pub use lines::{Form1065Lines, MAPPABLE_LINES, TaxLineDef};
 pub use schedule_b::{ScheduleB, PARTNERSHIP_REP, QUESTIONS as SCHEDULE_B_QUESTIONS};
 pub use schedule_l::ScheduleL;
+pub use schedule_m::ScheduleM;
 pub use attachments::{Attachment, Provenance};
