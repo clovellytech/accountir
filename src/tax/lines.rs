@@ -691,14 +691,36 @@ pub struct ComputedLines {
     pub warnings: Vec<String>,
 }
 
-/// Total a period's income statement onto page one's lines.
+/// What a line key resolves to: the key the engine buckets under, and whether
+/// the line prints its accounts positive or negative.
 ///
-/// `mapping` is account id → line key, as [`load_mapping`] returns it.
-pub fn compute(
+/// A closure rather than a catalogue slice, so a form with a different line type
+/// can use the same engine without either form's line definition growing a
+/// variant for the other's. Schedule C's lines are not Form 1065 lines and there
+/// is no useful sense in which they could be.
+pub type ResolveLine<'a> = &'a dyn Fn(&str) -> Option<(&'static str, Sense)>;
+
+/// Total a period's income statement onto whatever lines `resolve` recognises.
+///
+/// The whole of the arithmetic every form needs and none of the knowledge of any
+/// particular form: bucket the accounts, sum in cents so rounding happens once
+/// per line, and report what reached no line at all. That last part is the reason
+/// this is shared rather than copied — "which accounts are missing from the
+/// return" is the check that catches money going astray, and a second
+/// implementation of it would eventually disagree with this one.
+///
+/// `form` names the return in the warning, because "on no line" is only useful
+/// when the reader knows which form's lines were being looked at.
+pub fn sum_by_line(
     statement: &IncomeStatement,
     mapping: &BTreeMap<String, String>,
-) -> ComputedLines {
-    // Sum in cents, one bucket per line, so rounding happens once per line.
+    resolve: ResolveLine<'_>,
+    form: &str,
+) -> (
+    BTreeMap<&'static str, i64>,
+    BTreeMap<&'static str, Vec<LineDetail>>,
+    Vec<String>,
+) {
     let mut cents: BTreeMap<&'static str, i64> = BTreeMap::new();
     let mut detail: BTreeMap<&'static str, Vec<LineDetail>> = BTreeMap::new();
     let mut unmapped: Vec<(String, String, i64)> = Vec::new();
@@ -719,24 +741,25 @@ pub fn compute(
             continue;
         }
         match mapping.get(&line.account_id) {
-            Some(key) => match line_def(key) {
-                Some(def) => {
-                    let signed = match def.sense {
+            Some(key) => match resolve(key) {
+                Some((canonical, sense)) => {
+                    let signed = match sense {
                         Sense::Natural => line.balance,
                         Sense::Contra => -line.balance,
                     };
-                    *cents.entry(def.key).or_insert(0) += signed;
-                    detail.entry(def.key).or_default().push(LineDetail {
+                    *cents.entry(canonical).or_insert(0) += signed;
+                    detail.entry(canonical).or_default().push(LineDetail {
                         account_id: line.account_id.clone(),
                         account_number: line.account_number.clone(),
                         account_name: line.account_name.clone(),
                         cents: signed,
                     });
                 }
-                // A key the code no longer knows — a form revision dropped the
-                // line, or the row was hand-edited. Treated as unmapped, because
-                // that is what it is, and named separately so the cause is
-                // visible.
+                // A key this form does not have — a revision dropped the line,
+                // the row was hand-edited, or the books changed which return
+                // they file and the mapping still points at the old form.
+                // Treated as unmapped, because that is what it is, and named
+                // separately so the cause is visible.
                 None => {
                     unknown_keys.insert(key.clone());
                     unmapped.push((
@@ -754,11 +777,6 @@ pub fn compute(
         }
     }
 
-    let mapped: BTreeMap<&'static str, i64> = cents
-        .into_iter()
-        .map(|(k, c)| (k, cents_to_dollars(c)))
-        .collect();
-
     let mut warnings = Vec::new();
     if !unmapped.is_empty() {
         let total: i64 = unmapped.iter().map(|(_, _, c)| *c).sum();
@@ -767,7 +785,7 @@ pub fn compute(
             .map(|(num, name, c)| format!("{num} {name} ({})", format_dollars(cents_to_dollars(*c))))
             .collect();
         warnings.push(format!(
-            "{} account(s) carrying {} are on no Form 1065 line and are missing from the return: {}.",
+            "{} account(s) carrying {} are on no {form} line and are missing from the return: {}.",
             unmapped.len(),
             format_dollars(cents_to_dollars(total)),
             named.join(", ")
@@ -775,16 +793,41 @@ pub fn compute(
     }
     for key in unknown_keys {
         warnings.push(format!(
-            "Mapping refers to line key {key:?}, which this version of the form does not have."
+            "Mapping refers to line key {key:?}, which {form} does not have."
         ));
     }
 
     // Largest first: a statement of thirty accounts is read from the top, and
     // the figures that matter are the big ones.
     for rows in detail.values_mut() {
-        rows.sort_by(|a, b| b.cents.abs().cmp(&a.cents.abs()).then(a.account_number.cmp(&b.account_number)));
+        rows.sort_by(|a, b| {
+            b.cents
+                .abs()
+                .cmp(&a.cents.abs())
+                .then(a.account_number.cmp(&b.account_number))
+        });
     }
 
+    (cents, detail, warnings)
+}
+
+/// Total a period's income statement onto page one's lines.
+///
+/// `mapping` is account id → line key, as [`load_mapping`] returns it.
+pub fn compute(
+    statement: &IncomeStatement,
+    mapping: &BTreeMap<String, String>,
+) -> ComputedLines {
+    let (cents, detail, warnings) = sum_by_line(
+        statement,
+        mapping,
+        &|key| line_def(key).map(|d| (d.key, d.sense)),
+        "Form 1065",
+    );
+    let mapped: BTreeMap<&'static str, i64> = cents
+        .into_iter()
+        .map(|(k, c)| (k, cents_to_dollars(c)))
+        .collect();
     ComputedLines {
         lines: Form1065Lines { mapped },
         detail,

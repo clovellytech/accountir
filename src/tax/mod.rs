@@ -18,6 +18,7 @@ pub mod lines;
 pub mod schedule_b;
 pub mod schedule_b1;
 pub mod schedule_b2;
+pub mod schedule_c;
 pub mod schedule_l;
 pub mod schedule_m;
 pub mod statement;
@@ -30,6 +31,32 @@ pub use schedule_b::{ScheduleB, PARTNERSHIP_REP, QUESTIONS as SCHEDULE_B_QUESTIO
 pub use schedule_l::ScheduleL;
 pub use schedule_m::ScheduleM;
 pub use attachments::{Attachment, Provenance};
+
+/// The definition of a line key on **either** return.
+///
+/// One `tax_line_mappings` table serves both forms, because one set of books
+/// files one return and an account maps to one line. Every gate that asks "is
+/// this a real line key" therefore has to ask both catalogues — a gate that knew
+/// only Form 1065 would refuse every Schedule C mapping, and one that knew only
+/// Schedule C would refuse every partnership's.
+///
+/// The two vocabularies do not overlap: Schedule C's keys are prefixed `sc` and
+/// [`schedule_c::tests`] holds them to it. So the order of the lookup cannot
+/// matter, and a key that resolves resolves to exactly one line.
+pub fn any_line_def(key: &str) -> Option<&'static TaxLineDef> {
+    lines::line_def(key).or_else(|| schedule_c::line_def(key))
+}
+
+/// Which return a line key belongs to, for a message that has to say.
+pub fn line_key_form(key: &str) -> Option<&'static str> {
+    if lines::line_def(key).is_some() {
+        Some("Form 1065")
+    } else if schedule_c::line_def(key).is_some() {
+        Some("Schedule C")
+    } else {
+        None
+    }
+}
 
 /// Checking that a warning reads as a sentence, not as source code that leaked.
 ///

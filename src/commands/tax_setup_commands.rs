@@ -226,7 +226,10 @@ pub fn adopt_pending(store: &mut EventStore, user_id: &str) -> Result<Adopted, T
 
     let mut out = Adopted::default();
     for (account_id, line_key) in &mappings {
-        if crate::tax::lines::line_def(line_key).is_none() {
+        // Either catalogue: a book adopting pre-log setup may be filing
+        // either return, and dropping the other form's mappings here would
+        // silently discard the setup this migration exists to rescue.
+        if crate::tax::any_line_def(line_key).is_none() {
             continue;
         }
         set_account_line(store, user_id, account_id, line_key)?;

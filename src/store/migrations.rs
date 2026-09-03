@@ -115,6 +115,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             30,
             include_str!("../../migrations/030_depreciable_assets.sql"),
         ),
+        (31, include_str!("../../migrations/031_schedule_c.sql")),
     ];
 
     for (version, sql) in migrations {
@@ -516,6 +517,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             formation_date TEXT NOT NULL,
             principal_activity TEXT,
             principal_product TEXT,
+            -- 'partnership' or 'sole_proprietorship' (migration 031): which
+            -- return these books file. Nothing in the accounts can tell.
+            business_type TEXT NOT NULL DEFAULT 'partnership',
             updated_at_event INTEGER REFERENCES events(id)
         );
 
@@ -564,6 +568,33 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             apportions_outside_illinois INTEGER NOT NULL DEFAULT 0,
             elects_pte_tax INTEGER NOT NULL DEFAULT 0,
             updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        -- Sole proprietorships (migration 031): which return these books file,
+        -- and who files it. `business_type` lives on the profile row because it
+        -- is one fact about the one business these books describe.
+        CREATE TABLE IF NOT EXISTS sole_proprietor (
+            id TEXT PRIMARY KEY CHECK (id = 'default'),
+            name TEXT NOT NULL,
+            accounting_method TEXT NOT NULL DEFAULT 'cash',
+            accounting_method_other TEXT,
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        -- The proprietor's SSN, local like `partner_tins` and never in the log.
+        CREATE TABLE IF NOT EXISTS sole_proprietor_tin (
+            id TEXT PRIMARY KEY CHECK (id = 'default'),
+            ssn TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS schedule_c_answers (
+            tax_year INTEGER NOT NULL,
+            answer_key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (tax_year, answer_key)
         );
 
         -- The asset register (migration 030): what depreciates, and the facts

@@ -6,6 +6,7 @@ pub mod money;
 pub mod depreciation;
 pub mod partnership;
 pub mod reconciliation;
+pub mod sole_proprietor;
 pub mod reporting;
 
 pub use account::*;
@@ -16,4 +17,5 @@ pub use money::*;
 pub use depreciation::*;
 pub use partnership::*;
 pub use reconciliation::*;
+pub use sole_proprietor::*;
 pub use reporting::*;

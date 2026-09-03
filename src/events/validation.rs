@@ -240,6 +240,53 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::DepreciableAssetRemoved { asset_id } => {
             validate_non_empty(asset_id, "asset_id")?;
         }
+        // --- sole proprietorships (migration 031) ---
+        Event::BusinessTypeSet { business_type } => {
+            // Checked against the catalogue rather than for emptiness: an
+            // unrecognised type reads back as the default, so the books would
+            // quietly go on filing Form 1065 while the screen said otherwise.
+            if crate::domain::BusinessType::parse(business_type).is_none() {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{business_type} is not a business type"
+                )));
+            }
+        }
+        Event::SoleProprietorSet(d) => {
+            validate_non_empty(&d.name, "the proprietor's name")?;
+            if crate::domain::AccountingMethod::parse(&d.accounting_method).is_none() {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{} is not an accounting method",
+                    d.accounting_method
+                )));
+            }
+            // Line F(3) makes you name the method. A form ticking "Other" with
+            // nothing beside it is incomplete on its face.
+            if d.accounting_method == crate::domain::AccountingMethod::Other.as_str()
+                && d.accounting_method_other
+                    .as_deref()
+                    .is_none_or(|o| o.trim().is_empty())
+            {
+                return Err(ValidationError::InvalidValue(
+                    "Schedule C line F(3) asks which other accounting method — name it".to_string(),
+                ));
+            }
+        }
+        Event::ScheduleCAnswerSet {
+            tax_year,
+            answer_key,
+            value,
+        } => {
+            validate_tax_year(*tax_year)?;
+            validate_non_empty(answer_key, "answer_key")?;
+            validate_non_empty(value, "value")?;
+        }
+        Event::ScheduleCAnswerCleared {
+            tax_year,
+            answer_key,
+        } => {
+            validate_tax_year(*tax_year)?;
+            validate_non_empty(answer_key, "answer_key")?;
+        }
         Event::TaxLineMappingSet {
             account_id,
             line_key,
@@ -250,9 +297,11 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             // line on the return, which is the failure `tax::lines` exists to
             // prevent. Refusing it here keeps it out of the log, where it would
             // replay onto every member's machine.
-            if crate::tax::lines::line_def(line_key).is_none() {
+            // Both catalogues, because one mapping table serves both returns
+            // — see `tax::any_line_def`.
+            if crate::tax::any_line_def(line_key).is_none() {
                 return Err(ValidationError::InvalidValue(format!(
-                    "no Form 1065 line has key {line_key:?}"
+                    "no Form 1065 or Schedule C line has key {line_key:?}"
                 )));
             }
         }

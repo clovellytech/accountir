@@ -108,6 +108,22 @@ pub struct PartnerDetailsData {
     pub shares: ShareData,
 }
 
+/// The individual who owns a sole proprietorship.
+///
+/// No identifying number, on purpose, and for the reason
+/// [`PartnerAdmittedData`] carries none: this log is replicated in full to every
+/// member's machine and cannot be redacted. A sole proprietor's number on
+/// Schedule C is their own SSN and the whole return is about one person, so it
+/// stays in `sole_proprietor_tin` on the machine that prepares the return.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SoleProprietorData {
+    pub name: String,
+    /// "cash", "accrual" or "other" — Schedule C line F.
+    pub accounting_method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting_method_other: Option<String>,
+}
+
 /// A depreciable asset, whole. Boxed for the same reason as
 /// [`BusinessProfileData`] — a dozen fields would otherwise widen every
 /// `Event` to the size of its largest variant.
@@ -373,6 +389,40 @@ pub enum Event {
         asset_id: String,
         disposed_on: NaiveDate,
     },
+    // --- sole proprietorships (migration 031) ---
+    /// Which return these books file.
+    ///
+    /// Its own event rather than a field on
+    /// [`BusinessProfileSet`](Self::BusinessProfileSet), because the two change
+    /// on completely different occasions: the profile is edited when an address
+    /// or an EIN changes, and the type is set once when the books are opened and
+    /// essentially never again. Folding it in would mean re-stating the whole
+    /// header to answer one question, and — worse — every profile edit would
+    /// carry a business type the person editing was not thinking about.
+    BusinessTypeSet {
+        /// "partnership" or "sole_proprietorship" — see
+        /// [`crate::domain::BusinessType`].
+        business_type: String,
+    },
+    /// The owner of a sole proprietorship, set as a unit.
+    SoleProprietorSet(Box<SoleProprietorData>),
+    /// One Schedule C answer, for one tax year.
+    ScheduleCAnswerSet {
+        tax_year: i32,
+        answer_key: String,
+        value: String,
+    },
+    /// One Schedule C answer goes back to unanswered.
+    ///
+    /// Its own event rather than a set-to-empty, the same distinction
+    /// [`ScheduleBAnswerCleared`](Self::ScheduleBAnswerCleared) draws: unanswered
+    /// and "No" are different states on the form, and a log that could not tell
+    /// them apart would replay one as the other.
+    ScheduleCAnswerCleared {
+        tax_year: i32,
+        answer_key: String,
+    },
+
     /// An asset is taken off the register entirely — entered in error, never
     /// owned. Distinct from a disposal, which is a real event in the world and
     /// leaves a gain or loss behind it.
@@ -680,6 +730,10 @@ impl Event {
             Event::DepreciableAssetUpdated(_) => "depreciable_asset_updated",
             Event::DepreciableAssetDisposed { .. } => "depreciable_asset_disposed",
             Event::DepreciableAssetRemoved { .. } => "depreciable_asset_removed",
+            Event::BusinessTypeSet { .. } => "business_type_set",
+            Event::SoleProprietorSet(_) => "sole_proprietor_set",
+            Event::ScheduleCAnswerSet { .. } => "schedule_c_answer_set",
+            Event::ScheduleCAnswerCleared { .. } => "schedule_c_answer_cleared",
             Event::UserAdded { .. } => "user_added",
             Event::UserModified { .. } => "user_modified",
             Event::UserRemoved { .. } => "user_removed",
@@ -743,6 +797,13 @@ impl Event {
             Event::DepreciableAssetUpdated(d) => Some(&d.asset_id),
             Event::DepreciableAssetDisposed { asset_id, .. } => Some(asset_id),
             Event::DepreciableAssetRemoved { asset_id } => Some(asset_id),
+            // One business per book, so no id names the thing changed — the same
+            // answer `BusinessProfileSet` gives.
+            Event::BusinessTypeSet { .. } => None,
+            Event::SoleProprietorSet(_) => None,
+            // Keyed by (year, question), like the Schedule B answers.
+            Event::ScheduleCAnswerSet { .. } => None,
+            Event::ScheduleCAnswerCleared { .. } => None,
             Event::UserAdded { user_id, .. } => Some(user_id),
             Event::UserModified { user_id, .. } => Some(user_id),
             Event::UserRemoved { user_id } => Some(user_id),

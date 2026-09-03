@@ -68,9 +68,9 @@ async fn submit_set_mapping(
     // Checked before the append rather than inside it: `validate_event` would
     // catch this too, but as a store error — a 500 for what is squarely the
     // caller's mistake. Same reasoning as `set-business-profile`.
-    if crate::tax::lines::line_def(&req.line_key).is_none() {
+    if crate::tax::any_line_def(&req.line_key).is_none() {
         return Err(ApiError::bad_request(
-            "line_key is not a Form 1065 line this version knows",
+            "line_key is not a Form 1065 or Schedule C line this version knows",
         ));
     }
     if req.account_id.trim().is_empty() {

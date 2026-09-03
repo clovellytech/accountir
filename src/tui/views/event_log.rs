@@ -306,11 +306,32 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::DepreciableAssetRemoved { asset_id } => {
             format!("Asset {asset_id} removed from the register")
         }
+        Event::BusinessTypeSet { business_type } => {
+            let t = crate::domain::BusinessType::parse(business_type)
+                .map(|t| t.label())
+                .unwrap_or(business_type.as_str());
+            format!("Business type set to {t}")
+        }
+        Event::SoleProprietorSet(d) => {
+            let method = crate::domain::AccountingMethod::parse(&d.accounting_method)
+                .map(|m| m.label())
+                .unwrap_or(d.accounting_method.as_str());
+            format!("Sole proprietor: {} ({method})", d.name)
+        }
+        Event::ScheduleCAnswerSet {
+            tax_year,
+            answer_key,
+            value,
+        } => format!("Schedule C {tax_year} {answer_key}: {value}"),
+        Event::ScheduleCAnswerCleared {
+            tax_year,
+            answer_key,
+        } => format!("Schedule C {tax_year} {answer_key} cleared"),
         Event::TaxLineMappingSet {
             account_id,
             line_key,
         } => {
-            let line = crate::tax::lines::line_def(line_key)
+            let line = crate::tax::any_line_def(line_key)
                 .map(|d| d.number)
                 .unwrap_or(line_key);
             format!(

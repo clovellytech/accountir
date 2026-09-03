@@ -99,11 +99,32 @@ impl<'a> Projector<'a> {
                 let (principal_activity, principal_product) =
                     (&d.principal_activity, &d.principal_product);
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO business_profile
+                    // COALESCE, not a plain REPLACE: `business_type` lives on
+                    // this row (migration 031) and is set by its own event, so a
+                    // REPLACE that did not carry it forward would silently turn
+                    // a sole proprietorship back into a partnership every time
+                    // somebody corrected the address.
+                    "INSERT INTO business_profile
                         (id, legal_name, street, suite, city, state, postal_code, country,
                          ein, naics_code, formation_date, principal_activity, principal_product,
-                         updated_at_event)
-                     VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                         business_type, updated_at_event)
+                     VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                             COALESCE((SELECT business_type FROM business_profile
+                                        WHERE id = 'default'), 'partnership'), ?13)
+                     ON CONFLICT(id) DO UPDATE SET
+                        legal_name = excluded.legal_name,
+                        street = excluded.street,
+                        suite = excluded.suite,
+                        city = excluded.city,
+                        state = excluded.state,
+                        postal_code = excluded.postal_code,
+                        country = excluded.country,
+                        ein = excluded.ein,
+                        naics_code = excluded.naics_code,
+                        formation_date = excluded.formation_date,
+                        principal_activity = excluded.principal_activity,
+                        principal_product = excluded.principal_product,
+                        updated_at_event = excluded.updated_at_event",
                     params![
                         legal_name,
                         address.street,
@@ -313,6 +334,60 @@ impl<'a> Projector<'a> {
                         SET disposed_on = ?2, updated_at_event = ?3
                       WHERE id = ?1",
                     params![asset_id, disposed_on.to_string(), stored_event.id],
+                )?;
+            }
+            // --- sole proprietorships (migration 031) ---
+            //
+            // The type is set on the profile row rather than in a table of its
+            // own: it is one fact about the one business these books describe,
+            // exactly like the EIN beside it. Written with an upsert because the
+            // type can be chosen before the header is ever filled in — somebody
+            // opening fresh books says what they are before they say where they
+            // are — and a bare UPDATE would match no row and lose the answer.
+            Event::BusinessTypeSet { business_type } => {
+                self.conn.execute(
+                    "INSERT INTO business_profile
+                        (id, legal_name, street, city, state, postal_code, ein, naics_code,
+                         formation_date, business_type, updated_at_event)
+                     VALUES ('default', '', '', '', '', '', '', '', '', ?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET
+                        business_type = excluded.business_type,
+                        updated_at_event = excluded.updated_at_event",
+                    params![business_type, stored_event.id],
+                )?;
+            }
+            Event::SoleProprietorSet(d) => {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO sole_proprietor
+                        (id, name, accounting_method, accounting_method_other, updated_at_event)
+                     VALUES ('default', ?1, ?2, ?3, ?4)",
+                    params![
+                        d.name,
+                        d.accounting_method,
+                        d.accounting_method_other,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::ScheduleCAnswerSet {
+                tax_year,
+                answer_key,
+                value,
+            } => {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schedule_c_answers
+                        (tax_year, answer_key, value, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4)",
+                    params![tax_year, answer_key, value, stored_event.id],
+                )?;
+            }
+            Event::ScheduleCAnswerCleared {
+                tax_year,
+                answer_key,
+            } => {
+                self.conn.execute(
+                    "DELETE FROM schedule_c_answers WHERE tax_year = ?1 AND answer_key = ?2",
+                    params![tax_year, answer_key],
                 )?;
             }
             Event::DepreciableAssetRemoved { asset_id } => {
@@ -1021,7 +1096,13 @@ impl<'a> Projector<'a> {
              -- The asset register (migration 030). Derived from the log like the
              -- rest: an asset no event justifies would otherwise keep claiming
              -- depreciation on somebody's return after a replay.
-             DELETE FROM depreciable_assets;",
+             DELETE FROM depreciable_assets;
+             -- Projections too (migration 031). `sole_proprietor_tin` is
+             -- deliberately NOT cleared, exactly as `partner_tins` is not: it is
+             -- local configuration, not derived from the log, and a replay must
+             -- leave it alone.
+             DELETE FROM sole_proprietor;
+             DELETE FROM schedule_c_answers;",
         )?;
 
         // Replay all events
