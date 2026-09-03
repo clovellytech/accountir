@@ -1462,6 +1462,67 @@ impl SyncClient {
         .await
     }
 
+    /// Say which return the group's books file.
+    ///
+    /// Blind retry on a stale head is safe for the same reason the mapping
+    /// commands give: the command carries no id the server minted and no figure
+    /// derived from state it read, so re-sending it against a newer head means
+    /// exactly what it meant against the old one.
+    pub async fn set_business_type(
+        &mut self,
+        business_type: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-business-type", |head| {
+            crate::sync::commands::schedule_c::SetBusinessTypeRequest {
+                expected_head_seq: head,
+                business_type: business_type.to_string(),
+            }
+        })
+        .await
+    }
+
+    /// Record who owns a sole proprietorship on the group's books.
+    ///
+    /// Carries no identifying number, and there is no companion command that
+    /// does: a social security number has no business leaving the machine it was
+    /// typed on, because this log is replicated in full and cannot be redacted.
+    /// See `sync::commands::schedule_c`.
+    pub async fn set_sole_proprietor(
+        &mut self,
+        name: &str,
+        accounting_method: &str,
+        accounting_method_other: Option<&str>,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-sole-proprietor", |head| {
+            crate::sync::commands::schedule_c::SetSoleProprietorRequest {
+                expected_head_seq: head,
+                name: name.to_string(),
+                accounting_method: accounting_method.to_string(),
+                accounting_method_other: accounting_method_other.map(str::to_string),
+            }
+        })
+        .await
+    }
+
+    /// Answer one Schedule C question on the group's books. An empty value
+    /// clears it back to unanswered, which is not the same as "No".
+    pub async fn set_schedule_c_answer(
+        &mut self,
+        tax_year: i32,
+        answer_key: &str,
+        value: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-schedule-c-answer", |head| {
+            crate::sync::commands::schedule_c::SetScheduleCAnswerRequest {
+                expected_head_seq: head,
+                tax_year,
+                answer_key: answer_key.to_string(),
+                value: value.to_string(),
+            }
+        })
+        .await
+    }
+
     /// Take an account off the return on the group's books.
     pub async fn clear_tax_line_mapping(
         &mut self,
