@@ -285,10 +285,18 @@ pub fn build_from_ledger(
         ));
     }
 
+    // Named where they are, because the last version of this message said only
+    // that they were missing. One set of business details serves both returns
+    // and they are edited in one place; a person filling in a Schedule C has no
+    // reason to guess that place is Settings, still less that a panel headed
+    // "partnership details" was the one they wanted.
     let profile = crate::commands::partnership_commands::get_profile(conn)
         .ok_or_else(|| SoleProprietorError::Invalid(
-            "the business details have not been set yet — Schedule C needs the name, address, \
-             business code and EIN from them".to_string(),
+            "the business details have not been set. Schedule C takes its header from them — \
+             the business name (line C), the address (line E), the business code (line B), the \
+             EIN (line D) and the principal business (line A). They are on the Settings page, \
+             under Business details, and are the same details Form 1065 uses."
+                .to_string(),
         ))?;
 
     let (start, end) = (
@@ -546,6 +554,69 @@ mod tests {
             "{:?}",
             bundle.warnings
         );
+    }
+
+    /// The order somebody actually works in, and the one that produced a
+    /// confusing error: say what the books are first, fill the business details
+    /// afterwards.
+    ///
+    /// Setting the type before any header exists writes a stub row — the type has
+    /// to live somewhere and it lives on the profile row — whose formation date
+    /// is empty and therefore unreadable. `get_profile` returns `None` for that,
+    /// which is the right answer (the details genuinely are not set) but reached
+    /// by a route worth pinning down: the stub must not survive as a half-header,
+    /// and filling the form afterwards must produce a complete one without
+    /// undoing the type.
+    #[test]
+    fn setting_the_type_before_the_details_leaves_a_buildable_book_once_they_are_filled() {
+        let mut s = store();
+
+        set_business_type(&mut s, "u", BusinessType::SoleProprietorship).unwrap();
+        assert_eq!(business_type(s.connection()), BusinessType::SoleProprietorship);
+        assert!(
+            crate::commands::partnership_commands::get_profile(s.connection()).is_none(),
+            "a stub row must not read as a filled-in header"
+        );
+
+        // And the failure a person meets at that point says where to go.
+        let err = match build_from_ledger(s.connection(), 2025, None) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("built a Schedule C with no business details"),
+        };
+        assert!(err.contains("Settings"), "{err}");
+        assert!(err.contains("Business details"), "{err}");
+
+        // Filling the header afterwards completes it and leaves the type alone.
+        append(
+            &mut s,
+            "u",
+            Event::BusinessProfileSet(Box::new(BusinessProfileData {
+                legal_name: "Bunny Ears Art House".into(),
+                address: AddressData {
+                    street: "1808 W Summerdale Ave".into(),
+                    suite: None,
+                    city: "Chicago".into(),
+                    state: "IL".into(),
+                    postal_code: "60640".into(),
+                    country: None,
+                },
+                ein: "12-3456789".into(),
+                naics_code: "611610".into(),
+                formation_date: chrono::NaiveDate::from_ymd_opt(2023, 4, 13).unwrap(),
+                principal_activity: Some("Fine arts instruction".into()),
+                principal_product: None,
+            })),
+        )
+        .unwrap();
+
+        assert!(crate::commands::partnership_commands::get_profile(s.connection()).is_some());
+        assert_eq!(
+            business_type(s.connection()),
+            BusinessType::SoleProprietorship,
+            "filling the header turned the books back into a partnership"
+        );
+        set_proprietor(&mut s, "u", &proprietor()).unwrap();
+        assert!(build_from_ledger(s.connection(), 2025, Some(0)).is_ok());
     }
 
     #[test]
