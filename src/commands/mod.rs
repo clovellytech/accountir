@@ -1,6 +1,7 @@
 pub mod account_commands;
 pub mod amazon_commands;
 pub mod bill_commands;
+pub mod depreciation_commands;
 pub mod entry_commands;
 pub mod event_service_commands;
 pub mod fiscal_period_commands;

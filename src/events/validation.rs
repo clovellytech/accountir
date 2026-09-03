@@ -120,6 +120,126 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         } => {
             validate_non_empty(partner_id, "partner_id")?;
         }
+        Event::PartnerRelationshipSet {
+            partner_id,
+            related_partner_id,
+            relationship,
+        } => {
+            validate_non_empty(partner_id, "partner_id")?;
+            validate_non_empty(related_partner_id, "related_partner_id")?;
+            // A partner cannot be their own relative: a self-edge would attribute
+            // their own share to themselves twice if the family walk ever failed
+            // to exclude them, and it means nothing on the form either way.
+            if partner_id == related_partner_id {
+                return Err(ValidationError::InvalidValue(
+                    "a partner cannot be related to themselves".to_string(),
+                ));
+            }
+            // Checked against the known kinds, not merely for emptiness: an
+            // unrecognised kind is a tie the attribution walk would silently
+            // ignore, so a partner who should be on Schedule B-1 quietly is not.
+            if crate::domain::RelationshipKind::parse(relationship).is_none() {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{relationship:?} is not a relationship kind (spouse, sibling, parent_of)"
+                )));
+            }
+        }
+        Event::PartnerRelationshipCleared {
+            partner_id,
+            related_partner_id,
+        } => {
+            validate_non_empty(partner_id, "partner_id")?;
+            validate_non_empty(related_partner_id, "related_partner_id")?;
+        }
+        // Two booleans; every combination is a state the form can express, so
+        // there is nothing to refuse.
+        Event::Il1065SettingsSet(_) => {}
+        // The asset register. Everything state-dependent — that the accounts
+        // exist, that the asset does — is checked under the write lock by
+        // `depreciation_commands`; what is left here is what can be judged from
+        // the event alone, and it is checked because these strings replay onto
+        // every member's machine.
+        Event::DepreciableAssetAdded(d) | Event::DepreciableAssetUpdated(d) => {
+            validate_non_empty(&d.asset_id, "asset_id")?;
+            validate_non_empty(&d.description, "description")?;
+            validate_non_empty(&d.asset_account_id, "asset_account_id")?;
+            validate_non_empty(&d.expense_account_id, "expense_account_id")?;
+            validate_non_empty(&d.accumulated_account_id, "accumulated_account_id")?;
+            // Checked against the catalogue rather than for emptiness, the same
+            // rule `TaxLineMappingSet` follows below: a class nothing recognises
+            // is an asset that silently depreciates at nothing, and the register
+            // would look complete while the deduction quietly went missing.
+            if crate::domain::PropertyClass::parse(&d.property_class).is_none() {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{} is not a MACRS property class",
+                    d.property_class
+                )));
+            }
+            if crate::domain::System::parse(&d.system).is_none() {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{} is not a depreciation system",
+                    d.system
+                )));
+            }
+            if crate::domain::BonusElection::parse(&d.bonus).is_none() {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{} is not a bonus depreciation election",
+                    d.bonus
+                )));
+            }
+            if d.cost_cents <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "an asset costs more than nothing".to_string(),
+                ));
+            }
+            if d.section_179_cents < 0 {
+                return Err(ValidationError::InvalidValue(
+                    "a §179 election cannot be negative".to_string(),
+                ));
+            }
+            // An election with nowhere to post it is an election that would
+            // silently reach page 1 line 16a through the ordinary depreciation
+            // account — the one place §179 must never appear, since the partner
+            // applies their own limits to it on Schedule K line 12. Refused here
+            // rather than at posting time so the register never holds the
+            // broken state at all.
+            if d.section_179_cents > 0 {
+                match &d.section_179_account_id {
+                    None => {
+                        return Err(ValidationError::InvalidValue(format!(
+                            "{}: a §179 election needs its own expense account — it is \
+                             separately stated on Schedule K line 12, not deducted on page 1 \
+                             line 16a with ordinary depreciation",
+                            d.description
+                        )));
+                    }
+                    Some(a) if a == &d.expense_account_id => {
+                        return Err(ValidationError::InvalidValue(format!(
+                            "{}: the §179 account and the depreciation expense account are the \
+                             same. They reach different lines of the return — Schedule K line \
+                             12 and page 1 line 16a — so they cannot be one account",
+                            d.description
+                        )));
+                    }
+                    Some(a) => validate_non_empty(a, "section_179_account_id")?,
+                }
+            }
+            // Placed in service before it was acquired is not a late fit-out,
+            // it is a typo — and it would silently reach for the wrong bonus
+            // rate, since the two dates answer different questions.
+            if d.placed_in_service < d.acquired_on {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{} was placed in service on {} but acquired on {}, after",
+                    d.description, d.placed_in_service, d.acquired_on
+                )));
+            }
+        }
+        Event::DepreciableAssetDisposed { asset_id, .. } => {
+            validate_non_empty(asset_id, "asset_id")?;
+        }
+        Event::DepreciableAssetRemoved { asset_id } => {
+            validate_non_empty(asset_id, "asset_id")?;
+        }
         Event::TaxLineMappingSet {
             account_id,
             line_key,

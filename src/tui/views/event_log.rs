@@ -249,6 +249,63 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 end_date
             )
         }
+        Event::PartnerRelationshipSet {
+            partner_id,
+            related_partner_id,
+            relationship,
+        } => {
+            let kind = crate::domain::RelationshipKind::parse(relationship)
+                .map(|k| k.label())
+                .unwrap_or(relationship.as_str());
+            format!(
+                "Partner {} is {} {}",
+                widgets::truncate(partner_id, 8),
+                kind,
+                widgets::truncate(related_partner_id, 8)
+            )
+        }
+        Event::PartnerRelationshipCleared {
+            partner_id,
+            related_partner_id,
+        } => {
+            format!(
+                "Relationship between {} and {} removed",
+                widgets::truncate(partner_id, 8),
+                widgets::truncate(related_partner_id, 8)
+            )
+        }
+        Event::Il1065SettingsSet(d) => {
+            let apportion = if d.apportions_outside_illinois {
+                "multi-state"
+            } else {
+                "Illinois-only"
+            };
+            let pte = if d.elects_pte_tax { ", PTE elected" } else { "" };
+            format!("IL-1065 settings: {apportion}{pte}")
+        }
+        Event::DepreciableAssetAdded(d) | Event::DepreciableAssetUpdated(d) => {
+            let verb = if matches!(event, Event::DepreciableAssetAdded(_)) {
+                "Asset added"
+            } else {
+                "Asset updated"
+            };
+            let class = crate::domain::PropertyClass::parse(&d.property_class)
+                .map(|c| c.label())
+                .unwrap_or(&d.property_class);
+            format!(
+                "{verb}: {} — ${:.2}, in service {}, {class}",
+                d.description,
+                d.cost_cents as f64 / 100.0,
+                d.placed_in_service
+            )
+        }
+        Event::DepreciableAssetDisposed {
+            asset_id,
+            disposed_on,
+        } => format!("Asset {asset_id} disposed of on {disposed_on}"),
+        Event::DepreciableAssetRemoved { asset_id } => {
+            format!("Asset {asset_id} removed from the register")
+        }
         Event::TaxLineMappingSet {
             account_id,
             line_key,

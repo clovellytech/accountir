@@ -673,7 +673,7 @@ impl App {
                 StagedTransactionDisplay {
                     id: t.id.clone(),
                     date: t.date.clone(),
-                    name: t.merchant_name.as_deref().unwrap_or(&t.name).to_string(),
+                    name: crate::commands::plaid_commands::plaid_memo(&t.name, t.merchant_name.as_deref()),
                     account_name,
                     amount_cents: t.amount_cents,
                     card_holder,

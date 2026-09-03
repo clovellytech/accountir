@@ -113,6 +113,136 @@ impl std::fmt::Display for Residency {
     }
 }
 
+/// A family tie between two partners, as far as it bears on a return.
+///
+/// # Why these three and no more
+///
+/// The only reason the books need to know two partners are related is Schedule
+/// B-1's 50% test, which applies the constructive-ownership rules of **IRC
+/// §267(c)**. Under §267(c)(2) a person is treated as owning what their *family*
+/// owns, and §267(c)(4) defines that family as exactly: a **spouse**, **brothers
+/// and sisters**, **ancestors**, and **lineal descendants**. These three kinds
+/// span that set — [`Spouse`](Self::Spouse), [`Sibling`](Self::Sibling), and
+/// [`ParentOf`](Self::ParentOf), whose chains give ancestors and descendants — and
+/// nothing outside it.
+///
+/// Kinds the statute leaves out are left out on purpose. A spouse's sibling
+/// (a sibling-in-law), a sibling's spouse, a cousin, an aunt — none is §267(c)(4)
+/// family, so recording one would attribute ownership the law does not, and put a
+/// partner on Schedule B-1 who does not belong there. The attribution walk in
+/// [`crate::tax::constructive`] therefore reads these kinds by their exact meaning
+/// rather than treating the relationships as an undirected "related to" graph, in
+/// which those in-laws would leak across.
+///
+/// # Direction
+///
+/// [`Spouse`](Self::Spouse) and [`Sibling`](Self::Sibling) are symmetric: the tie
+/// is the same read from either partner, so it is stored once, in a canonical
+/// order (see [`PartnerRelationship::new`]). [`ParentOf`](Self::ParentOf) is
+/// directed — the first partner is the parent of the second — because "ancestor"
+/// and "descendant" are opposite directions of the same edge, and a chain of them
+/// is what makes a grandparent an ancestor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipKind {
+    /// Married. Symmetric. §267(c)(4) family.
+    Spouse,
+    /// Brother or sister, of whole or half blood — §267(c)(4) is explicit that
+    /// half blood counts. Symmetric.
+    Sibling,
+    /// The first partner is the parent of the second. Directed: walked upward it
+    /// yields ancestors, downward lineal descendants, and a chain of them reaches
+    /// grandparents and grandchildren, who are §267(c)(4) family too.
+    ParentOf,
+}
+
+impl RelationshipKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelationshipKind::Spouse => "spouse",
+            RelationshipKind::Sibling => "sibling",
+            RelationshipKind::ParentOf => "parent_of",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().replace(['-', ' '], "_").as_str() {
+            "spouse" | "husband" | "wife" | "married" => Some(RelationshipKind::Spouse),
+            "sibling" | "brother" | "sister" => Some(RelationshipKind::Sibling),
+            "parent_of" | "parent" | "child_of" | "father_of" | "mother_of" => {
+                Some(RelationshipKind::ParentOf)
+            }
+            _ => None,
+        }
+    }
+
+    /// How the tie reads on screen, from the first partner to the second.
+    pub fn label(self) -> &'static str {
+        match self {
+            RelationshipKind::Spouse => "spouse of",
+            RelationshipKind::Sibling => "sibling of",
+            RelationshipKind::ParentOf => "parent of",
+        }
+    }
+
+    /// Whether the tie reads the same from either partner.
+    ///
+    /// Spouse and sibling do; parent-of does not. This is what decides whether the
+    /// two ids are stored in a canonical order (symmetric — one edge whichever way
+    /// it was entered) or kept as given (directed — the order is the meaning).
+    pub fn is_symmetric(self) -> bool {
+        match self {
+            RelationshipKind::Spouse | RelationshipKind::Sibling => true,
+            RelationshipKind::ParentOf => false,
+        }
+    }
+
+    pub const ALL: &'static [RelationshipKind] = &[
+        RelationshipKind::Spouse,
+        RelationshipKind::Sibling,
+        RelationshipKind::ParentOf,
+    ];
+}
+
+impl std::fmt::Display for RelationshipKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// One family tie between two partners, held so Schedule B-1 can attribute
+/// ownership under §267(c). See [`RelationshipKind`] for what the kinds mean, and
+/// [`crate::tax::constructive`] for how the attribution is computed from them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartnerRelationship {
+    pub partner_id: String,
+    pub related_partner_id: String,
+    pub kind: RelationshipKind,
+}
+
+impl PartnerRelationship {
+    /// Build a tie, putting the two ids in the order the books store them in.
+    ///
+    /// For a symmetric kind the same tie can be entered either way round —
+    /// "Alice spouse of Bob" and "Bob spouse of Alice" are one fact — so the ids
+    /// are ordered canonically (lexicographically), and both entries land on the
+    /// same row rather than two half-duplicates the attribution walk would then
+    /// have to reconcile. For a directed kind the order carries the meaning (who
+    /// is the parent), so it is kept exactly as given.
+    pub fn new(partner_id: &str, related_partner_id: &str, kind: RelationshipKind) -> Self {
+        let (a, b) = if kind.is_symmetric() && partner_id > related_partner_id {
+            (related_partner_id, partner_id)
+        } else {
+            (partner_id, related_partner_id)
+        };
+        PartnerRelationship {
+            partner_id: a.to_string(),
+            related_partner_id: b.to_string(),
+            kind,
+        }
+    }
+}
+
 /// A postal address, in the shape the 1065 header and K-1 item F ask for.
 ///
 /// Split into fields rather than kept as a block of text because the 1065 header
@@ -323,6 +453,34 @@ pub struct BusinessProfile {
     /// Box B, "Principal product or service" — optional, free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal_product: Option<String>,
+}
+
+/// The Illinois-specific choices that shape an IL-1065 for this partnership.
+///
+/// # Why these are settings rather than asked each time
+///
+/// Both are the partnership's standing position, not a fact about one year's
+/// figures, and they differ between businesses: one of a person's partnerships may
+/// operate wholly in Illinois while another sells across state lines, and one may
+/// have elected the pass-through entity tax where another has not. Getting either
+/// wrong does not blank a box, it fills the *wrong* one — an Illinois-only return
+/// carries base income straight to the tax, where a multi-state one must apportion
+/// it first — so they are recorded once, per book, and drive which path
+/// [`crate::tax::il1065`] takes.
+///
+/// [`Default`] is Illinois-only with no PTE election, which is the common small
+/// partnership and the safer of the two wrong answers to start from: it computes a
+/// complete return a reader can see is Illinois-only, rather than an apportioned
+/// one with the sales figures silently blank.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Il1065Settings {
+    /// Whether any income is earned outside Illinois. `false` checks the form's
+    /// "inside Illinois only" box and carries base income straight to Step 7;
+    /// `true` checks "outside Illinois" and opens Step 6's apportionment.
+    pub apportions_outside_illinois: bool,
+    /// Whether the partnership has elected to pay the Illinois Pass-through Entity
+    /// tax (4.95%). Checks box I and opens the Step 7 PTE lines.
+    pub elects_pte_tax: bool,
 }
 
 /// One partner, and everything a Schedule K-1 needs to name them.

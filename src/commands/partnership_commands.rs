@@ -18,11 +18,12 @@
 //! route nobody intended.
 
 use crate::domain::{
-    Address, BusinessProfile, Partner, PartnerType, Residency, Shares, is_valid_tin,
+    Address, BusinessProfile, Il1065Settings, Partner, PartnerRelationship, PartnerType,
+    RelationshipKind, Residency, Shares, is_valid_tin,
 };
 use crate::events::types::{
-    AddressData, BusinessProfileData, Event, EventEnvelope, PartnerAdmittedData, PartnerDetailsData,
-    ShareData, StoredEvent,
+    AddressData, BusinessProfileData, Event, EventEnvelope, Il1065SettingsData, PartnerAdmittedData,
+    PartnerDetailsData, ShareData, StoredEvent,
 };
 use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::Projector;
@@ -47,6 +48,8 @@ pub enum PartnershipError {
     },
     #[error("A partner with id {0} already exists")]
     PartnerExists(String),
+    #[error("No relationship between partners {0} and {1}")]
+    NoSuchRelationship(String, String),
     #[error("The partnership's details have not been set yet")]
     NoProfile,
     #[error(
@@ -179,6 +182,16 @@ pub(crate) fn build_set_profile_event(profile: &BusinessProfile) -> Event {
         formation_date: profile.formation_date,
         principal_activity: profile.principal_activity.clone(),
         principal_product: profile.principal_product.clone(),
+    }))
+}
+
+/// Build the IL-1065 settings event. No state-dependent check: the row is keyed
+/// `'default'` by a CHECK constraint, so there is one and setting it replaces it —
+/// exactly like the business header.
+pub(crate) fn build_set_il1065_settings_event(settings: &Il1065Settings) -> Event {
+    Event::Il1065SettingsSet(Box::new(Il1065SettingsData {
+        apportions_outside_illinois: settings.apportions_outside_illinois,
+        elects_pte_tax: settings.elects_pte_tax,
     }))
 }
 
@@ -385,6 +398,102 @@ pub(crate) fn build_withdraw_partner_in_txn(
     }
 }
 
+/// State-independent validation for recording a relationship.
+///
+/// The kind is already a [`RelationshipKind`] by the time it reaches here — the
+/// transport layer parses the word and rejects an unknown one as a bad request —
+/// so all that is left to check state-independently is that the two ids are real
+/// and distinct. Existence of the partners is state-dependent and checked under
+/// the lock in [`build_set_relationship_in_txn`].
+pub(crate) fn check_set_relationship_pure(
+    partner_id: &str,
+    related_partner_id: &str,
+) -> Result<(), PartnershipError> {
+    if partner_id.trim().is_empty() || related_partner_id.trim().is_empty() {
+        return Err(PartnershipError::InvalidData(
+            "both partners are required".to_string(),
+        ));
+    }
+    if partner_id == related_partner_id {
+        return Err(PartnershipError::InvalidData(
+            "a partner cannot be related to themselves".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Record a family tie between two partners, against write-locked state.
+///
+/// Both partners must exist. Without the check the append succeeds and the
+/// projector writes a row keyed on ids that name nobody — a tie the attribution
+/// walk then reads, silently attributing ownership to or from a partner who was
+/// never admitted. Read under the lock because a concurrent `PartnerWithdrawn`
+/// does not remove the partner (a departed partner keeps their record), but an
+/// id that was never admitted must be refused whoever is mid-admitting one.
+///
+/// The two ids are put in canonical order for a symmetric kind by
+/// [`PartnerRelationship::new`], so "Alice spouse of Bob" and the reverse land on
+/// one row rather than two.
+pub(crate) fn build_set_relationship_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    partner_id: &str,
+    related_partner_id: &str,
+    kind: RelationshipKind,
+) -> Result<PartnerStep, EventStoreError> {
+    for id in [partner_id, related_partner_id] {
+        let exists: bool = tx
+            .query_row("SELECT 1 FROM partners WHERE id = ?1", [id], |_| Ok(true))
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            return Ok(PartnerStep::Reject(PartnershipError::NoSuchPartner(
+                id.to_string(),
+            )));
+        }
+    }
+
+    let rel = PartnerRelationship::new(partner_id, related_partner_id, kind);
+    Ok(PartnerStep::Append(Event::PartnerRelationshipSet {
+        partner_id: rel.partner_id,
+        related_partner_id: rel.related_partner_id,
+        relationship: kind.as_str().to_string(),
+    }))
+}
+
+/// Remove a family tie between two partners, against write-locked state.
+///
+/// The tie must exist, matched in either order — the same no-op refusal
+/// [`build_update_partner_in_txn`] makes: the projector's `DELETE` matches no rows
+/// for a pair with no tie, so without this check the append succeeds, the log
+/// gains an event, and nothing changes. Matched in either order because the caller
+/// names two partners, not a stored row, and the row may be in canonical order.
+pub(crate) fn build_clear_relationship_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    partner_id: &str,
+    related_partner_id: &str,
+) -> Result<PartnerStep, EventStoreError> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM partner_relationships
+             WHERE (partner_id = ?1 AND related_partner_id = ?2)
+                OR (partner_id = ?2 AND related_partner_id = ?1)",
+            [partner_id, related_partner_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        return Ok(PartnerStep::Reject(PartnershipError::NoSuchRelationship(
+            partner_id.to_string(),
+            related_partner_id.to_string(),
+        )));
+    }
+    Ok(PartnerStep::Append(Event::PartnerRelationshipCleared {
+        partner_id: partner_id.to_string(),
+        related_partner_id: related_partner_id.to_string(),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // The partnership header
 // ---------------------------------------------------------------------------
@@ -437,6 +546,41 @@ pub fn get_profile(conn: &Connection) -> Option<BusinessProfile> {
     .optional()
     .ok()
     .flatten()
+}
+
+/// Record the Illinois IL-1065 settings, replacing whatever was there.
+///
+/// Replacing rather than merging, like the header: the two flags are one position
+/// ("Illinois-only, no PTE"), and a half-updated one is not a state worth reaching.
+pub fn set_il1065_settings(
+    store: &mut EventStore,
+    user_id: &str,
+    settings: &Il1065Settings,
+) -> Result<StoredEvent, PartnershipError> {
+    append_checked_locally(store, user_id, |_tx| {
+        Ok(PartnerStep::Append(build_set_il1065_settings_event(settings)))
+    })
+}
+
+/// The Illinois IL-1065 settings, or the default (Illinois-only, no PTE) when none
+/// have been set — which is the right starting point rather than an error, so a
+/// return can be built before anybody visits the settings.
+pub fn get_il1065_settings(conn: &Connection) -> Il1065Settings {
+    conn.query_row(
+        "SELECT apportions_outside_illinois, elects_pte_tax
+         FROM il1065_settings WHERE id = 'default'",
+        [],
+        |r| {
+            Ok(Il1065Settings {
+                apportions_outside_illinois: r.get(0)?,
+                elects_pte_tax: r.get(1)?,
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +685,74 @@ pub fn withdraw_partner(
     append_checked_locally(store, user_id, |tx| {
         build_withdraw_partner_in_txn(tx, partner_id, end_date)
     })
+}
+
+/// Record a family tie between two partners, for Schedule B-1's §267(c) test.
+///
+/// The kind is a [`RelationshipKind`] the caller has already chosen; the ids are
+/// canonicalised for symmetric kinds inside the transaction, so entering the same
+/// marriage the other way round replaces the one row rather than adding a second.
+pub fn set_relationship(
+    store: &mut EventStore,
+    user_id: &str,
+    partner_id: &str,
+    related_partner_id: &str,
+    kind: RelationshipKind,
+) -> Result<StoredEvent, PartnershipError> {
+    check_set_relationship_pure(partner_id, related_partner_id)?;
+    append_checked_locally(store, user_id, |tx| {
+        build_set_relationship_in_txn(tx, partner_id, related_partner_id, kind)
+    })
+}
+
+/// Remove a family tie between two partners.
+///
+/// Refused if there is no tie between them, matched in either order — a no-op
+/// append is a write that reports success and changed nothing.
+pub fn clear_relationship(
+    store: &mut EventStore,
+    user_id: &str,
+    partner_id: &str,
+    related_partner_id: &str,
+) -> Result<StoredEvent, PartnershipError> {
+    append_checked_locally(store, user_id, |tx| {
+        build_clear_relationship_in_txn(tx, partner_id, related_partner_id)
+    })
+}
+
+/// Every recorded family tie between partners.
+///
+/// An unreadable row — a relationship word this crate did not write — is skipped
+/// rather than failing the read: the cost of dropping one is that a partner might
+/// be missing from Schedule B-1, so the schedule already carries a caveat to check
+/// attribution by hand, and a whole return that will not build is worse.
+pub fn list_relationships(conn: &Connection) -> Vec<PartnerRelationship> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT partner_id, related_partner_id, relationship
+         FROM partner_relationships ORDER BY partner_id, related_partner_id",
+    ) else {
+        return out;
+    };
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    });
+    if let Ok(rows) = rows {
+        for (partner_id, related_partner_id, relationship) in rows.flatten() {
+            if let Some(kind) = RelationshipKind::parse(&relationship) {
+                out.push(PartnerRelationship {
+                    partner_id,
+                    related_partner_id,
+                    kind,
+                });
+            }
+        }
+    }
+    out
 }
 
 pub fn list_partners(conn: &Connection) -> Vec<Partner> {
@@ -745,7 +957,8 @@ fn row_to_partner(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Partner, Str
     let raw_start: String = r.get(11)?;
     let Some(start_date) = parse_stored_date(&raw_start) else {
         return Ok(Err(format!(
-            "Partner '{name}' ({id}) has an unreadable start date {raw_start:?} and is left off.              Fix the record and try again."
+            "Partner '{name}' ({id}) has an unreadable start date {raw_start:?} and is left off. \
+             Fix the record and try again."
         )));
     };
     let end_date = match end.as_deref() {
@@ -754,7 +967,8 @@ fn row_to_partner(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Partner, Str
             Some(d) => Some(d),
             None => {
                 return Ok(Err(format!(
-                    "Partner '{name}' ({id}) has an unreadable end date {raw:?} and is left off.                      Fix the record and try again."
+                    "Partner '{name}' ({id}) has an unreadable end date {raw:?} and is left off. \
+                     Fix the record and try again."
                 )));
             }
         },
@@ -1301,5 +1515,133 @@ mod tests {
         let totals = Shares::sums_to_whole(&shares);
         assert_eq!(totals.profit_ppm, FULL_SHARE);
         assert!(totals.is_whole());
+    }
+
+    /// Admit two partners and return their ids, so the relationship tests have
+    /// real partners to tie together.
+    fn two_partners(s: &mut EventStore) -> (String, String) {
+        set_profile(s, "u", &profile()).unwrap();
+        let mut b = a_partner("Bob");
+        b.tin = None;
+        let (a_id, _) = admit_partner(s, "u", &a_partner("Alice")).unwrap();
+        let (b_id, _) = admit_partner(s, "u", &b).unwrap();
+        (a_id, b_id)
+    }
+
+    #[test]
+    fn a_relationship_reads_back_as_it_was_written() {
+        let mut s = store();
+        let (a, b) = two_partners(&mut s);
+        set_relationship(&mut s, "u", &a, &b, RelationshipKind::Spouse).unwrap();
+
+        let rels = list_relationships(s.connection());
+        assert_eq!(rels.len(), 1);
+        assert_eq!(rels[0].kind, RelationshipKind::Spouse);
+        // The pair is present regardless of which order it went in.
+        assert!(
+            (rels[0].partner_id == a && rels[0].related_partner_id == b)
+                || (rels[0].partner_id == b && rels[0].related_partner_id == a)
+        );
+    }
+
+    /// A symmetric tie is one row whichever way round it is entered.
+    #[test]
+    fn a_spouse_tie_entered_both_ways_is_a_single_row() {
+        let mut s = store();
+        let (a, b) = two_partners(&mut s);
+        set_relationship(&mut s, "u", &a, &b, RelationshipKind::Spouse).unwrap();
+        set_relationship(&mut s, "u", &b, &a, RelationshipKind::Spouse).unwrap();
+        assert_eq!(list_relationships(s.connection()).len(), 1, "one marriage, one row");
+    }
+
+    #[test]
+    fn a_relationship_can_be_cleared_from_either_side() {
+        let mut s = store();
+        let (a, b) = two_partners(&mut s);
+        set_relationship(&mut s, "u", &a, &b, RelationshipKind::Spouse).unwrap();
+        // Clear naming the pair in the other order — it is still the same tie.
+        clear_relationship(&mut s, "u", &b, &a).unwrap();
+        assert!(list_relationships(s.connection()).is_empty());
+    }
+
+    #[test]
+    fn a_relationship_to_a_partner_who_does_not_exist_is_refused() {
+        let mut s = store();
+        let (a, _) = two_partners(&mut s);
+        let err = set_relationship(&mut s, "u", &a, "nobody", RelationshipKind::Spouse).unwrap_err();
+        assert!(matches!(err, PartnershipError::NoSuchPartner(_)), "got {err:?}");
+        assert!(list_relationships(s.connection()).is_empty(), "nothing was recorded");
+    }
+
+    #[test]
+    fn a_partner_cannot_be_related_to_themselves() {
+        let mut s = store();
+        let (a, _) = two_partners(&mut s);
+        let err = set_relationship(&mut s, "u", &a, &a, RelationshipKind::Spouse).unwrap_err();
+        assert!(matches!(err, PartnershipError::InvalidData(_)), "got {err:?}");
+    }
+
+    /// Clearing a tie that is not there is a refusal, not a no-op append — the
+    /// same rule editing a non-existent partner follows.
+    #[test]
+    fn clearing_a_relationship_that_does_not_exist_is_refused() {
+        let mut s = store();
+        let (a, b) = two_partners(&mut s);
+        let err = clear_relationship(&mut s, "u", &a, &b).unwrap_err();
+        assert!(matches!(err, PartnershipError::NoSuchRelationship(..)), "got {err:?}");
+    }
+
+    #[test]
+    fn il1065_settings_default_to_illinois_only_and_read_back_as_written() {
+        let mut s = store();
+        // Nothing set yet: the safe default.
+        let d = get_il1065_settings(s.connection());
+        assert!(!d.apportions_outside_illinois);
+        assert!(!d.elects_pte_tax);
+
+        set_profile(&mut s, "u", &profile()).unwrap();
+        set_il1065_settings(
+            &mut s,
+            "u",
+            &Il1065Settings { apportions_outside_illinois: true, elects_pte_tax: true },
+        )
+        .unwrap();
+        let got = get_il1065_settings(s.connection());
+        assert!(got.apportions_outside_illinois);
+        assert!(got.elects_pte_tax);
+
+        // Replaces in place — one book, one setting.
+        set_il1065_settings(
+            &mut s,
+            "u",
+            &Il1065Settings { apportions_outside_illinois: false, elects_pte_tax: true },
+        )
+        .unwrap();
+        let got = get_il1065_settings(s.connection());
+        assert!(!got.apportions_outside_illinois);
+        assert!(got.elects_pte_tax);
+        let n: i64 = s
+            .connection()
+            .query_row("SELECT COUNT(*) FROM il1065_settings", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "one book, one settings row");
+    }
+
+    /// A relationship is not a secret — unlike a TIN, it belongs in the log, so
+    /// every member preparing the return sees the same ties.
+    #[test]
+    fn a_relationship_is_recorded_in_the_event_log() {
+        let mut s = store();
+        let (a, b) = two_partners(&mut s);
+        set_relationship(&mut s, "u", &a, &b, RelationshipKind::Spouse).unwrap();
+        let log: String = s
+            .connection()
+            .query_row(
+                "SELECT COALESCE(GROUP_CONCAT(event_type, ' '), '') FROM events",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(log.contains("partner_relationship_set"), "the tie is not in the log: {log}");
     }
 }

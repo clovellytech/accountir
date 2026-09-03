@@ -103,6 +103,18 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             27,
             include_str!("../../migrations/027_tax_setup_is_event_sourced.sql"),
         ),
+        (
+            28,
+            include_str!("../../migrations/028_partner_relationships.sql"),
+        ),
+        (
+            29,
+            include_str!("../../migrations/029_il1065_settings.sql"),
+        ),
+        (
+            30,
+            include_str!("../../migrations/030_depreciable_assets.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -529,6 +541,61 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_partners_start ON partners(start_date);
+
+        -- Family ties between partners, for Schedule B-1's §267(c) constructive
+        -- ownership test (migration 028). Event-sourced like `partners`, not local
+        -- like `partner_tins` — which two partners are married is a fact the whole
+        -- partnership files against, not a secret. Pair is the key; for symmetric
+        -- kinds the ids are stored canonically so a tie is one row. No foreign key
+        -- to `partners`, for the reason migration 025 gives.
+        CREATE TABLE IF NOT EXISTS partner_relationships (
+            partner_id TEXT NOT NULL,
+            related_partner_id TEXT NOT NULL,
+            relationship TEXT NOT NULL,
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (partner_id, related_partner_id)
+        );
+
+        -- Illinois IL-1065 settings (migration 029). One row keyed 'default', like
+        -- business_profile — the standing apportionment and PTE-election choices
+        -- that decide which path tax::il1065 fills. Event-sourced, not local.
+        CREATE TABLE IF NOT EXISTS il1065_settings (
+            id TEXT PRIMARY KEY CHECK (id = 'default'),
+            apportions_outside_illinois INTEGER NOT NULL DEFAULT 0,
+            elects_pte_tax INTEGER NOT NULL DEFAULT 0,
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        -- The asset register (migration 030): what depreciates, and the facts
+        -- MACRS needs. Event-sourced. `property_class` holds a class name and
+        -- never a number of years — land improvements and qualified improvement
+        -- property are both 15-year property with different methods, so a life
+        -- alone cannot say how to depreciate anything.
+        CREATE TABLE IF NOT EXISTS depreciable_assets (
+            id TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            asset_account_id TEXT NOT NULL,
+            expense_account_id TEXT NOT NULL,
+            accumulated_account_id TEXT NOT NULL,
+            -- Where §179 is expensed: a different line of the return from ordinary
+            -- depreciation (Schedule K line 12, not page 1 line 16a), so a
+            -- different account. NULL when no election is made.
+            section_179_account_id TEXT,
+            acquired_on TEXT NOT NULL,
+            placed_in_service TEXT NOT NULL,
+            cost_cents INTEGER NOT NULL,
+            property_class TEXT NOT NULL,
+            system TEXT NOT NULL DEFAULT 'gds',
+            section_179_cents INTEGER NOT NULL DEFAULT 0,
+            bonus TEXT NOT NULL DEFAULT 'take',
+            disposed_on TEXT,
+            notes TEXT,
+            added_at_event INTEGER REFERENCES events(id),
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_depreciable_assets_placed
+            ON depreciable_assets(placed_in_service);
 
         -- Which Form 1065 line each account is reported on (migration 024).
         -- Keyed by account because many accounts share one line, and because

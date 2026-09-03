@@ -23,8 +23,8 @@ use super::commands::event_service::{
 };
 use crate::commands::partnership_commands::UpdatePartner;
 use super::commands::partnership::{
-    AdmitPartnerRequest, AdmitPartnerResponse, SetBusinessProfileRequest, UpdatePartnerRequest,
-    WithdrawPartnerRequest,
+    AdmitPartnerRequest, AdmitPartnerResponse, ClearRelationshipRequest, SetBusinessProfileRequest,
+    SetIl1065SettingsRequest, SetRelationshipRequest, UpdatePartnerRequest, WithdrawPartnerRequest,
 };
 use super::commands::plaid::{
     ConnectPlaidItemRequest, ConnectPlaidItemResponse, DisconnectPlaidItemRequest,
@@ -1615,6 +1615,58 @@ impl SyncClient {
                 expected_head_seq: head,
                 partner_id: partner_id.clone(),
                 end_date,
+            }
+        })
+        .await
+    }
+
+    /// Record a family tie between two of the group's partners, for Schedule
+    /// B-1's §267(c) constructive-ownership test.
+    pub async fn set_relationship(
+        &mut self,
+        partner_id: impl Into<String>,
+        related_partner_id: impl Into<String>,
+        kind: crate::domain::RelationshipKind,
+    ) -> Result<i64, SyncClientError> {
+        let (partner_id, related_partner_id) = (partner_id.into(), related_partner_id.into());
+        self.submit_retrying("/sync/commands/set-partner-relationship", |head| {
+            SetRelationshipRequest {
+                expected_head_seq: head,
+                partner_id: partner_id.clone(),
+                related_partner_id: related_partner_id.clone(),
+                relationship: kind.as_str().to_string(),
+            }
+        })
+        .await
+    }
+
+    /// Remove a recorded family tie between two of the group's partners.
+    pub async fn clear_relationship(
+        &mut self,
+        partner_id: impl Into<String>,
+        related_partner_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (partner_id, related_partner_id) = (partner_id.into(), related_partner_id.into());
+        self.submit_retrying("/sync/commands/clear-partner-relationship", |head| {
+            ClearRelationshipRequest {
+                expected_head_seq: head,
+                partner_id: partner_id.clone(),
+                related_partner_id: related_partner_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record the group's Illinois IL-1065 settings.
+    pub async fn set_il1065_settings(
+        &mut self,
+        settings: crate::domain::Il1065Settings,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-il1065-settings", |head| {
+            SetIl1065SettingsRequest {
+                expected_head_seq: head,
+                apportions_outside_illinois: settings.apportions_outside_illinois,
+                elects_pte_tax: settings.elects_pte_tax,
             }
         })
         .await

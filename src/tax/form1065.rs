@@ -313,6 +313,21 @@ pub struct ReturnRequest {
     /// present-but-empty one means "computed, and nothing was mapped", which is
     /// worth a warning.
     pub schedule_l: Option<super::schedule_l::ScheduleL>,
+    /// Family ties between the partners, for Schedule B-1's §267(c) constructive
+    /// ownership test. Empty is the ordinary case — no relationships recorded, so
+    /// every partner is attributed only their own direct share. A spouse pair here
+    /// is what puts two partners under 50% each onto the schedule at their combined
+    /// percentage. See [`super::constructive`].
+    pub relationships: Vec<crate::domain::PartnerRelationship>,
+    /// The depreciable asset register, for Form 4562 and for checking the
+    /// ledger's depreciation against what the assets actually earn.
+    ///
+    /// Empty is a real state and not a missing input: a partnership can post
+    /// depreciation by hand and keep no register, in which case no 4562 is
+    /// produced and nothing is reconciled. [`build_return_from_ledger`] reads it
+    /// from the books when the caller leaves it empty, the same way it reads
+    /// Schedule L.
+    pub assets: Vec<crate::domain::DepreciableAsset>,
 }
 
 /// Choices about the return that are not facts about the partnership.
@@ -389,6 +404,13 @@ pub fn build_return_from_ledger(
     let mut owned = req.clone();
     if owned.schedule_l.is_none() {
         owned.schedule_l = super::schedule_l::compute(conn, req.year, &mapping).ok();
+    }
+    // The asset register, read here for the reason Schedule L is: this is the
+    // only entry point with a connection, and a caller that forgot would ship a
+    // return with no Form 4562 and nothing checking line 16a against the assets
+    // that justify it.
+    if owned.assets.is_empty() {
+        owned.assets = crate::commands::depreciation_commands::list_assets(conn);
     }
     // The statements are built from this, and only this path knows it.
     owned.detail = computed.detail;
@@ -494,7 +516,9 @@ fn build_return_inner(
             // L that never ran and a Schedule L with nothing mapped produced the
             // same blank page and the same absence of explanation.
             None => warnings.push(
-                "Schedule L is blank because no balance sheet was computed for this return.                  `build_return_from_ledger` reads one from the books; `build_return` has no                  ledger to read."
+                "Schedule L is blank because no balance sheet was computed for this return. \
+                 `build_return_from_ledger` reads one from the books; `build_return` has no ledger \
+                 to read."
                     .to_string(),
             ),
         }
@@ -543,15 +567,36 @@ fn build_return_inner(
     // Before the statements, because they are IRS schedules and the statements
     // are ours: the return reads form, K-1s, official schedules, then the
     // supporting pages we composed.
+    // Attribute ownership under §267(c) from the recorded family ties, over
+    // *every* partner (not only those filing this year), because a relative who
+    // has left still attributes their interest for the 50% test.
+    //
+    // Computed before the question is consulted, because it is needed either way:
+    // the schedule uses it when 2a or 2b says Yes, and the consistency check below
+    // uses it precisely when they do not.
+    let all_partners: Vec<crate::domain::Partner> =
+        req.partners.iter().map(|f| f.partner.clone()).collect();
+    let owners: Vec<super::schedule_b1::Owner> = req
+        .partners
+        .iter()
+        .map(|f| super::schedule_b1::Owner {
+            partner: &f.partner,
+            tin: f.tin.as_deref(),
+            constructive: super::constructive::constructive_shares(
+                &f.partner,
+                &all_partners,
+                &req.relationships,
+            ),
+        })
+        .collect();
+
+    // Checked whether or not the schedule is required, because the case that
+    // needs catching is the one where it is *not*: an answer of No over a partner
+    // the books put at 50% or more drops the whole B-1 path silently, and a
+    // return that is short a schedule looks exactly like one that never owed it.
+    warnings.extend(super::schedule_b1::contradictions(&req.schedule_b, &owners));
+
     if super::schedule_b1::is_required(&req.schedule_b) {
-        let owners: Vec<super::schedule_b1::Owner> = req
-            .partners
-            .iter()
-            .map(|f| super::schedule_b1::Owner {
-                partner: &f.partner,
-                tin: f.tin.as_deref(),
-            })
-            .collect();
         let (sched, b1_warnings) =
             super::schedule_b1::build(&req.profile.legal_name, &req.profile.ein, &owners)?;
         warnings.extend(b1_warnings);
@@ -565,10 +610,44 @@ fn build_return_inner(
             // ownership from family and related entities — so this is a mismatch
             // to resolve, not a schedule to quietly omit.
             None => warnings.push(
-                "Schedule B question 2a or 2b is Yes, but no partner in the books owns 50% or                  more, so no Schedule B-1 was produced. Either the answer is wrong or the owner                  holds their interest indirectly — the schedule has to be attached by hand in                  that case."
+                "Schedule B question 2a or 2b is Yes, but no partner in the books owns 50% or \
+                 more, so no Schedule B-1 was produced. Either the answer is wrong or the owner \
+                 holds their interest indirectly — the schedule has to be attached by hand in that \
+                 case."
                     .to_string(),
             ),
         }
+    }
+
+    // --- Form 4562 ---
+    //
+    // Built from the register rather than from the ledger, because the ledger
+    // holds only the result: a journal entry records the deduction and none of
+    // the facts — cost, class, date placed in service, recovery year — the form
+    // asks for. The entry and the form come from the same computation, which is
+    // what makes them agree.
+    let year_schedule = super::depreciation::compute_year(&req.assets, req.year);
+    warnings.extend(year_schedule.warnings.iter().cloned());
+
+    // Checked whether or not a 4562 is produced: the disagreements worth
+    // catching are the ones where the register says something the ledger does
+    // not, and an unposted year is exactly that.
+    warnings.extend(super::depreciation::reconcile_with_ledger(
+        &year_schedule,
+        lines,
+        req.schedule_l.as_ref(),
+    ));
+
+    let activity = req
+        .profile
+        .principal_activity
+        .clone()
+        .unwrap_or_else(|| req.profile.legal_name.clone());
+    let (form_4562, f4562_warnings) =
+        super::form4562::build(&req.profile, &year_schedule, &activity)?;
+    warnings.extend(f4562_warnings);
+    if let Some(filled) = form_4562 {
+        append_document(&mut doc, filled.document)?;
     }
 
     if super::schedule_b2::is_required(&req.schedule_b) {
@@ -592,7 +671,8 @@ fn build_return_inner(
         // the election.
         match req.schedule_b.get("b31_total") {
             Some(typed) if typed != count.to_string() => warnings.push(format!(
-                "Question 31 says the Schedule B-2 total is {typed}, but the schedule produced                  lists {count} partner(s). The two have to agree."
+                "Question 31 says the Schedule B-2 total is {typed}, but the schedule produced \
+                 lists {count} partner(s). The two have to agree."
             )),
             _ => {}
         }
@@ -630,7 +710,8 @@ fn build_return_inner(
     {
         if lines.is_mapped(def.key) && req.detail.get(def.key).is_none_or(|r| r.is_empty()) {
             warnings.push(format!(
-                "Line {} carries a figure and the form asks for a statement of what is in it, but                  no account detail was supplied, so none was produced. Attach one before filing.",
+                "Line {} carries a figure and the form asks for a statement of what is in it, but \
+                 no account detail was supplied, so none was produced. Attach one before filing.",
                 def.number
             ));
         }
@@ -876,7 +957,9 @@ fn fill_schedule_k(
     // nothing in the chart of accounts to point at them.
     if !lines.any_schedule_k() {
         warnings.push(
-            "Nothing is mapped to a Schedule K line, so every separately stated item is blank.              Charitable contributions, section 179, investment interest and capital gains belong              there rather than in page 1, line 21."
+            "Nothing is mapped to a Schedule K line, so every separately stated item is blank. \
+             Charitable contributions, section 179, investment interest and capital gains belong \
+             there rather than in page 1, line 21."
                 .to_string(),
         );
     }
@@ -943,7 +1026,9 @@ fn split_across_partners(
     let mut warnings = Vec::new();
     if profit_and_loss_shares_differ(&partners) {
         warnings.push(
-            "Profit and loss percentages differ for at least one partner, so income items and              loss items were split on different percentages. Check each K-1 against the              partnership agreement."
+            "Profit and loss percentages differ for at least one partner, so income items and loss \
+             items were split on different percentages. Check each K-1 against the partnership \
+             agreement."
                 .to_string(),
         );
     }
@@ -1109,6 +1194,8 @@ mod tests {
                 },
             ],
             schedule_b: Default::default(),
+            relationships: Vec::new(),
+            assets: Vec::new(),
             schedule_l: None,
             detail: Default::default(),
             options: Default::default(),
@@ -1600,6 +1687,8 @@ mod tests {
                 .map(|partner| PartnerFiling { partner, tin: None })
                 .collect(),
             schedule_b: Default::default(),
+            relationships: Vec::new(),
+            assets: Vec::new(),
             schedule_l: None,
             detail: Default::default(),
             options: Default::default(),
@@ -2058,10 +2147,280 @@ mod tests {
         assert!(text.contains("49842K"), "Schedule B-1 is not in the bundle");
         // And the constructive-ownership caveat travels with it.
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("family members")),
+            bundle.warnings.iter().any(|w| w.contains("family attribution")),
             "{:?}",
             bundle.warnings
         );
+    }
+
+    /// The whole feature, end to end: two spouses under 50% each, with a spouse
+    /// relationship on the request, produce a Schedule B-1 in the bundle they
+    /// would not produce without it. A `partner` in these tests is already an
+    /// individual, so both land in Part II.
+    /// Every warning a return can produce has to read as a sentence.
+    ///
+    /// This drives the warning-producing paths across the whole return — the
+    /// schedules, the elections, the asset register, the reconciliations — and
+    /// puts each message through [`crate::tax::warning_shape`], which catches the
+    /// line break or the run of spaces a mis-written string literal leaves in the
+    /// middle of a message. That defect has reached this crate fifteen times; it
+    /// survives review because the source looks right and every `contains` test
+    /// still passes, and it only shows in the warnings panel.
+    ///
+    /// Driven through `build_return_inner` rather than asserted against a list of
+    /// literals on purpose: a scan of the source cannot tell a swallowed
+    /// continuation from a column of deliberately aligned CLI output, and the
+    /// rendered string is where both forms of the defect look identical.
+    #[test]
+    fn every_warning_a_return_produces_reads_as_a_sentence() {
+        use crate::domain::{
+            BonusElection, DepreciableAsset, PropertyClass, Shares, System,
+        };
+        use crate::tax::schedule_b::{ScheduleB, NO, YES};
+        use crate::tax::warning_shape;
+
+        fn asset(
+            description: &str,
+            class: PropertyClass,
+            placed: NaiveDate,
+            cost: i64,
+        ) -> DepreciableAsset {
+            DepreciableAsset {
+                asset_id: description.to_lowercase(),
+                description: description.into(),
+                asset_account_id: "1500".into(),
+                expense_account_id: "6500".into(),
+                accumulated_account_id: "1590".into(),
+                section_179_account_id: Some("6501".into()),
+                acquired_on: placed,
+                placed_in_service: placed,
+                cost_cents: cost,
+                class,
+                system: System::Gds,
+                section_179_cents: 0,
+                bonus: BonusElection::Decline,
+                disposed_on: None,
+                notes: None,
+            }
+        }
+
+        let mut all: Vec<String> = Vec::new();
+
+        // 1. A bare return: no balance sheet, nothing on Schedule K, no answers.
+        all.extend(
+            build_return_inner(&two_partner_request(), &Default::default(), Vec::new())
+                .unwrap()
+                .warnings,
+        );
+
+        // 2. Question 2a Yes with nobody in the books over 50% — the schedule is
+        //    declared and cannot be produced.
+        let mut req = two_partner_request();
+        let mut sb = ScheduleB::default();
+        sb.set("b2a", YES);
+        req.schedule_b = sb;
+        all.extend(
+            build_return_inner(&req, &Default::default(), Vec::new())
+                .unwrap()
+                .warnings,
+        );
+
+        // 3. Question 2b No over a partner who owns 60%, and a partner with no
+        //    TIN, and profit and loss split on different percentages.
+        let mut req = two_partner_request();
+        let mut owner = partner("Dana", PartnerType::General, Residency::Domestic, 60.0);
+        owner.shares = Shares::from_percents(60.0, 40.0, 60.0);
+        req.partners = vec![PartnerFiling { partner: owner, tin: None }];
+        let mut sb = ScheduleB::default();
+        sb.set("b2b", NO);
+        // 4. …and question 31 Yes with a total that disagrees with the schedule.
+        sb.set("b31", YES);
+        sb.set("b31_total", "17");
+        req.schedule_b = sb;
+        all.extend(
+            build_return_inner(&req, &Default::default(), Vec::new())
+                .unwrap()
+                .warnings,
+        );
+
+        // 5. The asset register: an unposted year, a §179 election on property
+        //    that only conditionally allows one, bonus on property too long-lived
+        //    to take it, the two 15-year classes colliding on line 19e, and an
+        //    asset that came and went inside one year.
+        let mut req = two_partner_request();
+        let mut building = asset(
+            "Studio building",
+            PropertyClass::Nonresidential,
+            NaiveDate::from_ymd_opt(FORM_TAX_YEAR, 4, 1).unwrap(),
+            50_000_000,
+        );
+        building.section_179_cents = 1_000_000;
+        building.bonus = BonusElection::Take;
+
+        let mut fleeting = asset(
+            "Borrowed press",
+            PropertyClass::FiveYear,
+            NaiveDate::from_ymd_opt(FORM_TAX_YEAR, 2, 1).unwrap(),
+            400_000,
+        );
+        fleeting.disposed_on = Some(NaiveDate::from_ymd_opt(FORM_TAX_YEAR, 9, 1).unwrap());
+
+        let mut lot = asset(
+            "Parking lot",
+            PropertyClass::FifteenYearLandImprovement,
+            NaiveDate::from_ymd_opt(FORM_TAX_YEAR, 3, 1).unwrap(),
+            1_000_000,
+        );
+        lot.section_179_cents = 200_000;
+
+        req.assets = vec![
+            building,
+            fleeting,
+            lot,
+            asset(
+                "Studio fit-out",
+                PropertyClass::QualifiedImprovement,
+                NaiveDate::from_ymd_opt(FORM_TAX_YEAR, 3, 1).unwrap(),
+                1_000_000,
+            ),
+        ];
+        let mut lines = crate::tax::lines::Form1065Lines::default();
+        lines.set_for_test("l16a", 0);
+        lines.set_for_test("k12", 0);
+        all.extend(build_return_inner(&req, &lines, Vec::new()).unwrap().warnings);
+
+        // 6. A balance sheet that *was* computed and has nothing mapped to it —
+        //    a different warning from "nobody computed one", and reached only
+        //    when the schedule is present and empty.
+        let mut req = two_partner_request();
+        req.schedule_l = Some(crate::tax::schedule_l::ScheduleL::default());
+        all.extend(
+            build_return_inner(&req, &Default::default(), Vec::new())
+                .unwrap()
+                .warnings,
+        );
+
+        // 7. The ledger path, which reaches the warnings the request-only path
+        //    cannot: accounts carrying a balance that no tax line claims, and the
+        //    balance sheet read from the books rather than handed in.
+        let store = seeded_ledger();
+        all.extend(
+            build_return_from_ledger(store.connection(), &two_partner_request())
+                .unwrap()
+                .warnings,
+        );
+
+        // 8. A year the bundled forms are not the revision for.
+        let mut req = two_partner_request();
+        req.year = FORM_TAX_YEAR + 1;
+        all.extend(
+            build_return_inner(&req, &Default::default(), Vec::new())
+                .unwrap()
+                .warnings,
+        );
+
+        // The scenarios above have to have actually exercised the paths — a
+        // handful of warnings would mean this passes by not reaching them.
+        assert!(
+            all.len() >= 20,
+            "only {} warning(s) reached the check; the scenarios are not covering the \
+             warning paths any more: {all:#?}",
+            all.len()
+        );
+        warning_shape::assert_all(&all);
+    }
+
+    /// The register reaches the bundle as a Form 4562, and the reconciliation
+    /// notices that the year was never posted to the ledger — the state a return
+    /// is most likely to be built in, and the one where it is quietly wrong.
+    #[test]
+    fn the_asset_register_produces_a_4562_and_an_unposted_year_is_reported() {
+        use crate::domain::{BonusElection, DepreciableAsset, PropertyClass, System};
+
+        let mut req = two_partner_request();
+        req.assets = vec![DepreciableAsset {
+            asset_id: "kiln".into(),
+            description: "Kiln".into(),
+            asset_account_id: "1500".into(),
+            expense_account_id: "6500".into(),
+            accumulated_account_id: "1590".into(),
+            section_179_account_id: None,
+            acquired_on: NaiveDate::from_ymd_opt(2025, 3, 1).unwrap(),
+            placed_in_service: NaiveDate::from_ymd_opt(2025, 3, 1).unwrap(),
+            cost_cents: 1_000_000,
+            class: PropertyClass::SevenYear,
+            system: System::Gds,
+            section_179_cents: 0,
+            bonus: BonusElection::Decline,
+            disposed_on: None,
+            notes: None,
+        }];
+
+        let mut lines = crate::tax::lines::Form1065Lines::default();
+        // The books carry nothing on 16a, because the year was never posted.
+        lines.set_for_test("l16a", 0);
+
+        let before = build_return_inner(&two_partner_request(), &lines, Vec::new())
+            .unwrap()
+            .page_count;
+        let bundle = build_return_inner(&req, &lines, Vec::new()).expect("a return");
+        assert!(
+            bundle.page_count > before,
+            "the bundle gained no Form 4562: {} vs {before}",
+            bundle.page_count
+        );
+        assert!(
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("line 16a") && w.contains("register computes")),
+            "{:?}",
+            bundle.warnings
+        );
+    }
+
+    #[test]
+    fn a_spouse_relationship_on_the_request_puts_both_partners_on_schedule_b1() {
+        use crate::domain::{PartnerRelationship, RelationshipKind::Spouse, Shares};
+        use crate::tax::schedule_b::{ScheduleB, YES};
+
+        let mut req = two_partner_request();
+        req.partners[0].partner.partner_id = "me".into();
+        req.partners[0].partner.shares = Shares::from_percents(40.0, 40.0, 40.0);
+        req.partners[1].partner.partner_id = "wife".into();
+        req.partners[1].partner.shares = Shares::from_percents(20.0, 20.0, 20.0);
+
+        let mut sb = ScheduleB::default();
+        sb.set("b2b", YES);
+        req.schedule_b = sb;
+
+        // Without the relationship: 40 and 20, nobody at 50%, no B-1.
+        let without = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&without.pdf).unwrap();
+        let text: String = doc
+            .get_pages()
+            .keys()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect();
+        assert!(
+            !text.contains("49842K"),
+            "a B-1 was produced with no relationship on file"
+        );
+
+        // With it: each spouse owns 60%, both on the schedule.
+        req.relationships = vec![PartnerRelationship::new("me", "wife", Spouse)];
+        let with = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&with.pdf).unwrap();
+        assert!(
+            with.page_count > without.page_count,
+            "the spouse attribution added no Schedule B-1 page"
+        );
+        let text: String = doc
+            .get_pages()
+            .keys()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect();
+        assert!(text.contains("49842K"), "Schedule B-1 is not in the bundle");
     }
 
     /// Declared on Schedule B but nobody in the books crosses the threshold. The

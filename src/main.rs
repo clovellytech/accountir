@@ -215,6 +215,28 @@ enum PartnershipCliCommands {
         partner_id: String,
         tin: String,
     },
+
+    /// Record a family tie between two partners, for Schedule B-1's §267(c)
+    /// constructive-ownership test. Two spouses at 40% and 20% then each own 60%
+    /// and both appear on Schedule B-1
+    Relate {
+        /// The first partner's id. For "parent_of", this is the parent
+        partner_id: String,
+        /// The second partner's id. For "parent_of", this is the child
+        related_partner_id: String,
+        /// "spouse", "sibling", or "parent_of"
+        #[arg(long)]
+        kind: String,
+    },
+
+    /// Remove a recorded family tie between two partners
+    Unrelate {
+        partner_id: String,
+        related_partner_id: String,
+    },
+
+    /// List the recorded family ties between partners
+    Relationships,
 }
 
 #[derive(Subcommand)]
@@ -227,6 +249,31 @@ enum TaxCliCommands {
         /// Where to write the PDF
         #[arg(short, long)]
         output: PathBuf,
+    },
+
+    /// Build the Illinois IL-1065 Partnership Replacement Tax Return, as one
+    /// fillable PDF (with Illinois Schedule B)
+    #[command(name = "il-1065")]
+    Il1065 {
+        /// Tax year to file
+        #[arg(long)]
+        year: i32,
+        /// Where to write the PDF
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Show or change the Illinois IL-1065 settings for this book. With no flags,
+    /// prints the current settings
+    IlSettings {
+        /// Whether any income is earned outside Illinois (apportion). Omit to leave
+        /// unchanged
+        #[arg(long)]
+        apportion_outside: Option<bool>,
+        /// Whether the partnership elected the 4.95% Pass-through Entity tax. Omit
+        /// to leave unchanged
+        #[arg(long)]
+        elect_pte: Option<bool>,
     },
 }
 
@@ -633,8 +680,8 @@ async fn main() -> Result<()> {
         }
 
         Commands::Tax(cmd) => {
-            let store = EventStore::open(&cli.database)?;
-            handle_tax_command(&store, cmd)?;
+            let mut store = EventStore::open(&cli.database)?;
+            handle_tax_command(&mut store, cmd)?;
         }
     }
 
@@ -1813,6 +1860,46 @@ fn handle_partnership_command(
             pc::set_tin(store.connection(), &partner_id, &tin)?;
             println!("TIN stored on this machine only — it is not in the event log.");
         }
+
+        PartnershipCliCommands::Relate {
+            partner_id,
+            related_partner_id,
+            kind,
+        } => {
+            let kind = accountir::domain::RelationshipKind::parse(&kind).ok_or_else(|| {
+                anyhow::anyhow!("--kind must be spouse, sibling, or parent_of")
+            })?;
+            pc::set_relationship(store, "cli-user", &partner_id, &related_partner_id, kind)?;
+            println!("Recorded: {partner_id} is {} {related_partner_id}", kind.label());
+        }
+
+        PartnershipCliCommands::Unrelate {
+            partner_id,
+            related_partner_id,
+        } => {
+            pc::clear_relationship(store, "cli-user", &partner_id, &related_partner_id)?;
+            println!("Removed the relationship between {partner_id} and {related_partner_id}.");
+        }
+
+        PartnershipCliCommands::Relationships => {
+            let rels = pc::list_relationships(store.connection());
+            if rels.is_empty() {
+                println!("No relationships recorded.");
+            }
+            for r in &rels {
+                let name = |id: &str| {
+                    pc::get_partner(store.connection(), id)
+                        .map(|p| p.name)
+                        .unwrap_or_else(|| id.to_string())
+                };
+                println!(
+                    "  {} is {} {}",
+                    name(&r.partner_id),
+                    r.kind.label(),
+                    name(&r.related_partner_id)
+                );
+            }
+        }
     }
 
     fn print_partner(conn: &rusqlite::Connection, p: &accountir::domain::Partner) {
@@ -1862,7 +1949,7 @@ fn handle_partnership_command(
     Ok(())
 }
 
-fn handle_tax_command(store: &EventStore, cmd: TaxCliCommands) -> Result<()> {
+fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()> {
     use accountir::commands::partnership_commands as pc;
     use accountir::tax::{PartnerFiling, ReturnRequest, build_return_from_ledger};
 
@@ -1893,8 +1980,13 @@ fn handle_tax_command(store: &EventStore, cmd: TaxCliCommands) -> Result<()> {
                     profile,
                     partners,
                     schedule_b: accountir::tax::schedule_b::load(conn, year),
-                    // Both left to `build_return_from_ledger`, which has the
-                    // connection and reads them from the books.
+                    // Family ties for Schedule B-1's §267(c) attribution. Read here
+                    // like the partners are; empty means nobody is attributed
+                    // anything but their own share.
+                    relationships: pc::list_relationships(conn),
+                    // All three left to `build_return_from_ledger`, which has
+                    // the connection and reads them from the books.
+                    assets: Vec::new(),
                     schedule_l: None,
                     detail: Default::default(),
                     options: Default::default(),
@@ -1916,6 +2008,60 @@ fn handle_tax_command(store: &EventStore, cmd: TaxCliCommands) -> Result<()> {
                 "\nThe form is prefilled but still editable. Income and deduction lines \
                  come from the books via the Form 1065 line mappings; Schedule K, the \
                  capital accounts, and Schedule B are deliberately left blank."
+            );
+        }
+
+        TaxCliCommands::Il1065 { year, output } => {
+            let settings = pc::get_il1065_settings(store.connection());
+            let bundle = accountir::tax::il1065::build_from_ledger(store.connection(), year, &settings)?;
+            std::fs::write(&output, &bundle.pdf)?;
+            println!(
+                "Wrote {} ({} pages) — Illinois IL-1065, {}{}.",
+                output.display(),
+                bundle.page_count,
+                if settings.apportions_outside_illinois {
+                    "apportioned"
+                } else {
+                    "Illinois-only"
+                },
+                if settings.elects_pte_tax {
+                    ", PTE elected"
+                } else {
+                    ""
+                }
+            );
+            for w in &bundle.warnings {
+                println!("warning: {w}");
+            }
+        }
+
+        TaxCliCommands::IlSettings {
+            apportion_outside,
+            elect_pte,
+        } => {
+            let mut settings = pc::get_il1065_settings(store.connection());
+            let changing = apportion_outside.is_some() || elect_pte.is_some();
+            if let Some(a) = apportion_outside {
+                settings.apportions_outside_illinois = a;
+            }
+            if let Some(p) = elect_pte {
+                settings.elects_pte_tax = p;
+            }
+            if changing {
+                pc::set_il1065_settings(store, "cli-user", &settings)?;
+            }
+            println!(
+                "Illinois IL-1065 settings: {}, {}.",
+                if settings.apportions_outside_illinois {
+                    "apportions outside Illinois"
+                } else {
+                    "Illinois-only"
+                },
+                if settings.elects_pte_tax {
+                    "PTE tax elected"
+                } else {
+                    "no PTE election"
+                }
             );
         }
     }

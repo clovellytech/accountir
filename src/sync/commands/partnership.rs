@@ -51,10 +51,14 @@
 
 use crate::commands::partnership_commands::{
     AdmitPartner, PartnerStep, PartnershipError, UpdatePartner, build_admit_partner_in_txn,
-    build_set_profile_event, build_update_partner_in_txn, build_withdraw_partner_in_txn,
-    check_admit_partner_pure, check_set_profile_pure, check_update_partner_pure,
+    build_clear_relationship_in_txn, build_set_il1065_settings_event, build_set_profile_event,
+    build_set_relationship_in_txn, build_update_partner_in_txn, build_withdraw_partner_in_txn,
+    check_admit_partner_pure, check_set_profile_pure, check_set_relationship_pure,
+    check_update_partner_pure,
 };
-use crate::domain::{Address, BusinessProfile, PartnerType, Residency, Shares};
+use crate::domain::{
+    Address, BusinessProfile, Il1065Settings, PartnerType, RelationshipKind, Residency, Shares,
+};
 use crate::store::event_store::{CheckedOutcome, Verdict};
 use crate::sync::{ApiError, AuthedUser, SyncState, outcome_to_response, project, stamp};
 use axum::{Json, Router, extract::State, routing::post};
@@ -73,6 +77,27 @@ pub fn router() -> Router<SyncState> {
             "/sync/commands/withdraw-partner",
             post(submit_withdraw_partner),
         )
+        .route(
+            "/sync/commands/set-partner-relationship",
+            post(submit_set_relationship),
+        )
+        .route(
+            "/sync/commands/clear-partner-relationship",
+            post(submit_clear_relationship),
+        )
+        .route(
+            "/sync/commands/set-il1065-settings",
+            post(submit_set_il1065_settings),
+        )
+}
+
+/// Parse the relationship word, or say it was not understood.
+///
+/// A `400` rather than a `422`, exactly as [`parse_partner_type`]: an unknown kind
+/// is a malformed request, not a tie the books refused.
+fn parse_relationship(s: &str) -> Result<RelationshipKind, ApiError> {
+    RelationshipKind::parse(s)
+        .ok_or_else(|| ApiError::bad_request("relationship must be spouse, sibling, or parent_of"))
 }
 
 /// Parse the two K-1 checkbox fields, or say which word was not understood.
@@ -302,6 +327,124 @@ async fn submit_withdraw_partner(
             move |tx| match build_withdraw_partner_in_txn(tx, &req.partner_id, req.end_date)? {
                 PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
                 PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
+
+// ---------------------------------------------------------------------------
+// Partner relationships — for Schedule B-1's §267(c) constructive-ownership test
+// ---------------------------------------------------------------------------
+//
+// A family tie is not a secret, unlike a TIN, so it crosses this boundary like
+// the partners themselves do: which two partners are married is a fact the whole
+// group files against, and every member is entitled to see it. See the module
+// docs on what does and does not cross.
+
+#[derive(Serialize, Deserialize)]
+pub struct SetRelationshipRequest {
+    pub expected_head_seq: i64,
+    pub partner_id: String,
+    pub related_partner_id: String,
+    /// "spouse", "sibling", or "parent_of" — see domain::RelationshipKind. For
+    /// parent_of, `partner_id` is the parent.
+    pub relationship: String,
+}
+
+/// Record a family tie between two of the group's partners.
+async fn submit_set_relationship(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetRelationshipRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let kind = parse_relationship(&req.relationship)?;
+    check_set_relationship_pure(&req.partner_id, &req.related_partner_id).map_err(ApiError::domain)?;
+
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_set_relationship_in_txn(
+                tx,
+                &req.partner_id,
+                &req.related_partner_id,
+                kind,
+            )? {
+                PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ClearRelationshipRequest {
+    pub expected_head_seq: i64,
+    pub partner_id: String,
+    pub related_partner_id: String,
+}
+
+/// Remove a family tie between two of the group's partners.
+async fn submit_clear_relationship(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<ClearRelationshipRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_clear_relationship_in_txn(
+                tx,
+                &req.partner_id,
+                &req.related_partner_id,
+            )? {
+                PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
+
+// ---------------------------------------------------------------------------
+// Illinois IL-1065 settings — which state return the group files
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize)]
+pub struct SetIl1065SettingsRequest {
+    pub expected_head_seq: i64,
+    pub apportions_outside_illinois: bool,
+    pub elects_pte_tax: bool,
+}
+
+/// Record the group's IL-1065 settings, replacing whatever was there.
+///
+/// Last-writer-wins, like the header: two flags read as one position, and there is
+/// one partnership per book.
+async fn submit_set_il1065_settings(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetIl1065SettingsRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let settings = Il1065Settings {
+        apportions_outside_illinois: req.apportions_outside_illinois,
+        elects_pte_tax: req.elects_pte_tax,
+    };
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |_tx| {
+                Ok(Verdict::<_, PartnershipError>::Append(stamp(
+                    build_set_il1065_settings_event(&settings),
+                    &actor,
+                )))
             },
             project,
         )
@@ -804,6 +947,140 @@ mod tests {
         assert!(
             matches!(err, crate::sync::SyncClientError::Rejected(ref m) if m.contains("already left")),
             "got {err:?}"
+        );
+    }
+
+    /// A family tie between two of the group's partners is recorded on the shared
+    /// log, so every member's Schedule B-1 attributes the same ownership.
+    #[tokio::test]
+    async fn a_relationship_is_recorded_on_hosted_books() {
+        let base = serve().await;
+        set_profile(&base).await;
+        let alice = admit(&base, "Alice Example", 40.0).await;
+        let bob = admit(&base, "Bob Example", 20.0).await;
+        let (a, b) = (
+            alice["partner_id"].as_str().unwrap().to_string(),
+            bob["partner_id"].as_str().unwrap().to_string(),
+        );
+
+        let r = post(
+            &base,
+            "set-partner-relationship",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "partner_id": a,
+                "related_partner_id": b,
+                "relationship": "spouse",
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+
+        let events: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/sync/events?since=0&limit=50"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            events.to_string().contains("partner_relationship_set"),
+            "the tie did not reach the shared log"
+        );
+
+        // And it can be cleared, naming the pair in the other order.
+        let r = post(
+            &base,
+            "clear-partner-relationship",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "partner_id": b,
+                "related_partner_id": a,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+    }
+
+    /// A relationship naming a partner who does not exist is a domain refusal —
+    /// the same 422 an unknown partner gets anywhere else.
+    #[tokio::test]
+    async fn a_relationship_to_a_nonexistent_partner_is_refused() {
+        let base = serve().await;
+        set_profile(&base).await;
+        let alice = admit(&base, "Alice Example", 50.0).await;
+        let a = alice["partner_id"].as_str().unwrap().to_string();
+
+        let r = post(
+            &base,
+            "set-partner-relationship",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "partner_id": a,
+                "related_partner_id": "nobody",
+                "relationship": "spouse",
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// An unknown relationship word is a malformed request, not a refusal — like
+    /// an unknown partner type.
+    #[tokio::test]
+    async fn an_unknown_relationship_kind_is_a_bad_request() {
+        let base = serve().await;
+        set_profile(&base).await;
+        let alice = admit(&base, "Alice Example", 40.0).await;
+        let bob = admit(&base, "Bob Example", 20.0).await;
+
+        let r = post(
+            &base,
+            "set-partner-relationship",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "partner_id": alice["partner_id"],
+                "related_partner_id": bob["partner_id"],
+                "relationship": "cousin",
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+
+    /// The IL-1065 settings reach the shared log, so every member's Illinois
+    /// return takes the same apportionment and PTE path.
+    #[tokio::test]
+    async fn il1065_settings_are_recorded_on_hosted_books() {
+        let base = serve().await;
+        set_profile(&base).await;
+
+        let r = post(
+            &base,
+            "set-il1065-settings",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "apportions_outside_illinois": true,
+                "elects_pte_tax": true,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+
+        let events: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/sync/events?since=0&limit=50"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            events.to_string().contains("il1065_settings_set"),
+            "the settings did not reach the shared log"
         );
     }
 

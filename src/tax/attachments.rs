@@ -49,6 +49,7 @@ pub fn required(
     lines: &Form1065Lines,
     partner_count: usize,
     schedule_l_mapped: bool,
+    asset_register_size: usize,
 ) -> Vec<Attachment> {
     let mut generated = Vec::new();
     let mut owed = Vec::new();
@@ -140,17 +141,35 @@ pub fn required(
             Schedule::K => format!("Schedule K, line {}", def.number),
             Schedule::L => format!("Schedule L, line {}", def.number),
         };
+        // Form 4562 is the one attachment whose provenance is not a property of
+        // the line. It is produced here when there is an asset register to
+        // produce it from, and owed to the filer when there is not — the same
+        // form, and which of the two it is depends on whether anybody has
+        // entered the assets.
+        let is_4562 = a.name == "Form 4562";
+        let produced = a.generated || (is_4562 && asset_register_size > 0);
+        let because = if is_4562 && produced {
+            format!(
+                "{where_} carries a figure, and the register holds {asset_register_size} asset(s) — the schedule is computed from them."
+            )
+        } else if is_4562 {
+            format!(
+                "{where_} carries a figure, and no depreciable asset is on the register. Enter the assets to have this computed, or fill it in yourself."
+            )
+        } else {
+            format!("{where_} carries a figure.")
+        };
         let entry = Attachment {
             name: a.name,
-            because: format!("{where_} carries a figure."),
-            provenance: if a.generated {
+            because,
+            provenance: if produced {
                 Provenance::Generated
             } else {
                 Provenance::YourJob
             },
             url: a.url,
         };
-        if a.generated {
+        if produced {
             generated.push(entry);
         } else {
             owed.push(entry);
@@ -238,12 +257,33 @@ mod tests {
         list.iter().map(|a| a.name).collect()
     }
 
+    /// Form 4562 is the one attachment that changes hands: owed to the filer
+    /// with no register, produced here with one — the same line, the same figure,
+    /// and the difference is whether anybody entered the assets.
+    #[test]
+    fn form_4562_is_owed_without_a_register_and_produced_with_one() {
+        let mut a = ScheduleB::default();
+        a.set("b4", YES);
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l16a", 8_420);
+
+        let owed = required(&a, &lines, 1, false, 0);
+        let f = owed.iter().find(|x| x.name == "Form 4562").expect("listed");
+        assert_eq!(f.provenance, Provenance::YourJob);
+        assert!(f.because.contains("no depreciable asset"), "{}", f.because);
+
+        let produced = required(&a, &lines, 1, false, 3);
+        let f = produced.iter().find(|x| x.name == "Form 4562").expect("listed");
+        assert_eq!(f.provenance, Provenance::Generated);
+        assert!(f.because.contains("3 asset(s)"), "{}", f.because);
+    }
+
     #[test]
     fn a_bare_return_carries_only_its_k1s() {
         let mut a = ScheduleB::default();
         // Question 4 Yes takes Schedule L off the list.
         a.set("b4", YES);
-        let list = required(&a, &Form1065Lines::default(), 2, false);
+        let list = required(&a, &Form1065Lines::default(), 2, false, 0);
         assert_eq!(names(&list), vec!["Schedule K-1 (Form 1065)"]);
     }
 
@@ -252,13 +292,13 @@ mod tests {
         let mut a = ScheduleB::default();
         a.set("b4", YES);
         a.set("b2a", YES);
-        let list = required(&a, &Form1065Lines::default(), 1, false);
+        let list = required(&a, &Form1065Lines::default(), 1, false, 0);
         let b1 = list.iter().find(|x| x.name.starts_with("Schedule B-1")).unwrap();
         assert_eq!(b1.provenance, Provenance::Generated);
         assert!(b1.because.contains("question 2a"), "{}", b1.because);
 
         a.set("b2b", YES);
-        let list = required(&a, &Form1065Lines::default(), 1, false);
+        let list = required(&a, &Form1065Lines::default(), 1, false, 0);
         let b1 = list.iter().find(|x| x.name.starts_with("Schedule B-1")).unwrap();
         assert!(b1.because.contains("2a and 2b"), "{}", b1.because);
     }
@@ -268,11 +308,11 @@ mod tests {
         let mut a = ScheduleB::default();
         a.set("b4", YES);
         a.set("b31", YES);
-        let list = required(&a, &Form1065Lines::default(), 1, false);
+        let list = required(&a, &Form1065Lines::default(), 1, false, 0);
         assert!(names(&list).iter().any(|n| n.starts_with("Schedule B-2")));
 
         a.set("b31", NO);
-        let list = required(&a, &Form1065Lines::default(), 1, false);
+        let list = required(&a, &Form1065Lines::default(), 1, false, 0);
         assert!(!names(&list).iter().any(|n| n.starts_with("Schedule B-2")));
     }
 
@@ -281,11 +321,11 @@ mod tests {
     #[test]
     fn schedule_l_is_owed_when_question_4_is_not_yes_even_with_nothing_mapped() {
         let a = ScheduleB::default();
-        let list = required(&a, &Form1065Lines::default(), 1, false);
+        let list = required(&a, &Form1065Lines::default(), 1, false, 0);
         let l = list.iter().find(|x| x.name.starts_with("Schedule L")).unwrap();
         assert_eq!(l.provenance, Provenance::YourJob);
 
-        let list = required(&a, &Form1065Lines::default(), 1, true);
+        let list = required(&a, &Form1065Lines::default(), 1, true, 0);
         let l = list.iter().find(|x| x.name.starts_with("Schedule L")).unwrap();
         assert_eq!(l.provenance, Provenance::Generated);
     }
@@ -298,7 +338,7 @@ mod tests {
         lines.set_for_test("l21", 5000);
         lines.set_for_test("l2", 1000);
 
-        let list = required(&a, &lines, 1, false);
+        let list = required(&a, &lines, 1, false, 0);
         let stmt = list.iter().find(|x| x.name.contains("Other deductions")).unwrap();
         assert_eq!(stmt.provenance, Provenance::Generated);
         let f1125a = list.iter().find(|x| x.name == "Form 1125-A").unwrap();
@@ -315,7 +355,7 @@ mod tests {
         let mut lines = Form1065Lines::default();
         lines.set_for_test("l21", 5000);
 
-        let list = required(&a, &lines, 2, false);
+        let list = required(&a, &lines, 2, false, 0);
         let first_owed = list
             .iter()
             .position(|x| x.provenance == Provenance::YourJob)
@@ -334,7 +374,7 @@ mod tests {
         let mut a = ScheduleB::default();
         a.set("b4", YES);
         a.set("b24", YES);
-        let list = required(&a, &Form1065Lines::default(), 1, false);
+        let list = required(&a, &Form1065Lines::default(), 1, false, 0);
         let f = list.iter().find(|x| x.name == "Form 8990").unwrap();
         assert_eq!(f.provenance, Provenance::YourJob);
         assert!(f.because.contains("question 24"), "{}", f.because);
@@ -351,7 +391,7 @@ mod tests {
         for def in MAPPABLE_LINES {
             lines.set_for_test(def.key, 100);
         }
-        let list = required(&a, &lines, 3, true);
+        let list = required(&a, &lines, 3, true, 0);
         assert!(!list.is_empty());
         for at in &list {
             assert!(

@@ -290,8 +290,10 @@ pub const QUESTIONS: &[Question] = &[
         follow_ups: &[],
         refs: &[SCHEDULE_B1],
         yes_warning: "Question 2a is Yes, so Schedule B-1 is attached, listing every partner in the \
-                      books who owns 50% or more. Check it against anybody who reaches 50% through \
-                      family or related entities, which the books cannot see.",
+                      books who owns 50% or more, applying §267(c) family attribution from the \
+                      partner relationships on file. Check it against anybody who reaches 50% \
+                      through a related entity, or a family tie not yet recorded — neither of \
+                      which the books can see.",
         reserved: false,
         depends_on: None,
     },
@@ -306,8 +308,10 @@ pub const QUESTIONS: &[Question] = &[
         follow_ups: &[],
         refs: &[SCHEDULE_B1],
         yes_warning: "Question 2b is Yes, so Schedule B-1 is attached, listing every partner in the \
-                      books who owns 50% or more. Check it against anybody who reaches 50% through \
-                      family or related entities, which the books cannot see.",
+                      books who owns 50% or more, applying §267(c) family attribution from the \
+                      partner relationships on file. Check it against anybody who reaches 50% \
+                      through a related entity, or a family tie not yet recorded — neither of \
+                      which the books can see.",
         reserved: false,
         depends_on: None,
     },

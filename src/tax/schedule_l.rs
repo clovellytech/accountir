@@ -254,7 +254,10 @@ pub fn fill(
         // Warning only when required was the reason this looked like it silently
         // did nothing.
         warnings.push(format!(
-            "Schedule L is blank: no balance-sheet account is mapped to a Schedule L line{}. Map              your cash, receivable, payable and capital accounts on the Form 1065 page — the              picker offers Schedule L lines for every asset, liability and equity account — then              regenerate.",
+            "Schedule L is blank: no balance-sheet account is mapped to a Schedule L line{}. Map \
+             your cash, receivable, payable and capital accounts on the Form 1065 page — the \
+             picker offers Schedule L lines for every asset, liability and equity account — then \
+             regenerate.",
             if required {
                 ", and Schedule B question 4 does not exempt this partnership"
             } else {

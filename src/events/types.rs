@@ -70,6 +70,15 @@ pub struct BusinessProfileData {
     pub principal_product: Option<String>,
 }
 
+/// The Illinois IL-1065 settings, as one event. Small, but boxed-free because it
+/// is two flags rather than the dozen fields that make [`BusinessProfileData`]
+/// worth boxing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Il1065SettingsData {
+    pub apportions_outside_illinois: bool,
+    pub elects_pte_tax: bool,
+}
+
 /// A partner joining. Boxed for the same reason as [`BusinessProfileData`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartnerAdmittedData {
@@ -97,6 +106,45 @@ pub struct PartnerDetailsData {
     pub entity_type: String,
     pub address: AddressData,
     pub shares: ShareData,
+}
+
+/// A depreciable asset, whole. Boxed for the same reason as
+/// [`BusinessProfileData`] — a dozen fields would otherwise widen every
+/// `Event` to the size of its largest variant.
+///
+/// Carries the entire record on both the add and the update, not a diff, so the
+/// state after any one event is readable without replaying the ones before it —
+/// the rule [`PartnerDetailsData`] follows for the same reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepreciableAssetData {
+    pub asset_id: String,
+    pub description: String,
+    pub asset_account_id: String,
+    pub expense_account_id: String,
+    pub accumulated_account_id: String,
+    /// Where a §179 election is expensed. Required once §179 is elected and
+    /// distinct from `expense_account_id`, because §179 is separately stated on
+    /// Schedule K line 12 rather than deducted on page 1 line 16a.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_179_account_id: Option<String>,
+    /// When it was acquired — which decides the bonus rate, and is not the same
+    /// question as when it was placed in service. 2025 splits on 20 January.
+    pub acquired_on: NaiveDate,
+    /// When it became available and ready for its intended use — which starts
+    /// the recovery period and fixes the averaging convention.
+    pub placed_in_service: NaiveDate,
+    pub cost_cents: i64,
+    /// `domain::PropertyClass::as_str`, never a bare number of years: 15-year
+    /// land improvements and 15-year qualified improvement property share a life
+    /// and not a method, and a log recording `"15"` could not tell them apart.
+    pub property_class: String,
+    /// "gds" or "ads".
+    pub system: String,
+    pub section_179_cents: i64,
+    /// "take" or "decline" — §168(k).
+    pub bonus: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
 }
 
 /// Source of a journal entry
@@ -267,6 +315,69 @@ pub enum Event {
     PartnerWithdrawn {
         partner_id: String,
         end_date: NaiveDate,
+    },
+    /// A family tie between two partners is recorded, for Schedule B-1's §267(c)
+    /// constructive-ownership test.
+    ///
+    /// Not a secret, so — unlike a TIN — it belongs in the log like every other
+    /// fact about who the partners are: which two partners are married is
+    /// something every member preparing the return has to agree on, exactly as
+    /// they agree on the partners' shares.
+    ///
+    /// `relationship` is the [`crate::domain::RelationshipKind`] as a string
+    /// (`"spouse"`, `"sibling"`, `"parent_of"`); for the symmetric kinds the two
+    /// ids arrive in canonical order so the pair is one edge whichever way it was
+    /// entered, and for `parent_of` `partner_id` is the parent.
+    PartnerRelationshipSet {
+        partner_id: String,
+        related_partner_id: String,
+        relationship: String,
+    },
+    /// A recorded family tie between two partners is removed.
+    ///
+    /// Its own event rather than a set-to-none: the pair either has a tie or does
+    /// not, and a log that could not say a tie was *taken back* would keep
+    /// attributing ownership from a marriage that ended.
+    PartnerRelationshipCleared {
+        partner_id: String,
+        related_partner_id: String,
+    },
+    /// The Illinois IL-1065 settings for this book, set as a unit and replacing
+    /// whatever was there — like [`BusinessProfileSet`](Self::BusinessProfileSet),
+    /// because they are read together and the pair "apportions but no PTE" is one
+    /// coherent position, not two independent toggles worth logging separately.
+    Il1065SettingsSet(Box<Il1065SettingsData>),
+
+    // The asset register (migration 030). Event-sourced like the partners, and
+    // for the same reason: what the partnership owns and how it is being
+    // depreciated is a fact the whole partnership files on, not a secret one
+    // machine holds.
+    /// An asset joins the register.
+    DepreciableAssetAdded(Box<DepreciableAssetData>),
+    /// An asset's details change — a cost corrected, a class reconsidered, a
+    /// §179 election made or withdrawn.
+    ///
+    /// Carries the whole record rather than the changed field, so a reader of
+    /// this one event knows the asset without replaying its history. The class
+    /// in particular is worth changing after the fact: whether a fit-out is
+    /// qualified improvement property or 39-year real property is a judgement
+    /// people revise, and it is worth 24 years of recovery period.
+    DepreciableAssetUpdated(Box<DepreciableAssetData>),
+    /// An asset leaves the business.
+    ///
+    /// Its own event rather than an update with a date set, because a disposal is
+    /// not a correction: it stops depreciation part-way through the year on the
+    /// asset's own convention, and takes both the cost and the accumulated
+    /// depreciation off Schedule L together.
+    DepreciableAssetDisposed {
+        asset_id: String,
+        disposed_on: NaiveDate,
+    },
+    /// An asset is taken off the register entirely — entered in error, never
+    /// owned. Distinct from a disposal, which is a real event in the world and
+    /// leaves a gain or loss behind it.
+    DepreciableAssetRemoved {
+        asset_id: String,
     },
 
     UserAdded {
@@ -562,6 +673,13 @@ impl Event {
             Event::ScheduleBAnswerSet { .. } => "schedule_b_answer_set",
             Event::ScheduleBAnswerCleared { .. } => "schedule_b_answer_cleared",
             Event::PartnerWithdrawn { .. } => "partner_withdrawn",
+            Event::PartnerRelationshipSet { .. } => "partner_relationship_set",
+            Event::PartnerRelationshipCleared { .. } => "partner_relationship_cleared",
+            Event::Il1065SettingsSet(_) => "il1065_settings_set",
+            Event::DepreciableAssetAdded(_) => "depreciable_asset_added",
+            Event::DepreciableAssetUpdated(_) => "depreciable_asset_updated",
+            Event::DepreciableAssetDisposed { .. } => "depreciable_asset_disposed",
+            Event::DepreciableAssetRemoved { .. } => "depreciable_asset_removed",
             Event::UserAdded { .. } => "user_added",
             Event::UserModified { .. } => "user_modified",
             Event::UserRemoved { .. } => "user_removed",
@@ -618,6 +736,13 @@ impl Event {
             Event::ScheduleBAnswerSet { .. } => None,
             Event::ScheduleBAnswerCleared { .. } => None,
             Event::PartnerWithdrawn { partner_id, .. } => Some(partner_id),
+            Event::PartnerRelationshipSet { partner_id, .. } => Some(partner_id),
+            Event::PartnerRelationshipCleared { partner_id, .. } => Some(partner_id),
+            Event::Il1065SettingsSet(_) => None,
+            Event::DepreciableAssetAdded(d) => Some(&d.asset_id),
+            Event::DepreciableAssetUpdated(d) => Some(&d.asset_id),
+            Event::DepreciableAssetDisposed { asset_id, .. } => Some(asset_id),
+            Event::DepreciableAssetRemoved { asset_id } => Some(asset_id),
             Event::UserAdded { user_id, .. } => Some(user_id),
             Event::UserModified { user_id, .. } => Some(user_id),
             Event::UserRemoved { user_id } => Some(user_id),

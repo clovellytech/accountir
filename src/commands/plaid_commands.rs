@@ -10,6 +10,39 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Choose the memo for a Plaid transaction.
+///
+/// Plaid's `merchant_name` enrichment is usually the cleaner label ("Square
+/// Inc" instead of a long DES string), so it is preferred. But it is sometimes
+/// a broken fragment of the bank description rather than a name — Bank of
+/// America's "Payments and Invoicing payment to Lincoln Propert" enriches to
+/// "And Invo", and "…payment to Checker Notions" to "AND". When the merchant
+/// name is one of those fragments the full `name` is used instead, so the memo
+/// stays meaningful and traceable.
+pub fn plaid_memo(name: &str, merchant_name: Option<&str>) -> String {
+    match merchant_name {
+        Some(m) if !m.trim().is_empty() && !is_fragment(m.trim(), name) => m.trim().to_string(),
+        _ => name.to_string(),
+    }
+}
+
+/// Whether `merchant` looks like a slice of `name` rather than a real merchant.
+///
+/// The observed garbage all begins with the conjunction "and" — Plaid enriched
+/// "Payments and Invoicing payment to …" down to "And Invo" or "AND". A real
+/// merchant name never begins with a bare "and"/"&", and this is deliberately
+/// narrow: a merchant that is merely a prefix of a longer machine description
+/// ("Figofabrics" for "FIGOFABRICSUSA DES:…") is a *better* label, not a
+/// fragment, so it is kept.
+fn is_fragment(merchant: &str, _name: &str) -> bool {
+    let first = merchant
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphanumeric());
+    first.eq_ignore_ascii_case("and") || first == "&"
+}
+
 #[derive(Error, Debug)]
 pub enum PlaidCommandError {
     #[error("Event store error: {0}")]
@@ -436,11 +469,7 @@ impl<'a> PlaidCommands<'a> {
 
             let amount_cents = (txn.amount * 100.0).round() as i64;
             let currency = txn.currency.clone().unwrap_or_else(|| "USD".to_string());
-            let memo = txn
-                .merchant_name
-                .as_deref()
-                .unwrap_or(&txn.name)
-                .to_string();
+            let memo = plaid_memo(&txn.name, txn.merchant_name.as_deref());
             let user_id = self.user_id.clone();
             let uncat = uncategorized_id.clone();
             let txn_ref = txn.transaction_id.clone();
@@ -637,7 +666,7 @@ impl<'a> PlaidCommands<'a> {
         let abs_amount = from_txn.amount_cents.unsigned_abs() as i64;
         let memo = format!(
             "Transfer: {}",
-            from_txn.merchant_name.as_deref().unwrap_or(&from_txn.name)
+            plaid_memo(&from_txn.name, from_txn.merchant_name.as_deref())
         );
 
         let from_account = from_txn.local_account_id.clone().ok_or_else(|| {
@@ -766,11 +795,7 @@ impl<'a> PlaidCommands<'a> {
 
         let date = NaiveDate::parse_from_str(&txn.date, "%Y-%m-%d")
             .unwrap_or_else(|_| Utc::now().date_naive());
-        let memo = txn
-            .merchant_name
-            .as_deref()
-            .unwrap_or(&txn.name)
-            .to_string();
+        let memo = plaid_memo(&txn.name, txn.merchant_name.as_deref());
         let currency = txn.currency.clone();
         let amount_cents = txn.amount_cents;
         let txn_ref = txn.plaid_transaction_id.clone();

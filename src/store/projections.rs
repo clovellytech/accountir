@@ -205,6 +205,122 @@ impl<'a> Projector<'a> {
                     params![partner_id, end_date.to_string(), stored_event.id],
                 )?;
             }
+            Event::PartnerRelationshipSet {
+                partner_id,
+                related_partner_id,
+                relationship,
+            } => {
+                // The ids arrive canonically ordered for symmetric kinds (the
+                // command orders them before building the event), so the pair is
+                // one row whichever way the tie was entered.
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO partner_relationships
+                        (partner_id, related_partner_id, relationship, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![partner_id, related_partner_id, relationship, stored_event.id],
+                )?;
+            }
+            Event::PartnerRelationshipCleared {
+                partner_id,
+                related_partner_id,
+            } => {
+                // Removes the tie between the two partners whichever order it is
+                // stored in. A Cleared event does not carry the kind, so it cannot
+                // know whether the row is in canonical order; matching both
+                // orderings removes the tie either way, which is exactly what
+                // "these two are no longer related" means.
+                self.conn.execute(
+                    "DELETE FROM partner_relationships
+                     WHERE (partner_id = ?1 AND related_partner_id = ?2)
+                        OR (partner_id = ?2 AND related_partner_id = ?1)",
+                    params![partner_id, related_partner_id],
+                )?;
+            }
+            Event::Il1065SettingsSet(d) => {
+                // One row keyed 'default' by a CHECK constraint, replaced in place
+                // — like business_profile, there is one partnership per book.
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO il1065_settings
+                        (id, apportions_outside_illinois, elects_pte_tax, updated_at_event)
+                     VALUES ('default', ?1, ?2, ?3)",
+                    params![
+                        d.apportions_outside_illinois,
+                        d.elects_pte_tax,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            // --- the asset register (migration 030) ---
+            //
+            // Added and Updated share a statement: both carry the whole record,
+            // so replacing the row is exactly right for either, and a projector
+            // that treated the update as a partial write would have to know which
+            // fields were meant. `added_at_event` is preserved across an update
+            // by the COALESCE — an asset's history starts when it was entered,
+            // not when it was last corrected.
+            Event::DepreciableAssetAdded(d) | Event::DepreciableAssetUpdated(d) => {
+                self.conn.execute(
+                    "INSERT INTO depreciable_assets
+                        (id, description, asset_account_id, expense_account_id,
+                         accumulated_account_id, section_179_account_id, acquired_on,
+                         placed_in_service, cost_cents, property_class, system,
+                         section_179_cents, bonus, disposed_on, notes,
+                         added_at_event, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14, ?15, ?15)
+                     ON CONFLICT(id) DO UPDATE SET
+                        description = excluded.description,
+                        asset_account_id = excluded.asset_account_id,
+                        expense_account_id = excluded.expense_account_id,
+                        accumulated_account_id = excluded.accumulated_account_id,
+                        section_179_account_id = excluded.section_179_account_id,
+                        acquired_on = excluded.acquired_on,
+                        placed_in_service = excluded.placed_in_service,
+                        cost_cents = excluded.cost_cents,
+                        property_class = excluded.property_class,
+                        system = excluded.system,
+                        section_179_cents = excluded.section_179_cents,
+                        bonus = excluded.bonus,
+                        notes = excluded.notes,
+                        updated_at_event = excluded.updated_at_event",
+                    params![
+                        d.asset_id,
+                        d.description,
+                        d.asset_account_id,
+                        d.expense_account_id,
+                        d.accumulated_account_id,
+                        d.section_179_account_id,
+                        d.acquired_on.to_string(),
+                        d.placed_in_service.to_string(),
+                        d.cost_cents,
+                        d.property_class,
+                        d.system,
+                        d.section_179_cents,
+                        d.bonus,
+                        d.notes,
+                        stored_event.id,
+                    ],
+                )?;
+            }
+            // A disposal touches one column, deliberately: everything else about
+            // the asset stays true, and the depreciation already taken against it
+            // is still the depreciation already taken against it.
+            Event::DepreciableAssetDisposed {
+                asset_id,
+                disposed_on,
+            } => {
+                self.conn.execute(
+                    "UPDATE depreciable_assets
+                        SET disposed_on = ?2, updated_at_event = ?3
+                      WHERE id = ?1",
+                    params![asset_id, disposed_on.to_string(), stored_event.id],
+                )?;
+            }
+            Event::DepreciableAssetRemoved { asset_id } => {
+                self.conn.execute(
+                    "DELETE FROM depreciable_assets WHERE id = ?1",
+                    params![asset_id],
+                )?;
+            }
             Event::UserAdded {
                 user_id,
                 username,
@@ -893,7 +1009,19 @@ impl<'a> Projector<'a> {
              -- and its colleagues do not, which is the divergence that made these
              -- events necessary in the first place.
              DELETE FROM tax_line_mappings;
-             DELETE FROM schedule_b_answers;",
+             DELETE FROM schedule_b_answers;
+             -- Projections too, and missing from this list until now: a rebuild
+             -- that left them behind was a merge rather than a replay, so a
+             -- relationship or a setting deleted from the log survived it. The
+             -- stakes are not academic — a stale spouse row keeps attributing
+             -- ownership under §267(c) and puts a partner on Schedule B-1 that
+             -- the log no longer justifies.
+             DELETE FROM partner_relationships;
+             DELETE FROM il1065_settings;
+             -- The asset register (migration 030). Derived from the log like the
+             -- rest: an asset no event justifies would otherwise keep claiming
+             -- depreciation on somebody's return after a replay.
+             DELETE FROM depreciable_assets;",
         )?;
 
         // Replay all events
