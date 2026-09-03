@@ -619,6 +619,76 @@ mod tests {
         assert!(build_from_ledger(s.connection(), 2025, Some(0)).is_ok());
     }
 
+    /// Many sole proprietors have never applied for an EIN — Schedule C line D
+    /// is optional and the return goes under the owner's own SSN. Demanding one
+    /// made the business details unsaveable for exactly the businesses this
+    /// feature is for.
+    #[test]
+    fn a_sole_proprietor_can_file_with_no_ein_at_all() {
+        let mut s = store();
+        set_business_type(&mut s, "u", BusinessType::SoleProprietorship).unwrap();
+        append(
+            &mut s,
+            "u",
+            Event::BusinessProfileSet(Box::new(BusinessProfileData {
+                legal_name: "Bunny Ears Art House".into(),
+                address: AddressData {
+                    street: "1808 W Summerdale Ave".into(),
+                    suite: None,
+                    city: "Chicago".into(),
+                    state: "IL".into(),
+                    postal_code: "60640".into(),
+                    country: None,
+                },
+                ein: String::new(),
+                naics_code: "611610".into(),
+                formation_date: chrono::NaiveDate::from_ymd_opt(2023, 4, 13).unwrap(),
+                principal_activity: Some("Fine arts instruction".into()),
+                principal_product: None,
+            })),
+        )
+        .expect("an absent EIN is a legitimate profile");
+        set_proprietor(&mut s, "u", &proprietor()).unwrap();
+
+        let bundle = build_from_ledger(s.connection(), 2025, Some(0)).expect("a Schedule C");
+        assert!(bundle.pdf.len() > 1000);
+        // And nothing complains about the missing number, because nothing should.
+        assert!(
+            !bundle.warnings.iter().any(|w| w.contains("EIN")),
+            "{:?}",
+            bundle.warnings
+        );
+    }
+
+    /// A malformed EIN is still refused — absence and a typo are different.
+    #[test]
+    fn an_ein_that_is_present_and_malformed_is_still_refused() {
+        use crate::commands::partnership_commands::check_set_profile_pure;
+        use crate::domain::{Address, BusinessProfile};
+
+        let profile = |ein: &str| BusinessProfile {
+            legal_name: "Bunny Ears Art House".into(),
+            address: Address {
+                street: "1808 W Summerdale Ave".into(),
+                suite: None,
+                city: "Chicago".into(),
+                state: "IL".into(),
+                postal_code: "60640".into(),
+                country: None,
+            },
+            ein: ein.into(),
+            naics_code: "611610".into(),
+            formation_date: chrono::NaiveDate::from_ymd_opt(2023, 4, 13).unwrap(),
+            principal_activity: None,
+            principal_product: None,
+        };
+
+        assert!(check_set_profile_pure(&profile("")).is_ok(), "absent is allowed");
+        assert!(check_set_profile_pure(&profile("12-3456789")).is_ok());
+        assert!(check_set_profile_pure(&profile("123456789")).is_err(), "no hyphen");
+        assert!(check_set_profile_pure(&profile("12-345678")).is_err(), "too short");
+    }
+
     #[test]
     fn an_unknown_question_key_is_refused() {
         let mut s = store();

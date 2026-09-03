@@ -63,10 +63,17 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::BusinessProfileSet(d) => {
             let (legal_name, address, ein, naics_code) = (&d.legal_name, &d.address, &d.ein, &d.naics_code);
             validate_non_empty(legal_name, "legal_name")?;
-            // Checked for shape, not for existence: a mistyped EIN is a rejected
-            // return weeks later, and the shape is the only half of that we can
-            // catch here.
-            if !crate::domain::is_valid_ein(ein) {
+            // Checked for shape, and only when there is one to check. A sole
+            // proprietorship may have no EIN at all — Schedule C line D is
+            // optional and the return is identified by the owner's own SSN — and
+            // this event does not carry the business type, so it cannot know
+            // which case it is in. Whether a *particular return* can be filed
+            // without one is a question for whoever is filing it: the command
+            // layer refuses it for a partnership, and `form1065` warns.
+            //
+            // Shape when present is still worth catching here: a mistyped EIN is
+            // a rejected return weeks later.
+            if !ein.is_empty() && !crate::domain::is_valid_ein(ein) {
                 return Err(ValidationError::InvalidValue(format!(
                     "EIN {ein:?} is not NN-NNNNNNN"
                 )));

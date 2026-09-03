@@ -45,6 +45,8 @@
 
 use std::collections::BTreeMap;
 
+use chrono::Datelike;
+
 use lopdf::Document;
 
 use super::acroform::{FormError, field_map, set_check, set_text, strip_xfa};
@@ -712,6 +714,31 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
         set_text(&mut doc, &map, field::L4_COST_OF_GOODS, &format_dollars(cogs))?;
     }
 
+    // --- what the books *can* answer, and the form asks anyway ---
+    //
+    // The date the business started has no box on Schedule C, which made it look
+    // like a Form 1065 field a sole proprietor was being asked for out of habit.
+    // It is not: question H asks whether the business started or was acquired
+    // during the year, and the business details already know. Checked rather
+    // than filled in, because "started" and "acquired" are not the same event and
+    // only the filer knows which this was.
+    let started_this_year = req.profile.formation_date.year() == req.year;
+    match (started_this_year, req.answers.get("h")) {
+        (true, Some(YES)) | (false, None) | (false, Some(NO)) => {}
+        (true, _) => warnings.push(format!(
+            "The business details say this business started on {}, and question H asks whether \
+             it started or was acquired during {}. H is not ticked. Tick it, or correct the date \
+             on the Settings page — they cannot both be right.",
+            req.profile.formation_date, req.year
+        )),
+        (false, Some(YES)) => warnings.push(format!(
+            "Question H says the business started or was acquired during {}, but the business \
+             details give {} as the date it started. One of the two is wrong.",
+            req.year, req.profile.formation_date
+        )),
+        (false, Some(_)) => {}
+    }
+
     // --- what the books cannot answer ---
     if req.home_office_dollars.is_none() {
         warnings.push(
@@ -1196,6 +1223,50 @@ mod tests {
         };
         let warnings = build(&req, &c).unwrap().warnings;
         assert!(warnings.iter().any(|w| w.contains("revision")), "{warnings:?}");
+    }
+
+    /// The date the business started has no box on this form, which made it look
+    /// like a Form 1065 field a sole proprietor was asked for out of habit. It
+    /// is not — question H asks the same thing, and the two have to agree.
+    #[test]
+    fn the_date_the_business_started_is_checked_against_question_h() {
+        let c = computed(&[("sc1", 100_000)]);
+        let p = proprietor();
+        let profile = profile(); // started 13 April 2023
+
+        let build_for = |year: i32, h: Option<&str>| {
+            let mut answers = ScheduleC::default();
+            if let Some(v) = h {
+                answers.set("h", v);
+            }
+            let req = ScheduleCRequest {
+                year,
+                profile: &profile,
+                proprietor: Some(&p),
+                ssn: None,
+                answers: &answers,
+                home_office_dollars: Some(0),
+            };
+            build(&req, &c).unwrap().warnings
+        };
+
+        // Filing 2023, the year it started, with H unticked.
+        let w = build_for(2023, None);
+        assert!(w.iter().any(|w| w.contains("H is not ticked")), "{w:?}");
+
+        // Same year, H ticked — nothing to say.
+        let w = build_for(2023, Some(YES));
+        assert!(!w.iter().any(|w| w.contains("question H")), "{w:?}");
+
+        // A later year with H ticked contradicts the date.
+        let w = build_for(2025, Some(YES));
+        assert!(w.iter().any(|w| w.contains("One of the two is wrong")), "{w:?}");
+
+        // A later year, H unanswered or No — the ordinary case, silent.
+        for h in [None, Some(NO)] {
+            let w = build_for(2025, h);
+            assert!(!w.iter().any(|x| x.contains("question H")), "{h:?}: {w:?}");
+        }
     }
 
     #[test]

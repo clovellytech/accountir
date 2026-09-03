@@ -735,6 +735,21 @@ fn build_return_inner(
 fn check(req: &ReturnRequest, filed: &[&PartnerFiling]) -> Vec<String> {
     let mut out = Vec::new();
 
+    // An absent EIN is allowed when the profile is saved, because a sole
+    // proprietorship may genuinely have none — Schedule C line D is optional and
+    // the return goes under the owner's own SSN. A partnership may not: the
+    // return is matched to the entity by that number. The event cannot tell the
+    // two apart, because it does not carry the business type; this can, because
+    // by here the form being filled is a Form 1065.
+    if req.profile.ein.trim().is_empty() {
+        out.push(
+            "The partnership has no EIN, so the box at the top of page 1 and the same box on \
+             every Schedule K-1 are blank. A partnership return is matched to the entity by that \
+             number — it is on the Settings page, under Business details."
+                .to_string(),
+        );
+    }
+
     if req.year != FORM_TAX_YEAR {
         out.push(format!(
             "The bundled forms are the {FORM_TAX_YEAR} revision, but this is a {} return. \
@@ -2328,6 +2343,27 @@ mod tests {
             all.len()
         );
         warning_shape::assert_all(&all);
+    }
+
+    /// The mirror of the sole proprietor's case: absence is allowed when the
+    /// profile is saved, and refused at the point a partnership return is built,
+    /// because that is where which return is being filed is finally known.
+    #[test]
+    fn a_partnership_with_no_ein_is_told_before_it_files() {
+        let mut req = two_partner_request();
+        req.profile.ein = String::new();
+        let bundle =
+            build_return_inner(&req, &Default::default(), Vec::new()).expect("a return");
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("no EIN")),
+            "{:?}",
+            bundle.warnings
+        );
+
+        // And a partnership that has one is not nagged about it.
+        let bundle =
+            build_return_inner(&two_partner_request(), &Default::default(), Vec::new()).unwrap();
+        assert!(!bundle.warnings.iter().any(|w| w.contains("no EIN")));
     }
 
     /// The register reaches the bundle as a Form 4562, and the reconciliation
