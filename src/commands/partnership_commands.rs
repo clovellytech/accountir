@@ -150,10 +150,11 @@ pub(crate) fn check_set_profile_pure(profile: &BusinessProfile) -> Result<(), Pa
             "the partnership's legal name is required".to_string(),
         ));
     }
-    // Shape when present, and absence is allowed: a sole proprietorship files
-    // Schedule C under the owner's SSN and line D is optional. Which returns can
-    // go without one is decided where the business type is known — see
-    // `events::validation` on why this event cannot decide it.
+    // Shape when present, and absence is allowed: a sole proprietorship may never
+    // have applied for an EIN. Not that the number is unimportant — one the
+    // business has is reported on Schedule C line D — only that having one is not
+    // universal. Which returns can go without one is decided where the business
+    // type is known; see `events::validation` on why this event cannot decide it.
     let ein = profile.ein.trim();
     if !ein.is_empty() && !crate::domain::is_valid_ein(ein) {
         return Err(PartnershipError::InvalidData(format!(

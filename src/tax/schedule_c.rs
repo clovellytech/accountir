@@ -496,7 +496,10 @@ mod field {
     pub const BUSINESS_CODE: &str = "f1_4[0]";
     /// C, business name.
     pub const BUSINESS_NAME: &str = "f1_5[0]";
-    /// D, EIN — optional on this form, unlike a partnership's.
+    /// D, the business's EIN. Reported whenever the business has one — it is not
+    /// "the partnership box" and not a place to repeat the SSN, which the
+    /// instructions forbid outright. What is optional is *having* an EIN, not
+    /// entering one you have.
     pub const EIN: &str = "f1_6[0]";
     /// E, address.
     pub const STREET: &str = "f1_7[0]";
@@ -749,6 +752,18 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
     if lines.is_mapped("sc9") {
         warnings.push(
             "Line 9 carries car and truck expenses, so Part IV has to be completed — the date              the vehicle went into service, the miles split between business, commuting and              other, and four questions about its use. None of that is in a ledger, so Part IV is              blank. If a Form 4562 is required for this business, Part IV is answered there              instead."
+                .to_string(),
+        );
+    }
+    // Wages mean employees, and employees mean an EIN. You cannot file a Form 941
+    // or issue a W-2 without one, so a Schedule C reporting wages with line D
+    // blank is describing a business that could not have paid them.
+    if lines.is_mapped("sc26") && req.profile.ein.trim().is_empty() {
+        warnings.push(
+            "Line 26 reports wages, so this business has employees — and an employer must have \
+             an EIN, because Forms 941 and W-2 are filed under it. Line D is blank. If the \
+             business has an EIN, it belongs in the business details on the Settings page; if it \
+             has none, it cannot have employees."
                 .to_string(),
         );
     }
@@ -1267,6 +1282,50 @@ mod tests {
             let w = build_for(2025, h);
             assert!(!w.iter().any(|x| x.contains("question H")), "{h:?}: {w:?}");
         }
+    }
+
+    /// An EIN a sole proprietor has is reported on line D — it is not the
+    /// partnership's box, and the digits go in without the hyphen because the box
+    /// is a nine-character comb.
+    #[test]
+    fn a_sole_proprietors_ein_is_reported_on_line_d() {
+        let c = computed(&[("sc1", 100_000)]);
+        let (doc, warnings) = built(&c, Some(&proprietor()), Some("123-45-6789"));
+
+        assert_eq!(box_of(&doc, field::EIN), "123456789");
+        // The SSN is the owner's and belongs at the top, never on line D.
+        assert_eq!(box_of(&doc, field::SSN), "123-45-6789");
+        assert_ne!(box_of(&doc, field::EIN), box_of(&doc, field::SSN));
+        assert!(!warnings.iter().any(|w| w.contains("Line 26")), "{warnings:?}");
+    }
+
+    /// Wages mean employees, and an employer must have an EIN — Forms 941 and
+    /// W-2 are filed under it. A Schedule C reporting wages with line D blank
+    /// describes a business that could not have paid them.
+    #[test]
+    fn wages_with_no_ein_are_reported() {
+        let c = computed(&[("sc1", 100_000), ("sc26", 40_000)]);
+        let answers = ScheduleC::default();
+        let mut profile = profile();
+        profile.ein = String::new();
+        let p = proprietor();
+        let req = ScheduleCRequest {
+            year: FORM_TAX_YEAR,
+            profile: &profile,
+            proprietor: Some(&p),
+            ssn: Some("123-45-6789"),
+            answers: &answers,
+            home_office_dollars: Some(0),
+        };
+        let warnings = build(&req, &c).unwrap().warnings;
+        assert!(
+            warnings.iter().any(|w| w.contains("must have") && w.contains("EIN")),
+            "{warnings:?}"
+        );
+
+        // With an EIN, nothing to say — and no wages, nothing to say either.
+        let (_, w) = built(&c, Some(&p), None);
+        assert!(!w.iter().any(|x| x.contains("Line 26")), "{w:?}");
     }
 
     #[test]

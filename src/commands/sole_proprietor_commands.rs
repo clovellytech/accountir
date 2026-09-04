@@ -619,10 +619,14 @@ mod tests {
         assert!(build_from_ledger(s.connection(), 2025, Some(0)).is_ok());
     }
 
-    /// Many sole proprietors have never applied for an EIN — Schedule C line D
-    /// is optional and the return goes under the owner's own SSN. Demanding one
-    /// made the business details unsaveable for exactly the businesses this
-    /// feature is for.
+    /// Many sole proprietors have never applied for an EIN, and the return is
+    /// identified by the owner's SSN regardless. Demanding one made the business
+    /// details unsaveable for exactly the businesses this feature is for.
+    ///
+    /// What is optional is *having* an EIN, not reporting one you have: an EIN
+    /// the business holds goes on Schedule C line D, which
+    /// `tax::schedule_c::tests::a_sole_proprietors_ein_is_reported_on_line_d`
+    /// covers.
     #[test]
     fn a_sole_proprietor_can_file_with_no_ein_at_all() {
         let mut s = store();

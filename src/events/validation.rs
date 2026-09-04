@@ -64,9 +64,9 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             let (legal_name, address, ein, naics_code) = (&d.legal_name, &d.address, &d.ein, &d.naics_code);
             validate_non_empty(legal_name, "legal_name")?;
             // Checked for shape, and only when there is one to check. A sole
-            // proprietorship may have no EIN at all — Schedule C line D is
-            // optional and the return is identified by the owner's own SSN — and
-            // this event does not carry the business type, so it cannot know
+            // proprietorship may have no EIN, because many never need to apply
+            // for one — an EIN it *does* have is reported on Schedule C line D.
+            // This event does not carry the business type, so it cannot know
             // which case it is in. Whether a *particular return* can be filed
             // without one is a question for whoever is filing it: the command
             // layer refuses it for a partnership, and `form1065` warns.
