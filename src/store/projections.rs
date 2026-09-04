@@ -559,12 +559,20 @@ impl<'a> Projector<'a> {
                     params![entry_id],
                 )?;
             }
+            // Migration 032. This arm used to be empty — "for now, we'll skip
+            // this" — so the command appended the event, returned Ok, and the
+            // note was unreadable forever after. Keyed by event id so a replay
+            // rewrites the same row rather than adding a second copy.
             Event::JournalEntryAnnotated {
-                entry_id: _,
-                annotation: _,
+                entry_id,
+                annotation,
             } => {
-                // Annotations could be stored in a separate table
-                // For now, we'll skip this
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO journal_entry_annotations
+                        (event_id, entry_id, annotation, created_at)
+                     VALUES (?1, ?2, ?3, datetime('now'))",
+                    params![stored_event.id, entry_id, annotation],
+                )?;
             }
             Event::JournalLineReassigned {
                 entry_id: _,
@@ -1066,6 +1074,7 @@ impl<'a> Projector<'a> {
              DELETE FROM currencies;
              DELETE FROM fiscal_periods;
              DELETE FROM fiscal_years;
+             DELETE FROM journal_entry_annotations;
              DELETE FROM journal_lines;
              DELETE FROM journal_entries;
              DELETE FROM accounts;

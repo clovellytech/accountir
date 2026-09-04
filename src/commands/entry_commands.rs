@@ -142,6 +142,91 @@ pub(crate) fn check_reference_free_in_txn(
         .optional()?)
 }
 
+/// One note somebody added to an entry, newest last.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Annotation {
+    pub annotation: String,
+    /// The event that recorded it — also the order they were made in.
+    pub event_id: i64,
+    pub created_at: String,
+}
+
+/// Every note on one entry, oldest first.
+///
+/// All of them, not just the latest. A note that was corrected is part of the
+/// record — the reader who needs to know a cheque was described as one thing and
+/// later as another is the reader this exists for. Callers wanting one line to
+/// print take [`latest_annotation`].
+pub fn annotations_for(conn: &rusqlite::Connection, entry_id: &str) -> Vec<Annotation> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT annotation, event_id, created_at
+           FROM journal_entry_annotations
+          WHERE entry_id = ?1
+          ORDER BY event_id",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map([entry_id], |r| {
+        Ok(Annotation {
+            annotation: r.get(0)?,
+            event_id: r.get(1)?,
+            created_at: r.get(2)?,
+        })
+    });
+    rows.map(|r| r.flatten().collect()).unwrap_or_default()
+}
+
+/// The most recent note on an entry, which is what a one-line view shows.
+pub fn latest_annotation(conn: &rusqlite::Connection, entry_id: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT annotation FROM journal_entry_annotations
+          WHERE entry_id = ?1 ORDER BY event_id DESC LIMIT 1",
+        [entry_id],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// The latest note for each of many entries, for a list that shows one per row.
+///
+/// One query rather than one per entry: the journal renders hundreds of rows and
+/// a per-row lookup is what makes a list scroll badly.
+pub fn latest_annotations(
+    conn: &rusqlite::Connection,
+    entry_ids: &[String],
+) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if entry_ids.is_empty() {
+        return out;
+    }
+    // Built rather than bound in one go because rusqlite has no array binding;
+    // the ids are uuids this crate minted, and `?` placeholders keep them out of
+    // the SQL text regardless.
+    let placeholders = std::iter::repeat_n("?", entry_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT entry_id, annotation FROM journal_entry_annotations
+          WHERE event_id IN (
+                SELECT MAX(event_id) FROM journal_entry_annotations
+                 WHERE entry_id IN ({placeholders}) GROUP BY entry_id)"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return out;
+    };
+    let params = rusqlite::params_from_iter(entry_ids.iter());
+    if let Ok(rows) = stmt.query_map(params, |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) {
+        for (id, note) in rows.flatten() {
+            out.insert(id, note);
+        }
+    }
+    out
+}
+
 /// A line in a journal entry command
 #[derive(Debug, Clone)]
 pub struct EntryLine {
@@ -1270,8 +1355,15 @@ mod tests {
         assert_eq!(is_void, 1, "A remains voided after the rejected unvoid");
     }
 
+    /// The note has to be readable afterwards.
+    ///
+    /// This test used to stop at `.unwrap()`, and passed for as long as the
+    /// projection for this event was an empty block with `// For now, we'll skip
+    /// this` in it. A test that asserts a write returned Ok and never that the
+    /// thing written can be read back is a test that cannot fail for the reason
+    /// it exists.
     #[test]
-    fn annotate_entry_happy_path() {
+    fn an_annotation_can_be_read_back() {
         let mut store = setup();
         create_test_accounts(&mut store);
         let entry_id = post_simple_entry(&mut store);
@@ -1279,9 +1371,106 @@ mod tests {
         EntryCommands::new(&mut store, "user".to_string())
             .annotate_entry(AnnotateEntryCommand {
                 entry_id: entry_id.clone(),
-                annotation: "reviewed".to_string(),
+                annotation: "January rent — cheque to the landlord".to_string(),
             })
             .unwrap();
+
+        let notes = annotations_for(store.connection(), &entry_id);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].annotation, "January rent — cheque to the landlord");
+        assert_eq!(
+            latest_annotation(store.connection(), &entry_id).as_deref(),
+            Some("January rent — cheque to the landlord")
+        );
+    }
+
+    /// Every note is kept, oldest first, and the latest is what a one-line view
+    /// shows. A corrected note is part of the record rather than a replacement
+    /// for one.
+    #[test]
+    fn a_corrected_note_keeps_the_one_it_corrected() {
+        let mut store = setup();
+        create_test_accounts(&mut store);
+        let entry_id = post_simple_entry(&mut store);
+
+        for note in ["Rent?", "January rent", "January rent — landlord, cheque 1234"] {
+            EntryCommands::new(&mut store, "user".to_string())
+                .annotate_entry(AnnotateEntryCommand {
+                    entry_id: entry_id.clone(),
+                    annotation: note.to_string(),
+                })
+                .unwrap();
+        }
+
+        let notes = annotations_for(store.connection(), &entry_id);
+        assert_eq!(notes.len(), 3, "an earlier note was overwritten");
+        assert_eq!(notes[0].annotation, "Rent?");
+        assert_eq!(
+            latest_annotation(store.connection(), &entry_id).as_deref(),
+            Some("January rent — landlord, cheque 1234")
+        );
+    }
+
+    /// The imported memo is what the bank said and is never touched by a note.
+    /// It is how the entry matches the statement and how a re-import is spotted
+    /// as a duplicate, so a note sits beside it rather than over it.
+    #[test]
+    fn annotating_leaves_the_banks_own_memo_alone() {
+        let mut store = setup();
+        create_test_accounts(&mut store);
+        let entry_id = post_simple_entry(&mut store);
+
+        let memo_before: String = store
+            .connection()
+            .query_row(
+                "SELECT memo FROM journal_entries WHERE id = ?1",
+                [&entry_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        EntryCommands::new(&mut store, "user".to_string())
+            .annotate_entry(AnnotateEntryCommand {
+                entry_id: entry_id.clone(),
+                annotation: "January rent".to_string(),
+            })
+            .unwrap();
+
+        let memo_after: String = store
+            .connection()
+            .query_row(
+                "SELECT memo FROM journal_entries WHERE id = ?1",
+                [&entry_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(memo_before, memo_after);
+    }
+
+    /// The journal renders hundreds of rows, so the list view reads every
+    /// entry's latest note in one query rather than one per row.
+    #[test]
+    fn the_latest_note_for_many_entries_comes_back_in_one_lookup() {
+        let mut store = setup();
+        create_test_accounts(&mut store);
+        let a = post_simple_entry(&mut store);
+        let b = post_simple_entry(&mut store);
+        let c = post_simple_entry(&mut store);
+
+        for (id, note) in [(&a, "first"), (&a, "second"), (&b, "only")] {
+            EntryCommands::new(&mut store, "user".to_string())
+                .annotate_entry(AnnotateEntryCommand {
+                    entry_id: id.clone(),
+                    annotation: note.to_string(),
+                })
+                .unwrap();
+        }
+
+        let ids = vec![a.clone(), b.clone(), c.clone()];
+        let map = latest_annotations(store.connection(), &ids);
+        assert_eq!(map.get(&a).map(String::as_str), Some("second"));
+        assert_eq!(map.get(&b).map(String::as_str), Some("only"));
+        assert!(!map.contains_key(&c), "an entry with no note has no row");
     }
 
     #[test]

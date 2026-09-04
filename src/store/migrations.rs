@@ -116,6 +116,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             include_str!("../../migrations/030_depreciable_assets.sql"),
         ),
         (31, include_str!("../../migrations/031_schedule_c.sql")),
+        (
+            32,
+            include_str!("../../migrations/032_journal_entry_annotations.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -569,6 +573,20 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             elects_pte_tax INTEGER NOT NULL DEFAULT 0,
             updated_at_event INTEGER REFERENCES events(id)
         );
+
+        -- Notes added to an entry after it was posted (migration 032). The
+        -- imported memo is what the bank said and stays untouched; this is what
+        -- a person says it was for. Every note is kept, keyed by the event that
+        -- made it, so a replay is idempotent.
+        CREATE TABLE IF NOT EXISTS journal_entry_annotations (
+            event_id INTEGER PRIMARY KEY REFERENCES events(id),
+            entry_id TEXT NOT NULL,
+            annotation TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_journal_entry_annotations_entry
+            ON journal_entry_annotations(entry_id, event_id);
 
         -- Sole proprietorships (migration 031): which return these books file,
         -- and who files it. `business_type` lives on the profile row because it

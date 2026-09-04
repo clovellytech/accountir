@@ -22,6 +22,7 @@ use crate::commands::entry_commands::{
     EntryCommandError, PostEntryStep, ReassignLineCommand, ReassignLineStep, UnvoidEntryCommand,
     VoidEntryCommand,
 };
+use rusqlite::OptionalExtension;
 use crate::events::types::Event;
 use crate::store::event_store::Verdict;
 use crate::sync::{
@@ -36,6 +37,7 @@ pub fn router() -> Router<SyncState> {
         .route("/sync/commands/unvoid-entry", post(submit_unvoid_entry))
         .route("/sync/commands/reassign-lines", post(submit_reassign_lines))
         .route("/sync/commands/void-entries", post(submit_void_entries))
+        .route("/sync/commands/annotate-entry", post(submit_annotate_entry))
 }
 
 /// Void a journal entry over the wire. Serde-reusable DTO (the client half can
@@ -69,6 +71,62 @@ async fn submit_void_entry(
             move |tx| match build_void_entry_in_txn(tx, &cmd)? {
                 PostEntryStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
                 PostEntryStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<EntryCommandError>)
+}
+
+/// Add a note to a journal entry over the wire. Serde-reusable DTO.
+#[derive(Serialize, Deserialize)]
+pub struct AnnotateEntryRequest {
+    pub expected_head_seq: i64,
+    pub entry_id: String,
+    pub annotation: String,
+}
+
+/// Note a journal entry, validated server-side.
+///
+/// The entry must exist, re-checked under the write lock, because an annotation
+/// against an id that names nothing is a note nobody will ever see. No other
+/// invariant: notes are additive by design, so two members annotating the same
+/// entry at once is two notes rather than a conflict.
+async fn submit_annotate_entry(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<AnnotateEntryRequest>,
+) -> Result<Json<SubmitResponse>, ApiError> {
+    if req.annotation.trim().is_empty() {
+        return Err(ApiError::bad_request("annotation is required"));
+    }
+    let (entry_id, annotation) = (req.entry_id, req.annotation.trim().to_string());
+
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| {
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM journal_entries WHERE id = ?1",
+                        [&entry_id],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if !exists {
+                    return Ok(Verdict::Reject(EntryCommandError::NotFound(
+                        entry_id.clone(),
+                    )));
+                }
+                Ok(Verdict::Append(stamp(
+                    crate::events::types::Event::JournalEntryAnnotated {
+                        entry_id: entry_id.clone(),
+                        annotation: annotation.clone(),
+                    },
+                    &actor,
+                )))
             },
             project,
         )

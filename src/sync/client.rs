@@ -1462,6 +1462,27 @@ impl SyncClient {
         .await
     }
 
+    /// Add a note to an entry on the group's books.
+    ///
+    /// Blind retry on a stale head is safe: notes are additive, so re-sending one
+    /// against a newer head means what it meant against the old one. The only
+    /// risk of a retry is a duplicate note, and `submit_retrying` retries a
+    /// rejected head rather than a successful append.
+    pub async fn annotate_entry(
+        &mut self,
+        entry_id: &str,
+        annotation: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/annotate-entry", |head| {
+            crate::sync::commands::entry_ops::AnnotateEntryRequest {
+                expected_head_seq: head,
+                entry_id: entry_id.to_string(),
+                annotation: annotation.to_string(),
+            }
+        })
+        .await
+    }
+
     /// Say which return the group's books file.
     ///
     /// Blind retry on a stale head is safe for the same reason the mapping
