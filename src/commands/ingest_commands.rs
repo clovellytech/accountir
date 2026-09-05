@@ -53,6 +53,8 @@ pub const MAPPING_DEFS: &[MappingDef] = &[
     MappingDef { key: "square_fees", label: "Processing fees (expense)", group: "Square sales" },
     MappingDef { key: "sales_tax_payable", label: "Sales tax payable (liability)", group: "Square sales" },
     MappingDef { key: "tips_payable", label: "Tips payable (liability)", group: "Square sales" },
+    MappingDef { key: "customer_deposits", label: "Customer deposits held (liability)", group: "Square sales" },
+    MappingDef { key: "gift_card_liability", label: "Gift cards outstanding (liability)", group: "Square sales" },
     MappingDef { key: "payroll_wages_expense", label: "Wages expense", group: "Square payroll" },
     MappingDef { key: "payroll_tax_expense", label: "Employer payroll taxes (expense)", group: "Square payroll" },
     MappingDef { key: "payroll_taxes_payable", label: "Payroll taxes payable (liability)", group: "Square payroll" },

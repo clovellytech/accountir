@@ -78,6 +78,16 @@ mod columns {
     pub const SALES_TIPS: &[&str] = &["tips"];
     pub const SALES_FEES: &[&str] = &["fees", "square fees"];
     pub const SALES_NET_TOTAL: &[&str] = &["net total"];
+    pub const SALES_TOTAL_SALES: &[&str] = &["total sales"];
+    /// Money taken now against a sale not yet made — a deposit on a booking.
+    pub const SALES_PARTIAL_PAYMENTS: &[&str] = &["partial payments"];
+    /// A deposit taken earlier being applied to a sale now. Negative on the
+    /// report, because the money already arrived in an earlier period.
+    pub const SALES_DEPOSITS_REDEEMED: &[&str] = &["deposits redeemed"];
+    pub const SALES_GIFT_CARDS: &[&str] = &["gift card sales"];
+    /// Money handed back that is not an item return — the report keeps the two
+    /// apart, and only this one moves the balance on its own line.
+    pub const SALES_REFUNDS_BY_AMOUNT: &[&str] = &["refunds by amount"];
 
     // ---- Payroll "Company Totals" matrix (labels in the header row; the
     //      authoritative figures live in the "Total" row). Value for a label is
@@ -132,6 +142,40 @@ struct SalesSummary {
     tax: i64,
     tips: i64,
     fees: i64, // positive magnitude
+    /// Partial payments taken plus deposits redeemed, netted. Cash that moved
+    /// without being this period's revenue: money held for a sale not yet made,
+    /// less money held earlier and earned now.
+    deposits: i64,
+    gift_cards: i64,
+    /// Negative on the report and kept negative here.
+    refunds_by_amount: i64,
+    /// Set when the figures do not reconcile to the report's own "Net total".
+    ///
+    /// Carried rather than printed. This used to go to stderr, where a desktop
+    /// user never saw it — so a report whose columns had drifted imported
+    /// quietly and wrongly.
+    reconciliation: Option<String>,
+}
+
+impl SalesSummary {
+    /// What actually reached the Square balance — the report's "Net total".
+    ///
+    /// Revenue, tax and tips are what was earned; deposits, gift cards and
+    /// refunds are money that moved without being earned this period; fees come
+    /// off. Anything left out here shows up as a reconciliation warning rather
+    /// than as a quietly wrong deposit.
+    fn net_to_balance(&self) -> i64 {
+        self.revenue + self.tax + self.tips + self.deposits + self.gift_cards
+            + self.refunds_by_amount
+            - self.fees
+    }
+}
+
+/// Cents as a signed dollar figure, for a message somebody reads.
+fn format_cents(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let a = cents.abs();
+    format!("{sign}${}.{:02}", a / 100, a % 100)
 }
 
 /// Look up a value from the label→amount map by candidate labels: exact
@@ -175,23 +219,40 @@ fn parse_sales_summary(content: &str) -> SalesSummary {
             - pick(&map, columns::SALES_DISCOUNTS).unwrap_or(0).abs()
     });
 
-    let summary = SalesSummary {
+    // Deposits net out: money taken for a future sale, less a deposit taken
+    // earlier and applied now. Both are on the report and neither is revenue.
+    let deposits = pick(&map, columns::SALES_PARTIAL_PAYMENTS).unwrap_or(0)
+        + pick(&map, columns::SALES_DEPOSITS_REDEEMED).unwrap_or(0);
+
+    let mut summary = SalesSummary {
         revenue,
         tax: pick(&map, columns::SALES_TAX).unwrap_or(0),
         tips: pick(&map, columns::SALES_TIPS).unwrap_or(0),
         fees: pick(&map, columns::SALES_FEES).unwrap_or(0).abs(),
+        deposits,
+        gift_cards: pick(&map, columns::SALES_GIFT_CARDS).unwrap_or(0),
+        refunds_by_amount: pick(&map, columns::SALES_REFUNDS_BY_AMOUNT).unwrap_or(0),
+        reconciliation: None,
     };
 
-    // Integrity check: our net-to-balance should equal the report's own
-    // "Net total". A mismatch means a column label drifted — surface it loudly
-    // rather than silently posting an unbalanced-looking deposit.
+    // The report's own arithmetic, checked against ours. "Net total" is what
+    // actually reached the Square balance, so if the two disagree this is
+    // reading the wrong columns and the deposit posted would be wrong.
+    //
+    // "Deferred sales" is deliberately not in the sum: it is revenue recognised
+    // in another period rather than money that moved, and including it was what
+    // made this check fail on twenty of twenty-four real reports.
     if let Some(reported_net) = pick(&map, columns::SALES_NET_TOTAL) {
-        let computed = summary.revenue + summary.tax + summary.tips - summary.fees;
+        let computed = summary.net_to_balance();
         if computed != reported_net {
-            eprintln!(
-                "square-sales: computed net {} != reported 'Net total' {} — check column mapping",
-                computed, reported_net
-            );
+            summary.reconciliation = Some(format!(
+                "This report's own \"Net total\" is {}, and the columns read here come to {} — \
+                 a difference of {}. Something on the report is not being accounted for, so the \
+                 deposit this would post is wrong by that amount. Check it before importing.",
+                format_cents(reported_net),
+                format_cents(computed),
+                format_cents(computed - reported_net)
+            ));
         }
     }
 
@@ -227,6 +288,12 @@ pub fn plan_square_sales(
     if s.revenue == 0 && s.tax == 0 && s.tips == 0 && s.fees == 0 {
         return Ok((None, summary));
     }
+    // A report that does not reconcile to its own "Net total" is refused rather
+    // than posted. The deposit would be wrong by the difference, and a deposit
+    // that is wrong looks exactly like one that is right.
+    if let Some(problem) = &s.reconciliation {
+        return Err(IngestError::EntryError(problem.clone()));
+    }
 
     let reference = if start == end {
         format!("square-sales-{}", start.format("%Y-%m-%d"))
@@ -242,17 +309,30 @@ pub fn plan_square_sales(
         return Ok((None, summary));
     }
 
+    // Only what this report actually needs. A month with no tips should not
+    // demand a tips account, and a business that never takes a deposit should
+    // never be asked for one.
     let mut required = vec!["pos_square", "pos_revenue", "square_fees"];
-    if s.tax > 0 {
+    if s.tax != 0 {
         required.push("sales_tax_payable");
     }
-    if s.tips > 0 {
+    if s.tips != 0 {
         required.push("tips_payable");
+    }
+    if s.deposits != 0 {
+        required.push("customer_deposits");
+    }
+    if s.gift_cards != 0 {
+        required.push("gift_card_liability");
+    }
+    if s.refunds_by_amount != 0 {
+        required.push("refunds");
     }
     let mappings = load_ingest_mappings(conn, &required)?;
 
-    // Net change to the Square balance (matches the report's "Net total").
-    let net_to_balance = s.revenue + s.tax + s.tips - s.fees;
+    // Net change to the Square balance — the report's own "Net total", which
+    // `parse_sales_summary` has already reconciled against.
+    let net_to_balance = s.net_to_balance();
 
     let mut lines = vec![
         EntryLine::debit(&mappings["pos_square"], net_to_balance, "USD")
@@ -267,15 +347,36 @@ pub fn plan_square_sales(
     lines.push(
         EntryLine::credit(&mappings["pos_revenue"], s.revenue, "USD").with_memo("Sales revenue"),
     );
-    if s.tax > 0 {
+    if s.tax != 0 {
         lines.push(
             EntryLine::credit(&mappings["sales_tax_payable"], s.tax, "USD")
                 .with_memo("Sales tax collected"),
         );
     }
-    if s.tips > 0 {
+    if s.tips != 0 {
         lines.push(
             EntryLine::credit(&mappings["tips_payable"], s.tips, "USD").with_memo("Tips collected"),
+        );
+    }
+    // Money that moved without being earned this period. Credited when held,
+    // debited when released — a deposit taken is a liability, and one redeemed
+    // against a sale gives it back.
+    if s.deposits != 0 {
+        lines.push(
+            EntryLine::credit(&mappings["customer_deposits"], s.deposits, "USD")
+                .with_memo("Customer deposits taken, less deposits redeemed"),
+        );
+    }
+    if s.gift_cards != 0 {
+        lines.push(
+            EntryLine::credit(&mappings["gift_card_liability"], s.gift_cards, "USD")
+                .with_memo("Gift cards sold"),
+        );
+    }
+    if s.refunds_by_amount != 0 {
+        lines.push(
+            EntryLine::credit(&mappings["refunds"], s.refunds_by_amount, "USD")
+                .with_memo("Refunds paid out"),
         );
     }
 
@@ -569,7 +670,90 @@ mod tests {
         assert_eq!(s.tips, 0);
         assert_eq!(s.fees, 4426);
         // Net to Square balance must equal the report's "Net total".
-        assert_eq!(s.revenue + s.tax + s.tips - s.fees, 159785);
+        assert_eq!(s.net_to_balance(), 159785);
+        assert!(s.reconciliation.is_none(), "{:?}", s.reconciliation);
+    }
+
+    /// A real month from this ledger, with the rows the parser used to ignore.
+    ///
+    /// Deposits, gift cards and refunds-by-amount are money that reached the
+    /// Square balance without being this period's revenue. Leaving them out made
+    /// the deposit wrong by their total — which the report's own "Net total"
+    /// catches, and which went to stderr where nobody saw it.
+    #[test]
+    fn deposits_and_gift_cards_are_money_that_moved() {
+        let csv = "\"Sales summary - Summary\",\" \"\n\
+Gross sales,\"$26,362.90\"\n\
+Returns,($250.00)\n\
+Discounts & comps,($177.75)\n\
+Net sales,\"$25,935.15\"\n\
+Deferred sales,($100.00)\n\
+Gift card sales,$0.00\n\
+Partial payments,\"$1,100.00\"\n\
+Deposits redeemed,\"($1,200.00)\"\n\
+Taxes,$13.31\n\
+Tips,$100.00\n\
+Refunds by amount,($150.00)\n\
+Total sales,\"$25,798.46\"\n\
+Fees,($861.39)\n\
+Square fees,($861.39)\n\
+Net total,\"$24,937.07\"\n";
+        let s = parse_sales_summary(csv);
+        assert_eq!(s.revenue, 2593515);
+        assert_eq!(s.tips, 10000);
+        assert_eq!(s.deposits, 110000 - 120000, "taken less redeemed");
+        assert_eq!(s.refunds_by_amount, -15000);
+        assert_eq!(s.fees, 86139);
+
+        // The whole point: this now reconciles to the report's own figure.
+        assert_eq!(s.net_to_balance(), 2493707);
+        assert!(s.reconciliation.is_none(), "{:?}", s.reconciliation);
+    }
+
+    /// "Deferred sales" is revenue recognised in another period, not money that
+    /// moved. Counting it broke the reconciliation on twenty of this ledger's
+    /// twenty-four reports.
+    #[test]
+    fn deferred_sales_is_not_a_movement_of_money() {
+        let with_deferred = "Net sales,$1000.00\n\
+Deferred sales,($600.00)\n\
+Taxes,$0.00\n\
+Tips,$0.00\n\
+Fees,$0.00\n\
+Net total,\"$1,000.00\"\n";
+        let s = parse_sales_summary(with_deferred);
+        assert_eq!(s.net_to_balance(), 100000);
+        assert!(
+            s.reconciliation.is_none(),
+            "deferred sales was counted: {:?}",
+            s.reconciliation
+        );
+    }
+
+    /// A report whose columns do not add up to its own "Net total" is reported
+    /// rather than posted — the deposit would be wrong by the difference, and a
+    /// wrong deposit looks exactly like a right one.
+    #[test]
+    fn a_report_that_does_not_reconcile_says_so_and_is_refused() {
+        let csv = "Net sales,$1000.00\n\
+Taxes,$0.00\n\
+Tips,$0.00\n\
+Fees,$0.00\n\
+Net total,\"$1,234.00\"\n";
+        let s = parse_sales_summary(csv);
+        let problem = s.reconciliation.expect("should not reconcile");
+        assert!(problem.contains("$1,234.00") || problem.contains("$1234.00"), "{problem}");
+
+        // And the planner refuses it rather than posting.
+        let store = crate::store::event_store::EventStore::in_memory().unwrap();
+        crate::store::migrations::init_schema(store.connection()).unwrap();
+        let err = plan_square_sales(
+            store.connection(),
+            csv,
+            "sales-summary-2025-01-01-2025-01-31.csv",
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("not being accounted for"), "{err}");
     }
 
     #[test]
