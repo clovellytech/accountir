@@ -108,6 +108,83 @@ fn dollars(cents: i64) -> String {
     format!("{sign}${}.{:02}", a / 100, a % 100)
 }
 
+/// What the summary's one "account activity" figure is actually made of.
+///
+/// Stripe's balance summary nets charges, refunds, top-ups and adjustments into
+/// a single `activity_gross`, and the importer had no choice but to call the
+/// whole of it revenue. On this ledger that booked a $2,000.00 bank wire as
+/// sales in June 2024 and quietly netted $3,160.00 of refunds against income.
+///
+/// The itemized export breaks the same figure out by `reporting_category`, and
+/// its rows sum to exactly the summary's activity — which is what makes it safe
+/// to use: the two reports are checked against each other before either is
+/// trusted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ItemizedActivity {
+    /// What customers paid.
+    pub charges: i64,
+    /// Negative: money handed back.
+    pub refunds: i64,
+    /// Positive: money wired to Stripe to fund the balance.
+    pub topups: i64,
+    /// Everything else Stripe puts through the balance.
+    pub adjustments: i64,
+    /// Stripe's cut, as a positive figure.
+    pub fees: i64,
+}
+
+impl ItemizedActivity {
+    /// What the summary would call `activity_gross`.
+    pub fn gross(&self) -> i64 {
+        self.charges + self.refunds + self.topups + self.adjustments
+    }
+}
+
+/// Read an "Itemized balance change from activity" export.
+///
+/// Activity only — it carries no payouts, which is why it supplements the
+/// summary rather than replacing it.
+pub fn parse_itemized_activity(content: &str) -> Result<ItemizedActivity, IngestError> {
+    let mut lines = content.lines();
+    let header = lines.next().ok_or_else(|| {
+        IngestError::MissingMapping("the itemized export is empty".to_string())
+    })?;
+    let cols: Vec<String> = parse_delimited_line(header.trim_start_matches('\u{feff}'), ',')
+        .into_iter()
+        .map(|c| c.trim().trim_matches('"').to_ascii_lowercase())
+        .collect();
+    let at = |name: &str| cols.iter().position(|c| c == name);
+    let (Some(gross_at), Some(fee_at), Some(cat_at)) =
+        (at("gross"), at("fee"), at("reporting_category"))
+    else {
+        return Err(IngestError::MissingMapping(
+            "this does not look like an itemized balance change: no 'reporting_category',              'gross' and 'fee' columns"
+                .to_string(),
+        ));
+    };
+
+    let mut out = ItemizedActivity::default();
+    for line in lines {
+        let f = parse_delimited_line(line, ',');
+        if f.len() <= gross_at.max(fee_at).max(cat_at) {
+            continue;
+        }
+        let cell = |i: usize| f[i].trim().trim_matches('"').to_string();
+        let Some(gross) = parse_amount(&cell(gross_at)) else { continue };
+        out.fees += parse_amount(&cell(fee_at)).unwrap_or(0);
+        match cell(cat_at).as_str() {
+            "charge" => out.charges += gross,
+            "refund" => out.refunds += gross,
+            "topup" => out.topups += gross,
+            // Named categories only where the treatment differs; anything else
+            // is still balance movement and still has to be carried, or the
+            // cross-check against the summary would fail for the wrong reason.
+            _ => out.adjustments += gross,
+        }
+    }
+    Ok(out)
+}
+
 /// Read a balance summary.
 pub fn parse_balance_summary(content: &str) -> Result<BalanceSummary, IngestError> {
     let mut out = BalanceSummary::default();
@@ -171,6 +248,22 @@ pub fn plan_stripe(
     content: &str,
     file_name: &str,
 ) -> Result<Option<PostEntryCommand>, IngestError> {
+    plan_stripe_with_activity(conn, content, None, file_name)
+}
+
+/// The same, with the itemized export for the period when one is to hand.
+///
+/// Without it the summary's single activity figure has to be called revenue
+/// whole, which books a top-up as sales and nets refunds against income. With
+/// it each category goes where it belongs — and the two reports are checked
+/// against each other first, so a mismatched pair is refused rather than
+/// half-believed.
+pub fn plan_stripe_with_activity(
+    conn: &Connection,
+    content: &str,
+    itemized: Option<&str>,
+    file_name: &str,
+) -> Result<Option<PostEntryCommand>, IngestError> {
     let (start, end) = extract_period(file_name).ok_or_else(|| {
         IngestError::InvalidDate(format!(
             "no YYYY-MM-DD period found in the filename '{file_name}'"
@@ -194,7 +287,31 @@ pub fn plan_stripe(
         return Ok(None);
     }
 
+    let items = match itemized {
+        Some(raw) => {
+            let it = parse_itemized_activity(raw)?;
+            if it.gross() != s.activity_gross {
+                return Err(IngestError::EntryError(format!(
+                    "the itemized export for this period comes to {} of activity and the balance \
+                     summary reports {} — a difference of {}. They are not the same period, or \
+                     one of them is incomplete.",
+                    dollars(it.gross()),
+                    dollars(s.activity_gross),
+                    dollars(it.gross() - s.activity_gross)
+                )));
+            }
+            Some(it)
+        }
+        None => None,
+    };
+
     let mut required = vec!["pos_stripe", "stripe_revenue"];
+    if items.as_ref().is_some_and(|i| i.refunds != 0) {
+        required.push("refunds");
+    }
+    if items.as_ref().is_some_and(|i| i.topups != 0) {
+        required.push("stripe_payouts_in_transit");
+    }
     if s.fees() != 0 {
         required.push("stripe_fees");
     }
@@ -227,10 +344,38 @@ pub fn plan_stripe(
                 .with_memo("Topped up from the bank"),
         );
     }
-    lines.push(
-        EntryLine::signed(&m["stripe_revenue"], -s.activity_gross, "USD")
-            .with_memo("Stripe sales"),
-    );
+    match &items {
+        // Each category to its own account. A refund is not negative revenue, a
+        // top-up is not revenue at all, and an adjustment is neither.
+        Some(it) => {
+            lines.push(
+                EntryLine::signed(&m["stripe_revenue"], -it.charges, "USD")
+                    .with_memo("Stripe charges"),
+            );
+            if it.refunds != 0 {
+                lines.push(
+                    EntryLine::signed(&m["refunds"], -it.refunds, "USD")
+                        .with_memo("Stripe refunds"),
+                );
+            }
+            if it.topups != 0 {
+                lines.push(
+                    EntryLine::signed(&m["stripe_payouts_in_transit"], -it.topups, "USD")
+                        .with_memo("Topped up from the bank"),
+                );
+            }
+            if it.adjustments != 0 {
+                lines.push(
+                    EntryLine::signed(&m["stripe_revenue"], -it.adjustments, "USD")
+                        .with_memo("Stripe balance adjustments"),
+                );
+            }
+        }
+        None => lines.push(
+            EntryLine::signed(&m["stripe_revenue"], -s.activity_gross, "USD")
+                .with_memo("Stripe sales"),
+        ),
+    }
     lines.retain(|l| l.amount != 0);
 
     Ok(Some(PostEntryCommand {
@@ -254,7 +399,19 @@ pub fn ingest_stripe(
     content: &str,
     file_name: &str,
 ) -> Result<bool, IngestError> {
-    let Some(cmd) = plan_stripe(store.connection(), content, file_name)? else {
+    ingest_stripe_with_activity(store, user_id, content, None, file_name)
+}
+
+/// The same, with the period's itemized export when the folder holds one.
+pub fn ingest_stripe_with_activity(
+    store: &mut crate::store::event_store::EventStore,
+    user_id: &str,
+    content: &str,
+    itemized: Option<&str>,
+    file_name: &str,
+) -> Result<bool, IngestError> {
+    let Some(cmd) = plan_stripe_with_activity(store.connection(), content, itemized, file_name)?
+    else {
         return Ok(false);
     };
     let mut commands =
@@ -356,6 +513,97 @@ mod tests {
         assert_eq!(clearing, 9500 - 200000, "a payout debits it, a top-up credits it");
         let of = |a: &str| cmd.lines.iter().find(|l| l.account_id == a).map(|l| l.amount);
         assert_eq!(of("balance"), Some(200000), "the balance rose by the top-up");
+    }
+
+    /// The summary's one activity figure is not revenue, and the itemized
+    /// export is what says so.
+    ///
+    /// June 2024 on this ledger: Stripe reports $4,765.00 of "account activity",
+    /// which is $5,925.00 of charges less $3,160.00 of refunds plus a $2,000.00
+    /// wire the business sent to fund the balance. Called revenue whole, it
+    /// books the wire as sales and hides the refunds inside income.
+    #[test]
+    fn the_itemized_export_splits_activity_into_what_it_actually_was() {
+        let summary = "\"category\",\"description\",\"net_amount\",\"currency\"\n\
+\"starting_balance\",\"Starting balance\",\"383.24\",\"usd\"\n\
+\"activity_gross\",\"Account activity before fees\",\"4765.00\",\"usd\"\n\
+\"activity_fee\",\"Less fees\",\"-175.17\",\"usd\"\n\
+\"payouts_gross\",\"Payouts to bank\",\"-4973.07\",\"usd\"\n\
+\"payouts_fee\",\"Payout fees\",\"0.00\",\"usd\"\n\
+\"ending_balance\",\"Ending balance\",\"0.00\",\"usd\"\n";
+        let itemized = "\"balance_transaction_id\",\"created\",\"available_on\",\"currency\",\
+\"gross\",\"fee\",\"net\",\"reporting_category\",\"description\"\n\
+\"txn_a\",\"2024-06-01\",\"2024-06-04\",\"usd\",\"5925.00\",\"175.17\",\"5749.83\",\"charge\",\"c\"\n\
+\"txn_b\",\"2024-06-10\",\"2024-06-11\",\"usd\",\"-3160.00\",\"0.00\",\"-3160.00\",\"refund\",\"r\"\n\
+\"txn_c\",\"2024-06-07\",\"2024-06-07\",\"usd\",\"2000.00\",\"0.00\",\"2000.00\",\"topup\",\"wire\"\n";
+        let it = parse_itemized_activity(itemized).unwrap();
+        assert_eq!((it.charges, it.refunds, it.topups), (592500, -316000, 200000));
+        assert_eq!(it.gross(), 476500, "and it sums to the summary's activity");
+
+        let store = crate::store::event_store::EventStore::in_memory().unwrap();
+        crate::store::migrations::init_schema(store.connection()).unwrap();
+        for (k, a) in [
+            ("pos_stripe", "balance"),
+            ("stripe_revenue", "revenue"),
+            ("stripe_fees", "fees"),
+            ("stripe_payouts_in_transit", "clearing"),
+            ("refunds", "refunds"),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO ingest_account_mappings (key, account_id) VALUES (?1, ?2)",
+                    rusqlite::params![k, a],
+                )
+                .unwrap();
+        }
+        let name = "Balance_Summary_USD_2024-06-01_to_2024-06-30_America-Chicago.csv";
+        let cmd = plan_stripe_with_activity(store.connection(), summary, Some(itemized), name)
+            .unwrap()
+            .expect("an entry");
+        assert_eq!(cmd.lines.iter().map(|l| l.amount).sum::<i64>(), 0, "balances");
+        let of = |a: &str| {
+            cmd.lines.iter().filter(|l| l.account_id == a).map(|l| l.amount).sum::<i64>()
+        };
+        assert_eq!(of("revenue"), -592500, "the charges, and only the charges");
+        assert_eq!(of("refunds"), 316000, "refunds are their own account, not less revenue");
+        assert_eq!(of("clearing"), 497307 - 200000, "the payout out, the top-up in");
+
+        // Without it, all three collapse into one revenue line.
+        let plain = plan_stripe(store.connection(), summary, name).unwrap().expect("an entry");
+        assert_eq!(
+            plain.lines.iter().filter(|l| l.account_id == "revenue").map(|l| l.amount).sum::<i64>(),
+            -476500,
+            "which is the wire and the refunds buried in sales"
+        );
+    }
+
+    /// The two reports are checked against each other before either is used: a
+    /// pair from different periods would otherwise post a confident entry built
+    /// from two unrelated months.
+    #[test]
+    fn a_mismatched_pair_of_reports_is_refused() {
+        let summary = "\"category\",\"description\",\"net_amount\",\"currency\"\n\
+\"starting_balance\",\"Starting balance\",\"0.00\",\"usd\"\n\
+\"activity_gross\",\"Account activity before fees\",\"4765.00\",\"usd\"\n\
+\"activity_fee\",\"Less fees\",\"0.00\",\"usd\"\n\
+\"payouts_gross\",\"Payouts to bank\",\"-4765.00\",\"usd\"\n\
+\"payouts_fee\",\"Payout fees\",\"0.00\",\"usd\"\n\
+\"ending_balance\",\"Ending balance\",\"0.00\",\"usd\"\n";
+        let wrong_month = "\"balance_transaction_id\",\"created\",\"available_on\",\"currency\",\
+\"gross\",\"fee\",\"net\",\"reporting_category\",\"description\"\n\
+\"txn_a\",\"2024-07-01\",\"2024-07-02\",\"usd\",\"100.00\",\"0.00\",\"100.00\",\"charge\",\"c\"\n";
+        let store = crate::store::event_store::EventStore::in_memory().unwrap();
+        crate::store::migrations::init_schema(store.connection()).unwrap();
+        let err = plan_stripe_with_activity(
+            store.connection(),
+            summary,
+            Some(wrong_month),
+            "Balance_Summary_USD_2024-06-01_to_2024-06-30_America-Chicago.csv",
+        )
+        .expect_err("the two do not describe the same period");
+        let msg = err.to_string();
+        assert!(msg.contains("$100.00") && msg.contains("$4765.00"), "{msg}");
     }
 
     /// The payout leg must not go straight to checking.
