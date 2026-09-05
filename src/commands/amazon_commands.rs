@@ -45,7 +45,7 @@ use crate::commands::account_commands::find_or_create_uncategorized;
 use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
 use crate::commands::import_commands::{parse_amount, parse_date, parse_delimited_line};
 use crate::commands::ingest_commands::{
-    check_idempotent, load_all_mappings, load_ingest_mappings, post_ingest_entry, IngestError,
+    load_all_mappings, load_ingest_mappings, post_ingest_entry, IngestError,
 };
 use crate::events::types::JournalEntrySource;
 use crate::store::event_store::EventStore;
@@ -269,7 +269,7 @@ pub fn plan_amazon_entries(
     let mut to_post: Vec<(Charge, String)> = Vec::new();
     for charge in parsed.charges {
         let reference = charge_reference(&charge);
-        if check_idempotent(conn, &reference).is_some() {
+        if charge_already_imported(conn, &charge) {
             summary.skipped_duplicates += 1;
         } else {
             to_post.push((charge, reference));
@@ -375,6 +375,38 @@ fn charge_reference(c: &Charge) -> String {
     )
 }
 
+/// Whether this charge is already in the ledger, ignoring the payment date.
+///
+/// # Why the date is written but not matched on
+///
+/// Amazon moves a charge's payment date between exports — a settlement that read
+/// as the 5th on Monday reads as the 6th a week later. The date is part of
+/// [`charge_reference`], so the same charge came back under a new key and posted
+/// a second time; nine orders on this ledger were imported twice that way, and
+/// the reference index could not see it because the two references genuinely
+/// differed.
+///
+/// The date stays in the written reference: every entry already in the books
+/// carries it, and changing the format would orphan all of them and re-import
+/// the lot. So the format is kept and the *lookup* drops the date, which fixes
+/// re-imports going forward and stays compatible with everything already posted.
+///
+/// The obvious worry is a collision — one order settling twice for the same
+/// amount on the same card, which this would wrongly treat as a duplicate.
+/// Amazon's own per-charge `Payment Reference ID` is 1:1 with the charges in
+/// this export (209 for 209), and across it no order has two charges differing
+/// only by date. A genuine repeat would need the same order, amount and card
+/// twice, which is what a re-export looks like anyway.
+fn charge_already_imported(conn: &Connection, c: &Charge) -> bool {
+    let pattern = format!("amazon-{}-%-{}-{}", c.order_id, c.payment_amount, c.card_last4);
+    conn.query_row(
+        "SELECT 1 FROM journal_entries WHERE reference LIKE ?1 AND is_void = 0 LIMIT 1",
+        [&pattern],
+        |_| Ok(true),
+    )
+    .unwrap_or(false)
+}
+
 /// Human-readable card label, e.g. "Mastercard ••1234".
 fn card_label(c: &Charge) -> String {
     if c.card_last4.is_empty() {
@@ -453,7 +485,7 @@ pub fn plan_amazon_orders(store: &EventStore, content: &str) -> AmazonPlan {
         .charges
         .iter()
         .map(|c| {
-            let already_imported = check_idempotent(conn, &charge_reference(c)).is_some();
+            let already_imported = charge_already_imported(conn, c);
             let items_sum: i64 = c.items.iter().map(|(_, a)| a).sum();
             PlannedCharge {
                 order_id: c.order_id.clone(),
@@ -472,6 +504,88 @@ pub fn plan_amazon_orders(store: &EventStore, content: &str) -> AmazonPlan {
         cancelled_orders: parsed.cancelled_orders,
         pending_orders: parsed.pending_orders,
         clearing_account_id,
+    }
+}
+
+
+#[cfg(test)]
+mod reimport_tests {
+    use super::*;
+    use crate::store::migrations::init_schema;
+
+    fn charge(order: &str, date: (i32, u32, u32), cents: i64, card: &str) -> Charge {
+        Charge {
+            order_id: order.to_string(),
+            date: chrono::NaiveDate::from_ymd_opt(date.0, date.1, date.2).unwrap(),
+            payment_amount: cents,
+            card_last4: card.to_string(),
+            card_type: "Visa".to_string(),
+            items: Vec::new(),
+        }
+    }
+
+    /// The reported defect: Amazon moved a charge's payment date between
+    /// exports, the date is part of the reference, and the same charge posted a
+    /// second time. Nine orders on the real ledger arrived twice this way.
+    #[test]
+    fn a_charge_whose_payment_date_moved_is_recognised_as_already_imported() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let first = charge("114-2102713-7939431", (2026, 4, 5), 806, "1174");
+        conn.execute(
+            "INSERT INTO journal_entries (id, date, memo, reference, is_void) \
+             VALUES ('e1', '2026-04-05', 'Amazon', ?1, 0)",
+            [charge_reference(&first)],
+        )
+        .unwrap();
+        assert!(charge_already_imported(&conn, &first), "the same export again");
+
+        // The same charge, one day later — a different reference entirely.
+        let moved = charge("114-2102713-7939431", (2026, 4, 6), 806, "1174");
+        assert_ne!(charge_reference(&first), charge_reference(&moved));
+        assert!(
+            charge_already_imported(&conn, &moved),
+            "a shifted payment date is the same charge, not a new one"
+        );
+    }
+
+    /// The date is the only thing ignored. A different order, amount or card is
+    /// a different charge, and treating one as a duplicate would silently drop
+    /// a real purchase.
+    #[test]
+    fn only_the_date_is_ignored_when_matching() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let base = charge("114-2102713-7939431", (2026, 4, 5), 806, "1174");
+        conn.execute(
+            "INSERT INTO journal_entries (id, date, memo, reference, is_void) \
+             VALUES ('e1', '2026-04-05', 'Amazon', ?1, 0)",
+            [charge_reference(&base)],
+        )
+        .unwrap();
+        for other in [
+            charge("114-0000000-0000000", (2026, 4, 5), 806, "1174"),
+            charge("114-2102713-7939431", (2026, 4, 5), 807, "1174"),
+            charge("114-2102713-7939431", (2026, 4, 5), 806, "1007"),
+        ] {
+            assert!(!charge_already_imported(&conn, &other), "{:?}", charge_reference(&other));
+        }
+    }
+
+    /// A voided entry does not block a re-import: voiding is how a bad import is
+    /// undone, and the charge has to be able to come back.
+    #[test]
+    fn a_voided_entry_does_not_count_as_imported() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        let c = charge("114-2102713-7939431", (2026, 4, 5), 806, "1174");
+        conn.execute(
+            "INSERT INTO journal_entries (id, date, memo, reference, is_void) \
+             VALUES ('e1', '2026-04-05', 'Amazon', ?1, 1)",
+            [charge_reference(&c)],
+        )
+        .unwrap();
+        assert!(!charge_already_imported(&conn, &c));
     }
 }
 

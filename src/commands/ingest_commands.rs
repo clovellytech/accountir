@@ -29,6 +29,13 @@ pub enum IngestError {
     MissingPayment,
     #[error("Payments total {got} cents but the transaction is {expected} cents")]
     PaymentMismatch { expected: i64, got: i64 },
+    #[error(
+        "'{key}' is mapped to {account}, which a bank feed already fills. Importing would \
+         record the same money twice: the platform's report says it left the platform and \
+         the feed says it arrived at the bank. Map '{key}' to a clearing account instead, \
+         and categorise the bank deposits against that same account."
+    )]
+    ClearingIsBankFeed { key: String, account: String },
 }
 
 pub struct IngestResult {
@@ -41,35 +48,77 @@ pub struct MappingDef {
     pub key: &'static str,
     pub label: &'static str,
     pub group: &'static str,
+    /// A sentence shown under the row when the label alone is not enough to
+    /// pick the right account. Empty for the ones that are self-evident.
+    pub note: &'static str,
+}
+
+/// Mapping roles that must not point at an account a bank feed also fills.
+///
+/// These are holding accounts: money sits in them between two events that are
+/// recorded separately. A platform's own report says the money left the
+/// platform; the bank feed says it arrived at the bank. Both are true, and
+/// pointing them at the same account records the arrival twice.
+///
+/// The clearing account is what makes the two meet: the report debits it, the
+/// bank deposit credits it, and a balance that does not return to zero is a
+/// payout that never landed — which is worth knowing.
+pub const SETTLED_BY_ANOTHER_FEED: &[&str] = &[
+    "stripe_payouts_in_transit",
+    "sawyer_clearing",
+    "amazon_clearing",
+    "pos_square",
+    "pos_stripe",
+];
+
+/// Whether an account is filled by a Plaid bank feed.
+///
+/// A missing table is not an error: books with no bank connection have nothing
+/// to collide with.
+pub fn is_bank_feed_account(conn: &Connection, account_id: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM plaid_local_accounts WHERE local_account_id = ?1",
+        [account_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
 }
 
 /// Canonical list of ingest account-mapping keys — the single source of truth
 /// shared by the server's validation and the desktop mapping editor.
 pub const MAPPING_DEFS: &[MappingDef] = &[
-    MappingDef { key: "pos_square", label: "Square balance (asset)", group: "Square" },
-    MappingDef { key: "pos_stripe", label: "Stripe balance (asset)", group: "Stripe" },
-    MappingDef { key: "pos_revenue", label: "Sales revenue", group: "Square sales" },
-    MappingDef { key: "refunds", label: "Refunds / returns (contra-revenue)", group: "Square sales" },
-    MappingDef { key: "square_fees", label: "Processing fees (expense)", group: "Square sales" },
-    MappingDef { key: "sales_tax_payable", label: "Sales tax payable (liability)", group: "Square sales" },
-    MappingDef { key: "tips_payable", label: "Tips payable (liability)", group: "Square sales" },
-    MappingDef { key: "customer_deposits", label: "Customer deposits held (liability)", group: "Square sales" },
-    MappingDef { key: "gift_card_liability", label: "Gift cards outstanding (liability)", group: "Square sales" },
-    MappingDef { key: "sawyer_clearing", label: "Sawyer balance owed to you (asset)", group: "Sawyer" },
-    MappingDef { key: "sawyer_revenue", label: "Class and camp revenue", group: "Sawyer" },
-    MappingDef { key: "sawyer_fees", label: "Sawyer platform fees (expense)", group: "Sawyer" },
-    MappingDef { key: "stripe_fees", label: "Stripe processing fees (expense)", group: "Stripe" },
-    MappingDef { key: "stripe_revenue", label: "Stripe sales revenue", group: "Stripe" },
-    MappingDef { key: "stripe_payout_bank", label: "Bank account Stripe pays out to (asset)", group: "Stripe" },
-    MappingDef { key: "payroll_wages_expense", label: "Wages expense", group: "Square payroll" },
-    MappingDef { key: "payroll_tax_expense", label: "Employer payroll taxes (expense)", group: "Square payroll" },
-    MappingDef { key: "payroll_taxes_payable", label: "Payroll taxes payable (liability)", group: "Square payroll" },
-    MappingDef { key: "pos_cash", label: "Cash (POS)", group: "Point of sale" },
-    MappingDef { key: "cogs", label: "Cost of goods sold (expense)", group: "Inventory" },
-    MappingDef { key: "inventory", label: "Inventory (asset)", group: "Inventory" },
-    MappingDef { key: "inventory_adjustment", label: "Inventory adjustment", group: "Inventory" },
-    MappingDef { key: "accounts_payable", label: "Accounts payable (liability)", group: "Inventory" },
-    MappingDef { key: "amazon_clearing", label: "Amazon clearing/liability", group: "Amazon" },
+    MappingDef { key: "pos_square", label: "Square balance (asset)", group: "Square", note: "" },
+    MappingDef { key: "pos_stripe", label: "Stripe balance (asset)", group: "Stripe", note: "" },
+    MappingDef { key: "pos_revenue", label: "Sales revenue", group: "Square sales", note: "" },
+    MappingDef { key: "refunds", label: "Refunds / returns (contra-revenue)", group: "Square sales", note: "" },
+    MappingDef { key: "square_fees", label: "Processing fees (expense)", group: "Square sales", note: "" },
+    MappingDef { key: "sales_tax_payable", label: "Sales tax payable (liability)", group: "Square sales", note: "" },
+    MappingDef { key: "tips_payable", label: "Tips payable (liability)", group: "Square sales", note: "" },
+    MappingDef { key: "customer_deposits", label: "Customer deposits held (liability)", group: "Square sales", note: "" },
+    MappingDef { key: "gift_card_liability", label: "Gift cards outstanding (liability)", group: "Square sales", note: "" },
+    MappingDef { key: "sawyer_clearing", label: "Sawyer balance owed to you (asset)", group: "Sawyer", note: "" },
+    MappingDef { key: "sawyer_revenue", label: "Class and camp revenue", group: "Sawyer", note: "" },
+    MappingDef { key: "sawyer_fees", label: "Sawyer platform fees (expense)", group: "Sawyer", note: "" },
+    MappingDef { key: "stripe_fees", label: "Stripe processing fees (expense)", group: "Stripe", note: "" },
+    MappingDef { key: "stripe_revenue", label: "Stripe sales revenue", group: "Stripe", note: "" },
+    MappingDef {
+        key: "stripe_payouts_in_transit",
+        label: "Stripe payouts in transit (clearing asset)",
+        group: "Stripe",
+        note: "Not your checking account. Stripe's monthly report says the money left Stripe; \
+               your bank feed brings in each deposit as it lands. Both post here, and the \
+               balance returns to zero once a payout has arrived.",
+    },
+    MappingDef { key: "payroll_wages_expense", label: "Wages expense", group: "Square payroll", note: "" },
+    MappingDef { key: "payroll_tax_expense", label: "Employer payroll taxes (expense)", group: "Square payroll", note: "" },
+    MappingDef { key: "payroll_taxes_payable", label: "Payroll taxes payable (liability)", group: "Square payroll", note: "" },
+    MappingDef { key: "pos_cash", label: "Cash (POS)", group: "Point of sale", note: "" },
+    MappingDef { key: "cogs", label: "Cost of goods sold (expense)", group: "Inventory", note: "" },
+    MappingDef { key: "inventory", label: "Inventory (asset)", group: "Inventory", note: "" },
+    MappingDef { key: "inventory_adjustment", label: "Inventory adjustment", group: "Inventory", note: "" },
+    MappingDef { key: "accounts_payable", label: "Accounts payable (liability)", group: "Inventory", note: "" },
+    MappingDef { key: "amazon_clearing", label: "Amazon clearing/liability", group: "Amazon", note: "" },
 ];
 
 /// All valid ingest mapping keys.
@@ -319,6 +368,32 @@ pub fn load_ingest_mappings(
 
     if !missing.is_empty() {
         return Err(IngestError::MissingMapping(missing.join(", ")));
+    }
+
+    // Refuse before posting rather than after. A double-counted payout is not
+    // visibly wrong in the entry that causes it — it is wrong in a bank
+    // reconciliation weeks later, which is a far worse place to find it.
+    let mut clashes: Vec<&String> = mappings
+        .iter()
+        .filter(|(k, id)| {
+            SETTLED_BY_ANOTHER_FEED.contains(&k.as_str()) && is_bank_feed_account(conn, id)
+        })
+        .map(|(k, _)| k)
+        .collect();
+    clashes.sort();
+    if let Some(key) = clashes.first() {
+        let account_id = &mappings[*key];
+        let account = conn
+            .query_row(
+                "SELECT account_number || ' ' || name FROM accounts WHERE id = ?1",
+                [account_id],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| account_id.clone());
+        return Err(IngestError::ClearingIsBankFeed {
+            key: (*key).clone(),
+            account,
+        });
     }
 
     Ok(mappings)

@@ -1,0 +1,11 @@
+-- Stripe payouts move to a clearing account.
+--
+-- The old key invited the checking account by name, and a monthly payout total
+-- posted there double-counts against the individual deposits the bank feed
+-- already brings in. The role is a clearing account, so the key now says so.
+--
+-- The old mapping is dropped rather than carried over: whatever it points at is
+-- the wrong kind of account for the new role, and leaving it would preserve the
+-- mistake under a better name. The importer asks for the new mapping and
+-- refuses a bank-feed account.
+DELETE FROM ingest_account_mappings WHERE key = 'stripe_payout_bank';

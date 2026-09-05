@@ -120,6 +120,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             32,
             include_str!("../../migrations/032_journal_entry_annotations.sql"),
         ),
+        (
+            34,
+            include_str!("../../migrations/034_stripe_payouts_clear.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {

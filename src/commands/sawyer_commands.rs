@@ -330,24 +330,27 @@ pub fn plan_sawyer(
             continue;
         }
 
+        // Signed: a refunded order is a negative row, and at transaction grain
+        // there is nothing to net it against. Each line flips side rather than
+        // magnitude.
         let mut lines = vec![
-            EntryLine::debit(&mappings["sawyer_clearing"], g.to_provider, "USD")
+            EntryLine::signed(&mappings["sawyer_clearing"], g.to_provider, "USD")
                 .with_memo("Owed by Sawyer"),
         ];
         if g.stripe_fees != 0 {
             lines.push(
-                EntryLine::debit(&mappings["stripe_fees"], g.stripe_fees, "USD")
+                EntryLine::signed(&mappings["stripe_fees"], g.stripe_fees, "USD")
                     .with_memo("Stripe processing fees"),
             );
         }
         if g.sawyer_fees != 0 {
             lines.push(
-                EntryLine::debit(&mappings["sawyer_fees"], g.sawyer_fees, "USD")
+                EntryLine::signed(&mappings["sawyer_fees"], g.sawyer_fees, "USD")
                     .with_memo("Sawyer platform fees"),
             );
         }
         lines.push(
-            EntryLine::credit(&mappings["sawyer_revenue"], g.net_order, "USD")
+            EntryLine::signed(&mappings["sawyer_revenue"], -g.net_order, "USD")
                 .with_memo("Class and camp revenue"),
         );
         lines.retain(|l| l.amount != 0);

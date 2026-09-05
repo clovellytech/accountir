@@ -239,7 +239,19 @@ pub struct EntryLine {
 }
 
 impl EntryLine {
+    /// A debit of `amount`, which must not be negative.
+    ///
+    /// The `abs()` is a normalisation for callers that know the side they want
+    /// and hold the figure with whatever sign a report printed it. It is *not*
+    /// a way to pass a signed figure: a negative here silently becomes a debit
+    /// of the magnitude rather than the credit the caller meant, which unbalances
+    /// the entry. Use [`EntryLine::signed`] when the sign is data.
     pub fn debit(account_id: &str, amount: i64, currency: &str) -> Self {
+        debug_assert!(
+            amount >= 0,
+            "debit({account_id}, {amount}) — a negative debit is a credit, and `abs()` will not \
+             make it one. Use EntryLine::signed when the sign comes from the data."
+        );
         Self {
             account_id: account_id.to_string(),
             amount: amount.abs(),
@@ -249,10 +261,39 @@ impl EntryLine {
         }
     }
 
+    /// A credit of `amount`, which must not be negative. See [`EntryLine::debit`].
     pub fn credit(account_id: &str, amount: i64, currency: &str) -> Self {
+        debug_assert!(
+            amount >= 0,
+            "credit({account_id}, {amount}) — a negative credit is a debit, and `abs()` will not \
+             make it one. Use EntryLine::signed when the sign comes from the data."
+        );
         Self {
             account_id: account_id.to_string(),
             amount: -amount.abs(),
+            currency: currency.to_string(),
+            exchange_rate: None,
+            memo: None,
+        }
+    }
+
+    /// A line whose side is carried by the sign: positive debits, negative
+    /// credits.
+    ///
+    /// For figures that come from data rather than from the caller's intent. A
+    /// month of Square sales can have negative tips (a tip refunded), negative
+    /// net deposits (more redeemed than taken) and a refunds column that is
+    /// always negative — and each of those has to flip the side of its line, not
+    /// just its magnitude.
+    ///
+    /// The convention for a credit-natured figure is `signed(account, -x)`: it
+    /// credits when `x` is positive and debits when it is not, which is what
+    /// keeps an entry balanced whatever the report says. A zero-amount line is
+    /// still produced; callers that do not want one drop it themselves.
+    pub fn signed(account_id: &str, amount: i64, currency: &str) -> Self {
+        Self {
+            account_id: account_id.to_string(),
+            amount,
             currency: currency.to_string(),
             exchange_rate: None,
             memo: None,

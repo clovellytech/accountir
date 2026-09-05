@@ -25,6 +25,21 @@
 //! this report knows: it has no idea what was sold, to whom, or against which
 //! invoice. So the entry it produces is deliberately coarse — revenue, fees,
 //! payouts — and anything finer would have to be invented.
+//!
+//! # Payouts land in a clearing account, not the bank
+//!
+//! The payout leg is the one place this import can go quietly wrong. Stripe pays
+//! out on its own schedule, several times a month, and each of those deposits
+//! also arrives through the bank feed as its own transaction. A monthly total
+//! debited straight to checking would sit alongside the individual deposits it
+//! is made of, and the account would be overstated by the whole month.
+//!
+//! So `stripe_payouts_in_transit` is a clearing account. This import debits it;
+//! the bank deposits credit it as they land. Its balance is what Stripe has sent
+//! but the bank has not yet shown, and it returns to zero once everything has
+//! arrived — which makes it a check rather than just a workaround.
+//! [`load_ingest_mappings`] refuses to run if it is pointed at an account a bank
+//! feed already fills.
 
 use rusqlite::Connection;
 
@@ -163,27 +178,30 @@ pub fn plan_stripe(
         required.push("stripe_fees");
     }
     if s.paid_out() != 0 {
-        required.push("stripe_payout_bank");
+        required.push("stripe_payouts_in_transit");
     }
     let m = load_ingest_mappings(conn, &required)?;
 
     // The balance moves by what came in, less what Stripe took, less what was
     // paid away — which is the report's ending balance less its starting one.
+    // Signed throughout: the balance can fall over a month, and a period with
+    // more refunded than taken shows negative activity. Either flips the side of
+    // its line rather than just its magnitude.
     let mut lines = vec![
-        EntryLine::debit(&m["pos_stripe"], s.net_change(), "USD")
+        EntryLine::signed(&m["pos_stripe"], s.net_change(), "USD")
             .with_memo("Change in Stripe balance"),
     ];
     if s.fees() != 0 {
-        lines.push(EntryLine::debit(&m["stripe_fees"], s.fees(), "USD").with_memo("Stripe fees"));
+        lines.push(EntryLine::signed(&m["stripe_fees"], s.fees(), "USD").with_memo("Stripe fees"));
     }
     if s.paid_out() != 0 {
         lines.push(
-            EntryLine::debit(&m["stripe_payout_bank"], s.paid_out(), "USD")
-                .with_memo("Paid out to bank"),
+            EntryLine::signed(&m["stripe_payouts_in_transit"], s.paid_out(), "USD")
+                .with_memo("Paid out to bank — clears against the deposits"),
         );
     }
     lines.push(
-        EntryLine::credit(&m["stripe_revenue"], s.activity_gross, "USD")
+        EntryLine::signed(&m["stripe_revenue"], -s.activity_gross, "USD")
             .with_memo("Stripe sales"),
     );
     lines.retain(|l| l.amount != 0);
@@ -249,6 +267,66 @@ mod tests {
         assert_eq!(s.starting + s.net_change(), s.ending);
     }
 
+    /// The payout leg must not go straight to checking.
+    ///
+    /// Stripe pays out several times a month and every one of those deposits
+    /// also arrives through the bank feed. A monthly total debited to the same
+    /// account would sit on top of the deposits it is made of, and nothing in
+    /// the entry itself would look wrong — the damage shows up in a bank
+    /// reconciliation weeks later. So it is refused at the point of import.
+    #[test]
+    fn a_payout_mapped_to_a_bank_feed_account_is_refused() {
+        let store = crate::store::event_store::EventStore::in_memory().unwrap();
+        crate::store::migrations::init_schema(store.connection()).unwrap();
+        let conn = store.connection();
+        for (k, a) in [
+            ("pos_stripe", "stripe-balance"),
+            ("stripe_revenue", "revenue"),
+            ("stripe_fees", "fees"),
+            ("stripe_payouts_in_transit", "checking"),
+        ] {
+            conn.execute(
+                "INSERT INTO ingest_account_mappings (key, account_id) VALUES (?1, ?2)",
+                rusqlite::params![k, a],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO accounts (id, account_type, account_number, name) \
+             VALUES ('checking', 'asset', '1001', 'Business Checking')",
+            [],
+        )
+        .unwrap();
+        let file = "Balance_Summary_USD_2026-07-01_to_2026-07-31_America-Chicago.csv";
+
+        // With no bank connection there is nothing to collide with, so the same
+        // mapping imports cleanly. This is the control: the guard has to fire on
+        // the link, not on the key.
+        assert!(plan_stripe(conn, SAMPLE, file).unwrap().is_some());
+
+        conn.execute(
+            "INSERT INTO plaid_items (id, institution_name) VALUES ('i1', 'Bank')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plaid_local_accounts \
+                 (item_id, plaid_account_id, name, account_type, local_account_id) \
+             VALUES ('i1', 'p1', 'BUS COMPLETE CHK', 'depository', 'checking')",
+            [],
+        )
+        .unwrap();
+
+        let err = plan_stripe(conn, SAMPLE, file).expect_err("the double-count is refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stripe_payouts_in_transit")
+                && msg.contains("1001 Business Checking")
+                && msg.contains("bank feed"),
+            "the message has to name the mapping, the account, and the reason: {msg}"
+        );
+    }
+
     /// The entry balances, and each of the three things the report knows lands
     /// on its own line.
     #[test]
@@ -259,7 +337,7 @@ mod tests {
             ("pos_stripe", "stripe-balance"),
             ("stripe_revenue", "revenue"),
             ("stripe_fees", "fees"),
-            ("stripe_payout_bank", "bank"),
+            ("stripe_payouts_in_transit", "bank"),
         ] {
             store
                 .connection()
@@ -281,7 +359,7 @@ mod tests {
         assert_eq!(cmd.lines.iter().map(|l| l.amount).sum::<i64>(), 0, "balances");
         let of = |a: &str| cmd.lines.iter().find(|l| l.account_id == a).map(|l| l.amount);
         assert_eq!(of("fees"), Some(767), "fees are a cost");
-        assert_eq!(of("bank"), Some(18416), "the payout reached the bank");
+        assert_eq!(of("bank"), Some(18416), "the payout left Stripe for the bank");
         assert_eq!(of("revenue"), Some(-19183), "gross activity is the revenue");
         // The balance itself did not move this period, so it carries no line.
         assert_eq!(of("stripe-balance"), None);
