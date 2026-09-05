@@ -15,7 +15,9 @@ pub mod reconciliation_commands;
 pub mod recurring_transfers;
 pub mod vendor_rules;
 pub mod sole_proprietor_commands;
+pub mod sawyer_commands;
 pub mod square_commands;
+pub mod stripe_commands;
 
 pub use account_commands::*;
 pub use bill_commands::*;

@@ -111,7 +111,7 @@ pub struct SquareImportSummary {
 
 /// Find every `YYYY-MM-DD` in a string (e.g. a filename) and return the first
 /// and last as a (start, end) period.
-fn extract_period(name: &str) -> Option<(NaiveDate, NaiveDate)> {
+pub fn extract_period(name: &str) -> Option<(NaiveDate, NaiveDate)> {
     let mut found = Vec::new();
     let bytes = name.as_bytes();
     let mut i = 0;
