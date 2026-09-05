@@ -60,6 +60,11 @@ pub struct BalanceSummary {
     /// Negative: money leaving the balance for a bank account.
     pub payouts_gross: i64,
     pub payouts_fee: i64,
+    /// Positive: money sent *to* Stripe to fund the balance, the opposite of a
+    /// payout. Wired from the bank, so it is the same journey in reverse and
+    /// settles against the same clearing account.
+    pub topups_gross: i64,
+    pub topups_fee: i64,
     pub ending: i64,
     /// Set when the rows do not account for the movement the report itself
     /// reports between its starting and ending balances.
@@ -69,17 +74,31 @@ pub struct BalanceSummary {
 impl BalanceSummary {
     /// What the balance actually moved by, from the rows.
     pub fn net_change(&self) -> i64 {
-        self.activity_gross + self.activity_fee + self.payouts_gross + self.payouts_fee
+        self.activity_gross
+            + self.activity_fee
+            + self.payouts_gross
+            + self.payouts_fee
+            + self.topups_gross
+            + self.topups_fee
     }
 
     /// Everything Stripe took, as a positive figure.
     pub fn fees(&self) -> i64 {
-        -(self.activity_fee + self.payouts_fee)
+        -(self.activity_fee + self.payouts_fee + self.topups_fee)
     }
 
     /// What reached the bank, as a positive figure.
     pub fn paid_out(&self) -> i64 {
         -self.payouts_gross
+    }
+
+    /// What was sent to Stripe from the bank, as a positive figure.
+    ///
+    /// A payout run backwards: the bank pays Stripe instead of Stripe paying the
+    /// bank. The bank feed books its side to the same clearing account, so this
+    /// credits what a payout debits and the two meet there.
+    pub fn topped_up(&self) -> i64 {
+        self.topups_gross
     }
 }
 
@@ -114,6 +133,8 @@ pub fn parse_balance_summary(content: &str) -> Result<BalanceSummary, IngestErro
             "activity_fee" => out.activity_fee = amount,
             "payouts_gross" => out.payouts_gross = amount,
             "payouts_fee" => out.payouts_fee = amount,
+            "topups_gross" => out.topups_gross = amount,
+            "topups_fee" => out.topups_fee = amount,
             "ending_balance" => out.ending = amount,
             _ => {}
         }
@@ -160,7 +181,7 @@ pub fn plan_stripe(
     if let Some(problem) = &s.reconciliation {
         return Err(IngestError::EntryError(problem.clone()));
     }
-    if s.activity_gross == 0 && s.fees() == 0 && s.paid_out() == 0 {
+    if s.activity_gross == 0 && s.fees() == 0 && s.paid_out() == 0 && s.topped_up() == 0 {
         return Ok(None);
     }
 
@@ -177,7 +198,7 @@ pub fn plan_stripe(
     if s.fees() != 0 {
         required.push("stripe_fees");
     }
-    if s.paid_out() != 0 {
+    if s.paid_out() != 0 || s.topped_up() != 0 {
         required.push("stripe_payouts_in_transit");
     }
     let m = load_ingest_mappings(conn, &required)?;
@@ -198,6 +219,12 @@ pub fn plan_stripe(
         lines.push(
             EntryLine::signed(&m["stripe_payouts_in_transit"], s.paid_out(), "USD")
                 .with_memo("Paid out to bank — clears against the deposits"),
+        );
+    }
+    if s.topped_up() != 0 {
+        lines.push(
+            EntryLine::signed(&m["stripe_payouts_in_transit"], -s.topped_up(), "USD")
+                .with_memo("Topped up from the bank"),
         );
     }
     lines.push(
@@ -265,6 +292,70 @@ mod tests {
         // it has to come out as nothing.
         assert_eq!(s.net_change(), 0);
         assert_eq!(s.starting + s.net_change(), s.ending);
+    }
+
+    /// Money can go the other way: a wire to Stripe funding the balance.
+    ///
+    /// Stripe calls it a top-up and reports it beside the payouts. The export
+    /// this ledger has does not carry the category at all — thirty-seven files,
+    /// not one topups row — but the dashboard does, so a later export will. Left
+    /// unread it would not post quietly wrong: the balance check would fail and
+    /// refuse the file. Read, it settles against the clearing account the bank
+    /// side already books to, which is the same journey backwards.
+    #[test]
+    fn a_top_up_is_a_payout_in_reverse() {
+        let csv = "\"category\",\"description\",\"net_amount\",\"currency\"\n\
+\"starting_balance\",\"Starting balance\",\"0.00\",\"usd\"\n\
+\"activity_gross\",\"Account activity before fees\",\"100.00\",\"usd\"\n\
+\"activity_fee\",\"Less fees\",\"-5.00\",\"usd\"\n\
+\"topups_gross\",\"Top-ups\",\"2000.00\",\"usd\"\n\
+\"topups_fee\",\"Top-up fees\",\"0.00\",\"usd\"\n\
+\"payouts_gross\",\"Payouts to bank\",\"-95.00\",\"usd\"\n\
+\"payouts_fee\",\"Payout fees\",\"0.00\",\"usd\"\n\
+\"ending_balance\",\"Ending balance\",\"2000.00\",\"usd\"\n";
+        let s = parse_balance_summary(csv).unwrap();
+        assert_eq!(s.topped_up(), 200000);
+        assert_eq!(s.paid_out(), 9500);
+        // It reconciles only because the top-up is counted.
+        assert_eq!(s.starting + s.net_change(), s.ending);
+        assert!(s.reconciliation.is_none(), "{:?}", s.reconciliation);
+
+        let store = crate::store::event_store::EventStore::in_memory().unwrap();
+        crate::store::migrations::init_schema(store.connection()).unwrap();
+        for (k, a) in [
+            ("pos_stripe", "balance"),
+            ("stripe_revenue", "revenue"),
+            ("stripe_fees", "fees"),
+            ("stripe_payouts_in_transit", "clearing"),
+        ] {
+            store
+                .connection()
+                .execute(
+                    "INSERT INTO ingest_account_mappings (key, account_id) VALUES (?1, ?2)",
+                    rusqlite::params![k, a],
+                )
+                .unwrap();
+        }
+        let cmd = plan_stripe(
+            store.connection(),
+            csv,
+            "Balance_Summary_USD_2024-06-01_to_2024-06-30_America-Chicago.csv",
+        )
+        .unwrap()
+        .expect("an entry");
+        assert_eq!(cmd.lines.iter().map(|l| l.amount).sum::<i64>(), 0, "balances");
+
+        // The clearing account carries both directions on one line: $95.00 out
+        // to the bank, $2,000.00 in from it.
+        let clearing: i64 = cmd
+            .lines
+            .iter()
+            .filter(|l| l.account_id == "clearing")
+            .map(|l| l.amount)
+            .sum();
+        assert_eq!(clearing, 9500 - 200000, "a payout debits it, a top-up credits it");
+        let of = |a: &str| cmd.lines.iter().find(|l| l.account_id == a).map(|l| l.amount);
+        assert_eq!(of("balance"), Some(200000), "the balance rose by the top-up");
     }
 
     /// The payout leg must not go straight to checking.
