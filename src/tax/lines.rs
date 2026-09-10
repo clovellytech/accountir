@@ -1860,3 +1860,154 @@ mod tests {
         assert_eq!(provenance(&conn, "6100", 2026), Provenance::SetHere);
     }
 }
+
+/// Form 1065 page one, across a year-end close.
+///
+/// The assertion that matters most in the whole closing feature. Everything else
+/// a bad close could do is recoverable; a return built on a year that reports
+/// itself as having earned nothing is filed, and then it is the IRS's problem
+/// and the partners'.
+///
+/// A closing entry is dated inside the year it closes and debits every revenue
+/// account. If the income statement counted it, line 8 and line 22 would both
+/// collapse to zero and line 23 with them — and the form would still foot, still
+/// print, and still look like a return.
+#[cfg(test)]
+mod closing_tests {
+    use super::*;
+    use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
+    use crate::commands::closing_commands::{close_books, CloseBooksCommand};
+    use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
+    use crate::domain::AccountType;
+    use crate::events::types::JournalEntrySource;
+    use crate::queries::reports::Reports;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+    use chrono::NaiveDate;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// Gross receipts of 500,000 against salaries of 120,000 and rent of 80,000,
+    /// so line 8 is 500,000, line 22 is 200,000 and line 23 is 300,000.
+    fn books_for_2023() -> (EventStore, BTreeMap<String, String>, String) {
+        let store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let mut store = store;
+        store
+            .connection()
+            .execute(
+                "INSERT INTO company (id, company_id, name, base_currency, fiscal_year_start_month)
+                 VALUES ('c', 'c', 'Co', 'USD', 1)",
+                [],
+            )
+            .unwrap();
+
+        for (ty, number, name) in [
+            (AccountType::Asset, "1000", "Cash"),
+            (AccountType::Revenue, "4000", "Gross receipts"),
+            (AccountType::Expense, "6000", "Salaries"),
+            (AccountType::Expense, "6100", "Rent"),
+            (AccountType::Equity, "3023", "2023"),
+        ] {
+            AccountCommands::new(&mut store, "user".to_string())
+                .create_account(CreateAccountCommand {
+                    account_type: ty,
+                    account_number: number.to_string(),
+                    name: name.to_string(),
+                    parent_id: None,
+                    currency: Some("USD".to_string()),
+                    description: None,
+                })
+                .unwrap();
+        }
+        let id = |store: &EventStore, n: &str| -> String {
+            store
+                .connection()
+                .query_row(
+                    "SELECT id FROM accounts WHERE account_number = ?1",
+                    [n],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let (cash, receipts, salaries, rent, equity) = (
+            id(&store, "1000"),
+            id(&store, "4000"),
+            id(&store, "6000"),
+            id(&store, "6100"),
+            id(&store, "3023"),
+        );
+
+        let mut post = |date: NaiveDate, debit: &str, credit: &str, cents: i64| {
+            EntryCommands::new(&mut store, "user".to_string())
+                .post_entry(PostEntryCommand {
+                    date,
+                    memo: "test".to_string(),
+                    lines: vec![
+                        EntryLine::debit(debit, cents, "USD"),
+                        EntryLine::credit(credit, cents, "USD"),
+                    ],
+                    reference: None,
+                    source: Some(JournalEntrySource::Manual),
+                })
+                .unwrap();
+        };
+        post(day(2023, 4, 1), &cash, &receipts, 50_000_000);
+        post(day(2023, 7, 1), &salaries, &cash, 12_000_000);
+        post(day(2023, 10, 1), &rent, &cash, 8_000_000);
+
+        // 1a gross receipts; 9 salaries and wages; 13 rent.
+        let mapping: BTreeMap<String, String> = [
+            (receipts, "l1a".to_string()),
+            (salaries, "l9".to_string()),
+            (rent, "l13".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        (store, mapping, equity)
+    }
+
+    fn page_one(store: &EventStore, mapping: &BTreeMap<String, String>) -> (i64, i64, i64) {
+        let statement = Reports::new(store.connection())
+            .income_statement(day(2023, 1, 1), day(2023, 12, 31))
+            .unwrap();
+        let computed = compute(&statement, mapping, &BTreeMap::new());
+        (
+            computed.lines.line_8(),
+            computed.lines.line_22(),
+            computed.lines.line_23(),
+        )
+    }
+
+    #[test]
+    fn closing_2023_does_not_change_the_2023_return() {
+        let (mut store, mapping, equity) = books_for_2023();
+
+        let before = page_one(&store, &mapping);
+        assert_eq!(
+            before,
+            (500_000, 200_000, 300_000),
+            "the fixture should produce a return worth protecting"
+        );
+
+        close_books(
+            &mut store,
+            "user",
+            CloseBooksCommand {
+                year: 2023,
+                equity_account_id: equity,
+                include_draws: false,
+            },
+        )
+        .unwrap();
+
+        let after = page_one(&store, &mapping);
+        assert_eq!(
+            after, before,
+            "closing the books must leave the filed figures exactly as they were"
+        );
+    }
+}

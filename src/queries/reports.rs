@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::domain::AccountType;
 use crate::queries::account_queries::AccountQueries;
 use chrono::NaiveDate;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -197,8 +197,12 @@ impl<'a> Reports<'a> {
             }
         }
 
-        // Calculate income to date for equity section
-        let income = self.calculate_net_income(None, Some(as_of_date))?;
+        // Income not yet swept into equity by a close, for the equity section.
+        // Starts the day after the last closed year rather than at the beginning
+        // of time: once a year is closed its result sits in a real equity
+        // account, and counting it here as well would show it twice and take the
+        // sheet out of balance.
+        let income = self.calculate_net_income(self.unclosed_from(as_of_date)?, Some(as_of_date))?;
         if income != 0 {
             equity.push(BalanceSheetLine {
                 account_id: "__net_income__".to_string(),
@@ -263,17 +267,9 @@ impl<'a> Reports<'a> {
                 continue;
             }
 
-            // Calculate balance change during the period
-            let start_balance = queries
-                .get_account_balance(
-                    &account.id,
-                    Some(start_date.pred_opt().unwrap_or(start_date)),
-                )?
-                .balance;
-            let end_balance = queries
-                .get_account_balance(&account.id, Some(end_date))?
-                .balance;
-            let period_change = end_balance - start_balance;
+            // Movement during the period, with year-end closing entries left
+            // out — see `AccountQueries::period_movement` for why that matters.
+            let period_change = queries.period_movement(&account.id, start_date, end_date)?;
 
             if period_change == 0 {
                 continue;
@@ -399,6 +395,31 @@ impl<'a> Reports<'a> {
     }
 
     /// Calculate net income for a period
+    /// The day after the latest fiscal year that is closed as of `as_of` — the
+    /// point from which income has *not* yet been swept into equity.
+    ///
+    /// `None` when nothing is closed, which is every ledger that has never run a
+    /// year-end close and is the behaviour this report has always had.
+    fn unclosed_from(&self, as_of: NaiveDate) -> Result<Option<NaiveDate>, ReportError> {
+        let last_closed: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT MAX(end_date) FROM fiscal_years
+                 WHERE is_closed = 1 AND end_date <= ?1",
+                [as_of.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        Ok(match last_closed {
+            None => None,
+            Some(d) => NaiveDate::parse_from_str(&d, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.succ_opt()),
+        })
+    }
+
     fn calculate_net_income(
         &self,
         start_date: Option<NaiveDate>,
@@ -414,7 +435,8 @@ impl<'a> Reports<'a> {
              FROM journal_lines jl
              JOIN journal_entries je ON jl.entry_id = je.id
              JOIN accounts a ON jl.account_id = a.id
-             WHERE je.is_void = 0 AND a.account_type IN ('revenue', 'expense')",
+             WHERE je.is_void = 0 AND a.account_type IN ('revenue', 'expense')
+               AND (je.source IS NULL OR je.source != 'closing')",
         );
 
         if start_date.is_some() || end_date.is_some() {
@@ -808,5 +830,285 @@ mod tests {
         // L&E: Equity $1000 + Net Income $300 = $1300
         assert_eq!(bs.total_liabilities_and_equity, 130000);
         assert!(bs.is_balanced);
+    }
+}
+
+/// What a year-end close does to the reports that read the year it closed.
+///
+/// These are regression tests for a failure that is silent rather than loud: a
+/// closing entry is dated inside the year it closes and zeroes every revenue and
+/// expense account, so a report that counts it reports the year as having earned
+/// nothing — and produces a *plausible, wrong* tax return rather than an error.
+#[cfg(test)]
+mod closing_tests {
+    use super::*;
+    use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
+    use crate::commands::closing_commands::{close_books, CloseBooksCommand};
+    use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
+    use crate::events::types::JournalEntrySource;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    struct Books {
+        store: EventStore,
+        cash: String,
+        sales: String,
+        rent: String,
+        equity: String,
+    }
+
+    fn books() -> Books {
+        let store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let mut store = store;
+        store
+            .connection()
+            .execute(
+                "INSERT INTO company (id, company_id, name, base_currency, fiscal_year_start_month)
+                 VALUES ('c', 'c', 'Co', 'USD', 1)",
+                [],
+            )
+            .unwrap();
+
+        for (ty, number, name) in [
+            (AccountType::Asset, "1000", "Cash"),
+            (AccountType::Revenue, "4000", "Sales"),
+            (AccountType::Expense, "6100", "Rent"),
+            (AccountType::Equity, "3023", "2023"),
+        ] {
+            AccountCommands::new(&mut store, "user".to_string())
+                .create_account(CreateAccountCommand {
+                    account_type: ty,
+                    account_number: number.to_string(),
+                    name: name.to_string(),
+                    parent_id: None,
+                    currency: Some("USD".to_string()),
+                    description: None,
+                })
+                .unwrap();
+        }
+        let id = |store: &EventStore, n: &str| -> String {
+            store
+                .connection()
+                .query_row(
+                    "SELECT id FROM accounts WHERE account_number = ?1",
+                    [n],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        Books {
+            cash: id(&store, "1000"),
+            sales: id(&store, "4000"),
+            rent: id(&store, "6100"),
+            equity: id(&store, "3023"),
+            store,
+        }
+    }
+
+    impl Books {
+        fn post(&mut self, date: NaiveDate, debit: &str, credit: &str, cents: i64) {
+            EntryCommands::new(&mut self.store, "user".to_string())
+                .post_entry(PostEntryCommand {
+                    date,
+                    memo: "test".to_string(),
+                    lines: vec![
+                        EntryLine::debit(debit, cents, "USD"),
+                        EntryLine::credit(credit, cents, "USD"),
+                    ],
+                    reference: None,
+                    source: Some(JournalEntrySource::Manual),
+                })
+                .unwrap();
+        }
+
+        /// 5,000 of sales against 3,000 of rent: net income 2,000.
+        fn year(&mut self, year: i32) {
+            let (cash, sales, rent) = (self.cash.clone(), self.sales.clone(), self.rent.clone());
+            self.post(day(year, 3, 1), &cash, &sales, 500_000);
+            self.post(day(year, 9, 1), &rent, &cash, 300_000);
+        }
+
+        fn close(&mut self, year: i32) {
+            let equity = self.equity.clone();
+            close_books(
+                &mut self.store,
+                "user",
+                CloseBooksCommand {
+                    year,
+                    equity_account_id: equity,
+                    include_draws: false,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// The one that protects the tax return: a closed year still reports the
+    /// revenue, expenses and net income it actually had.
+    #[test]
+    fn a_closed_year_still_reports_its_own_income_statement() {
+        let mut b = books();
+        b.year(2023);
+
+        let before = Reports::new(b.store.connection())
+            .income_statement(day(2023, 1, 1), day(2023, 12, 31))
+            .unwrap();
+        assert_eq!(before.revenue.total, 500_000);
+        assert_eq!(before.expenses.total, 300_000);
+        assert_eq!(before.net_income, 200_000);
+
+        b.close(2023);
+
+        let after = Reports::new(b.store.connection())
+            .income_statement(day(2023, 1, 1), day(2023, 12, 31))
+            .unwrap();
+        assert_eq!(
+            (after.revenue.total, after.expenses.total, after.net_income),
+            (500_000, 300_000, 200_000),
+            "closing the year must not erase the year"
+        );
+    }
+
+    /// The other half: after the close the *equity* holds the result, and the
+    /// synthetic "current year net income" line must not report it a second time.
+    #[test]
+    fn the_balance_sheet_balances_after_a_close_without_double_counting() {
+        let mut b = books();
+        b.year(2023);
+        b.close(2023);
+
+        let bs = Reports::new(b.store.connection())
+            .balance_sheet(day(2023, 12, 31))
+            .unwrap();
+
+        assert!(bs.is_balanced, "assets {} vs L+E {}", bs.total_assets, bs.total_liabilities_and_equity);
+        assert_eq!(bs.total_assets, 200_000);
+        assert_eq!(bs.equity.total, 200_000);
+        assert!(
+            !bs.equity
+                .lines
+                .iter()
+                .any(|l| l.account_id == "__net_income__"),
+            "the year's result is in a real account now; the synthetic line would double it"
+        );
+        assert!(
+            bs.equity
+                .lines
+                .iter()
+                .any(|l| l.account_number == "3023" && l.balance == -200_000),
+            "the year account carries the result: {:?}",
+            bs.equity.lines
+        );
+    }
+
+    /// A balance sheet drawn part-way through the *next* year shows only that
+    /// year's activity as unswept income.
+    #[test]
+    fn income_after_a_close_belongs_to_the_year_that_earned_it() {
+        let mut b = books();
+        b.year(2023);
+        b.close(2023);
+
+        let (cash, sales) = (b.cash.clone(), b.sales.clone());
+        b.post(day(2024, 2, 1), &cash, &sales, 90_000);
+
+        let bs = Reports::new(b.store.connection())
+            .balance_sheet(day(2024, 6, 30))
+            .unwrap();
+        assert!(bs.is_balanced);
+
+        let synthetic = bs
+            .equity
+            .lines
+            .iter()
+            .find(|l| l.account_id == "__net_income__")
+            .expect("2024 is not closed, so its income shows as the current-year line");
+        assert_eq!(
+            -synthetic.balance, 90_000,
+            "only 2024's income — 2023's is in the year account"
+        );
+        assert_eq!(bs.equity.total, 290_000);
+    }
+
+    /// A year still open is unaffected by any of this — the behaviour every
+    /// ledger has today, which the fix must not disturb.
+    #[test]
+    fn an_open_year_reports_exactly_as_it_always_did() {
+        let mut b = books();
+        b.year(2023);
+
+        let bs = Reports::new(b.store.connection())
+            .balance_sheet(day(2023, 12, 31))
+            .unwrap();
+        assert!(bs.is_balanced);
+        let synthetic = bs
+            .equity
+            .lines
+            .iter()
+            .find(|l| l.account_id == "__net_income__")
+            .expect("an open year's income shows as the current-year line");
+        assert_eq!(-synthetic.balance, 200_000);
+    }
+
+    /// Two closed years each keep their own result, and neither leaks into the
+    /// other's income statement.
+    #[test]
+    fn consecutive_closed_years_each_keep_their_own_result() {
+        let mut b = books();
+        b.year(2022);
+        b.year(2023);
+
+        // A second year account, so each close has its own home.
+        AccountCommands::new(&mut b.store, "user".to_string())
+            .create_account(CreateAccountCommand {
+                account_type: AccountType::Equity,
+                account_number: "3022".to_string(),
+                name: "2022".to_string(),
+                parent_id: None,
+                currency: Some("USD".to_string()),
+                description: None,
+            })
+            .unwrap();
+        let equity_2022: String = b
+            .store
+            .connection()
+            .query_row(
+                "SELECT id FROM accounts WHERE account_number = '3022'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        close_books(
+            &mut b.store,
+            "user",
+            CloseBooksCommand {
+                year: 2022,
+                equity_account_id: equity_2022,
+                include_draws: false,
+            },
+        )
+        .unwrap();
+        b.close(2023);
+
+        let reports = Reports::new(b.store.connection());
+        for year in [2022, 2023] {
+            let is = reports
+                .income_statement(day(year, 1, 1), day(year, 12, 31))
+                .unwrap();
+            assert_eq!(
+                is.net_income, 200_000,
+                "{year} should still report its own 2,000"
+            );
+        }
+
+        let bs = reports.balance_sheet(day(2023, 12, 31)).unwrap();
+        assert!(bs.is_balanced);
+        assert_eq!(bs.equity.total, 400_000, "both years' results, once each");
     }
 }

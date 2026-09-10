@@ -531,24 +531,11 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::FiscalYearOpened { year, .. } => {
             format!("Opened fiscal year {}", year)
         }
-        Event::PeriodClosed { year, period, .. } => {
-            format!("Closed period {} of {}", period, year)
-        }
-        Event::PeriodReopened {
-            year,
-            period,
-            reason,
-            ..
-        } => {
-            format!(
-                "Reopened period {} of {} - {}",
-                period,
-                year,
-                widgets::truncate(reason, 20)
-            )
-        }
         Event::YearEndClosed { year, .. } => {
-            format!("Closed year-end {}", year)
+            format!("Closed the books for {}", year)
+        }
+        Event::YearEndReopened { year, reason, .. } => {
+            format!("Reopened {} - {}", year, widgets::truncate(reason, 20))
         }
         Event::CurrencyEnabled { code, name, .. } => {
             format!("Enabled currency {} ({})", code, name)

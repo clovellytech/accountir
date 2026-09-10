@@ -9,8 +9,8 @@ pub enum JournalEntryError {
     NotBalanced(i64),
     #[error("Entry must have at least two lines")]
     InsufficientLines,
-    #[error("Entry date is in a closed period")]
-    PeriodClosed,
+    #[error("Entry date is in a closed year")]
+    YearClosed,
     #[error("Entry has already been voided")]
     AlreadyVoided,
     #[error("Account not found: {0}")]

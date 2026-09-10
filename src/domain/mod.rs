@@ -1,7 +1,7 @@
 pub mod account;
 pub mod ap_ar;
 pub mod depreciation;
-pub mod fiscal_period;
+pub mod fiscal_year;
 pub mod journal_entry;
 pub mod money;
 pub mod partnership;
@@ -12,7 +12,7 @@ pub mod sole_proprietor;
 pub use account::*;
 pub use ap_ar::*;
 pub use depreciation::*;
-pub use fiscal_period::*;
+pub use fiscal_year::*;
 pub use journal_entry::*;
 pub use money::*;
 pub use partnership::*;

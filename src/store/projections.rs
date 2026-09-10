@@ -1,5 +1,4 @@
 use crate::events::types::{Event, EventAccountType, StoredEvent};
-use chrono::Datelike;
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
@@ -638,6 +637,7 @@ impl<'a> Projector<'a> {
                     }
                     crate::events::types::JournalEntrySource::BillPayment => "bill_payment",
                     crate::events::types::JournalEntrySource::InvoicePayment => "invoice_payment",
+                    crate::events::types::JournalEntrySource::Closing => "closing",
                 });
 
                 self.conn.execute(
@@ -723,53 +723,6 @@ impl<'a> Projector<'a> {
                      VALUES (?1, ?2, ?3, 0)",
                     params![year, start_date.to_string(), end_date.to_string()],
                 )?;
-
-                // Create monthly periods
-                let mut current = *start_date;
-                let mut period = 1u8;
-                while current <= *end_date && period <= 12 {
-                    let period_end = {
-                        let next_month = if current.month() == 12 {
-                            chrono::NaiveDate::from_ymd_opt(current.year() + 1, 1, 1).unwrap()
-                        } else {
-                            chrono::NaiveDate::from_ymd_opt(current.year(), current.month() + 1, 1)
-                                .unwrap()
-                        };
-                        next_month.pred_opt().unwrap().min(*end_date)
-                    };
-
-                    self.conn.execute(
-                        "INSERT INTO fiscal_periods (year, period, start_date, end_date, status)
-                         VALUES (?1, ?2, ?3, ?4, 'open')",
-                        params![year, period, current.to_string(), period_end.to_string()],
-                    )?;
-
-                    current = period_end.succ_opt().unwrap_or(period_end);
-                    period += 1;
-                }
-            }
-            Event::PeriodClosed {
-                year,
-                period,
-                closed_by_user_id,
-            } => {
-                self.conn.execute(
-                    "UPDATE fiscal_periods SET status = 'closed', closed_by_user_id = ?1, closed_at = datetime('now')
-                     WHERE year = ?2 AND period = ?3",
-                    params![closed_by_user_id, year, period],
-                )?;
-            }
-            Event::PeriodReopened {
-                year,
-                period,
-                reason: _,
-                reopened_by_user_id: _,
-            } => {
-                self.conn.execute(
-                    "UPDATE fiscal_periods SET status = 'open', closed_by_user_id = NULL, closed_at = NULL
-                     WHERE year = ?1 AND period = ?2",
-                    params![year, period],
-                )?;
             }
             Event::YearEndClosed {
                 year,
@@ -778,6 +731,17 @@ impl<'a> Projector<'a> {
                 self.conn.execute(
                     "UPDATE fiscal_years SET is_closed = 1, retained_earnings_entry_id = ?1 WHERE year = ?2",
                     params![retained_earnings_entry_id, year],
+                )?;
+            }
+            Event::YearEndReopened {
+                year,
+                reason: _,
+                reopened_by_user_id: _,
+            } => {
+                self.conn.execute(
+                    "UPDATE fiscal_years SET is_closed = 0, retained_earnings_entry_id = NULL
+                     WHERE year = ?1",
+                    params![year],
                 )?;
             }
             Event::CurrencyEnabled {
@@ -1200,7 +1164,6 @@ impl<'a> Projector<'a> {
              DELETE FROM reconciliations;
              DELETE FROM exchange_rates;
              DELETE FROM currencies;
-             DELETE FROM fiscal_periods;
              DELETE FROM fiscal_years;
              DELETE FROM journal_entry_annotations;
              DELETE FROM journal_lines;

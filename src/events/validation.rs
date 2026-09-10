@@ -19,8 +19,6 @@ pub enum ValidationError {
     InvalidAccountNumber(String),
     #[error("Invalid fiscal year start month: {0}")]
     InvalidFiscalYearStart(u32),
-    #[error("Invalid period: {0}")]
-    InvalidPeriod(u8),
 }
 
 /// A tax year a return could plausibly be filed for.
@@ -509,29 +507,19 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         } => {
             // Dates are validated by chrono
         }
-        Event::PeriodClosed {
-            year: _,
-            period,
-            closed_by_user_id,
-        } => {
-            validate_period(*period)?;
-            validate_non_empty(closed_by_user_id, "closed_by_user_id")?;
-        }
-        Event::PeriodReopened {
-            year: _,
-            period,
-            reason,
-            reopened_by_user_id,
-        } => {
-            validate_period(*period)?;
-            validate_non_empty(reason, "reason")?;
-            validate_non_empty(reopened_by_user_id, "reopened_by_user_id")?;
-        }
         Event::YearEndClosed {
             year: _,
             retained_earnings_entry_id,
         } => {
             validate_non_empty(retained_earnings_entry_id, "retained_earnings_entry_id")?;
+        }
+        Event::YearEndReopened {
+            year: _,
+            reason,
+            reopened_by_user_id,
+        } => {
+            validate_non_empty(reason, "reason")?;
+            validate_non_empty(reopened_by_user_id, "reopened_by_user_id")?;
         }
         Event::CurrencyEnabled {
             code,
@@ -802,14 +790,6 @@ fn validate_account_number(number: &str) -> Result<(), ValidationError> {
 fn validate_fiscal_year_start(month: u32) -> Result<(), ValidationError> {
     if !(1..=12).contains(&month) {
         Err(ValidationError::InvalidFiscalYearStart(month))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_period(period: u8) -> Result<(), ValidationError> {
-    if !(1..=12).contains(&period) {
-        Err(ValidationError::InvalidPeriod(period))
     } else {
         Ok(())
     }

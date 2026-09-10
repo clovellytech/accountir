@@ -249,6 +249,35 @@ impl<'a> AccountQueries<'a> {
         })
     }
 
+    /// How much one account moved between two dates, inclusive, ignoring
+    /// year-end closing entries.
+    ///
+    /// This is what an income statement wants, and it is deliberately not
+    /// `balance(end) - balance(start - 1)`: a closing entry is dated the last day
+    /// of the year it closes, so it falls *inside* that year's window and zeroes
+    /// every revenue and expense account in it. Counted, the year that was closed
+    /// reports as having earned nothing — and Form 1065 page 1, Schedule C and
+    /// every P&L go with it. Filtering `source` here is what keeps a closed year
+    /// still readable as the year it was.
+    pub fn period_movement(
+        &self,
+        account_id: &str,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<i64, AccountQueryError> {
+        Ok(self.conn.query_row(
+            "SELECT COALESCE(SUM(jl.amount), 0)
+             FROM journal_lines jl
+             JOIN journal_entries je ON jl.entry_id = je.id
+             WHERE jl.account_id = ?1
+               AND je.date >= ?2 AND je.date <= ?3
+               AND je.is_void = 0
+               AND (je.source IS NULL OR je.source != 'closing')",
+            params![account_id, start_date.to_string(), end_date.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Get all account balances
     pub fn get_all_balances(
         &self,

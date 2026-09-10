@@ -15,6 +15,5 @@
 -- - users: System users
 -- - company: Company settings
 -- - fiscal_years: Fiscal year definitions
--- - fiscal_periods: Monthly/quarterly periods
 
 SELECT 1; -- Placeholder, actual schema is in migrations.rs

@@ -140,6 +140,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             38,
             include_str!("../../migrations/038_dated_tax_line_assignments.sql"),
         ),
+        (
+            39,
+            include_str!("../../migrations/039_drop_fiscal_periods.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -292,17 +296,6 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             end_date TEXT NOT NULL,
             is_closed INTEGER DEFAULT 0,
             retained_earnings_entry_id TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS fiscal_periods (
-            year INTEGER NOT NULL,
-            period INTEGER NOT NULL,
-            start_date TEXT NOT NULL,
-            end_date TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'open',
-            closed_by_user_id TEXT,
-            closed_at TEXT,
-            PRIMARY KEY (year, period)
         );
 
         -- Bank import mappings (links extension bank recipes to TUI accounts)

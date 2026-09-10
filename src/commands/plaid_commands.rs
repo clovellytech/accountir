@@ -2019,15 +2019,15 @@ mod tests {
     }
 
     #[test]
-    fn import_transactions_skips_transaction_in_closed_period() {
+    fn import_transactions_skips_transaction_in_closed_year() {
         let (mut store, _local) = setup();
-        // Seed a closed fiscal period covering the transaction date. (There is no
-        // command emitter for period-close yet, so seed the projection directly.)
+        // Close the fiscal year covering the transaction date, which is what
+        // raises the fence the import is expected to respect.
         store
             .connection()
             .execute(
-                "INSERT INTO fiscal_periods (year, period, start_date, end_date, status)
-                 VALUES (2026, 3, '2026-03-01', '2026-03-31', 'closed')",
+                "INSERT INTO fiscal_years (year, start_date, end_date, is_closed)
+                 VALUES (2026, '2026-01-01', '2026-12-31', 1)",
                 [],
             )
             .unwrap();

@@ -180,6 +180,17 @@ pub enum JournalEntrySource {
     InvoiceReceivable,
     BillPayment,
     InvoicePayment,
+    /// A year-end closing entry: the one that sweeps revenue and expense to
+    /// equity and zeroes the income statement.
+    ///
+    /// This is load-bearing, not a label. A closing entry is dated the last day
+    /// of the year it closes, so it falls *inside* that year's income-statement
+    /// window — and it debits every revenue account and credits every expense
+    /// one. Counted, it reports the year it closed as having earned nothing, and
+    /// takes Form 1065 page 1, Schedule C and every P&L down with it. This
+    /// variant is how `Reports::income_statement` and
+    /// `Reports::calculate_net_income` know to leave it out.
+    Closing,
 }
 
 /// Info about a Plaid account, used in PlaidItemConnected events
@@ -594,26 +605,29 @@ pub enum Event {
         new_account_id: String,
     },
 
-    // Fiscal Periods
+    // Fiscal Years
     FiscalYearOpened {
         year: i32,
         start_date: NaiveDate,
         end_date: NaiveDate,
     },
-    PeriodClosed {
-        year: i32,
-        period: u8,
-        closed_by_user_id: String,
-    },
-    PeriodReopened {
-        year: i32,
-        period: u8,
-        reason: String,
-        reopened_by_user_id: String,
-    },
+    /// The year's revenue and expense were swept to equity by
+    /// `retained_earnings_entry_id`, and the year is now fenced against further
+    /// posting. The two land together — see `closing_commands::close_books`.
     YearEndClosed {
         year: i32,
         retained_earnings_entry_id: String,
+    },
+    /// A closed year is opened again, so it can be corrected and re-closed.
+    ///
+    /// `reason` is required for the same purpose it serves everywhere else in
+    /// this log: reopening a filed year is legitimate and is also what a mistake
+    /// looks like, and the difference is only ever in someone's head until they
+    /// write it down.
+    YearEndReopened {
+        year: i32,
+        reason: String,
+        reopened_by_user_id: String,
     },
 
     // Multi-Currency
@@ -850,9 +864,8 @@ impl Event {
             Event::JournalEntryAnnotated { .. } => "journal_entry_annotated",
             Event::JournalLineReassigned { .. } => "journal_line_reassigned",
             Event::FiscalYearOpened { .. } => "fiscal_year_opened",
-            Event::PeriodClosed { .. } => "period_closed",
-            Event::PeriodReopened { .. } => "period_reopened",
             Event::YearEndClosed { .. } => "year_end_closed",
+            Event::YearEndReopened { .. } => "year_end_reopened",
             Event::CurrencyEnabled { .. } => "currency_enabled",
             Event::ExchangeRateRecorded { .. } => "exchange_rate_recorded",
             Event::PlaidItemConnected { .. } => "plaid_item_connected",
@@ -926,9 +939,8 @@ impl Event {
             Event::JournalEntryAnnotated { entry_id, .. } => Some(entry_id),
             Event::JournalLineReassigned { entry_id, .. } => Some(entry_id),
             Event::FiscalYearOpened { .. } => None,
-            Event::PeriodClosed { .. } => None,
-            Event::PeriodReopened { .. } => None,
             Event::YearEndClosed { .. } => None,
+            Event::YearEndReopened { .. } => None,
             Event::CurrencyEnabled { code, .. } => Some(code),
             Event::ExchangeRateRecorded { .. } => None,
             Event::PlaidItemConnected { item_id, .. } => Some(item_id),

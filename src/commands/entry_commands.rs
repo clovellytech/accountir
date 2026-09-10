@@ -29,8 +29,8 @@ pub enum EntryCommandError {
     AlreadyVoided,
     #[error("Entry is not voided")]
     NotVoided,
-    #[error("Period is closed for date: {0}")]
-    PeriodClosed(NaiveDate),
+    #[error("The books are closed for the year containing {0}")]
+    YearClosed(NaiveDate),
     #[error("An entry with reference {reference} already exists")]
     DuplicateReference {
         reference: String,
@@ -85,17 +85,20 @@ pub(crate) fn check_entry_invariants_in_txn(
         }
     }
 
-    let period_closed: bool = tx
+    // The closed-year fence. A date in no fiscal year at all is unfenced —
+    // `fiscal_years` only has rows for years someone opened, and a ledger that
+    // has never closed anything should not be refusing entries.
+    let year_closed: bool = tx
         .query_row(
-            "SELECT status = 'closed' FROM fiscal_periods
+            "SELECT is_closed = 1 FROM fiscal_years
              WHERE ?1 BETWEEN start_date AND end_date",
             [date.to_string()],
             |row| row.get(0),
         )
         .optional()?
         .unwrap_or(false);
-    if period_closed {
-        return Ok(Some(EntryCommandError::PeriodClosed(date)));
+    if year_closed {
+        return Ok(Some(EntryCommandError::YearClosed(date)));
     }
 
     Ok(None)

@@ -396,17 +396,20 @@ pub fn build_set_partner_shares_in_txn(
 /// also exactly what a typo looks like — the wrong year in a date field — and
 /// the difference between the two is something only the person typing knows. So
 /// this hands them the sentence and lets them decide.
+///
+/// Reads `fiscal_years` rather than the entry's own date: what matters is
+/// whether the books covering that date have been closed, and a date can fall
+/// in a fiscal year that is not the calendar year it names.
 pub fn retrospective_warning(conn: &Connection, effective_from: NaiveDate) -> Option<String> {
-    let year = effective_from.format("%Y").to_string();
     let closed: Result<i64, _> = conn.query_row(
-        "SELECT COUNT(*) FROM fiscal_periods
-         WHERE strftime('%Y', start_date) <= ?1 AND status = 'closed'",
-        [&year],
+        "SELECT COUNT(*) FROM fiscal_years
+         WHERE is_closed = 1 AND start_date <= ?1",
+        [effective_from.to_string()],
         |r| r.get(0),
     );
     match closed {
         Ok(n) if n > 0 => Some(format!(
-            "{effective_from} falls in or before a closed period. If a return has already been \
+            "{effective_from} falls in or before a closed year. If a return has already been \
              filed for that year, changing the percentages behind it means amending it — the \
              Schedule K-1s it produced will no longer match what was filed."
         )),

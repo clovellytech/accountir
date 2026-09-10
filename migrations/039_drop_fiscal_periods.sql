@@ -1,0 +1,17 @@
+-- Drop the sub-year period model.
+--
+-- `fiscal_periods` held twelve monthly windows per fiscal year, each
+-- independently closable, and the posting fence read it to refuse entries dated
+-- inside a closed one. Nothing ever emitted the events that would have filled
+-- it: across every ledger in existence the table was empty, so the fence it
+-- existed to raise had never been raised.
+--
+-- It was removed rather than wired up because the year is the unit anyone
+-- actually closes here, and the period model made the year-end close strictly
+-- worse — the closing entry is dated the last day of the year, inside the
+-- twelfth period, so it could not be posted once that period was closed and the
+-- year could not be closed before it. The fence now reads `fiscal_years`.
+--
+-- No data is at risk: the table is empty wherever it exists. See
+-- `domain/fiscal_year.rs` and `commands/closing_commands.rs`.
+DROP TABLE IF EXISTS fiscal_periods;
