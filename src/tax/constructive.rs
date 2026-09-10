@@ -182,6 +182,7 @@ mod tests {
 
     fn partner(id: &str, profit: f64, loss: f64, capital: f64) -> Partner {
         Partner {
+            history: Vec::new(),
             partner_id: id.to_string(),
             name: id.to_string(),
             partner_type: PartnerType::General,
@@ -247,7 +248,10 @@ mod tests {
         ];
 
         // The child owns its own 15 + parent 10 + grandparent 30 = 55.
-        assert_eq!(constructive_shares(&child, &all, &rels).capital_ppm, 550_000);
+        assert_eq!(
+            constructive_shares(&child, &all, &rels).capital_ppm,
+            550_000
+        );
         // And the grandparent, looking down, owns 30 + 10 + 15 = 55.
         assert_eq!(
             constructive_shares(&grandparent, &all, &rels).capital_ppm,

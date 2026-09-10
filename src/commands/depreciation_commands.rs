@@ -55,7 +55,7 @@ use crate::commands::entry_commands::{
 use crate::domain::{BonusElection, DepreciableAsset, PropertyClass, System};
 use crate::events::types::{DepreciableAssetData, Event, JournalEntrySource, StoredEvent};
 use crate::store::event_store::EventStore;
-use crate::tax::depreciation::{YearSchedule, compute_year};
+use crate::tax::depreciation::{compute_year, YearSchedule};
 
 #[derive(Debug, Error)]
 pub enum DepreciationError {
@@ -187,8 +187,7 @@ pub fn list_assets(conn: &Connection) -> Vec<DepreciableAsset> {
             system,
             section_179_cents,
             bonus,
-            disposed_on: disposed
-                .and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()),
+            disposed_on: disposed.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()),
             notes,
         });
     }
@@ -196,7 +195,9 @@ pub fn list_assets(conn: &Connection) -> Vec<DepreciableAsset> {
 }
 
 pub fn get_asset(conn: &Connection, asset_id: &str) -> Option<DepreciableAsset> {
-    list_assets(conn).into_iter().find(|a| a.asset_id == asset_id)
+    list_assets(conn)
+        .into_iter()
+        .find(|a| a.asset_id == asset_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +266,11 @@ pub fn add_asset(
     let mut asset = asset.clone();
     asset.asset_id = asset_id.clone();
 
-    let stored = append(store, user_id, Event::DepreciableAssetAdded(Box::new(data_of(&asset))))?;
+    let stored = append(
+        store,
+        user_id,
+        Event::DepreciableAssetAdded(Box::new(data_of(&asset))),
+    )?;
     Ok((asset_id, stored))
 }
 
@@ -287,7 +292,11 @@ pub fn update_asset(
         return Err(DepreciationError::NoSuchAsset(asset.asset_id.clone()));
     }
     check_accounts(store.connection(), asset)?;
-    append(store, user_id, Event::DepreciableAssetUpdated(Box::new(data_of(asset))))
+    append(
+        store,
+        user_id,
+        Event::DepreciableAssetUpdated(Box::new(data_of(asset))),
+    )
 }
 
 /// Record that an asset left the business.
@@ -488,15 +497,18 @@ fn entry_lines(schedule: &YearSchedule<'_>, currency: &str) -> Vec<EntryLine> {
         let ordinary = row.bonus_cents + row.macrs_cents;
         if ordinary != 0 {
             *debits.entry(&row.asset.expense_account_id).or_default() += ordinary;
-            *credits.entry(&row.asset.accumulated_account_id).or_default() += ordinary;
+            *credits
+                .entry(&row.asset.accumulated_account_id)
+                .or_default() += ordinary;
         }
         if row.section_179_cents != 0 {
             // Validation guarantees this account exists once §179 is elected, so
             // an asset without one here has no election to post.
             if let Some(account) = row.asset.section_179_account_id.as_deref() {
                 *debits.entry(account).or_default() += row.section_179_cents;
-                *credits.entry(&row.asset.accumulated_account_id).or_default() +=
-                    row.section_179_cents;
+                *credits
+                    .entry(&row.asset.accumulated_account_id)
+                    .or_default() += row.section_179_cents;
             }
         }
     }
@@ -578,8 +590,8 @@ pub fn posting_is_stale(conn: &Connection, year: i32) -> Option<String> {
 mod tests {
     use super::*;
     use crate::domain::{AccountType, PropertyClass};
-    use rusqlite::params;
     use crate::store::event_store::EventStore;
+    use rusqlite::params;
 
     fn day(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -601,7 +613,12 @@ mod tests {
         .expect("company");
         for (id, number, name, kind) in [
             ("1500", "1500", "Studio equipment", AccountType::Asset),
-            ("1590", "1590", "Accumulated depreciation", AccountType::Asset),
+            (
+                "1590",
+                "1590",
+                "Accumulated depreciation",
+                AccountType::Asset,
+            ),
             ("6500", "6500", "Depreciation expense", AccountType::Expense),
             ("6501", "6501", "Section 179 expense", AccountType::Expense),
         ] {
@@ -702,7 +719,10 @@ mod tests {
         assert!(add_asset(&mut s, "u", &a).is_err(), "no §179 account");
 
         a.section_179_account_id = Some("6500".into());
-        assert!(add_asset(&mut s, "u", &a).is_err(), "same as the expense account");
+        assert!(
+            add_asset(&mut s, "u", &a).is_err(),
+            "same as the expense account"
+        );
 
         a.section_179_account_id = Some("6501".into());
         assert!(add_asset(&mut s, "u", &a).is_ok());
@@ -879,7 +899,10 @@ mod tests {
         update_asset(&mut s, "u", &asset).expect("corrected");
 
         let stale = posting_is_stale(s.connection(), 2025).expect("stale now");
-        assert!(stale.contains("post 2025 again") || stale.contains("post the"), "{stale}");
+        assert!(
+            stale.contains("post 2025 again") || stale.contains("post the"),
+            "{stale}"
+        );
 
         post_year(&mut s, "u", 2025, true).expect("reposted");
         assert!(posting_is_stale(s.connection(), 2025).is_none());

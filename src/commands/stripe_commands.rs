@@ -44,8 +44,8 @@
 use rusqlite::Connection;
 
 use crate::commands::entry_commands::{EntryLine, PostEntryCommand};
-use crate::commands::ingest_commands::{IngestError, check_idempotent, load_ingest_mappings};
 use crate::commands::import_commands::{parse_amount, parse_delimited_line};
+use crate::commands::ingest_commands::{check_idempotent, load_ingest_mappings, IngestError};
 use crate::commands::square_commands::extract_period;
 use crate::events::types::JournalEntrySource;
 
@@ -146,9 +146,9 @@ impl ItemizedActivity {
 /// summary rather than replacing it.
 pub fn parse_itemized_activity(content: &str) -> Result<ItemizedActivity, IngestError> {
     let mut lines = content.lines();
-    let header = lines.next().ok_or_else(|| {
-        IngestError::MissingMapping("the itemized export is empty".to_string())
-    })?;
+    let header = lines
+        .next()
+        .ok_or_else(|| IngestError::MissingMapping("the itemized export is empty".to_string()))?;
     let cols: Vec<String> = parse_delimited_line(header.trim_start_matches('\u{feff}'), ',')
         .into_iter()
         .map(|c| c.trim().trim_matches('"').to_ascii_lowercase())
@@ -170,7 +170,9 @@ pub fn parse_itemized_activity(content: &str) -> Result<ItemizedActivity, Ingest
             continue;
         }
         let cell = |i: usize| f[i].trim().trim_matches('"').to_string();
-        let Some(gross) = parse_amount(&cell(gross_at)) else { continue };
+        let Some(gross) = parse_amount(&cell(gross_at)) else {
+            continue;
+        };
         out.fees += parse_amount(&cell(fee_at)).unwrap_or(0);
         match cell(cat_at).as_str() {
             "charge" => out.charges += gross,
@@ -325,10 +327,8 @@ pub fn plan_stripe_with_activity(
     // Signed throughout: the balance can fall over a month, and a period with
     // more refunded than taken shows negative activity. Either flips the side of
     // its line rather than just its magnitude.
-    let mut lines = vec![
-        EntryLine::signed(&m["pos_stripe"], s.net_change(), "USD")
-            .with_memo("Change in Stripe balance"),
-    ];
+    let mut lines = vec![EntryLine::signed(&m["pos_stripe"], s.net_change(), "USD")
+        .with_memo("Change in Stripe balance")];
     if s.fees() != 0 {
         lines.push(EntryLine::signed(&m["stripe_fees"], s.fees(), "USD").with_memo("Stripe fees"));
     }
@@ -500,7 +500,11 @@ mod tests {
         )
         .unwrap()
         .expect("an entry");
-        assert_eq!(cmd.lines.iter().map(|l| l.amount).sum::<i64>(), 0, "balances");
+        assert_eq!(
+            cmd.lines.iter().map(|l| l.amount).sum::<i64>(),
+            0,
+            "balances"
+        );
 
         // The clearing account carries both directions on one line: $95.00 out
         // to the bank, $2,000.00 in from it.
@@ -510,9 +514,22 @@ mod tests {
             .filter(|l| l.account_id == "clearing")
             .map(|l| l.amount)
             .sum();
-        assert_eq!(clearing, 9500 - 200000, "a payout debits it, a top-up credits it");
-        let of = |a: &str| cmd.lines.iter().find(|l| l.account_id == a).map(|l| l.amount);
-        assert_eq!(of("balance"), Some(200000), "the balance rose by the top-up");
+        assert_eq!(
+            clearing,
+            9500 - 200000,
+            "a payout debits it, a top-up credits it"
+        );
+        let of = |a: &str| {
+            cmd.lines
+                .iter()
+                .find(|l| l.account_id == a)
+                .map(|l| l.amount)
+        };
+        assert_eq!(
+            of("balance"),
+            Some(200000),
+            "the balance rose by the top-up"
+        );
     }
 
     /// The summary's one activity figure is not revenue, and the itemized
@@ -537,7 +554,10 @@ mod tests {
 \"txn_b\",\"2024-06-10\",\"2024-06-11\",\"usd\",\"-3160.00\",\"0.00\",\"-3160.00\",\"refund\",\"r\"\n\
 \"txn_c\",\"2024-06-07\",\"2024-06-07\",\"usd\",\"2000.00\",\"0.00\",\"2000.00\",\"topup\",\"wire\"\n";
         let it = parse_itemized_activity(itemized).unwrap();
-        assert_eq!((it.charges, it.refunds, it.topups), (592500, -316000, 200000));
+        assert_eq!(
+            (it.charges, it.refunds, it.topups),
+            (592500, -316000, 200000)
+        );
         assert_eq!(it.gross(), 476500, "and it sums to the summary's activity");
 
         let store = crate::store::event_store::EventStore::in_memory().unwrap();
@@ -561,18 +581,41 @@ mod tests {
         let cmd = plan_stripe_with_activity(store.connection(), summary, Some(itemized), name)
             .unwrap()
             .expect("an entry");
-        assert_eq!(cmd.lines.iter().map(|l| l.amount).sum::<i64>(), 0, "balances");
+        assert_eq!(
+            cmd.lines.iter().map(|l| l.amount).sum::<i64>(),
+            0,
+            "balances"
+        );
         let of = |a: &str| {
-            cmd.lines.iter().filter(|l| l.account_id == a).map(|l| l.amount).sum::<i64>()
+            cmd.lines
+                .iter()
+                .filter(|l| l.account_id == a)
+                .map(|l| l.amount)
+                .sum::<i64>()
         };
         assert_eq!(of("revenue"), -592500, "the charges, and only the charges");
-        assert_eq!(of("refunds"), 316000, "refunds are their own account, not less revenue");
-        assert_eq!(of("clearing"), 497307 - 200000, "the payout out, the top-up in");
+        assert_eq!(
+            of("refunds"),
+            316000,
+            "refunds are their own account, not less revenue"
+        );
+        assert_eq!(
+            of("clearing"),
+            497307 - 200000,
+            "the payout out, the top-up in"
+        );
 
         // Without it, all three collapse into one revenue line.
-        let plain = plan_stripe(store.connection(), summary, name).unwrap().expect("an entry");
+        let plain = plan_stripe(store.connection(), summary, name)
+            .unwrap()
+            .expect("an entry");
         assert_eq!(
-            plain.lines.iter().filter(|l| l.account_id == "revenue").map(|l| l.amount).sum::<i64>(),
+            plain
+                .lines
+                .iter()
+                .filter(|l| l.account_id == "revenue")
+                .map(|l| l.amount)
+                .sum::<i64>(),
             -476500,
             "which is the wire and the refunds buried in sales"
         );
@@ -695,10 +738,23 @@ mod tests {
         .unwrap()
         .expect("an entry");
 
-        assert_eq!(cmd.lines.iter().map(|l| l.amount).sum::<i64>(), 0, "balances");
-        let of = |a: &str| cmd.lines.iter().find(|l| l.account_id == a).map(|l| l.amount);
+        assert_eq!(
+            cmd.lines.iter().map(|l| l.amount).sum::<i64>(),
+            0,
+            "balances"
+        );
+        let of = |a: &str| {
+            cmd.lines
+                .iter()
+                .find(|l| l.account_id == a)
+                .map(|l| l.amount)
+        };
         assert_eq!(of("fees"), Some(767), "fees are a cost");
-        assert_eq!(of("bank"), Some(18416), "the payout left Stripe for the bank");
+        assert_eq!(
+            of("bank"),
+            Some(18416),
+            "the payout left Stripe for the bank"
+        );
         assert_eq!(of("revenue"), Some(-19183), "gross activity is the revenue");
         // The balance itself did not move this period, so it carries no line.
         assert_eq!(of("stripe-balance"), None);
@@ -742,7 +798,10 @@ ending_balance,Ending,999.00,usd\n";
             "Balance_Summary_USD_2026-07-01_to_2026-07-31.csv",
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("not being accounted for"), "{err}");
+        assert!(
+            format!("{err}").contains("not being accounted for"),
+            "{err}"
+        );
     }
 
     #[test]

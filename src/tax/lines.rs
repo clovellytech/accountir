@@ -164,15 +164,47 @@ pub struct Attachment {
 /// The single source of truth, shared by the mapping editor and by [`compute`].
 /// Derived lines are deliberately absent — see the module docs.
 // Attachments the form names beside a line.
-const FORM_1125A: Attachment = Attachment { name: "Form 1125-A", url: "https://www.irs.gov/forms-pubs/about-form-1125-a", generated: false };
-const FORM_4797: Attachment = Attachment { name: "Form 4797", url: "https://www.irs.gov/forms-pubs/about-form-4797", generated: false };
-const FORM_4562: Attachment = Attachment { name: "Form 4562", url: "https://www.irs.gov/forms-pubs/about-form-4562", generated: false };
-const FORM_7205: Attachment = Attachment { name: "Form 7205", url: "https://www.irs.gov/forms-pubs/about-form-7205", generated: false };
-const FORM_8825: Attachment = Attachment { name: "Form 8825", url: "https://www.irs.gov/forms-pubs/about-form-8825", generated: false };
-const SCHEDULE_D: Attachment = Attachment { name: "Schedule D (Form 1065)", url: "https://www.irs.gov/forms-pubs/about-schedule-d-form-1065", generated: false };
+const FORM_1125A: Attachment = Attachment {
+    name: "Form 1125-A",
+    url: "https://www.irs.gov/forms-pubs/about-form-1125-a",
+    generated: false,
+};
+const FORM_4797: Attachment = Attachment {
+    name: "Form 4797",
+    url: "https://www.irs.gov/forms-pubs/about-form-4797",
+    generated: false,
+};
+const FORM_4562: Attachment = Attachment {
+    name: "Form 4562",
+    url: "https://www.irs.gov/forms-pubs/about-form-4562",
+    generated: false,
+};
+const FORM_7205: Attachment = Attachment {
+    name: "Form 7205",
+    url: "https://www.irs.gov/forms-pubs/about-form-7205",
+    generated: false,
+};
+const FORM_8825: Attachment = Attachment {
+    name: "Form 8825",
+    url: "https://www.irs.gov/forms-pubs/about-form-8825",
+    generated: false,
+};
+const SCHEDULE_D: Attachment = Attachment {
+    name: "Schedule D (Form 1065)",
+    url: "https://www.irs.gov/forms-pubs/about-schedule-d-form-1065",
+    generated: false,
+};
 /// The one attachment this program produces itself — see [`crate::tax::statement`].
-const LINE_21_STATEMENT: Attachment = Attachment { name: "Other deductions statement", url: "https://www.irs.gov/instructions/i1065", generated: true };
-const OTHER_INCOME_STATEMENT: Attachment = Attachment { name: "Other income statement", url: "https://www.irs.gov/instructions/i1065", generated: true };
+const LINE_21_STATEMENT: Attachment = Attachment {
+    name: "Other deductions statement",
+    url: "https://www.irs.gov/instructions/i1065",
+    generated: true,
+};
+const OTHER_INCOME_STATEMENT: Attachment = Attachment {
+    name: "Other income statement",
+    url: "https://www.irs.gov/instructions/i1065",
+    generated: true,
+};
 
 /// The Instructions for Form 1065 themselves — the document every `instructions`
 /// string on this table is condensed from, and where a preparer goes when the
@@ -473,6 +505,35 @@ pub struct Form1065Lines {
 }
 
 impl Form1065Lines {
+    /// Build from explicit figures. Tests and segment arithmetic.
+    pub fn from_pairs(pairs: &[(&'static str, i64)]) -> Self {
+        Form1065Lines {
+            mapped: pairs.iter().copied().collect(),
+        }
+    }
+
+    /// The same lines scaled to a fraction of a period — `days` out of `total`.
+    ///
+    /// For §706(d) proration, which spreads one year's figures across the
+    /// segments its partners' changes divide it into. Every line is scaled by
+    /// the same fraction, so the relationships between them survive; the
+    /// rounding is per line and toward zero, which means the segments can come
+    /// to a dollar or two less than the year. That is why the caller turns these
+    /// into percentages of the annual figure rather than filing them: the shares
+    /// are then allocated out of the year's own total and foot to it exactly.
+    pub fn scaled(&self, days: i64, total: i64) -> Self {
+        if total == 0 {
+            return Form1065Lines::default();
+        }
+        Form1065Lines {
+            mapped: self
+                .mapped
+                .iter()
+                .map(|(k, v)| (*k, (*v as i128 * days as i128 / total as i128) as i64))
+                .collect(),
+        }
+    }
+
     /// A mapped line's figure, or zero when nothing was mapped to it.
     ///
     /// Zero rather than `None` because every arithmetic use of a line wants it
@@ -714,6 +775,13 @@ pub type ResolveLine<'a> = &'a dyn Fn(&str) -> Option<(&'static str, Sense)>;
 pub fn sum_by_line(
     statement: &IncomeStatement,
     mapping: &BTreeMap<String, String>,
+    // How much of each account is deductible, inherited down the tree. An
+    // account absent from it is fully deductible.
+    limits: &BTreeMap<String, u8>,
+    // Where the disallowed part goes. `Some` on Form 1065, which reports it on
+    // Schedule K line 18c so it reaches each partner's basis; `None` on
+    // Schedule C, which has nowhere to put it and simply does not deduct it.
+    disallowed_line: Option<&'static str>,
     resolve: ResolveLine<'_>,
     form: &str,
 ) -> (
@@ -725,6 +793,7 @@ pub fn sum_by_line(
     let mut detail: BTreeMap<&'static str, Vec<LineDetail>> = BTreeMap::new();
     let mut unmapped: Vec<(String, String, i64)> = Vec::new();
     let mut unknown_keys: BTreeSet<String> = BTreeSet::new();
+    let mut warnings_from_limits: Vec<(String, String, i64, u8)> = Vec::new();
 
     let all = statement
         .revenue
@@ -741,19 +810,55 @@ pub fn sum_by_line(
             continue;
         }
         match mapping.get(&line.account_id) {
+            // Deliberately on no line. Not summed, and — unlike an account
+            // nobody has ruled on — not warned about either.
+            Some(key) if key == OFF_RETURN => continue,
             Some(key) => match resolve(key) {
                 Some((canonical, sense)) => {
                     let signed = match sense {
                         Sense::Natural => line.balance,
                         Sense::Contra => -line.balance,
                     };
-                    *cents.entry(canonical).or_insert(0) += signed;
+                    // The law's share of it. Meals are the standing example: the
+                    // books hold what the meal cost, the return deducts half,
+                    // and the other half is reported rather than forgotten.
+                    let pct = limits.get(&line.account_id).copied().unwrap_or(100);
+                    let (allowed, disallowed) = split_deductible(signed, pct);
+
+                    *cents.entry(canonical).or_insert(0) += allowed;
                     detail.entry(canonical).or_default().push(LineDetail {
                         account_id: line.account_id.clone(),
                         account_number: line.account_number.clone(),
                         account_name: line.account_name.clone(),
-                        cents: signed,
+                        cents: allowed,
                     });
+
+                    if disallowed != 0 {
+                        match disallowed_line.and_then(|k| resolve(k)) {
+                            Some((nd_line, _)) => {
+                                *cents.entry(nd_line).or_insert(0) += disallowed;
+                                detail.entry(nd_line).or_default().push(LineDetail {
+                                    account_id: line.account_id.clone(),
+                                    account_number: line.account_number.clone(),
+                                    account_name: format!(
+                                        "{} — {}% disallowed",
+                                        line.account_name,
+                                        100 - pct
+                                    ),
+                                    cents: disallowed,
+                                });
+                            }
+                            // Nowhere to report it on this form. Not deducted,
+                            // and said out loud: a limit that silently evaporated
+                            // would look exactly like a full deduction.
+                            None => warnings_from_limits.push((
+                                line.account_number.clone(),
+                                line.account_name.clone(),
+                                disallowed,
+                                pct,
+                            )),
+                        }
+                    }
                 }
                 // A key this form does not have — a revision dropped the line,
                 // the row was hand-edited, or the books changed which return
@@ -778,11 +883,21 @@ pub fn sum_by_line(
     }
 
     let mut warnings = Vec::new();
+    for (number, name, disallowed, pct) in &warnings_from_limits {
+        warnings.push(format!(
+            "{number} {name} is {pct}% deductible, so {} is not deducted — but {form} has no line \
+             for a disallowed expense, so it is simply left out. Check that is what the form \
+             expects for this deduction.",
+            format_dollars(cents_to_dollars(*disallowed))
+        ));
+    }
     if !unmapped.is_empty() {
         let total: i64 = unmapped.iter().map(|(_, _, c)| *c).sum();
         let named: Vec<String> = unmapped
             .iter()
-            .map(|(num, name, c)| format!("{num} {name} ({})", format_dollars(cents_to_dollars(*c))))
+            .map(|(num, name, c)| {
+                format!("{num} {name} ({})", format_dollars(cents_to_dollars(*c)))
+            })
             .collect();
         warnings.push(format!(
             "{} account(s) carrying {} are on no {form} line and are missing from the return: {}.",
@@ -817,10 +932,13 @@ pub fn sum_by_line(
 pub fn compute(
     statement: &IncomeStatement,
     mapping: &BTreeMap<String, String>,
+    limits: &BTreeMap<String, u8>,
 ) -> ComputedLines {
     let (cents, detail, warnings) = sum_by_line(
         statement,
         mapping,
+        limits,
+        Some(NONDEDUCTIBLE_LINE),
         &|key| line_def(key).map(|d| (d.key, d.sense)),
         "Form 1065",
     );
@@ -839,16 +957,242 @@ pub fn compute(
 // Storage
 // ---------------------------------------------------------------------------
 
-/// Every saved mapping as account id → line key.
-pub fn load_mapping(conn: &Connection) -> BTreeMap<String, String> {
+/// Line key meaning "deliberately on no line".
+///
+/// Absence from the mapping means "nobody has said yet", and the page shouts
+/// about an account in that state carrying a balance — money that would go
+/// missing from the return. Once a parent is mapped its children inherit, so
+/// there has to be a way to say *no* for one of them that is louder than
+/// silence: this key is that, and unlike silence it draws no warning, because
+/// somebody decided it.
+pub const OFF_RETURN: &str = "off";
+
+/// Every account's parent, for walking a mapping up the tree.
+///
+/// Read straight from the table rather than from a list of active accounts: a
+/// deactivated parent still sits between a live child and the line it inherits,
+/// and dropping it out of the chain would silently take the child off the
+/// return.
+pub fn load_parents(conn: &Connection) -> BTreeMap<String, Option<String>> {
     let mut out = BTreeMap::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT account_id, line_key FROM tax_line_mappings") {
-        if let Ok(rows) =
-            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        {
-            for (account_id, key) in rows.flatten() {
-                out.insert(account_id, key);
+    if let Ok(mut stmt) = conn.prepare("SELECT id, parent_id FROM accounts") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        }) {
+            for (id, parent) in rows.flatten() {
+                out.insert(id, parent);
             }
+        }
+    }
+    out
+}
+
+/// How far up a parent chain to walk before deciding it is not a chain.
+///
+/// A chart of accounts is a handful of levels deep. This is not a limit on
+/// nesting anybody will meet — it is what stops a corrupt `parent_id` cycle
+/// from hanging the tax page.
+const MAX_TREE_DEPTH: usize = 32;
+
+/// Expand a mapping so every account carries the line of its nearest mapped
+/// ancestor.
+///
+/// # Why this is the shape of the feature
+///
+/// A chart of accounts already says that Squarespace, Canva and Flodesk are
+/// software; repeating that on a tax page by pointing all three at line 20, one
+/// dropdown at a time, is work the tree has already done. Mapping
+/// `Expenses:Software` is the same statement made once. A child that belongs
+/// somewhere else says so itself and its own key wins, because the nearest
+/// answer is the most specific one.
+///
+/// # Why it is expanded here rather than looked up at each use
+///
+/// Three forms and a preview all ask "which line does this account reach", and
+/// the warning about accounts reaching no line is the check that catches money
+/// going astray. If inheritance lived in the callers, one of them would
+/// eventually walk the tree differently, and the symptom would be a return that
+/// foots and is wrong. Expanding once, here, means every caller is asking the
+/// same question of the same answer.
+pub fn inherit_through_tree(
+    stored: &BTreeMap<String, String>,
+    parent_of: &BTreeMap<String, Option<String>>,
+) -> BTreeMap<String, String> {
+    // Anything mapped whose account the tree does not know about is kept as it
+    // is: a mapping is not worth dropping because an account row is missing.
+    let mut out = stored.clone();
+    for account_id in parent_of.keys() {
+        if out.contains_key(account_id) {
+            continue;
+        }
+        let mut cursor = parent_of.get(account_id).cloned().flatten();
+        for _ in 0..MAX_TREE_DEPTH {
+            let Some(id) = cursor else { break };
+            if let Some(key) = stored.get(&id) {
+                out.insert(account_id.clone(), key.clone());
+                break;
+            }
+            cursor = parent_of.get(&id).cloned().flatten();
+        }
+    }
+    out
+}
+
+/// Schedule K's line for expenses paid that the law does not let you deduct.
+///
+/// Where the disallowed part of a limited deduction goes on Form 1065. It is not
+/// a deduction anywhere: it reduces each partner's outside basis and capital
+/// account, which is why dropping it silently would overstate basis and
+/// understate a later gain.
+pub const NONDEDUCTIBLE_LINE: &str = "k18c";
+
+/// How much of each account's balance the law lets you deduct, as a percentage.
+///
+/// An account with no row is fully deductible. Stored sparsely for that reason:
+/// a 100 written against every account is a hundred rows that mean "nothing
+/// unusual here" and one more thing to keep right.
+pub fn load_deduction_limits(conn: &Connection, year: i32) -> BTreeMap<String, u8> {
+    load_dated(conn, "tax_deduction_limits", "deductible_pct", year)
+        .into_iter()
+        .filter_map(|(account, pct)| pct.parse::<u8>().ok().map(|p| (account, p.min(100))))
+        .collect()
+}
+
+/// The same, inherited down the account tree like a line assignment.
+///
+/// A limit set on "Meals" is a statement about everything filed under it, in
+/// exactly the way a line assignment is — and a child that is limited
+/// differently says so itself and wins, being the nearer answer.
+pub fn load_effective_limits(conn: &Connection, year: i32) -> BTreeMap<String, u8> {
+    let stored = load_deduction_limits(conn, year);
+    let parent_of = load_parents(conn);
+    let as_text: BTreeMap<String, String> = stored
+        .iter()
+        .map(|(k, v)| (k.clone(), v.to_string()))
+        .collect();
+    inherit_through_tree(&as_text, &parent_of)
+        .into_iter()
+        .filter_map(|(k, v)| v.parse::<u8>().ok().map(|p| (k, p)))
+        .collect()
+}
+
+/// Split a balance into the part that is deducted and the part that is not.
+///
+/// Rounding is done once, on the deductible part, and the remainder is whatever
+/// is left — so the two halves always add back to the balance exactly. Rounding
+/// both independently is how a return ends up a cent out from its own books.
+pub fn split_deductible(balance: i64, pct: u8) -> (i64, i64) {
+    let pct = pct.min(100) as i64;
+    // Round half away from zero, so a negative balance (a credit sitting in an
+    // expense account) splits the same way its positive twin would.
+    let scaled = balance * pct;
+    let allowed = if scaled >= 0 {
+        (scaled + 50) / 100
+    } else {
+        (scaled - 50) / 100
+    };
+    (allowed, balance - allowed)
+}
+
+/// Every saved mapping, expanded down the account tree — what the forms ask.
+///
+/// [`load_mapping`] is what a *mapping editor* wants: the choices somebody
+/// actually made. This is what a *return* wants: the line every account ends up
+/// on once those choices are inherited.
+pub fn load_effective_mapping(conn: &Connection, year: i32) -> BTreeMap<String, String> {
+    inherit_through_tree(&load_mapping(conn, year), &load_parents(conn))
+}
+
+/// Every saved mapping as account id → line key, exactly as stored.
+pub fn load_mapping(conn: &Connection, year: i32) -> BTreeMap<String, String> {
+    load_dated(conn, "tax_line_mappings", "line_key", year)
+}
+
+/// The rows of a dated assignment table that are in force for a tax year.
+///
+/// # How a year picks its row
+///
+/// The greatest `effective_from` at or before the year. So an assignment made in
+/// 2026 does not reach back into a 2023 return that was filed on the old one,
+/// and a year with no assignment of its own inherits the most recent earlier one
+/// rather than starting with an unmapped chart. `effective_from = 0` is the
+/// sentinel for an assignment made before assignments were dated: it is at or
+/// before every year, so books that predate the change behave exactly as they
+/// did.
+fn load_dated(
+    conn: &Connection,
+    table: &str,
+    value_column: &str,
+    year: i32,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    // `CAST(... AS TEXT)` because one of the two value columns is an INTEGER,
+    // and reading an integer as a string makes `query_map` yield an error per
+    // row — which `flatten` then drops, so every deduction limit silently
+    // vanished rather than failing loudly.
+    let sql = format!(
+        "SELECT account_id, CAST({value_column} AS TEXT) FROM {table} t
+          WHERE effective_from <= ?1
+            AND effective_from = (
+                SELECT MAX(effective_from) FROM {table} u
+                 WHERE u.account_id = t.account_id AND u.effective_from <= ?1
+            )"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return out;
+    };
+    let Ok(rows) = stmt.query_map([year], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    }) else {
+        return out;
+    };
+    for (account_id, value) in rows.flatten() {
+        out.insert(account_id, value);
+    }
+    out
+}
+
+/// Where the assignment in force for a year came from.
+///
+/// The desktop needs this to say "set here" rather than "inherited from 2024" —
+/// and a reviewer needs it to see at a glance that the year they are looking at
+/// is one somebody actually decided, rather than one that drifted in from a
+/// neighbour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Assigned for this very year.
+    SetHere,
+    /// Inherited from an assignment made in an earlier year.
+    From(i32),
+    /// Made before assignments were dated, so it applies to every year.
+    Undated,
+    /// No assignment at any year at or before this one.
+    None,
+}
+
+/// Where an account's assignment for a year came from.
+pub fn provenance(conn: &Connection, account_id: &str, year: i32) -> Provenance {
+    let years = assignment_years(conn, account_id);
+    match years.iter().filter(|y| **y <= year).max() {
+        None => Provenance::None,
+        Some(&y) if y == year => Provenance::SetHere,
+        Some(&y) if y == crate::events::types::ANY_YEAR => Provenance::Undated,
+        Some(&y) => Provenance::From(y),
+    }
+}
+
+/// Every year an assignment was made in, for one account, oldest first.
+///
+/// What the desktop needs to say "set here" rather than "inherited from 2024",
+/// and what a reviewer needs to see that a filed year has not been disturbed.
+pub fn assignment_years(conn: &Connection, account_id: &str) -> Vec<i32> {
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT effective_from FROM tax_line_mappings
+          WHERE account_id = ?1 ORDER BY effective_from",
+    ) {
+        if let Ok(rows) = stmt.query_map([account_id], |r| r.get::<_, i32>(0)) {
+            out.extend(rows.flatten());
         }
     }
     out
@@ -878,15 +1222,17 @@ pub fn set_account_line(
     conn: &Connection,
     account_id: &str,
     line_key: &str,
+    effective_from: i32,
 ) -> Result<(), MappingError> {
     if line_def(line_key).is_none() {
         return Err(MappingError::UnknownLine(line_key.to_string()));
     }
     conn.execute(
-        "INSERT INTO tax_line_mappings (account_id, line_key, updated_at)
-         VALUES (?1, ?2, datetime('now'))
-         ON CONFLICT(account_id) DO UPDATE SET line_key = ?2, updated_at = datetime('now')",
-        rusqlite::params![account_id, line_key],
+        "INSERT INTO tax_line_mappings (account_id, effective_from, line_key, updated_at)
+         VALUES (?1, ?2, ?3, datetime('now'))
+         ON CONFLICT(account_id, effective_from)
+           DO UPDATE SET line_key = ?3, updated_at = datetime('now')",
+        rusqlite::params![account_id, effective_from, line_key],
     )?;
     Ok(())
 }
@@ -894,12 +1240,106 @@ pub fn set_account_line(
 /// Take an account off the return, writing straight to the table.
 ///
 /// **Not the command path** — see [`set_account_line`].
-pub fn clear_account_line(conn: &Connection, account_id: &str) -> Result<(), MappingError> {
+pub fn clear_account_line(
+    conn: &Connection,
+    account_id: &str,
+    effective_from: i32,
+) -> Result<(), MappingError> {
     conn.execute(
-        "DELETE FROM tax_line_mappings WHERE account_id = ?1",
-        [account_id],
+        "DELETE FROM tax_line_mappings WHERE account_id = ?1 AND effective_from = ?2",
+        rusqlite::params![account_id, effective_from],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+
+    fn tree(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+        pairs
+            .iter()
+            .map(|(id, parent)| (id.to_string(), parent.map(str::to_string)))
+            .collect()
+    }
+
+    fn stored(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(id, key)| (id.to_string(), key.to_string()))
+            .collect()
+    }
+
+    /// The point of the feature: say it once on the parent.
+    #[test]
+    fn a_child_takes_its_parents_line() {
+        let t = tree(&[
+            ("expenses", None),
+            ("software", Some("expenses")),
+            ("canva", Some("software")),
+        ]);
+        let e = inherit_through_tree(&stored(&[("software", "l20")]), &t);
+        assert_eq!(e.get("canva").map(String::as_str), Some("l20"));
+        assert_eq!(e.get("software").map(String::as_str), Some("l20"));
+        // Nothing above the mapped account is dragged onto the line with it.
+        assert_eq!(e.get("expenses"), None);
+    }
+
+    /// The nearest answer is the most specific one, so a child that says
+    /// something else says it for itself and not for its parent.
+    #[test]
+    fn the_nearest_mapped_ancestor_wins() {
+        let t = tree(&[
+            ("expenses", None),
+            ("software", Some("expenses")),
+            ("canva", Some("software")),
+        ]);
+        let e = inherit_through_tree(&stored(&[("expenses", "l20"), ("software", "l13")]), &t);
+        assert_eq!(
+            e.get("canva").map(String::as_str),
+            Some("l13"),
+            "nearest, not topmost"
+        );
+        assert_eq!(e.get("software").map(String::as_str), Some("l13"));
+        assert_eq!(e.get("expenses").map(String::as_str), Some("l20"));
+    }
+
+    /// Without this there is no way out of an inherited line, and mapping a
+    /// parent becomes a trap.
+    #[test]
+    fn a_child_can_be_held_off_a_line_its_parent_is_on() {
+        let t = tree(&[("expenses", None), ("personal", Some("expenses"))]);
+        let e = inherit_through_tree(
+            &stored(&[("expenses", "l20"), ("personal", OFF_RETURN)]),
+            &t,
+        );
+        assert_eq!(e.get("personal").map(String::as_str), Some(OFF_RETURN));
+    }
+
+    /// An account under nothing mapped is still simply unmapped, which is the
+    /// state the page warns about.
+    #[test]
+    fn an_account_under_no_mapped_ancestor_stays_unmapped() {
+        let t = tree(&[("expenses", None), ("rent", Some("expenses"))]);
+        let e = inherit_through_tree(&stored(&[]), &t);
+        assert!(e.is_empty());
+    }
+
+    /// A corrupt `parent_id` must not hang the tax page.
+    #[test]
+    fn a_cycle_in_the_tree_terminates() {
+        let t = tree(&[("a", Some("b")), ("b", Some("a"))]);
+        let e = inherit_through_tree(&stored(&[]), &t);
+        assert!(e.is_empty());
+    }
+
+    /// A mapping whose account the tree does not know about is kept, not
+    /// dropped — losing one silently takes money off the return.
+    #[test]
+    fn a_mapping_for_an_unknown_account_survives() {
+        let e = inherit_through_tree(&stored(&[("ghost", "l20")]), &tree(&[("a", None)]));
+        assert_eq!(e.get("ghost").map(String::as_str), Some("l20"));
+    }
 }
 
 #[cfg(test)]
@@ -952,10 +1392,20 @@ mod tests {
         for def in MAPPABLE_LINES {
             assert!(keys.insert(def.key), "duplicate line key {}", def.key);
             match def.field {
-                Field::One(f) => assert!(boxes.insert(f), "duplicate box {f} at line {}", def.number),
+                Field::One(f) => {
+                    assert!(boxes.insert(f), "duplicate box {f} at line {}", def.number)
+                }
                 Field::Period { begin, end } => {
-                    assert!(boxes.insert(begin), "duplicate box {begin} at line {}", def.number);
-                    assert!(boxes.insert(end), "duplicate box {end} at line {}", def.number);
+                    assert!(
+                        boxes.insert(begin),
+                        "duplicate box {begin} at line {}",
+                        def.number
+                    );
+                    assert!(
+                        boxes.insert(end),
+                        "duplicate box {end} at line {}",
+                        def.number
+                    );
                 }
             }
         }
@@ -1013,20 +1463,125 @@ mod tests {
         }
     }
 
-    fn statement(revenue: Vec<IncomeStatementLine>, expenses: Vec<IncomeStatementLine>) -> IncomeStatement {
+    fn statement(
+        revenue: Vec<IncomeStatementLine>,
+        expenses: Vec<IncomeStatementLine>,
+    ) -> IncomeStatement {
         let rt = revenue.iter().map(|l| l.balance).sum();
         let et = expenses.iter().map(|l| l.balance).sum();
         IncomeStatement {
             start_date: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             end_date: NaiveDate::from_ymd_opt(2025, 12, 31).unwrap(),
-            revenue: IncomeStatementSection { name: "Revenue".into(), lines: revenue, total: rt },
-            expenses: IncomeStatementSection { name: "Expenses".into(), lines: expenses, total: et },
+            revenue: IncomeStatementSection {
+                name: "Revenue".into(),
+                lines: revenue,
+                total: rt,
+            },
+            expenses: IncomeStatementSection {
+                name: "Expenses".into(),
+                lines: expenses,
+                total: et,
+            },
             net_income: rt - et,
         }
     }
 
     fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(a, k)| (a.to_string(), k.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(a, k)| (a.to_string(), k.to_string()))
+            .collect()
+    }
+
+    fn limits(pairs: &[(&str, u8)]) -> BTreeMap<String, u8> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    /// The two halves must add back to the balance exactly. Rounding each
+    /// independently is how a return ends up a cent away from its own books.
+    #[test]
+    fn a_limited_deduction_splits_without_losing_a_cent() {
+        for balance in [0, 1, 99, 100, 101, 12_345, 1_320_91, -4_567, -1] {
+            for pct in [0u8, 25, 50, 75, 100] {
+                let (allowed, disallowed) = split_deductible(balance, pct);
+                assert_eq!(
+                    allowed + disallowed,
+                    balance,
+                    "{balance} at {pct}% split into {allowed} + {disallowed}"
+                );
+            }
+        }
+        // An odd cent rounds away from zero, and the same way for a credit.
+        assert_eq!(split_deductible(101, 50), (51, 50));
+        assert_eq!(split_deductible(-101, 50), (-51, -50));
+        assert_eq!(split_deductible(1_320_91, 50), (66_046, 66_045));
+        // The ends are exact.
+        assert_eq!(split_deductible(999, 100), (999, 0));
+        assert_eq!(split_deductible(999, 0), (0, 999));
+    }
+
+    /// The meals case, end to end: half is deducted on the line it is mapped
+    /// to, and the other half is *reported* on Schedule K line 18c rather than
+    /// disappearing. Dropping it would overstate every partner's basis.
+    #[test]
+    fn the_disallowed_half_of_a_meal_reaches_the_nondeductible_line() {
+        let s = statement(vec![], vec![line("meals", "3045", "Staff meals", 1_320_91)]);
+        let m = map(&[("meals", "l21")]);
+        let c = compute(&s, &m, &limits(&[("meals", 50)]));
+
+        assert_eq!(c.lines.get("l21"), 660, "660.46 rounds to 660");
+        assert_eq!(
+            c.lines.get(NONDEDUCTIBLE_LINE),
+            660,
+            "the disallowed half is reported, not dropped"
+        );
+        // And it is attributed, so the line 18c statement can say what it was.
+        let detail = c.detail.get(NONDEDUCTIBLE_LINE).expect("18c has detail");
+        assert!(
+            detail
+                .iter()
+                .any(|d| d.account_name.contains("50% disallowed")),
+            "{detail:?}"
+        );
+    }
+
+    /// No limit means no split and nothing on 18c — the overwhelmingly common
+    /// case has to stay exactly as it was.
+    #[test]
+    fn an_unlimited_account_is_untouched_and_reports_nothing_as_nondeductible() {
+        let s = statement(vec![], vec![line("rent", "3002", "Rent", 100_000)]);
+        let c = compute(&s, &map(&[("rent", "l13")]), &BTreeMap::new());
+        assert_eq!(c.lines.get("l13"), 1_000);
+        assert_eq!(c.lines.get(NONDEDUCTIBLE_LINE), 0);
+    }
+
+    /// A limit set on a parent is a statement about everything under it, in the
+    /// same way a line assignment is.
+    #[test]
+    fn a_deduction_limit_inherits_down_the_tree() {
+        let tree = [
+            ("meals".to_string(), None),
+            ("lunches".to_string(), Some("meals".to_string())),
+            ("parties".to_string(), Some("meals".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        let stored = [("meals".to_string(), "50".to_string())]
+            .into_iter()
+            .collect();
+        let effective = inherit_through_tree(&stored, &tree);
+        assert_eq!(effective.get("lunches").map(String::as_str), Some("50"));
+
+        // …and a child that is limited differently wins, being the nearer answer.
+        let stored = [
+            ("meals".to_string(), "50".to_string()),
+            ("parties".to_string(), "100".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let effective = inherit_through_tree(&stored, &tree);
+        assert_eq!(effective.get("parties").map(String::as_str), Some("100"));
+        assert_eq!(effective.get("lunches").map(String::as_str), Some("50"));
     }
 
     /// The property the whole module exists for: what the reader adds up on the
@@ -1037,11 +1592,17 @@ mod tests {
         // first and summing the rounded dollars first give different answers —
         // if the code ever rounds in the wrong order, this catches it.
         let s = statement(
-            vec![line("a1", "4000", "Sales", 10_050), line("a2", "4100", "Consulting", 20_050)],
-            vec![line("b1", "6000", "Wages", 3_050), line("b2", "6100", "Rent", 1_050)],
+            vec![
+                line("a1", "4000", "Sales", 10_050),
+                line("a2", "4100", "Consulting", 20_050),
+            ],
+            vec![
+                line("b1", "6000", "Wages", 3_050),
+                line("b2", "6100", "Rent", 1_050),
+            ],
         );
         let m = map(&[("a1", "l1a"), ("a2", "l7"), ("b1", "l9"), ("b2", "l13")]);
-        let c = compute(&s, &m);
+        let c = compute(&s, &m, &BTreeMap::new());
         let l = &c.lines;
 
         assert_eq!(l.get("l1a"), 101, "100.50 rounds away from zero");
@@ -1058,7 +1619,10 @@ mod tests {
 
         // And the identity the form itself asserts.
         assert_eq!(l.line_23(), l.line_8() - l.line_22());
-        assert_eq!(l.line_8(), l.line_3() + l.get("l4") + l.get("l5") + l.get("l6") + l.get("l7"));
+        assert_eq!(
+            l.line_8(),
+            l.line_3() + l.get("l4") + l.get("l5") + l.get("l6") + l.get("l7")
+        );
     }
 
     /// Rounding each account before summing accumulates a cent per account. This
@@ -1077,7 +1641,7 @@ mod tests {
             ],
         );
         let m = map(&[("b1", "l21"), ("b2", "l21"), ("b3", "l21"), ("b4", "l21")]);
-        let c = compute(&s, &m);
+        let c = compute(&s, &m, &BTreeMap::new());
         assert_eq!(
             c.lines.get("l21"),
             2,
@@ -1090,14 +1654,21 @@ mod tests {
     #[test]
     fn a_less_line_prints_the_amount_it_takes_away_as_a_positive_figure() {
         let s = statement(
-            vec![line("a1", "4000", "Sales", 100_000), line("a2", "4900", "Refunds", -5_000)],
+            vec![
+                line("a1", "4000", "Sales", 100_000),
+                line("a2", "4900", "Refunds", -5_000),
+            ],
             vec![],
         );
         let m = map(&[("a1", "l1a"), ("a2", "l1b")]);
-        let c = compute(&s, &m);
+        let c = compute(&s, &m, &BTreeMap::new());
 
         assert_eq!(c.lines.get("l1a"), 1000);
-        assert_eq!(c.lines.get("l1b"), 50, "refunds print positive on a 'less' line");
+        assert_eq!(
+            c.lines.get("l1b"),
+            50,
+            "refunds print positive on a 'less' line"
+        );
         assert_eq!(c.lines.line_1c(), 950, "and are subtracted, not added");
     }
 
@@ -1113,7 +1684,7 @@ mod tests {
             ],
         );
         let m = map(&[("b1", "l16a"), ("b2", "l16b")]);
-        let c = compute(&s, &m);
+        let c = compute(&s, &m, &BTreeMap::new());
 
         assert_eq!(c.lines.get("l16a"), 100);
         assert_eq!(c.lines.get("l16b"), 40);
@@ -1134,7 +1705,7 @@ mod tests {
             vec![line("b9", "6999", "Mystery expense", 12_345)],
         );
         let m = map(&[("a1", "l1a")]);
-        let c = compute(&s, &m);
+        let c = compute(&s, &m, &BTreeMap::new());
 
         let joined = c.warnings.join(" ");
         assert!(joined.contains("6999"), "the account number: {joined}");
@@ -1151,11 +1722,14 @@ mod tests {
     #[test]
     fn an_account_with_no_balance_is_not_reported_as_missing() {
         let s = statement(
-            vec![line("a1", "4000", "Sales", 100_000), line("parent", "4", "Revenue", 0)],
+            vec![
+                line("a1", "4000", "Sales", 100_000),
+                line("parent", "4", "Revenue", 0),
+            ],
             vec![],
         );
         let m = map(&[("a1", "l1a")]);
-        let c = compute(&s, &m);
+        let c = compute(&s, &m, &BTreeMap::new());
         assert!(
             c.warnings.is_empty(),
             "a zero-balance ancestor is not missing money: {:?}",
@@ -1167,12 +1741,15 @@ mod tests {
     fn a_mapping_naming_a_line_the_form_does_not_have_is_reported_not_ignored() {
         let s = statement(vec![line("a1", "4000", "Sales", 100_000)], vec![]);
         let m = map(&[("a1", "l99")]);
-        let c = compute(&s, &m);
+        let c = compute(&s, &m, &BTreeMap::new());
 
         assert!(c.lines.is_empty(), "nothing was reportable");
         let joined = c.warnings.join(" ");
         assert!(joined.contains("l99"), "got {joined}");
-        assert!(joined.contains("4000"), "and the account is still missing money: {joined}");
+        assert!(
+            joined.contains("4000"),
+            "and the account is still missing money: {joined}"
+        );
     }
 
     #[test]
@@ -1194,7 +1771,7 @@ mod tests {
             vec![line("b1", "6000", "Wages", 250_000)],
         );
         let m = map(&[("a1", "l1a"), ("b1", "l9")]);
-        let c = compute(&s, &m);
+        let c = compute(&s, &m, &BTreeMap::new());
 
         assert_eq!(c.lines.line_8(), 1000);
         assert_eq!(c.lines.line_22(), 2500);
@@ -1250,5 +1827,36 @@ mod tests {
                 def.group
             );
         }
+    }
+
+    /// Provenance tells a year that decided something from a year that inherited.
+    #[test]
+    fn provenance_says_whether_a_year_decided_or_inherited() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::migrations::init_schema(&conn).unwrap();
+        set_account_line(&conn, "6100", "l21", 2023).unwrap();
+        set_account_line(&conn, "6100", "l11", 2026).unwrap();
+
+        assert_eq!(provenance(&conn, "6100", 2022), Provenance::None);
+        assert_eq!(provenance(&conn, "6100", 2023), Provenance::SetHere);
+        assert_eq!(provenance(&conn, "6100", 2024), Provenance::From(2023));
+        assert_eq!(provenance(&conn, "6100", 2026), Provenance::SetHere);
+        assert_eq!(provenance(&conn, "6100", 2027), Provenance::From(2026));
+        assert_eq!(provenance(&conn, "9999", 2025), Provenance::None);
+    }
+
+    /// An assignment made before assignments were dated says so, rather than
+    /// claiming to come from "year 0".
+    #[test]
+    fn an_undated_assignment_is_named_as_such() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::migrations::init_schema(&conn).unwrap();
+        set_account_line(&conn, "6100", "l21", crate::events::types::ANY_YEAR).unwrap();
+
+        assert_eq!(provenance(&conn, "6100", 2025), Provenance::Undated);
+        // A dated assignment then takes over from its own year.
+        set_account_line(&conn, "6100", "l11", 2026).unwrap();
+        assert_eq!(provenance(&conn, "6100", 2025), Provenance::Undated);
+        assert_eq!(provenance(&conn, "6100", 2026), Provenance::SetHere);
     }
 }

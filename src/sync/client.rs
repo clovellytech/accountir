@@ -5,8 +5,8 @@
 //! and retrying, so the caller doesn't hand-manage conflicts.
 
 use super::commands::account::{
-    CreateAccountRequest, DeactivateAccountRequest, SeedDefaultAccountsRequest,
-    UpdateAccountRequest,
+    CreateAccountRequest, DeactivateAccountRequest, DeleteAccountRequest,
+    SeedDefaultAccountsRequest, UpdateAccountRequest,
 };
 use super::commands::bill::{IssueInvoiceRequest, ReceiveBillRequest};
 use super::commands::bill_ops::{
@@ -21,10 +21,11 @@ use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
     RemoveEventServiceRequest, SetServiceReportingRequest, SetServiceReportingResponse,
 };
-use crate::commands::partnership_commands::UpdatePartner;
 use super::commands::partnership::{
-    AdmitPartnerRequest, AdmitPartnerResponse, ClearRelationshipRequest, SetBusinessProfileRequest,
-    SetIl1065SettingsRequest, SetRelationshipRequest, UpdatePartnerRequest, WithdrawPartnerRequest,
+    AdmitPartnerRequest, AdmitPartnerResponse, ClearRelationshipRequest, LinkEquityAccountRequest,
+    SetBusinessProfileRequest, SetIl1065SettingsRequest, SetPartnerSharesRequest,
+    SetRelationshipRequest, UnlinkEquityAccountRequest, UpdatePartnerRequest,
+    WithdrawPartnerRequest,
 };
 use super::commands::plaid::{
     ConnectPlaidItemRequest, ConnectPlaidItemResponse, DisconnectPlaidItemRequest,
@@ -35,7 +36,10 @@ use super::commands::reconciliation::{
     StartReconciliationRequest, UnclearTransactionRequest,
 };
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
-use crate::domain::{AccountType, Address, BusinessProfile, PartnerType, PaymentTerms, Residency, Shares};
+use crate::commands::partnership_commands::UpdatePartner;
+use crate::domain::{
+    AccountType, Address, BusinessProfile, PartnerType, PaymentTerms, Residency, Shares,
+};
 use chrono::NaiveDate;
 use thiserror::Error;
 
@@ -66,6 +70,18 @@ pub enum SyncClientError {
     ServerTooOld(String),
     #[error("unexpected status {0}: {1}")]
     Unexpected(u16, String),
+}
+
+/// What a group's adoption of an existing set of books came to.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AdoptOutcome {
+    pub group_id: String,
+    pub format_version: u32,
+    pub adopted: usize,
+    pub head_id: Option<i64>,
+    /// Hex of the group's head hash afterwards. Compared against the local file
+    /// before it is bound — see [`super::binding::bind_adopted`].
+    pub head_hash: Option<String>,
 }
 
 /// What a chunked import did, including when it did not finish.
@@ -142,6 +158,41 @@ impl SyncClient {
     }
 
     /// Fetch and cache the current canonical head.
+    /// Hand a whole local log to the group, which adopts it verbatim.
+    ///
+    /// Only possible into a group that has never been written to — the server
+    /// enforces that, and says so plainly when it refuses. Returns the head the
+    /// group ended at and its hash, which the caller checks against its own file
+    /// before binding it as a replica.
+    pub async fn adopt_log(&mut self, ndjson: &str) -> Result<AdoptOutcome, SyncClientError> {
+        let resp = self
+            .http
+            .post(self.url("/adopt/events.ndjson"))
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson")
+            .body(ndjson.to_string())
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        match status.as_u16() {
+            200..=299 => serde_json::from_str(&body).map_err(|e| {
+                SyncClientError::Unexpected(
+                    status.as_u16(),
+                    format!("the group answered with something unreadable: {e}"),
+                )
+            }),
+            401 | 403 => Err(SyncClientError::Unauthorized),
+            404 => Err(SyncClientError::ServerTooOld(
+                "sharing an existing set of books".into(),
+            )),
+            // 409 is "this group already has books", which is a decision for the
+            // person, not a fault: it is carried through as the server worded it.
+            400 | 409 => Err(SyncClientError::Rejected(body)),
+            other => Err(SyncClientError::Unexpected(other, body)),
+        }
+    }
+
     pub async fn refresh_head(&mut self) -> Result<i64, SyncClientError> {
         let resp = self
             .http
@@ -1264,6 +1315,47 @@ impl SyncClient {
         .await
     }
 
+    /// Remove an account that nothing points at.
+    ///
+    /// The server decides, against locked state: two members can be looking at
+    /// the same empty account while one of them posts to it, so a check made
+    /// here would pass for whoever read first.
+    pub async fn delete_account(
+        &mut self,
+        account_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let account_id = account_id.into();
+        self.submit_retrying("/sync/commands/delete-account", |head| {
+            DeleteAccountRequest {
+                expected_head_seq: head,
+                account_id: account_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Say how much of an account's balance the law lets you deduct.
+    ///
+    /// 100 clears the limit rather than storing it, on the server as locally —
+    /// "all of it" is the absence of a rule.
+    pub async fn set_deduction_limit(
+        &mut self,
+        account_id: impl Into<String>,
+        deductible_pct: u8,
+        effective_from: i32,
+    ) -> Result<i64, SyncClientError> {
+        let account_id = account_id.into();
+        self.submit_retrying("/sync/commands/set-deduction-limit", |head| {
+            crate::sync::commands::tax_setup::SetDeductionLimitRequest {
+                expected_head_seq: head,
+                effective_from,
+                account_id: account_id.clone(),
+                deductible_pct,
+            }
+        })
+        .await
+    }
+
     /// Receive a bill: the bill's journal entry and `BillReceived`, appended
     /// atomically by the server.
     #[allow(clippy::too_many_arguments)]
@@ -1451,10 +1543,12 @@ impl SyncClient {
         &mut self,
         account_id: &str,
         line_key: &str,
+        effective_from: i32,
     ) -> Result<i64, SyncClientError> {
         self.submit_retrying("/sync/commands/set-tax-line-mapping", |head| {
             crate::sync::commands::tax_setup::SetTaxLineMappingRequest {
                 expected_head_seq: head,
+                effective_from,
                 account_id: account_id.to_string(),
                 line_key: line_key.to_string(),
             }
@@ -1489,10 +1583,7 @@ impl SyncClient {
     /// commands give: the command carries no id the server minted and no figure
     /// derived from state it read, so re-sending it against a newer head means
     /// exactly what it meant against the old one.
-    pub async fn set_business_type(
-        &mut self,
-        business_type: &str,
-    ) -> Result<i64, SyncClientError> {
+    pub async fn set_business_type(&mut self, business_type: &str) -> Result<i64, SyncClientError> {
         self.submit_retrying("/sync/commands/set-business-type", |head| {
             crate::sync::commands::schedule_c::SetBusinessTypeRequest {
                 expected_head_seq: head,
@@ -1548,10 +1639,12 @@ impl SyncClient {
     pub async fn clear_tax_line_mapping(
         &mut self,
         account_id: &str,
+        effective_from: i32,
     ) -> Result<i64, SyncClientError> {
         self.submit_retrying("/sync/commands/clear-tax-line-mapping", |head| {
             crate::sync::commands::tax_setup::ClearTaxLineMappingRequest {
                 expected_head_seq: head,
+                effective_from,
                 account_id: account_id.to_string(),
             }
         })
@@ -1672,15 +1765,17 @@ impl SyncClient {
     ///
     /// [`admit_partner`]: SyncClient::admit_partner
     pub async fn update_partner(&mut self, cmd: &UpdatePartner) -> Result<i64, SyncClientError> {
-        self.submit_retrying("/sync/commands/update-partner", |head| UpdatePartnerRequest {
-            expected_head_seq: head,
-            partner_id: cmd.partner_id.clone(),
-            name: cmd.name.clone(),
-            partner_type: cmd.partner_type.as_str().to_string(),
-            residency: cmd.residency.as_str().to_string(),
-            entity_type: cmd.entity_type.clone(),
-            address: cmd.address.clone(),
-            shares: cmd.shares,
+        self.submit_retrying("/sync/commands/update-partner", |head| {
+            UpdatePartnerRequest {
+                expected_head_seq: head,
+                partner_id: cmd.partner_id.clone(),
+                name: cmd.name.clone(),
+                partner_type: cmd.partner_type.as_str().to_string(),
+                residency: cmd.residency.as_str().to_string(),
+                entity_type: cmd.entity_type.clone(),
+                address: cmd.address.clone(),
+                shares: cmd.shares,
+            }
         })
         .await
     }
@@ -1697,6 +1792,64 @@ impl SyncClient {
                 expected_head_seq: head,
                 partner_id: partner_id.clone(),
                 end_date,
+            }
+        })
+        .await
+    }
+
+    /// Record what a partner's percentages became, and from when.
+    ///
+    /// The server captures the split that preceded the change as well, when the
+    /// partner has no history yet — see `submit_set_partner_shares` for why.
+    pub async fn set_partner_shares(
+        &mut self,
+        partner_id: impl Into<String>,
+        effective_from: chrono::NaiveDate,
+        shares: crate::domain::Shares,
+    ) -> Result<i64, SyncClientError> {
+        let partner_id = partner_id.into();
+        self.submit_retrying("/sync/commands/set-partner-shares", |head| {
+            SetPartnerSharesRequest {
+                expected_head_seq: head,
+                partner_id: partner_id.clone(),
+                effective_from,
+                shares,
+            }
+        })
+        .await
+    }
+
+    /// Say that a ledger account holds a partner's capital — item L.
+    pub async fn link_equity_account(
+        &mut self,
+        partner_id: impl Into<String>,
+        account_id: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (partner_id, account_id, role) = (partner_id.into(), account_id.into(), role.into());
+        self.submit_retrying("/sync/commands/link-equity-account", |head| {
+            LinkEquityAccountRequest {
+                expected_head_seq: head,
+                partner_id: partner_id.clone(),
+                account_id: account_id.clone(),
+                role: role.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Stop treating an account as a partner's capital.
+    pub async fn unlink_equity_account(
+        &mut self,
+        partner_id: impl Into<String>,
+        account_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (partner_id, account_id) = (partner_id.into(), account_id.into());
+        self.submit_retrying("/sync/commands/unlink-equity-account", |head| {
+            UnlinkEquityAccountRequest {
+                expected_head_seq: head,
+                partner_id: partner_id.clone(),
+                account_id: account_id.clone(),
             }
         })
         .await

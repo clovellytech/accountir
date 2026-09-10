@@ -35,16 +35,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let rows: Vec<(String, String, i64)> = stmt
             .query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
             })?
             .filter_map(|r| r.ok())
             .collect();
         rows
     };
 
-    let total: i64 = store
-        .connection()
-        .query_row("SELECT COUNT(*) FROM bills WHERE status != 'void'", [], |r| r.get(0))?;
+    let total: i64 = store.connection().query_row(
+        "SELECT COUNT(*) FROM bills WHERE status != 'void'",
+        [],
+        |r| r.get(0),
+    )?;
     let dup_value: i64 = dup.iter().map(|(_, _, a)| *a).sum();
 
     println!("DB: {}", db_path);
@@ -54,11 +60,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dup.len(),
         dup_value as f64 / 100.0
     );
-    println!("mode: {}\n", if apply { "APPLY (writing)" } else { "DRY RUN" });
+    println!(
+        "mode: {}\n",
+        if apply { "APPLY (writing)" } else { "DRY RUN" }
+    );
 
     if !apply {
         for (id, vendor, amount) in dup.iter().take(25) {
-            println!("  would void {}  {}  ${:.2}", &id[..8.min(id.len())], vendor, *amount as f64 / 100.0);
+            println!(
+                "  would void {}  {}  ${:.2}",
+                &id[..8.min(id.len())],
+                vendor,
+                *amount as f64 / 100.0
+            );
         }
         if dup.len() > 25 {
             println!("  … and {} more", dup.len() - 25);
@@ -82,9 +96,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let after: i64 = store
-        .connection()
-        .query_row("SELECT COUNT(*) FROM bills WHERE status != 'void'", [], |r| r.get(0))?;
+    let after: i64 = store.connection().query_row(
+        "SELECT COUNT(*) FROM bills WHERE status != 'void'",
+        [],
+        |r| r.get(0),
+    )?;
     println!(
         "\nvoided {} duplicate bills ({} failed). active bills now: {}",
         voided, failed, after

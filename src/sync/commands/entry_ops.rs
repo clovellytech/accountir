@@ -22,13 +22,13 @@ use crate::commands::entry_commands::{
     EntryCommandError, PostEntryStep, ReassignLineCommand, ReassignLineStep, UnvoidEntryCommand,
     VoidEntryCommand,
 };
-use rusqlite::OptionalExtension;
 use crate::events::types::Event;
 use crate::store::event_store::Verdict;
 use crate::sync::{
     outcome_to_response, project, stamp, ApiError, AuthedUser, SubmitResponse, SyncState,
 };
 use axum::{extract::State, routing::post, Json, Router};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<SyncState> {

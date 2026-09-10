@@ -61,22 +61,33 @@ const PAYMENTS: &[(&str, &str, i64, &str, &str)] = &[
 
 fn card_balance(store: &EventStore) -> i64 {
     let q = AccountQueries::new(store.connection());
-    q.get_account_balance(CARD, None).map(|b| b.balance).unwrap_or(0)
+    q.get_account_balance(CARD, None)
+        .map(|b| b.balance)
+        .unwrap_or(0)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let db_path = args.get(1).expect("usage: fix_card_payments <db_path> [--apply]");
+    let db_path = args
+        .get(1)
+        .expect("usage: fix_card_payments <db_path> [--apply]");
     let apply = args.iter().any(|a| a == "--apply");
 
     let mut store = EventStore::open(db_path)?;
     let _ = UNCATEGORIZED; // documented for the reader; balance reported via SQL outside
 
     println!("DB: {}", db_path);
-    println!("card balance before: {:.2}", card_balance(&store) as f64 / 100.0);
+    println!(
+        "card balance before: {:.2}",
+        card_balance(&store) as f64 / 100.0
+    );
     println!(
         "mode: {}\n",
-        if apply { "APPLY (writing changes)" } else { "DRY RUN (no changes)" }
+        if apply {
+            "APPLY (writing changes)"
+        } else {
+            "DRY RUN (no changes)"
+        }
     );
 
     for (card_id, chk_id, abs, date, label) in PAYMENTS {
@@ -115,7 +126,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
-    println!("\ncard balance after:  {:.2}", card_balance(&store) as f64 / 100.0);
+    println!(
+        "\ncard balance after:  {:.2}",
+        card_balance(&store) as f64 / 100.0
+    );
     if !apply {
         println!("(dry run — re-run with --apply to write)");
     }

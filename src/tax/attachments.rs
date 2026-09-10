@@ -273,7 +273,10 @@ mod tests {
         assert!(f.because.contains("no depreciable asset"), "{}", f.because);
 
         let produced = required(&a, &lines, 1, false, 3);
-        let f = produced.iter().find(|x| x.name == "Form 4562").expect("listed");
+        let f = produced
+            .iter()
+            .find(|x| x.name == "Form 4562")
+            .expect("listed");
         assert_eq!(f.provenance, Provenance::Generated);
         assert!(f.because.contains("3 asset(s)"), "{}", f.because);
     }
@@ -293,13 +296,19 @@ mod tests {
         a.set("b4", YES);
         a.set("b2a", YES);
         let list = required(&a, &Form1065Lines::default(), 1, false, 0);
-        let b1 = list.iter().find(|x| x.name.starts_with("Schedule B-1")).unwrap();
+        let b1 = list
+            .iter()
+            .find(|x| x.name.starts_with("Schedule B-1"))
+            .unwrap();
         assert_eq!(b1.provenance, Provenance::Generated);
         assert!(b1.because.contains("question 2a"), "{}", b1.because);
 
         a.set("b2b", YES);
         let list = required(&a, &Form1065Lines::default(), 1, false, 0);
-        let b1 = list.iter().find(|x| x.name.starts_with("Schedule B-1")).unwrap();
+        let b1 = list
+            .iter()
+            .find(|x| x.name.starts_with("Schedule B-1"))
+            .unwrap();
         assert!(b1.because.contains("2a and 2b"), "{}", b1.because);
     }
 
@@ -322,11 +331,17 @@ mod tests {
     fn schedule_l_is_owed_when_question_4_is_not_yes_even_with_nothing_mapped() {
         let a = ScheduleB::default();
         let list = required(&a, &Form1065Lines::default(), 1, false, 0);
-        let l = list.iter().find(|x| x.name.starts_with("Schedule L")).unwrap();
+        let l = list
+            .iter()
+            .find(|x| x.name.starts_with("Schedule L"))
+            .unwrap();
         assert_eq!(l.provenance, Provenance::YourJob);
 
         let list = required(&a, &Form1065Lines::default(), 1, true, 0);
-        let l = list.iter().find(|x| x.name.starts_with("Schedule L")).unwrap();
+        let l = list
+            .iter()
+            .find(|x| x.name.starts_with("Schedule L"))
+            .unwrap();
         assert_eq!(l.provenance, Provenance::Generated);
     }
 
@@ -339,7 +354,10 @@ mod tests {
         lines.set_for_test("l2", 1000);
 
         let list = required(&a, &lines, 1, false, 0);
-        let stmt = list.iter().find(|x| x.name.contains("Other deductions")).unwrap();
+        let stmt = list
+            .iter()
+            .find(|x| x.name.contains("Other deductions"))
+            .unwrap();
         assert_eq!(stmt.provenance, Provenance::Generated);
         let f1125a = list.iter().find(|x| x.name == "Form 1125-A").unwrap();
         assert_eq!(f1125a.provenance, Provenance::YourJob);
@@ -384,7 +402,9 @@ mod tests {
     #[test]
     fn every_attachment_names_somewhere_to_read_about_it() {
         let mut a = ScheduleB::default();
-        for q in ["b2a", "b2b", "b8", "b10b", "b10c", "b10d", "b24", "b25", "b29a", "b29b", "b31"] {
+        for q in [
+            "b2a", "b2b", "b8", "b10b", "b10c", "b10d", "b24", "b25", "b29a", "b29b", "b31",
+        ] {
             a.set(q, YES);
         }
         let mut lines = Form1065Lines::default();

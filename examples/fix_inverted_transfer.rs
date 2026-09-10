@@ -43,17 +43,26 @@ fn checking_balance(store: &EventStore) -> i64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let db_path = args.get(1).expect("usage: fix_inverted_transfer <db_path> [--apply]");
+    let db_path = args
+        .get(1)
+        .expect("usage: fix_inverted_transfer <db_path> [--apply]");
     let apply = args.iter().any(|a| a == "--apply");
 
     let mut store = EventStore::open(db_path)?;
 
     println!("DB: {}", db_path);
     println!("entries: {}", INVERTED.len());
-    println!("checking balance before: {:.2}", checking_balance(&store) as f64 / 100.0);
+    println!(
+        "checking balance before: {:.2}",
+        checking_balance(&store) as f64 / 100.0
+    );
     println!(
         "mode: {}\n",
-        if apply { "APPLY (writing changes)" } else { "DRY RUN (no changes)" }
+        if apply {
+            "APPLY (writing changes)"
+        } else {
+            "DRY RUN (no changes)"
+        }
     );
 
     // (line_id suffix, account it belongs on): line-1 is the credit, line-2 the
@@ -70,7 +79,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 |r| r.get(0),
             )?;
             let action = if current == want { "ok" } else { "reassign" };
-            println!("  {line_id}  {action} → {}", if want == CHECKING { "Checking" } else { "Card" });
+            println!(
+                "  {line_id}  {action} → {}",
+                if want == CHECKING { "Checking" } else { "Card" }
+            );
             if apply && current != want {
                 let mut cmds = EntryCommands::new(&mut store, "correction".to_string());
                 cmds.reassign_line(ReassignLineCommand {
@@ -85,7 +97,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\napplied.");
     }
 
-    println!("checking balance after:  {:.2}", checking_balance(&store) as f64 / 100.0);
+    println!(
+        "checking balance after:  {:.2}",
+        checking_balance(&store) as f64 / 100.0
+    );
     if !apply {
         println!("(dry run — re-run with --apply to write)");
     }

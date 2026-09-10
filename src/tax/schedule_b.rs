@@ -97,10 +97,7 @@ pub struct FollowUp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     /// Two checkboxes, one of which gets ticked.
-    YesNo {
-        yes: &'static str,
-        no: &'static str,
-    },
+    YesNo { yes: &'static str, no: &'static str },
     /// Mutually exclusive checkboxes. Exclusivity is enforced here because the
     /// XFA logic that enforced it on the original form is stripped out — see
     /// [`super::acroform`] — so nothing but this code stops two boxes being
@@ -131,28 +128,16 @@ pub struct Question {
     /// Stable storage key. Not the number: the IRS renumbers, and a renumbering
     /// must not silently re-point an answer at a different question.
     pub key: &'static str,
-    /// As printed, e.g. "10b".
-    pub number: &'static str,
     /// Which page of the form it is on, so the desktop can group them the way
     /// the paper does.
     pub page: u8,
     /// Verbatim from the form.
     pub text: &'static str,
-    pub control: Control,
     pub follow_ups: &'static [(FollowUpWhen, FollowUp)],
     pub refs: &'static [FormRef],
     /// Said when the answer is yes and this program cannot fill in what a yes
     /// obliges. Empty when a yes needs nothing further.
     pub yes_warning: &'static str,
-    /// A number the IRS is holding for a question it has not written yet.
-    ///
-    /// Kept in the catalogue rather than deleted: the boxes exist on the form and
-    /// the guard test has to keep proving that the *other* questions still line up
-    /// with their fields, which means the numbering has to stay intact. But it is
-    /// never shown, never counted as unanswered, and never written to — there is
-    /// nothing to answer, and a form with a tick beside "reserved for future use"
-    /// is a form somebody answered a question that does not exist.
-    pub reserved: bool,
     /// A question that only applies when an earlier one was answered a
     /// particular way.
     ///
@@ -248,37 +233,1215 @@ const FORM_7208: FormRef = FormRef {
 };
 
 const ENTITY_TYPES: &[ChoiceOpt] = &[
-    ChoiceOpt { key: "general",  label: "Domestic general partnership",         field: "c2_1[0]", on: "1" },
-    ChoiceOpt { key: "lp",       label: "Domestic limited partnership",         field: "c2_1[1]", on: "2" },
-    ChoiceOpt { key: "llc",      label: "Domestic limited liability company",   field: "c2_1[2]", on: "3" },
-    ChoiceOpt { key: "llp",      label: "Domestic limited liability partnership", field: "c2_1[3]", on: "4" },
-    ChoiceOpt { key: "foreign",  label: "Foreign partnership",                  field: "c2_1[4]", on: "5" },
-    ChoiceOpt { key: "other",    label: "Other",                                field: "c2_1[5]", on: "6" },
+    ChoiceOpt {
+        key: "general",
+        label: "Domestic general partnership",
+        field: "c2_1[0]",
+        on: "1",
+    },
+    ChoiceOpt {
+        key: "lp",
+        label: "Domestic limited partnership",
+        field: "c2_1[1]",
+        on: "2",
+    },
+    ChoiceOpt {
+        key: "llc",
+        label: "Domestic limited liability company",
+        field: "c2_1[2]",
+        on: "3",
+    },
+    ChoiceOpt {
+        key: "llp",
+        label: "Domestic limited liability partnership",
+        field: "c2_1[3]",
+        on: "4",
+    },
+    ChoiceOpt {
+        key: "foreign",
+        label: "Foreign partnership",
+        field: "c2_1[4]",
+        on: "5",
+    },
+    ChoiceOpt {
+        key: "other",
+        label: "Other",
+        field: "c2_1[5]",
+        on: "6",
+    },
 ];
 
 /// Every question on Schedule B, in the order the form asks them.
 ///
 /// Checked against the vendored PDF by the tests at the bottom: a revision that
 /// renumbers a box fails there rather than silently ticking its neighbour.
+/// One question's boxes and printed number on one revision of the form.
+///
+/// # Why the number lives here and not on [`Question`]
+///
+/// The key never moves — that is what it is for. The *number* does: the
+/// centralized-audit-regime election is question 31 on the 2023 form and 33 on
+/// the 2024 and 2025 forms, and what was 13a became 13. A number carried once,
+/// beside the meaning, is a number that is wrong for two revisions out of three
+/// — which is what the Schedule B page showed, printing 2025's numbering beside
+/// a 2023 return.
+///
+/// A question a revision does not ask simply has no entry in that revision's
+/// table. There is no "absent" list to keep in step with anything.
+#[derive(Debug, Clone, Copy)]
+pub struct QuestionBoxes {
+    pub key: &'static str,
+    /// As this revision prints it.
+    pub number: &'static str,
+    pub control: Control,
+    /// A number the IRS is holding for a question it has not written yet.
+    ///
+    /// The boxes exist on the form, so the table names them and the guard tests
+    /// keep proving the questions around it still line up — but it is never
+    /// shown, never counted as unanswered, and never written to. A form with a
+    /// tick beside "reserved for future use" is a form somebody answered a
+    /// question that does not exist.
+    pub reserved: bool,
+}
+
+impl QuestionBoxes {
+    const fn new(key: &'static str, number: &'static str, control: Control) -> Self {
+        QuestionBoxes {
+            key,
+            number,
+            control,
+            reserved: false,
+        }
+    }
+}
+
+/// Schedule B on the 2023 revision.
+pub const SCHEDULE_B_2023: &[QuestionBoxes] = &[
+    QuestionBoxes {
+        key: "b1",
+        number: "1",
+        control: Control::Choice(ENTITY_TYPES),
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b2a",
+        number: "2a",
+        control: Control::YesNo {
+            yes: "c2_2[0]",
+            no: "c2_2[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b2b",
+        number: "2b",
+        control: Control::YesNo {
+            yes: "c2_3[0]",
+            no: "c2_3[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b3a",
+        number: "3a",
+        control: Control::YesNo {
+            yes: "c2_4[0]",
+            no: "c2_4[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b3b",
+        number: "3b",
+        control: Control::YesNo {
+            yes: "c2_5[0]",
+            no: "c2_5[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b4",
+        number: "4",
+        control: Control::YesNo {
+            yes: "c2_6[0]",
+            no: "c2_6[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b5",
+        number: "5",
+        control: Control::YesNo {
+            yes: "c2_7[0]",
+            no: "c2_7[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b6",
+        number: "6",
+        control: Control::YesNo {
+            yes: "c2_8[0]",
+            no: "c2_8[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b7",
+        number: "7",
+        control: Control::YesNo {
+            yes: "c2_9[0]",
+            no: "c2_9[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b8",
+        number: "8",
+        control: Control::YesNo {
+            yes: "c2_10[0]",
+            no: "c2_10[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b9",
+        number: "9",
+        control: Control::YesNo {
+            yes: "c2_11[0]",
+            no: "c2_11[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10a",
+        number: "10a",
+        control: Control::YesNo {
+            yes: "c2_12[0]",
+            no: "c2_12[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10b",
+        number: "10b",
+        control: Control::YesNo {
+            yes: "c2_13[0]",
+            no: "c2_13[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10c",
+        number: "10c",
+        control: Control::YesNo {
+            yes: "c3_1[0]",
+            no: "c3_1[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10d",
+        number: "10d",
+        control: Control::YesNo {
+            yes: "c3_2[0]",
+            no: "c3_2[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b11",
+        number: "11",
+        control: Control::Check { field: "c3_3_1[0]" },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b12",
+        number: "12",
+        control: Control::YesNo {
+            yes: "c3_3[0]",
+            no: "c3_3[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b13a",
+        number: "13",
+        control: Control::Entry {
+            field: "f3_4[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b14",
+        number: "14",
+        control: Control::YesNo {
+            yes: "c3_4[0]",
+            no: "c3_4[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b15",
+        number: "15",
+        control: Control::Entry {
+            field: "f3_6[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b16a",
+        number: "16a",
+        control: Control::YesNo {
+            yes: "c3_5[0]",
+            no: "c3_5[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b16b",
+        number: "16b",
+        control: Control::YesNo {
+            yes: "c3_6[0]",
+            no: "c3_6[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b17",
+        number: "17",
+        control: Control::Entry {
+            field: "f3_7[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b18",
+        number: "18",
+        control: Control::Entry {
+            field: "f3_8[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b19",
+        number: "19",
+        control: Control::YesNo {
+            yes: "c3_7[0]",
+            no: "c3_7[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b20",
+        number: "20",
+        control: Control::YesNo {
+            yes: "c3_8[0]",
+            no: "c3_8[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b21",
+        number: "21",
+        control: Control::YesNo {
+            yes: "c3_9[0]",
+            no: "c3_9[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b22",
+        number: "22",
+        control: Control::YesNo {
+            yes: "c3_10[0]",
+            no: "c3_10[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b23",
+        number: "23",
+        control: Control::YesNo {
+            yes: "c3_11[0]",
+            no: "c3_11[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b24",
+        number: "24",
+        control: Control::YesNo {
+            yes: "c3_12[0]",
+            no: "c3_12[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b25",
+        number: "25",
+        control: Control::YesNo {
+            yes: "c3_13[0]",
+            no: "c3_13[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b26",
+        number: "26",
+        control: Control::Entry {
+            field: "f3_11[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b27",
+        number: "27",
+        control: Control::YesNo {
+            yes: "c3_14[0]",
+            no: "c3_14[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b28",
+        number: "28",
+        control: Control::YesNo {
+            yes: "c3_15[0]",
+            no: "c3_15[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b29a",
+        number: "29a",
+        control: Control::YesNo {
+            yes: "c3_16[0]",
+            no: "c3_16[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b29b",
+        number: "29b",
+        control: Control::YesNo {
+            yes: "c4_16[0]",
+            no: "c4_16[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b30",
+        number: "30",
+        control: Control::YesNo {
+            yes: "c4_18[0]",
+            no: "c4_18[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b31",
+        number: "31",
+        control: Control::YesNo {
+            yes: "c4_19[0]",
+            no: "c4_19[1]",
+        },
+        reserved: false,
+    },
+];
+
+/// Schedule B on the 2024 revision.
+pub const SCHEDULE_B_2024: &[QuestionBoxes] = &[
+    QuestionBoxes {
+        key: "b1",
+        number: "1",
+        control: Control::Choice(ENTITY_TYPES),
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b2a",
+        number: "2a",
+        control: Control::YesNo {
+            yes: "c2_2[0]",
+            no: "c2_2[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b2b",
+        number: "2b",
+        control: Control::YesNo {
+            yes: "c2_3[0]",
+            no: "c2_3[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b3a",
+        number: "3a",
+        control: Control::YesNo {
+            yes: "c2_4[0]",
+            no: "c2_4[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b3b",
+        number: "3b",
+        control: Control::YesNo {
+            yes: "c2_5[0]",
+            no: "c2_5[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b4",
+        number: "4",
+        control: Control::YesNo {
+            yes: "c2_6[0]",
+            no: "c2_6[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b5",
+        number: "5",
+        control: Control::YesNo {
+            yes: "c2_7[0]",
+            no: "c2_7[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b6",
+        number: "6",
+        control: Control::YesNo {
+            yes: "c2_8[0]",
+            no: "c2_8[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b7",
+        number: "7",
+        control: Control::YesNo {
+            yes: "c2_9[0]",
+            no: "c2_9[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b8",
+        number: "8",
+        control: Control::YesNo {
+            yes: "c2_10[0]",
+            no: "c2_10[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b9",
+        number: "9",
+        control: Control::YesNo {
+            yes: "c2_11[0]",
+            no: "c2_11[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10a",
+        number: "10a",
+        control: Control::YesNo {
+            yes: "c2_12[0]",
+            no: "c2_12[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10b",
+        number: "10b",
+        control: Control::YesNo {
+            yes: "c2_13[0]",
+            no: "c2_13[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10c",
+        number: "10c",
+        control: Control::YesNo {
+            yes: "c3_1[0]",
+            no: "c3_1[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10d",
+        number: "10d",
+        control: Control::YesNo {
+            yes: "c3_2[0]",
+            no: "c3_2[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b11",
+        number: "11",
+        control: Control::Check { field: "c3_3_1[0]" },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b12",
+        number: "12",
+        control: Control::YesNo {
+            yes: "c3_3[0]",
+            no: "c3_3[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b13a",
+        number: "13",
+        control: Control::Entry {
+            field: "f3_4[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b14",
+        number: "14",
+        control: Control::YesNo {
+            yes: "c3_4[0]",
+            no: "c3_4[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b15",
+        number: "15",
+        control: Control::Entry {
+            field: "f3_6[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b16a",
+        number: "16a",
+        control: Control::YesNo {
+            yes: "c3_5[0]",
+            no: "c3_5[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b16b",
+        number: "16b",
+        control: Control::YesNo {
+            yes: "c3_6[0]",
+            no: "c3_6[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b17",
+        number: "17",
+        control: Control::Entry {
+            field: "f3_7[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b18",
+        number: "18",
+        control: Control::Entry {
+            field: "f3_8[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b19",
+        number: "19",
+        control: Control::YesNo {
+            yes: "c3_7[0]",
+            no: "c3_7[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b20",
+        number: "20",
+        control: Control::YesNo {
+            yes: "c3_8[0]",
+            no: "c3_8[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b21",
+        number: "21",
+        control: Control::YesNo {
+            yes: "c3_9[0]",
+            no: "c3_9[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b22",
+        number: "22",
+        control: Control::YesNo {
+            yes: "c3_10[0]",
+            no: "c3_10[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b23",
+        number: "23",
+        control: Control::YesNo {
+            yes: "c3_11[0]",
+            no: "c3_11[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b24",
+        number: "24",
+        control: Control::YesNo {
+            yes: "c3_12[0]",
+            no: "c3_12[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b25",
+        number: "25",
+        control: Control::YesNo {
+            yes: "c3_13[0]",
+            no: "c3_13[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b26",
+        number: "26",
+        control: Control::Entry {
+            field: "f3_11[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b27",
+        number: "27",
+        control: Control::YesNo {
+            yes: "c3_14[0]",
+            no: "c3_14[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b28",
+        number: "28",
+        control: Control::YesNo {
+            yes: "c3_15[0]",
+            no: "c3_15[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b29a",
+        number: "29a",
+        control: Control::YesNo {
+            yes: "c3_16[0]",
+            no: "c3_16[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b29b",
+        number: "29b",
+        control: Control::YesNo {
+            yes: "c4_1[0]",
+            no: "c4_1[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b30",
+        number: "30",
+        control: Control::YesNo {
+            yes: "c4_2[0]",
+            no: "c4_2[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b31",
+        number: "33",
+        control: Control::YesNo {
+            yes: "c4_5[0]",
+            no: "c4_5[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b32",
+        number: "32",
+        control: Control::Check { field: "c4_4[0]" },
+        reserved: false,
+    },
+];
+
+/// Schedule B on the 2025 revision.
+pub const SCHEDULE_B_2025: &[QuestionBoxes] = &[
+    QuestionBoxes {
+        key: "b1",
+        number: "1",
+        control: Control::Choice(ENTITY_TYPES),
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b2a",
+        number: "2a",
+        control: Control::YesNo {
+            yes: "c2_2[0]",
+            no: "c2_2[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b2b",
+        number: "2b",
+        control: Control::YesNo {
+            yes: "c2_3[0]",
+            no: "c2_3[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b3a",
+        number: "3a",
+        control: Control::YesNo {
+            yes: "c2_4[0]",
+            no: "c2_4[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b3b",
+        number: "3b",
+        control: Control::YesNo {
+            yes: "c2_5[0]",
+            no: "c2_5[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b4",
+        number: "4",
+        control: Control::YesNo {
+            yes: "c2_6[0]",
+            no: "c2_6[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b5",
+        number: "5",
+        control: Control::YesNo {
+            yes: "c2_7[0]",
+            no: "c2_7[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b6",
+        number: "6",
+        control: Control::YesNo {
+            yes: "c2_8[0]",
+            no: "c2_8[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b7",
+        number: "7",
+        control: Control::YesNo {
+            yes: "c2_9[0]",
+            no: "c2_9[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b8",
+        number: "8",
+        control: Control::YesNo {
+            yes: "c2_10[0]",
+            no: "c2_10[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b9",
+        number: "9",
+        control: Control::YesNo {
+            yes: "c2_11[0]",
+            no: "c2_11[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10a",
+        number: "10a",
+        control: Control::YesNo {
+            yes: "c2_12[0]",
+            no: "c2_12[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10b",
+        number: "10b",
+        control: Control::YesNo {
+            yes: "c2_13[0]",
+            no: "c2_13[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10c",
+        number: "10c",
+        control: Control::YesNo {
+            yes: "c3_1[0]",
+            no: "c3_1[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10d",
+        number: "10d",
+        control: Control::YesNo {
+            yes: "c3_2[0]",
+            no: "c3_2[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b10e",
+        number: "10e",
+        control: Control::YesNo {
+            yes: "c3_3[0]",
+            no: "c3_3[1]",
+        },
+        reserved: true,
+    },
+    QuestionBoxes {
+        key: "b11",
+        number: "11",
+        control: Control::Check { field: "c3_4[0]" },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b12",
+        number: "12",
+        control: Control::YesNo {
+            yes: "c3_5[0]",
+            no: "c3_5[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b13a",
+        number: "13a",
+        control: Control::Entry {
+            field: "f3_4[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b14",
+        number: "14",
+        control: Control::YesNo {
+            yes: "c3_6[0]",
+            no: "c3_6[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b15",
+        number: "15",
+        control: Control::Entry {
+            field: "f3_6[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b16a",
+        number: "16a",
+        control: Control::YesNo {
+            yes: "c3_7[0]",
+            no: "c3_7[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b16b",
+        number: "16b",
+        control: Control::YesNo {
+            yes: "c3_8[0]",
+            no: "c3_8[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b17",
+        number: "17",
+        control: Control::Entry {
+            field: "f3_7[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b18",
+        number: "18",
+        control: Control::Entry {
+            field: "f3_8[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b19",
+        number: "19",
+        control: Control::YesNo {
+            yes: "c3_9[0]",
+            no: "c3_9[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b20",
+        number: "20",
+        control: Control::YesNo {
+            yes: "c3_10[0]",
+            no: "c3_10[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b21",
+        number: "21",
+        control: Control::YesNo {
+            yes: "c3_11[0]",
+            no: "c3_11[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b22",
+        number: "22",
+        control: Control::YesNo {
+            yes: "c3_12[0]",
+            no: "c3_12[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b23",
+        number: "23",
+        control: Control::YesNo {
+            yes: "c3_13[0]",
+            no: "c3_13[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b24",
+        number: "24",
+        control: Control::YesNo {
+            yes: "c3_14[0]",
+            no: "c3_14[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b25",
+        number: "25",
+        control: Control::YesNo {
+            yes: "c3_15[0]",
+            no: "c3_15[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b26",
+        number: "26",
+        control: Control::Entry {
+            field: "f3_11[0]",
+            kind: InputKind::Count,
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b27",
+        number: "27",
+        control: Control::YesNo {
+            yes: "c3_16[0]",
+            no: "c3_16[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b28",
+        number: "28",
+        control: Control::YesNo {
+            yes: "c4_1[0]",
+            no: "c4_1[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b29a",
+        number: "29a",
+        control: Control::YesNo {
+            yes: "c4_2[0]",
+            no: "c4_2[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b29b",
+        number: "29b",
+        control: Control::YesNo {
+            yes: "c4_3[0]",
+            no: "c4_3[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b30",
+        number: "30",
+        control: Control::YesNo {
+            yes: "c4_4[0]",
+            no: "c4_4[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b31",
+        number: "33",
+        control: Control::YesNo {
+            yes: "c4_6[0]",
+            no: "c4_6[1]",
+        },
+        reserved: false,
+    },
+    QuestionBoxes {
+        key: "b32",
+        number: "32",
+        control: Control::Check { field: "c4_5[0]" },
+        reserved: false,
+    },
+];
+
+/// A question as one revision asks it: what it means, and where its answer goes.
+///
+/// The pair is the unit every consumer wants. Handing out a `Question` alone
+/// invites reading a number off it that the chosen year does not print.
+#[derive(Clone, Copy)]
+pub struct Asked {
+    pub meaning: &'static Question,
+    pub boxes: &'static QuestionBoxes,
+}
+
+impl Asked {
+    pub fn key(&self) -> &'static str {
+        self.meaning.key
+    }
+    pub fn number(&self) -> &'static str {
+        self.boxes.number
+    }
+    pub fn control(&self) -> Control {
+        self.boxes.control
+    }
+    pub fn reserved(&self) -> bool {
+        self.boxes.reserved
+    }
+    pub fn text(&self) -> &'static str {
+        self.meaning.text
+    }
+    pub fn page(&self) -> u8 {
+        self.meaning.page
+    }
+}
+
+/// What a revision prints beside a question, given its key.
+///
+/// For readers that hold an answer and a year but no table — the event log, for
+/// one. Falls back to the key, which is stable, rather than to another year's
+/// number.
+pub fn printed_number(table: &'static [QuestionBoxes], key: &str) -> &'static str {
+    table
+        .iter()
+        .find(|b| b.key == key)
+        .map(|b| b.number)
+        .unwrap_or("")
+}
+
+/// The number some carried revision prints beside a question.
+///
+/// For talking about a question the year in hand does not ask. The key is
+/// stable but unreadable; a number from a year that does ask it is what the
+/// person will recognise.
+fn number_anywhere(key: &str) -> Option<&'static str> {
+    [SCHEDULE_B_2025, SCHEDULE_B_2024, SCHEDULE_B_2023]
+        .iter()
+        .find_map(|t| t.iter().find(|b| b.key == key).map(|b| b.number))
+}
+
+/// The questions one revision asks, in the order the form prints them.
+///
+/// Driven by the revision's table, not by the catalogue: a question the year
+/// does not ask has no entry and therefore never reaches a screen or a box.
+pub fn asked(table: &'static [QuestionBoxes]) -> Vec<Asked> {
+    table
+        .iter()
+        .filter_map(|boxes| {
+            QUESTIONS
+                .iter()
+                .find(|q| q.key == boxes.key)
+                .map(|meaning| Asked { meaning, boxes })
+        })
+        .collect()
+}
+
 pub const QUESTIONS: &[Question] = &[
     Question {
         key: "b1",
-        number: "1",
         page: 2,
         text: "What type of entity is filing this return? Check the applicable box.",
-        control: Control::Choice(ENTITY_TYPES),
         follow_ups: &[(
             FollowUpWhen::Choice("other"),
             FollowUp { key: "b1_other", label: "Other — describe", field: "f2_01[0]", kind: InputKind::Text },
         )],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b2a",
-        number: "2a",
         page: 2,
         text: "At the end of the tax year: Did any foreign or domestic corporation, partnership \
                (including any entity treated as a partnership), trust, or tax-exempt organization, \
@@ -286,7 +1449,6 @@ pub const QUESTIONS: &[Question] = &[
                the profit, loss, or capital of the partnership? For rules of constructive ownership, \
                see instructions. If \u{201c}Yes,\u{201d} attach Schedule B-1, Information on Partners \
                Owning 50% or More of the Partnership.",
-        control: Control::YesNo { yes: "c2_2[0]", no: "c2_2[1]" },
         follow_ups: &[],
         refs: &[SCHEDULE_B1],
         yes_warning: "Question 2a is Yes, so Schedule B-1 is attached, listing every partner in the \
@@ -294,17 +1456,14 @@ pub const QUESTIONS: &[Question] = &[
                       partner relationships on file. Check it against anybody who reaches 50% \
                       through a related entity, or a family tie not yet recorded — neither of \
                       which the books can see.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b2b",
-        number: "2b",
         page: 2,
         text: "Did any individual or estate own, directly or indirectly, an interest of 50% or more \
                in the profit, loss, or capital of the partnership? For rules of constructive \
                ownership, see instructions. If \u{201c}Yes,\u{201d} attach Schedule B-1.",
-        control: Control::YesNo { yes: "c2_3[0]", no: "c2_3[1]" },
         follow_ups: &[],
         refs: &[SCHEDULE_B1],
         yes_warning: "Question 2b is Yes, so Schedule B-1 is attached, listing every partner in the \
@@ -312,49 +1471,41 @@ pub const QUESTIONS: &[Question] = &[
                       partner relationships on file. Check it against anybody who reaches 50% \
                       through a related entity, or a family tie not yet recorded — neither of \
                       which the books can see.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b3a",
-        number: "3a",
         page: 2,
         text: "At the end of the tax year, did the partnership own directly 20% or more, or own, \
                directly or indirectly, 50% or more of the total voting power of all classes of stock \
                entitled to vote of any foreign or domestic corporation? For rules of constructive \
                ownership, see instructions. If \u{201c}Yes,\u{201d} complete (i) through (iv) below.",
-        control: Control::YesNo { yes: "c2_4[0]", no: "c2_4[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "Question 3a is Yes, so the table under it — name, EIN, country and percentage \
                       for each corporation — has to be filled in. Those are facts about other \
                       companies that the books do not hold, so the rows are left blank and editable \
                       in the PDF.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b3b",
-        number: "3b",
         page: 2,
         text: "At the end of the tax year, did the partnership own directly an interest of 20% or \
                more, or own, directly or indirectly, an interest of 50% or more, in the profit, loss, \
                or capital in any foreign or domestic partnership (including an entity treated as a \
                partnership) or in the beneficial interest of a trust? For rules of constructive \
                ownership, see instructions. If \u{201c}Yes,\u{201d} complete (i) through (v) below.",
-        control: Control::YesNo { yes: "c2_5[0]", no: "c2_5[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "Question 3b is Yes, so the table under it — name, EIN, type, country and \
                       percentage for each entity — has to be filled in. Those are facts about other \
                       entities that the books do not hold, so the rows are left blank and editable \
                       in the PDF.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b4",
-        number: "4",
         page: 2,
         text: "Does the partnership satisfy all four of the following conditions? \
                (a) The partnership's total receipts for the tax year were less than $250,000. \
@@ -364,61 +1515,48 @@ pub const QUESTIONS: &[Question] = &[
                (d) The partnership is not filing and is not required to file Schedule M-3. \
                If \u{201c}Yes,\u{201d} the partnership is not required to complete Schedules L, M-1, \
                and M-2; item F on page 1 of Form 1065; or item L on Schedule K-1.",
-        control: Control::YesNo { yes: "c2_6[0]", no: "c2_6[1]" },
         follow_ups: &[],
         refs: &[SCHEDULE_M3],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b5",
-        number: "5",
         page: 2,
         text: "Is this partnership a publicly traded partnership, as defined in section 469(k)(2)?",
-        control: Control::YesNo { yes: "c2_7[0]", no: "c2_7[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b6",
-        number: "6",
         page: 2,
         text: "During the tax year, did the partnership have any debt that was canceled, was \
                forgiven, or had the terms modified so as to reduce the principal amount of the debt?",
-        control: Control::YesNo { yes: "c2_8[0]", no: "c2_8[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b7",
-        number: "7",
         page: 2,
         text: "Has this partnership filed, or is it required to file, Form 8918, Material Advisor \
                Disclosure Statement, to provide information on any reportable transaction?",
-        control: Control::YesNo { yes: "c2_9[0]", no: "c2_9[1]" },
         follow_ups: &[],
         refs: &[FORM_8918],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b8",
-        number: "8",
         page: 2,
         text: "At any time during calendar year 2025, did the partnership have an interest in or a \
                signature or other authority over a financial account in a foreign country (such as a \
                bank account, securities account, or other financial account)? See instructions for \
                exceptions and filing requirements for FinCEN Form 114, Report of Foreign Bank and \
                Financial Accounts (FBAR). If \u{201c}Yes,\u{201d} enter the name of the foreign country.",
-        control: Control::YesNo { yes: "c2_10[0]", no: "c2_10[1]" },
         follow_ups: &[(
             FollowUpWhen::Yes,
             FollowUp { key: "b8_country", label: "Name of the foreign country", field: "f2_47[0]", kind: InputKind::Text },
@@ -426,50 +1564,41 @@ pub const QUESTIONS: &[Question] = &[
         refs: &[FBAR_114],
         yes_warning: "Question 8 is Yes, which usually means an FBAR is owed. It is filed with \
                       FinCEN, separately from this return, and this program does not produce it.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b9",
-        number: "9",
         page: 2,
         text: "At any time during the tax year, did the partnership receive a distribution from, or \
                was it the grantor of, or transferor to, a foreign trust? If \u{201c}Yes,\u{201d} the \
                partnership may have to file Form 3520, Annual Return To Report Transactions With \
                Foreign Trusts and Receipt of Certain Foreign Gifts. See instructions.",
-        control: Control::YesNo { yes: "c2_11[0]", no: "c2_11[1]" },
         follow_ups: &[],
         refs: &[FORM_3520],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b10a",
-        number: "10a",
         page: 2,
         text: "Is the partnership making, or had it previously made (and not revoked), a section 754 \
                election? If \u{201c}Yes,\u{201d} enter the effective date of the election.",
-        control: Control::YesNo { yes: "c2_12[0]", no: "c2_12[1]" },
         follow_ups: &[(
             FollowUpWhen::Yes,
             FollowUp { key: "b10a_date", label: "Effective date of the election", field: "f2_48[0]", kind: InputKind::Date },
         )],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b10b",
-        number: "10b",
         page: 2,
         text: "For this tax year, did the partnership make an optional basis adjustment under section \
                743(b)? If \u{201c}Yes,\u{201d} enter the total aggregate net positive and net negative \
                amounts of such section 743(b) adjustments for all partners made in the tax year. The \
                partnership must also attach a statement showing the computation and allocation of each \
                basis adjustment.",
-        control: Control::YesNo { yes: "c2_13[0]", no: "c2_13[1]" },
         follow_ups: &[
             (FollowUpWhen::Yes, FollowUp { key: "b10b_positive", label: "Total aggregate net positive amount", field: "f2_49[0]", kind: InputKind::Money }),
             (FollowUpWhen::Yes, FollowUp { key: "b10b_negative", label: "Total aggregate net negative amount", field: "f2_50[0]", kind: InputKind::Money }),
@@ -477,19 +1606,16 @@ pub const QUESTIONS: &[Question] = &[
         refs: &[],
         yes_warning: "Question 10b is Yes, so a statement showing the computation and allocation of \
                       each basis adjustment has to be attached. This program does not produce it.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b10c",
-        number: "10c",
         page: 3,
         text: "For this tax year, did the partnership make an optional basis adjustment under section \
                734(b)? If \u{201c}Yes,\u{201d} enter the total aggregate net positive and net negative \
                amounts of such section 734(b) adjustments for all partnership property made in the tax \
                year. The partnership must also attach a statement showing the computation and \
                allocation of each basis adjustment.",
-        control: Control::YesNo { yes: "c3_1[0]", no: "c3_1[1]" },
         follow_ups: &[
             (FollowUpWhen::Yes, FollowUp { key: "b10c_positive", label: "Total aggregate net positive amount", field: "f3_1[0]", kind: InputKind::Money }),
             (FollowUpWhen::Yes, FollowUp { key: "b10c_negative", label: "Total aggregate net negative amount", field: "f3_2[0]", kind: InputKind::Money }),
@@ -497,12 +1623,10 @@ pub const QUESTIONS: &[Question] = &[
         refs: &[],
         yes_warning: "Question 10c is Yes, so a statement showing the computation and allocation of \
                       each basis adjustment has to be attached. This program does not produce it.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b10d",
-        number: "10d",
         page: 3,
         text: "For this tax year, is the partnership required to adjust the basis of partnership \
                property under section 743(b) or 734(b) because of a substantial built-in loss (as \
@@ -511,7 +1635,6 @@ pub const QUESTIONS: &[Question] = &[
                adjustments and/or section 734(b) adjustments for all partners and/or partnership \
                property made in the tax year. The partnership must also attach a statement showing the \
                computation and allocation of the basis adjustment.",
-        control: Control::YesNo { yes: "c3_2[0]", no: "c3_2[1]" },
         follow_ups: &[(
             FollowUpWhen::Yes,
             FollowUp { key: "b10d_amount", label: "Total aggregate amount", field: "f3_3[0]", kind: InputKind::Money },
@@ -519,116 +1642,91 @@ pub const QUESTIONS: &[Question] = &[
         refs: &[],
         yes_warning: "Question 10d is Yes, so a statement showing the computation and allocation of \
                       the basis adjustment has to be attached. This program does not produce it.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b10e",
-        number: "10e",
         page: 3,
         text: "Reserved for future use.",
-        control: Control::YesNo { yes: "c3_3[0]", no: "c3_3[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: true,
         depends_on: None,
     },
     Question {
         key: "b11",
-        number: "11",
         page: 3,
         text: "Check this box if, during the current or prior tax year, the partnership distributed \
                any property received in a like-kind exchange or contributed such property to another \
                entity (other than disregarded entities wholly owned by the partnership throughout the \
                tax year).",
-        control: Control::Check { field: "c3_4[0]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b12",
-        number: "12",
         page: 3,
         text: "At any time during the tax year, did the partnership distribute to any partner a \
                tenancy-in-common or other undivided interest in partnership property?",
-        control: Control::YesNo { yes: "c3_5[0]", no: "c3_5[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b13a",
-        number: "13a",
         page: 3,
         text: "If the partnership is required to file Form 8858, Information Return of U.S. Persons \
                With Respect to Foreign Disregarded Entities (FDEs) and Foreign Branches (FBs), enter \
                the number of Forms 8858 attached. See instructions.",
-        control: Control::Entry { field: "f3_4[0]", kind: InputKind::Count },
         follow_ups: &[],
         refs: &[FORM_8858],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b14",
-        number: "14",
         page: 3,
         text: "Does the partnership have any foreign partners? If \u{201c}Yes,\u{201d} enter the number \
                of Forms 8805, Foreign Partner\u{2019}s Information Statement of Section 1446 \
                Withholding Tax, filed for this partnership.",
-        control: Control::YesNo { yes: "c3_6[0]", no: "c3_6[1]" },
         follow_ups: &[(
             FollowUpWhen::Yes,
             FollowUp { key: "b14_count", label: "Number of Forms 8805 filed", field: "f3_5[0]", kind: InputKind::Count },
         )],
         refs: &[FORM_8805],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b15",
-        number: "15",
         page: 3,
         text: "Enter the number of Forms 8865, Return of U.S. Persons With Respect to Certain Foreign \
                Partnerships, attached to this return.",
-        control: Control::Entry { field: "f3_6[0]", kind: InputKind::Count },
         follow_ups: &[],
         refs: &[FORM_8865],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b16a",
-        number: "16a",
         page: 3,
         text: "Did you make any payments in 2025 that would require you to file Form(s) 1099? See \
                instructions.",
-        control: Control::YesNo { yes: "c3_7[0]", no: "c3_7[1]" },
         follow_ups: &[],
         refs: &[FORM_1099],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b16b",
-        number: "16b",
         page: 3,
         text: "If \u{201c}Yes\u{201d} to question 16a, did you or will you file required Form(s) 1099?",
-        control: Control::YesNo { yes: "c3_8[0]", no: "c3_8[1]" },
         follow_ups: &[],
         refs: &[FORM_1099],
         yes_warning: "",
-        reserved: false,
         depends_on: Some(Dependency {
             question: "b16a",
             value: YES,
@@ -637,103 +1735,81 @@ pub const QUESTIONS: &[Question] = &[
     },
     Question {
         key: "b17",
-        number: "17",
         page: 3,
         text: "Enter the number of Forms 5471, Information Return of U.S. Persons With Respect to \
                Certain Foreign Corporations, attached to this return.",
-        control: Control::Entry { field: "f3_7[0]", kind: InputKind::Count },
         follow_ups: &[],
         refs: &[FORM_5471],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b18",
-        number: "18",
         page: 3,
         text: "Enter the number of partners that are foreign governments under section 892.",
-        control: Control::Entry { field: "f3_8[0]", kind: InputKind::Count },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b19",
-        number: "19",
         page: 3,
         text: "During the partnership\u{2019}s tax year, did the partnership make any payments, or \
                receive any payments allocable to foreign partners, that would require it to file Forms \
                1042 and 1042-S under chapter 3 (sections 1441 through 1464) or chapter 4 (sections \
                1471 through 1474)?",
-        control: Control::YesNo { yes: "c3_9[0]", no: "c3_9[1]" },
         follow_ups: &[],
         refs: &[FORM_1042, FORM_1042S],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b20",
-        number: "20",
         page: 3,
         text: "Was the partnership a specified domestic entity required to file Form 8938 for the tax \
                year? See the Instructions for Form 8938.",
-        control: Control::YesNo { yes: "c3_10[0]", no: "c3_10[1]" },
         follow_ups: &[],
         refs: &[FORM_8938],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b21",
-        number: "21",
         page: 3,
         text: "Is the partnership a section 721(c) partnership, as defined in Regulations section \
                1.721(c)-1(b)(14)?",
-        control: Control::YesNo { yes: "c3_11[0]", no: "c3_11[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b22",
-        number: "22",
         page: 3,
         text: "During the tax year, did the partnership pay or accrue any interest or royalty for \
                which one or more partners are not allowed a deduction under section 267A? See \
                instructions. If \u{201c}Yes,\u{201d} enter the total amount of the disallowed deductions.",
-        control: Control::YesNo { yes: "c3_12[0]", no: "c3_12[1]" },
         follow_ups: &[(
             FollowUpWhen::Yes,
             FollowUp { key: "b22_amount", label: "Total disallowed deductions", field: "f3_9[0]", kind: InputKind::Money },
         )],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b23",
-        number: "23",
         page: 3,
         text: "Did the partnership have an election under section 163(j) for any real property trade or \
                business or any farming business in effect during the tax year? See instructions.",
-        control: Control::YesNo { yes: "c3_13[0]", no: "c3_13[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b24",
-        number: "24",
         page: 3,
         text: "Does the partnership satisfy one or more of the following? See instructions. \
                (a) The partnership owns a pass-through entity with current, or prior year carryover, \
@@ -744,22 +1820,18 @@ pub const QUESTIONS: &[Question] = &[
                (c) The partnership is a tax shelter (see instructions) and the partnership has business \
                interest expense. \
                If \u{201c}Yes\u{201d} to any, complete and attach Form 8990.",
-        control: Control::YesNo { yes: "c3_14[0]", no: "c3_14[1]" },
         follow_ups: &[],
         refs: &[FORM_8990],
         yes_warning: "Question 24 is Yes, so Form 8990 has to be completed and attached. This program \
                       does not produce it.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b25",
-        number: "25",
         page: 3,
         text: "Does the partnership intend to self-certify as a qualified opportunity fund? If \
                \u{201c}Yes,\u{201d} complete and attach Form 8996, Qualified Opportunity Fund, and \
                enter the amount (if any) from Form 8996, line 15.",
-        control: Control::YesNo { yes: "c3_15[0]", no: "c3_15[1]" },
         follow_ups: &[(
             FollowUpWhen::Yes,
             FollowUp { key: "b25_amount", label: "Amount from Form 8996, line 15", field: "f3_10[0]", kind: InputKind::Money },
@@ -767,39 +1839,31 @@ pub const QUESTIONS: &[Question] = &[
         refs: &[FORM_8996],
         yes_warning: "Question 25 is Yes, so Form 8996 has to be completed and attached. This program \
                       does not produce it.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b26",
-        number: "26",
         page: 3,
         text: "Enter the number of foreign partners subject to section 864(c)(8) as a result of \
                transferring all or a portion of an interest in the partnership or of receiving a \
                distribution from the partnership.",
-        control: Control::Entry { field: "f3_11[0]", kind: InputKind::Count },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b27",
-        number: "27",
         page: 3,
         text: "At any time during the tax year, were there any transfers between the partnership and \
                its partners subject to the disclosure requirements of Regulations section 1.707-8?",
-        control: Control::YesNo { yes: "c3_16[0]", no: "c3_16[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b28",
-        number: "28",
         page: 4,
         text: "Since December 22, 2017, did a foreign corporation directly or indirectly acquire \
                substantially all of the properties constituting a trade or business of your \
@@ -807,68 +1871,58 @@ pub const QUESTIONS: &[Question] = &[
                section 7874 greater than 50% (for example, the partners held more than 50% of the \
                stock of the foreign corporation)? If \u{201c}Yes,\u{201d} list the ownership percentage \
                by vote and by value. See instructions.",
-        control: Control::YesNo { yes: "c4_1[0]", no: "c4_1[1]" },
         follow_ups: &[
             (FollowUpWhen::Yes, FollowUp { key: "b28_vote", label: "Ownership percentage by vote", field: "f4_01[0]", kind: InputKind::Percent }),
             (FollowUpWhen::Yes, FollowUp { key: "b28_value", label: "Ownership percentage by value", field: "f4_02[0]", kind: InputKind::Percent }),
         ],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b29a",
-        number: "29a",
         page: 4,
         text: "Is the partnership required to file Form 7208, Excise Tax on Repurchase of Corporate \
                Stock, under the applicable foreign corporation rules? See instructions.",
-        control: Control::YesNo { yes: "c4_2[0]", no: "c4_2[1]" },
         follow_ups: &[],
         refs: &[FORM_7208],
         yes_warning: "Question 29a is Yes, so Form 7208 has to be completed. This program does not \
                       produce it.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b29b",
-        number: "29b",
         page: 4,
         text: "Is the partnership required to file Form 7208 under the covered surrogate foreign \
                corporation rules? If \u{201c}Yes\u{201d} to either (a) or (b), complete Form 7208. See \
                the Instructions for Form 7208.",
-        control: Control::YesNo { yes: "c4_3[0]", no: "c4_3[1]" },
         follow_ups: &[],
         refs: &[FORM_7208],
         yes_warning: "Question 29b is Yes, so Form 7208 has to be completed. This program does not \
                       produce it.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b30",
-        number: "30",
         page: 4,
         text: "At any time during this tax year, did the partnership (a) receive (as a reward, award, \
                or payment for property or services); or (b) sell, exchange, or otherwise dispose of a \
                digital asset (or financial interest in a digital asset)? See instructions.",
-        control: Control::YesNo { yes: "c4_4[0]", no: "c4_4[1]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b31",
-        number: "31",
+        // 33 on the 2024 and 2025 forms. It was 31 in 2023, which is where this
+        // code's number came from — see `FormYear::schedule_b_numbers`, and note
+        // that the *key* deliberately does not move with it.
         page: 4,
         text: "Is the partnership electing out of the centralized partnership audit regime under \
                section 6221(b)? See instructions. If \u{201c}Yes,\u{201d} the partnership must complete \
                Schedule B-2 (Form 1065); enter the total from Schedule B-2, Part III, line 3. If \
                \u{201c}No,\u{201d} complete the Designation of Partnership Representative below.",
-        control: Control::YesNo { yes: "c4_6[0]", no: "c4_6[1]" },
         follow_ups: &[(
             FollowUpWhen::Yes,
             FollowUp { key: "b31_total", label: "Total from Schedule B-2, Part III, line 3", field: "f4_03[0]", kind: InputKind::Count },
@@ -877,20 +1931,16 @@ pub const QUESTIONS: &[Question] = &[
         yes_warning: "Question 31 is Yes, so Schedule B-2 is attached, listing every partner as an \
                       eligible partner. Check each type code and TIN — an incomplete Part I is \
                       grounds for the IRS to treat the election as invalid.",
-        reserved: false,
         depends_on: None,
     },
     Question {
         key: "b32",
-        number: "32",
         page: 4,
         text: "Check this box if an election out of subchapter K under section 761 is being made. See \
                instructions.",
-        control: Control::Check { field: "c4_5[0]" },
         follow_ups: &[],
         refs: &[],
         yes_warning: "",
-        reserved: false,
         depends_on: None,
     },
 ];
@@ -902,25 +1952,117 @@ pub const QUESTIONS: &[Question] = &[
 /// centralized audit regime must give one. Keyed and stored exactly like the
 /// answers so the desktop and the filler treat both the same way.
 pub const PARTNERSHIP_REP: &[FollowUp] = &[
-    FollowUp { key: "pr_first",    label: "First name of PR (or entity name)", field: "f4_04[0]", kind: InputKind::Text },
-    FollowUp { key: "pr_last",     label: "Last name of PR",                   field: "f4_05[0]", kind: InputKind::Text },
-    FollowUp { key: "pr_street",   label: "U.S. address of PR — street",       field: "f4_06[0]", kind: InputKind::Text },
-    FollowUp { key: "pr_city",     label: "City",                              field: "f4_07[0]", kind: InputKind::Text },
-    FollowUp { key: "pr_state",    label: "State",                             field: "f4_08[0]", kind: InputKind::Text },
-    FollowUp { key: "pr_zip",      label: "ZIP code",                          field: "f4_09[0]", kind: InputKind::Text },
-    FollowUp { key: "pr_phone",    label: "U.S. phone number of PR",           field: "f4_10[0]", kind: InputKind::Text },
-    FollowUp { key: "di_first",    label: "First name of DI (if PR is an entity)", field: "f4_11[0]", kind: InputKind::Text },
-    FollowUp { key: "di_last",     label: "Last name of DI",                   field: "f4_12[0]", kind: InputKind::Text },
-    FollowUp { key: "di_street",   label: "U.S. address of DI — street",       field: "f4_13[0]", kind: InputKind::Text },
-    FollowUp { key: "di_city",     label: "City",                              field: "f4_14[0]", kind: InputKind::Text },
-    FollowUp { key: "di_state",    label: "State",                             field: "f4_15[0]", kind: InputKind::Text },
-    FollowUp { key: "di_zip",      label: "ZIP code",                          field: "f4_16[0]", kind: InputKind::Text },
-    FollowUp { key: "di_phone",    label: "U.S. phone number of DI",           field: "f4_17[0]", kind: InputKind::Text },
+    FollowUp {
+        key: "pr_first",
+        label: "First name of PR (or entity name)",
+        field: "f4_04[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "pr_last",
+        label: "Last name of PR",
+        field: "f4_05[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "pr_street",
+        label: "U.S. address of PR — street",
+        field: "f4_06[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "pr_city",
+        label: "City",
+        field: "f4_07[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "pr_state",
+        label: "State",
+        field: "f4_08[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "pr_zip",
+        label: "ZIP code",
+        field: "f4_09[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "pr_phone",
+        label: "U.S. phone number of PR",
+        field: "f4_10[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "di_first",
+        label: "First name of DI (if PR is an entity)",
+        field: "f4_11[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "di_last",
+        label: "Last name of DI",
+        field: "f4_12[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "di_street",
+        label: "U.S. address of DI — street",
+        field: "f4_13[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "di_city",
+        label: "City",
+        field: "f4_14[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "di_state",
+        label: "State",
+        field: "f4_15[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "di_zip",
+        label: "ZIP code",
+        field: "f4_16[0]",
+        kind: InputKind::Text,
+    },
+    FollowUp {
+        key: "di_phone",
+        label: "U.S. phone number of DI",
+        field: "f4_17[0]",
+        kind: InputKind::Text,
+    },
 ];
 
 /// Look a question up by its storage key.
 pub fn question(key: &str) -> Option<&'static Question> {
     QUESTIONS.iter().find(|q| q.key == key)
+}
+
+/// The years a Schedule B can be answered for, oldest first.
+///
+/// The years a question table is carried for — which is not every year the Form
+/// 1065 offers. The 2026 draft re-paginates and has no table, so a page that
+/// offered it would render no questions at all and store answers against boxes
+/// nothing can fill.
+pub fn answerable_years() -> Vec<i32> {
+    crate::tax::form1065::FORM_YEARS
+        .iter()
+        .filter(|f| f.schedule_b.is_some())
+        .map(|f| f.year)
+        .collect()
+}
+
+/// The question table for a tax year, for readers that hold a year and a key.
+///
+/// Returns `None` for a year no revision is carried for, so a caller shows the
+/// stable key rather than a number from some other year's form.
+pub fn table_for(tax_year: i32) -> Option<&'static [QuestionBoxes]> {
+    crate::tax::form1065::form_year(tax_year).and_then(|f| f.schedule_b)
 }
 
 // ---------------------------------------------------------------------------
@@ -942,6 +2084,12 @@ pub const YES: &str = "yes";
 pub const NO: &str = "no";
 
 impl ScheduleB {
+    /// Every key an answer is stored under, including ones this year's form may
+    /// not ask — which is exactly what the caller wants to know about.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.answers.keys().map(String::as_str)
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.answers.get(key).map(String::as_str)
     }
@@ -969,7 +2117,8 @@ impl ScheduleB {
         if value.trim().is_empty() {
             self.answers.remove(key);
         } else {
-            self.answers.insert(key.to_string(), value.trim().to_string());
+            self.answers
+                .insert(key.to_string(), value.trim().to_string());
         }
     }
 
@@ -979,11 +2128,11 @@ impl ScheduleB {
     /// while the question it hangs off holds the value it names — question 16b
     /// is a question about the 1099s you owed, and if you owed none it is not a
     /// question you can answer.
-    pub fn applies(&self, q: &Question) -> bool {
-        if q.reserved {
+    pub fn applies(&self, q: &Asked) -> bool {
+        if q.reserved() {
             return false;
         }
-        match q.depends_on {
+        match q.meaning.depends_on {
             None => true,
             Some(d) => self.get(d.question) == Some(d.value),
         }
@@ -996,15 +2145,17 @@ impl ScheduleB {
     /// it every time would train the reader to ignore the panel. So are reserved
     /// numbers and questions whose condition does not hold — neither is something
     /// anybody failed to do.
-    pub fn unanswered(&self) -> Vec<&'static str> {
-        QUESTIONS
-            .iter()
+    /// Takes the revision's table, because "which questions are there" and
+    /// "what are they called" are both facts about the form in front of you.
+    pub fn unanswered(&self, table: &'static [QuestionBoxes]) -> Vec<&'static str> {
+        asked(table)
+            .into_iter()
             .filter(|q| self.applies(q))
-            .filter(|q| !matches!(q.control, Control::Entry { .. }))
+            .filter(|q| !matches!(q.control(), Control::Entry { .. }))
             // A lone checkbox has no unanswered state — see `Control::Check`.
-            .filter(|q| !matches!(q.control, Control::Check { .. }))
-            .filter(|q| self.get(q.key).is_none())
-            .map(|q| q.number)
+            .filter(|q| !matches!(q.control(), Control::Check { .. }))
+            .filter(|q| self.get(q.key()).is_none())
+            .map(|q| q.number())
             .collect()
     }
 }
@@ -1041,9 +2192,10 @@ pub enum AnswerError {
 /// [`super::lines::set_account_line`] checks its line key: a stored key nothing
 /// recognises is an answer that will never reach the form, and it looks saved.
 pub fn known_key(key: &str) -> bool {
-    QUESTIONS.iter().any(|q| {
-        q.key == key || q.follow_ups.iter().any(|(_, f)| f.key == key)
-    }) || PARTNERSHIP_REP.iter().any(|f| f.key == key)
+    QUESTIONS
+        .iter()
+        .any(|q| q.key == key || q.follow_ups.iter().any(|(_, f)| f.key == key))
+        || PARTNERSHIP_REP.iter().any(|f| f.key == key)
 }
 
 /// Save one answer for one year, writing straight to the table.
@@ -1115,36 +2267,94 @@ pub fn copy_year(conn: &Connection, from: i32, to: i32) -> Result<usize, AnswerE
 /// value is stored for it: an amount sitting beside a "No" is a contradiction on
 /// a signed return, and the stored value is kept only so that flipping the answer
 /// back does not lose what was typed.
+/// Write a follow-up, or say the form has no box for it.
+///
+/// Older revisions lay some blocks out differently — 2023 gives the partnership
+/// representative one address line where 2025 gives street, city, state and ZIP —
+/// so a box can be genuinely missing rather than renamed. Failing the whole
+/// return over an address line would be the wrong trade; going quiet would be
+/// worse. Returns whether anything was written.
+fn write_or_report(
+    doc: &mut Document,
+    map: &FieldMap,
+    field: &str,
+    value: &str,
+    label: &str,
+    warnings: &mut Vec<String>,
+) -> Result<bool, FormError> {
+    if map.find(field).is_none() {
+        warnings.push(format!(
+            "This year's form has no box for {}, so it was left out — everything else on \
+             Schedule B is filled. Add it by hand if the return needs it.",
+            label.to_lowercase()
+        ));
+        return Ok(false);
+    }
+    set_text(doc, map, field, value)?;
+    Ok(true)
+}
+
+/// Write the answers onto one revision of the form.
+///
+/// Driven by that revision's table: a question it does not ask has no entry, so
+/// there is no separate "absent" list to keep in step. An answer on file for a
+/// question this year's form does not ask is reported rather than dropped
+/// silently — it is kept for the years that do ask it.
 pub fn fill(
     doc: &mut Document,
     map: &FieldMap,
     answers: &ScheduleB,
+    table: &'static [QuestionBoxes],
 ) -> Result<Vec<String>, FormError> {
     let mut warnings = Vec::new();
 
-    for q in QUESTIONS {
+    // An answer stored for a question this revision does not ask. Only whole
+    // questions: a follow-up key like `b31_total` belongs to a question, and
+    // reporting it separately would say the same thing twice — or, when its
+    // question *is* asked, say something untrue.
+    for stored in answers.keys() {
+        let Some(q) = QUESTIONS.iter().find(|q| q.key == stored) else {
+            continue;
+        };
+        if table.iter().any(|b| b.key == q.key) {
+            continue;
+        }
+        // Named by the number a revision that does ask it prints, because "b32"
+        // is not what anybody is looking at.
+        let named = number_anywhere(q.key)
+            .map(|n| format!("Question {n}"))
+            .unwrap_or_else(|| format!("Question {}", q.key));
+        warnings.push(format!(
+            "{named} is not on this year's form, so the answer on file for it was not written \
+             anywhere. It is kept for the years that do ask it."
+        ));
+    }
+
+    for q in asked(table) {
+        let q = &q;
         // A reserved number has nothing to answer, and a question whose condition
         // does not hold is not asking. Neither is written, whatever is stored:
         // the stored value is kept only so that flipping the governing answer
         // back does not lose what was already decided.
         if !answers.applies(q) {
-            if let (Some(d), Some(_)) = (q.depends_on, answers.get(q.key)) {
+            if let (Some(d), Some(_)) = (q.meaning.depends_on, answers.get(q.key())) {
                 warnings.push(format!(
                     "Question {} has an answer but {}, so it was left blank on the form.",
-                    q.number, d.label
+                    q.number(),
+                    d.label
                 ));
             }
             continue;
         }
-        let given = answers.get(q.key);
-        match q.control {
+        let given = answers.get(q.key());
+        match q.control() {
             Control::YesNo { yes, no } => match given {
                 Some(YES) => set_check(doc, map, yes, "1")?,
                 Some(NO) => set_check(doc, map, no, "2")?,
                 Some(other) => warnings.push(format!(
                     "Question {} is stored as {other:?}, which is neither yes nor no, so it was \
                      left blank. Answer it again.",
-                    q.number
+                    q.number()
                 )),
                 None => {}
             },
@@ -1159,7 +2369,7 @@ pub fn fill(
                         None => warnings.push(format!(
                             "Question {} is stored as {v:?}, which is not one of its choices, so it \
                              was left blank. Answer it again.",
-                            q.number
+                            q.number()
                         )),
                     }
                 }
@@ -1176,7 +2386,7 @@ pub fn fill(
             }
         }
 
-        for (when, f) in q.follow_ups {
+        for (when, f) in q.meaning.follow_ups {
             let show = match when {
                 FollowUpWhen::Always => true,
                 FollowUpWhen::Yes => given == Some(YES),
@@ -1187,17 +2397,19 @@ pub fn fill(
                 continue;
             }
             match answers.get(f.key) {
-                Some(v) => set_text(doc, map, f.field, v)?,
+                Some(v) => {
+                    write_or_report(doc, map, f.field, v, f.label, &mut warnings)?;
+                }
                 None => warnings.push(format!(
                     "Question {} needs {} and none was given, so that box is blank.",
-                    q.number,
+                    q.number(),
                     f.label.to_lowercase()
                 )),
             }
         }
 
-        if given == Some(YES) && !q.yes_warning.is_empty() {
-            warnings.push(q.yes_warning.to_string());
+        if given == Some(YES) && !q.meaning.yes_warning.is_empty() {
+            warnings.push(q.meaning.yes_warning.to_string());
         }
     }
 
@@ -1207,19 +2419,25 @@ pub fn fill(
     let mut rep_given = 0usize;
     for f in PARTNERSHIP_REP {
         if let Some(v) = answers.get(f.key) {
-            set_text(doc, map, f.field, v)?;
-            rep_given += 1;
+            if write_or_report(doc, map, f.field, v, f.label, &mut warnings)? {
+                rep_given += 1;
+            }
         }
     }
     if answers.get("b31") != Some(YES) && rep_given == 0 {
-        warnings.push(
+        // The number this revision prints, not a number baked in here: the
+        // election is question 31 on the 2023 form and 33 on the later ones.
+        let number = table
+            .iter()
+            .find(|b| b.key == "b31")
+            .map_or("31", |b| b.number);
+        warnings.push(format!(
             "No partnership representative is designated. Every partnership that has not elected \
-             out of the centralized audit regime must name one, and question 31 is not Yes."
-                .to_string(),
-        );
+             out of the centralized audit regime must name one, and question {number} is not Yes."
+        ));
     }
 
-    let missing = answers.unanswered();
+    let missing = answers.unanswered(table);
     if !missing.is_empty() {
         warnings.push(format!(
             "Schedule B question(s) {} have no answer and are blank on the form. The IRS reads a \
@@ -1252,17 +2470,36 @@ mod tests {
     #[test]
     fn every_field_in_the_catalogue_is_in_the_vendored_form() {
         let (doc, map) = form();
-        for q in QUESTIONS {
+        for q in SCHEDULE_B_2025 {
             match q.control {
                 Control::YesNo { yes, no } => {
-                    assert!(map.find(yes).is_some(), "q{} yes box {yes} missing", q.number);
+                    assert!(
+                        map.find(yes).is_some(),
+                        "q{} yes box {yes} missing",
+                        q.number
+                    );
                     assert!(map.find(no).is_some(), "q{} no box {no} missing", q.number);
-                    assert_eq!(on_states(&doc, &map, yes), vec!["1"], "q{} yes state", q.number);
-                    assert_eq!(on_states(&doc, &map, no), vec!["2"], "q{} no state", q.number);
+                    assert_eq!(
+                        on_states(&doc, &map, yes),
+                        vec!["1"],
+                        "q{} yes state",
+                        q.number
+                    );
+                    assert_eq!(
+                        on_states(&doc, &map, no),
+                        vec!["2"],
+                        "q{} no state",
+                        q.number
+                    );
                 }
                 Control::Choice(opts) => {
                     for o in opts {
-                        assert!(map.find(o.field).is_some(), "q{} {} box missing", q.number, o.key);
+                        assert!(
+                            map.find(o.field).is_some(),
+                            "q{} {} box missing",
+                            q.number,
+                            o.key
+                        );
                         assert_eq!(
                             on_states(&doc, &map, o.field),
                             vec![o.on.to_string()],
@@ -1273,15 +2510,36 @@ mod tests {
                     }
                 }
                 Control::Check { field } => {
-                    assert!(map.find(field).is_some(), "q{} box {field} missing", q.number);
-                    assert_eq!(on_states(&doc, &map, field), vec!["1"], "q{} state", q.number);
+                    assert!(
+                        map.find(field).is_some(),
+                        "q{} box {field} missing",
+                        q.number
+                    );
+                    assert_eq!(
+                        on_states(&doc, &map, field),
+                        vec!["1"],
+                        "q{} state",
+                        q.number
+                    );
                 }
                 Control::Entry { field, .. } => {
-                    assert!(map.find(field).is_some(), "q{} entry {field} missing", q.number);
+                    assert!(
+                        map.find(field).is_some(),
+                        "q{} entry {field} missing",
+                        q.number
+                    );
                 }
             }
-            for (_, f) in q.follow_ups {
-                assert!(map.find(f.field).is_some(), "q{} follow-up {} missing", q.number, f.key);
+            for (_, f) in question(q.key)
+                .expect("every table key is in the catalogue")
+                .follow_ups
+            {
+                assert!(
+                    map.find(f.field).is_some(),
+                    "q{} follow-up {} missing",
+                    q.number,
+                    f.key
+                );
             }
         }
         for f in PARTNERSHIP_REP {
@@ -1301,6 +2559,8 @@ mod tests {
                 assert!(keys.insert(f.key), "duplicate follow-up key {}", f.key);
                 assert!(fields.insert(f.field), "duplicate field {}", f.field);
             }
+        }
+        for q in SCHEDULE_B_2025 {
             match q.control {
                 Control::YesNo { yes, no } => {
                     assert!(fields.insert(yes), "duplicate field {yes}");
@@ -1331,12 +2591,12 @@ mod tests {
             for r in q.refs {
                 assert!(
                     r.url.starts_with("https://www.irs.gov/"),
-                    "q{} reference {} has a non-IRS url {}",
-                    q.number,
+                    "{} reference {} has a non-IRS url {}",
+                    q.key,
                     r.name,
                     r.url
                 );
-                assert!(!r.name.is_empty(), "q{} has a nameless reference", q.number);
+                assert!(!r.name.is_empty(), "{} has a nameless reference", q.key);
             }
         }
     }
@@ -1397,7 +2657,7 @@ mod tests {
         let mut a = ScheduleB::default();
         a.set("b5", YES);
         a.set("b6", NO);
-        fill(&mut doc, &map, &a).unwrap();
+        fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
 
         assert_eq!(
             crate::tax::acroform::get_value(&doc, &map, "c2_7[0]").as_deref(),
@@ -1418,7 +2678,7 @@ mod tests {
         let mut a = ScheduleB::default();
         a.set("b22", NO);
         a.set("b22_amount", "1234");
-        fill(&mut doc, &map, &a).unwrap();
+        fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
 
         assert_eq!(
             crate::tax::acroform::get_value(&doc, &map, "f3_9[0]"),
@@ -1433,7 +2693,7 @@ mod tests {
         let mut a = ScheduleB::default();
         a.set("b22", YES);
         a.set("b22_amount", "1234");
-        fill(&mut doc, &map, &a).unwrap();
+        fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
 
         assert_eq!(
             crate::tax::acroform::get_value(&doc, &map, "f3_9[0]").as_deref(),
@@ -1446,7 +2706,7 @@ mod tests {
         let (mut doc, map) = form();
         let mut a = ScheduleB::default();
         a.set("b1", "llc");
-        fill(&mut doc, &map, &a).unwrap();
+        fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
 
         assert_eq!(
             crate::tax::acroform::get_value(&doc, &map, "c2_1[2]").as_deref(),
@@ -1473,7 +2733,7 @@ mod tests {
         let (mut doc, map) = form();
         let mut a = ScheduleB::default();
         a.set("b24", YES);
-        let warnings = fill(&mut doc, &map, &a).unwrap();
+        let warnings = fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
         assert!(
             warnings.iter().any(|w| w.contains("Form 8990")),
             "{warnings:?}"
@@ -1484,20 +2744,23 @@ mod tests {
     /// be told they failed to answer it.
     #[test]
     fn a_reserved_number_is_never_shown_answered_or_written() {
-        let q = question("b10e").expect("10e is in the catalogue");
-        assert!(q.reserved);
+        let q = asked(SCHEDULE_B_2025)
+            .into_iter()
+            .find(|q| q.key() == "b10e")
+            .expect("10e is on the 2025 form");
+        assert!(q.reserved());
 
         let mut a = ScheduleB::default();
-        assert!(!a.applies(q), "a reserved number never applies");
+        assert!(!a.applies(&q), "a reserved number never applies");
         assert!(
-            !a.unanswered().contains(&"10e"),
+            !a.unanswered(SCHEDULE_B_2025).contains(&"10e"),
             "nobody failed to answer a question that does not exist"
         );
 
         // Even with a value forced in, nothing reaches the form.
         a.set("b10e", YES);
         let (mut doc, map) = form();
-        fill(&mut doc, &map, &a).unwrap();
+        fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
         assert_eq!(
             crate::tax::acroform::get_value(&doc, &map, "c3_3[0]").as_deref(),
             Some("/Off"),
@@ -1509,22 +2772,28 @@ mod tests {
     /// 1099s to file and did not file them", which is the opposite of the truth.
     #[test]
     fn a_conditional_question_only_applies_once_its_condition_holds() {
-        let q = question("b16b").expect("16b is in the catalogue");
-        let d = q.depends_on.expect("16b hangs off 16a");
+        let q = asked(SCHEDULE_B_2025)
+            .into_iter()
+            .find(|q| q.key() == "b16b")
+            .expect("16b is on the 2025 form");
+        let d = q.meaning.depends_on.expect("16b hangs off 16a");
         assert_eq!(d.question, "b16a");
         assert_eq!(d.value, YES);
 
         let mut a = ScheduleB::default();
-        assert!(!a.applies(q), "unanswered 16a leaves 16b inapplicable");
-        assert!(!a.unanswered().contains(&"16b"));
+        assert!(!a.applies(&q), "unanswered 16a leaves 16b inapplicable");
+        assert!(!a.unanswered(SCHEDULE_B_2025).contains(&"16b"));
 
         a.set("b16a", NO);
-        assert!(!a.applies(q), "16a No leaves 16b inapplicable");
-        assert!(!a.unanswered().contains(&"16b"));
+        assert!(!a.applies(&q), "16a No leaves 16b inapplicable");
+        assert!(!a.unanswered(SCHEDULE_B_2025).contains(&"16b"));
 
         a.set("b16a", YES);
-        assert!(a.applies(q), "16a Yes brings 16b into play");
-        assert!(a.unanswered().contains(&"16b"), "and now it is owed");
+        assert!(a.applies(&q), "16a Yes brings 16b into play");
+        assert!(
+            a.unanswered(SCHEDULE_B_2025).contains(&"16b"),
+            "and now it is owed"
+        );
     }
 
     /// An answer stored against a condition that no longer holds is kept but not
@@ -1536,7 +2805,7 @@ mod tests {
         a.set("b16b", YES);
 
         let (mut doc, map) = form();
-        fill(&mut doc, &map, &a).unwrap();
+        fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
         assert_eq!(
             crate::tax::acroform::get_value(&doc, &map, "c3_8[0]").as_deref(),
             Some("/1"),
@@ -1546,7 +2815,7 @@ mod tests {
         // 16a flips to No; 16b's stored answer must not reach the page.
         a.set("b16a", NO);
         let (mut doc, map) = form();
-        let warnings = fill(&mut doc, &map, &a).unwrap();
+        let warnings = fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
         assert_eq!(
             crate::tax::acroform::get_value(&doc, &map, "c3_8[0]").as_deref(),
             Some("/Off"),
@@ -1566,15 +2835,19 @@ mod tests {
         for q in QUESTIONS {
             a.set(q.key, YES);
         }
-        assert!(a.unanswered().is_empty(), "{:?}", a.unanswered());
+        assert!(
+            a.unanswered(SCHEDULE_B_2025).is_empty(),
+            "{:?}",
+            a.unanswered(SCHEDULE_B_2025)
+        );
         // 10e is reserved and 16b hangs off 16a, so neither can ever be nagged
         // about even when every other question is blank.
         let empty = ScheduleB::default();
-        assert!(!empty.unanswered().contains(&"10e"));
-        assert!(!empty.unanswered().contains(&"16b"));
+        assert!(!empty.unanswered(SCHEDULE_B_2025).contains(&"10e"));
+        assert!(!empty.unanswered(SCHEDULE_B_2025).contains(&"16b"));
 
         let empty = ScheduleB::default();
-        let missing = empty.unanswered();
+        let missing = empty.unanswered(SCHEDULE_B_2025);
         assert!(missing.contains(&"5"), "{missing:?}");
         // Counts and lone checkboxes are correctly blank when there is nothing to
         // report, so they are not nagged about.
@@ -1587,9 +2860,11 @@ mod tests {
     #[test]
     fn a_missing_partnership_representative_is_called_out() {
         let (mut doc, map) = form();
-        let warnings = fill(&mut doc, &map, &ScheduleB::default()).unwrap();
+        let warnings = fill(&mut doc, &map, &ScheduleB::default(), &[]).unwrap();
         assert!(
-            warnings.iter().any(|w| w.contains("partnership representative")),
+            warnings
+                .iter()
+                .any(|w| w.contains("partnership representative")),
             "{warnings:?}"
         );
     }
@@ -1599,9 +2874,11 @@ mod tests {
         let (mut doc, map) = form();
         let mut a = ScheduleB::default();
         a.set("b31", YES);
-        let warnings = fill(&mut doc, &map, &a).unwrap();
+        let warnings = fill(&mut doc, &map, &a, SCHEDULE_B_2025).unwrap();
         assert!(
-            !warnings.iter().any(|w| w.contains("No partnership representative")),
+            !warnings
+                .iter()
+                .any(|w| w.contains("No partnership representative")),
             "{warnings:?}"
         );
     }

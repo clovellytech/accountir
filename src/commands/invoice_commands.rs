@@ -289,7 +289,10 @@ pub(crate) fn build_void_invoice_in_txn(
         invoice_id: cmd.invoice_id.clone(),
         reason: cmd.reason.clone(),
     };
-    Ok(InvoiceStep::Append(vec![void_entry_event, void_invoice_event]))
+    Ok(InvoiceStep::Append(vec![
+        void_entry_event,
+        void_invoice_event,
+    ]))
 }
 
 pub struct InvoiceCommands<'a> {
@@ -516,7 +519,10 @@ mod tests {
             .optional()
             .unwrap()
             .unwrap_or(false);
-        assert!(entry_exists, "InvoiceIssued.entry_id must reference a posted entry");
+        assert!(
+            entry_exists,
+            "InvoiceIssued.entry_id must reference a posted entry"
+        );
     }
 
     #[test]
@@ -529,10 +535,12 @@ mod tests {
         // Deactivate the revenue account (zero balance, so it's allowed) so the
         // in-txn fence must reject the invoice.
         AccountCommands::new(&mut store, "u".to_string())
-            .deactivate_account(crate::commands::account_commands::DeactivateAccountCommand {
-                account_id: revenue.clone(),
-                reason: None,
-            })
+            .deactivate_account(
+                crate::commands::account_commands::DeactivateAccountCommand {
+                    account_id: revenue.clone(),
+                    reason: None,
+                },
+            )
             .unwrap();
 
         let before = store.count().unwrap();

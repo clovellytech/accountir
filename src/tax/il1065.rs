@@ -47,6 +47,63 @@ use lopdf::Document;
 
 const IL1065: &[u8] = include_bytes!("../../assets/il/il1065.pdf");
 
+/// One tax year's IL-1065 blank.
+///
+/// # Why a year is needed at all
+///
+/// The vendored form prints, on its own first page, "This form is for tax years
+/// ending on or after December 31, 2025, and before December 31, 2026." Filling
+/// it with an earlier year's figures produces a document that states on its face
+/// that it is not for the year it carries — and Illinois renumbers its lines
+/// between revisions exactly as the IRS does.
+///
+/// # Why every revision can share one set of box names
+///
+/// Illinois names its fields in plain language, and the names carry the line
+/// arithmetic with them — `Add L36 - L37`, `Divide L47 - L50 - a - 1`. A
+/// renumbering would therefore show up *in the names*, not silently behind them,
+/// which is the opposite of the IRS forms where `f1_19[0]` is a position and
+/// means whatever the current revision put there.
+///
+/// Checked rather than assumed: all 227 names are identical across the three
+/// revisions carried, the printed line numbers on pages 1–3 match one for one,
+/// and 2024's boxes are in exactly the same places as 2025's. The 2023 form
+/// reflows 78 rows vertically — same column, same name, a few points up or down
+/// — which is a page laid out afresh, not a form renumbered.
+///
+/// So what the year table gates is not the box map but the *paper*: each blank
+/// prints its own year and the range of tax years it may be filed for.
+pub struct Il1065Year {
+    pub year: i32,
+    pub form: &'static [u8],
+}
+
+/// The revisions carried, oldest first.
+pub const IL1065_YEARS: &[Il1065Year] = &[
+    Il1065Year {
+        year: 2023,
+        form: include_bytes!("../../assets/il/2023/il1065.pdf"),
+    },
+    Il1065Year {
+        year: 2024,
+        form: include_bytes!("../../assets/il/2024/il1065.pdf"),
+    },
+    Il1065Year {
+        year: crate::tax::form1065::FORM_TAX_YEAR,
+        form: IL1065,
+    },
+];
+
+/// The blank for a year, or `None` when none is carried.
+pub fn il1065_year(year: i32) -> Option<&'static Il1065Year> {
+    IL1065_YEARS.iter().find(|f| f.year == year)
+}
+
+/// The years an IL-1065 can be produced for.
+pub fn supported_years() -> Vec<i32> {
+    IL1065_YEARS.iter().map(|f| f.year).collect()
+}
+
 /// Illinois' replacement-tax rate, 1.5%, as a numerator over 1000.
 const REPLACEMENT_TAX_PER_MILLE: i64 = 15;
 /// Illinois' PTE-tax rate, 4.95%, as a numerator over 10_000.
@@ -251,9 +308,26 @@ pub fn figures(federal: &Form1065Lines, settings: &Il1065Settings) -> Figures {
     // carried through to the tax, because the apportioned path needs sales.
     if settings.apportions_outside_illinois {
         return Figures {
-            line1, line2, line3, line4, line5, line7, line8, line9, line10, line12, line13,
-            line20, line23, line35,
-            line47: None, line53: None, line54: None, line58: None, line61: None, line62: None,
+            line1,
+            line2,
+            line3,
+            line4,
+            line5,
+            line7,
+            line8,
+            line9,
+            line10,
+            line12,
+            line13,
+            line20,
+            line23,
+            line35,
+            line47: None,
+            line53: None,
+            line54: None,
+            line58: None,
+            line61: None,
+            line62: None,
         };
     }
 
@@ -274,8 +348,20 @@ pub fn figures(federal: &Form1065Lines, settings: &Il1065Settings) -> Figures {
     let line62 = line58 + line61; // line 59 withholding = 0 here
 
     Figures {
-        line1, line2, line3, line4, line5, line7, line8, line9, line10, line12, line13,
-        line20, line23, line35,
+        line1,
+        line2,
+        line3,
+        line4,
+        line5,
+        line7,
+        line8,
+        line9,
+        line10,
+        line12,
+        line13,
+        line20,
+        line23,
+        line35,
         line47: Some(line47),
         line53: Some(line53),
         line54: Some(line54),
@@ -321,11 +407,25 @@ pub fn build(
     partners: &[PartnerFiling],
     federal: &Form1065Lines,
     settings: &Il1065Settings,
+    year: i32,
 ) -> Result<Bundle, FormError> {
+    // The year's own blank, or none. Refused rather than substituted, for the
+    // reason the federal forms are: Illinois renumbers between revisions, and
+    // this one says on its first page which years it is for.
+    let revision = il1065_year(year).ok_or_else(|| FormError::NoFormForYear {
+        form: "Form IL-1065",
+        year,
+        available: supported_years()
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    })?;
+
     let mut warnings = Vec::new();
     let figs = figures(federal, settings);
 
-    let mut doc = Document::load_mem(IL1065)?;
+    let mut doc = Document::load_mem(revision.form)?;
     strip_xfa(&mut doc);
     let map = field_map(&doc);
 
@@ -339,7 +439,11 @@ pub fn build(
     let mut pdf = Vec::new();
     doc.save_to(&mut pdf)?;
     let page_count = doc.get_pages().len();
-    Ok(Bundle { pdf, warnings, page_count })
+    Ok(Bundle {
+        pdf,
+        warnings,
+        page_count,
+    })
 }
 
 /// Build an IL-1065 from the ledger: read the year's federal figures the same way
@@ -370,12 +474,14 @@ pub fn build_from_ledger(
     let statement = crate::queries::reports::Reports::new(conn)
         .income_statement(year_start, year_end)
         .map_err(|e| FormError::Malformed(format!("income statement: {e}")))?;
-    let mapping = super::lines::load_mapping(conn);
-    let federal = super::lines::compute(&statement, &mapping).lines;
+    let mapping = super::lines::load_effective_mapping(conn, year);
+    let limits = super::lines::load_effective_limits(conn, year);
+    let federal = super::lines::compute(&statement, &mapping, &limits).lines;
 
     // The partners who held an interest during the year — one Schedule B row each —
     // with the TIN this machine holds, exactly as the federal return assembles them.
-    let (partners, problems) = pc::partners_for_year_with_problems(conn, year);
+    let (partners, problems) =
+        crate::commands::share_period_commands::partners_for_year_with_problems(conn, year);
     let filings: Vec<PartnerFiling> = partners
         .into_iter()
         .map(|partner| PartnerFiling {
@@ -384,7 +490,7 @@ pub fn build_from_ledger(
         })
         .collect();
 
-    let mut bundle = build(&profile, &filings, &federal, settings)?;
+    let mut bundle = build(&profile, &filings, &federal, settings, year)?;
     bundle.warnings.extend(problems);
     Ok(bundle)
 }
@@ -588,7 +694,11 @@ fn fill_schedule_b(
 }
 
 /// The advisories that go with every IL-1065 this program produces.
-fn caveats(profile: &BusinessProfile, settings: &Il1065Settings, partner_count: usize) -> Vec<String> {
+fn caveats(
+    profile: &BusinessProfile,
+    settings: &Il1065Settings,
+    partner_count: usize,
+) -> Vec<String> {
     let mut out = Vec::new();
 
     if profile.address.state.trim().to_ascii_uppercase() != "IL" {
@@ -684,23 +794,64 @@ mod tests {
     use super::*;
     use crate::domain::{Address, PartnerType, Residency, Shares};
     use crate::tax::acroform::{get_value, on_states};
+    use crate::tax::form1065::FORM_TAX_YEAR;
     use chrono::NaiveDate;
 
     /// Every text box this module writes to, so a form revision that renamed one
     /// fails a test rather than silently dropping a figure.
     fn all_text_fields() -> Vec<String> {
         let mut v: Vec<String> = [
-            f::LEGAL_NAME, f::MAILING_ADDRESS, f::MAILING_CITY, f::MAILING_STATE, f::MAILING_ZIP,
-            f::FEIN_2, f::FEIN_7, f::NAICS, f::RECORDS_CITY, f::RECORDS_STATE, f::RECORDS_ZIP,
-            f::L1_ORDINARY, f::L2_RENTAL_RE, f::L3_OTHER_RENTAL, f::L4_PORTFOLIO, f::L5_1231,
-            f::L7_TOTAL_ORDINARY, f::L8_CHARITABLE, f::L9_SECTION179, f::L10_INVEST_INTEREST,
-            f::L12_ADD_8_11, f::L13_UNMODIFIED_BASE, f::L14_FROM_L13, f::L20_GUARANTEED,
-            f::L23_INCOME, f::L34_TOTAL_SUBTRACT, f::L35_BASE_INCOME, f::L36_NONBUSINESS,
-            f::L37_NONUNITARY, f::L38_ADD_36_37, f::L39_BUSINESS, f::L47_BASE, f::L49_AFTER_NLD,
-            f::L50_FROM_L35, f::L51_RATIO_WHOLE, f::L51_RATIO_FRAC, f::L52_EXEMPTION,
-            f::L53_NET_INCOME, f::L54_REPLACEMENT, f::L56_BEFORE_CREDITS, f::L58_NET_REPLACEMENT,
-            f::L59_TOTAL_WITHHOLDING, f::L60_PTE_INCOME, f::L61_PTE_TAX, f::L62_TOTAL_TAX,
-            f::L64_TOTAL, f::SCHB_NAME, f::SCHB_FEIN_2, f::SCHB_FEIN_7, f::SCHA_NAME, f::SCHA_FEIN_2,
+            f::LEGAL_NAME,
+            f::MAILING_ADDRESS,
+            f::MAILING_CITY,
+            f::MAILING_STATE,
+            f::MAILING_ZIP,
+            f::FEIN_2,
+            f::FEIN_7,
+            f::NAICS,
+            f::RECORDS_CITY,
+            f::RECORDS_STATE,
+            f::RECORDS_ZIP,
+            f::L1_ORDINARY,
+            f::L2_RENTAL_RE,
+            f::L3_OTHER_RENTAL,
+            f::L4_PORTFOLIO,
+            f::L5_1231,
+            f::L7_TOTAL_ORDINARY,
+            f::L8_CHARITABLE,
+            f::L9_SECTION179,
+            f::L10_INVEST_INTEREST,
+            f::L12_ADD_8_11,
+            f::L13_UNMODIFIED_BASE,
+            f::L14_FROM_L13,
+            f::L20_GUARANTEED,
+            f::L23_INCOME,
+            f::L34_TOTAL_SUBTRACT,
+            f::L35_BASE_INCOME,
+            f::L36_NONBUSINESS,
+            f::L37_NONUNITARY,
+            f::L38_ADD_36_37,
+            f::L39_BUSINESS,
+            f::L47_BASE,
+            f::L49_AFTER_NLD,
+            f::L50_FROM_L35,
+            f::L51_RATIO_WHOLE,
+            f::L51_RATIO_FRAC,
+            f::L52_EXEMPTION,
+            f::L53_NET_INCOME,
+            f::L54_REPLACEMENT,
+            f::L56_BEFORE_CREDITS,
+            f::L58_NET_REPLACEMENT,
+            f::L59_TOTAL_WITHHOLDING,
+            f::L60_PTE_INCOME,
+            f::L61_PTE_TAX,
+            f::L62_TOTAL_TAX,
+            f::L64_TOTAL,
+            f::SCHB_NAME,
+            f::SCHB_FEIN_2,
+            f::SCHB_FEIN_7,
+            f::SCHA_NAME,
+            f::SCHA_FEIN_2,
             f::SCHA_FEIN_7,
         ]
         .iter()
@@ -739,10 +890,16 @@ mod tests {
         strip_xfa(&mut doc);
         let map = field_map(&doc);
         for name in all_text_fields() {
-            assert!(map.find(&name).is_some(), "il1065.pdf has no text field {name:?}");
+            assert!(
+                map.find(&name).is_some(),
+                "il1065.pdf has no text field {name:?}"
+            );
         }
         for (name, _) in all_check_fields() {
-            assert!(map.find(&name).is_some(), "il1065.pdf has no checkbox {name:?}");
+            assert!(
+                map.find(&name).is_some(),
+                "il1065.pdf has no checkbox {name:?}"
+            );
         }
     }
 
@@ -781,6 +938,7 @@ mod tests {
 
     fn partner(name: &str, entity_type: &str, profit: f64) -> Partner {
         Partner {
+            history: Vec::new(),
             partner_id: name.to_lowercase(),
             name: name.into(),
             partner_type: PartnerType::General,
@@ -838,7 +996,10 @@ mod tests {
     #[test]
     fn electing_pte_adds_the_four_point_nine_five_percent_tax() {
         let fed = federal_ordinary(200_000);
-        let s = Il1065Settings { apportions_outside_illinois: false, elects_pte_tax: true };
+        let s = Il1065Settings {
+            apportions_outside_illinois: false,
+            elects_pte_tax: true,
+        };
         let figs = figures(&fed, &s);
         assert_eq!(figs.line54, Some(3_000)); // 1.5%
         assert_eq!(figs.line61, Some(9_900)); // 4.95% of 200,000
@@ -848,7 +1009,10 @@ mod tests {
     #[test]
     fn apportioning_leaves_the_tax_for_a_person() {
         let fed = federal_ordinary(100_000);
-        let s = Il1065Settings { apportions_outside_illinois: true, elects_pte_tax: false };
+        let s = Il1065Settings {
+            apportions_outside_illinois: true,
+            elects_pte_tax: false,
+        };
         let figs = figures(&fed, &s);
         // Base income is still known; the tax below it is not.
         assert_eq!(figs.line35, 100_000);
@@ -860,46 +1024,110 @@ mod tests {
     fn the_illinois_only_form_shows_identity_income_and_the_replacement_tax() {
         let fed = federal_ordinary(100_000);
         let p = partner("Dana Individual", "Individual", 60.0);
-        let partners = vec![PartnerFiling { partner: p, tin: Some("123-45-6789".into()) }];
-        let bundle = build(&profile(), &partners, &fed, &Il1065Settings::default()).unwrap();
+        let partners = vec![PartnerFiling {
+            partner: p,
+            tin: Some("123-45-6789".into()),
+        }];
+        let bundle = build(
+            &profile(),
+            &partners,
+            &fed,
+            &Il1065Settings::default(),
+            FORM_TAX_YEAR,
+        )
+        .unwrap();
 
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
-        assert_eq!(get_value(&doc, &map, f::LEGAL_NAME).as_deref(), Some("Prairie Partners LLC"));
+        assert_eq!(
+            get_value(&doc, &map, f::LEGAL_NAME).as_deref(),
+            Some("Prairie Partners LLC")
+        );
         assert_eq!(get_value(&doc, &map, f::FEIN_2).as_deref(), Some("37"));
         assert_eq!(get_value(&doc, &map, f::FEIN_7).as_deref(), Some("1234567"));
-        assert_eq!(get_value(&doc, &map, f::L1_ORDINARY).as_deref(), Some("100,000"));
-        assert_eq!(get_value(&doc, &map, f::L35_BASE_INCOME).as_deref(), Some("100,000"));
-        assert_eq!(get_value(&doc, &map, f::L54_REPLACEMENT).as_deref(), Some("1,500"));
+        assert_eq!(
+            get_value(&doc, &map, f::L1_ORDINARY).as_deref(),
+            Some("100,000")
+        );
+        assert_eq!(
+            get_value(&doc, &map, f::L35_BASE_INCOME).as_deref(),
+            Some("100,000")
+        );
+        assert_eq!(
+            get_value(&doc, &map, f::L54_REPLACEMENT).as_deref(),
+            Some("1,500")
+        );
 
         // Schedule B row 1: the partner and their 60% share of base income.
-        assert_eq!(get_value(&doc, &map, &member(1, M_NAME)).as_deref(), Some("Dana Individual"));
-        assert_eq!(get_value(&doc, &map, &member(1, M_COL_C_TIN)).as_deref(), Some("123456789"));
-        assert_eq!(get_value(&doc, &map, &member(1, M_COL_E_SHARE)).as_deref(), Some("60,000"));
+        assert_eq!(
+            get_value(&doc, &map, &member(1, M_NAME)).as_deref(),
+            Some("Dana Individual")
+        );
+        assert_eq!(
+            get_value(&doc, &map, &member(1, M_COL_C_TIN)).as_deref(),
+            Some("123456789")
+        );
+        assert_eq!(
+            get_value(&doc, &map, &member(1, M_COL_E_SHARE)).as_deref(),
+            Some("60,000")
+        );
     }
 
     #[test]
     fn an_entity_partner_is_flagged_subject_to_replacement_tax() {
         let fed = federal_ordinary(100_000);
-        let individual = PartnerFiling { partner: partner("Al", "Individual", 50.0), tin: None };
-        let corp = PartnerFiling { partner: partner("Holdings LLC", "Partnership", 50.0), tin: None };
-        let bundle = build(&profile(), &[individual, corp], &fed, &Il1065Settings::default()).unwrap();
+        let individual = PartnerFiling {
+            partner: partner("Al", "Individual", 50.0),
+            tin: None,
+        };
+        let corp = PartnerFiling {
+            partner: partner("Holdings LLC", "Partnership", 50.0),
+            tin: None,
+        };
+        let bundle = build(
+            &profile(),
+            &[individual, corp],
+            &fed,
+            &Il1065Settings::default(),
+            FORM_TAX_YEAR,
+        )
+        .unwrap();
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
         // Member 1 individual: box D clear (unticked → no value). Member 2 entity:
         // box D ticked to its "/Yes" on-state.
         assert_eq!(get_value(&doc, &map, &member(1, M_COL_D_SUBJECT)), None);
-        assert_eq!(get_value(&doc, &map, &member(2, M_COL_D_SUBJECT)).as_deref(), Some("/Yes"));
+        assert_eq!(
+            get_value(&doc, &map, &member(2, M_COL_D_SUBJECT)).as_deref(),
+            Some("/Yes")
+        );
     }
 
     #[test]
     fn more_than_three_partners_warns_about_a_continuation_page() {
         let fed = federal_ordinary(100_000);
         let partners: Vec<PartnerFiling> = (0..4)
-            .map(|i| PartnerFiling { partner: partner(&format!("P{i}"), "Individual", 25.0), tin: None })
+            .map(|i| PartnerFiling {
+                partner: partner(&format!("P{i}"), "Individual", 25.0),
+                tin: None,
+            })
             .collect();
-        let bundle = build(&profile(), &partners, &fed, &Il1065Settings::default()).unwrap();
-        assert!(bundle.warnings.iter().any(|w| w.contains("continuation page")), "{:?}", bundle.warnings);
+        let bundle = build(
+            &profile(),
+            &partners,
+            &fed,
+            &Il1065Settings::default(),
+            FORM_TAX_YEAR,
+        )
+        .unwrap();
+        assert!(
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("continuation page")),
+            "{:?}",
+            bundle.warnings
+        );
     }
 
     #[test]
@@ -907,8 +1135,12 @@ mod tests {
         let fed = federal_ordinary(100_000);
         let mut prof = profile();
         prof.address.state = "TX".into();
-        let bundle = build(&prof, &[], &fed, &Il1065Settings::default()).unwrap();
-        assert!(bundle.warnings.iter().any(|w| w.contains("not IL")), "{:?}", bundle.warnings);
+        let bundle = build(&prof, &[], &fed, &Il1065Settings::default(), FORM_TAX_YEAR).unwrap();
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("not IL")),
+            "{:?}",
+            bundle.warnings
+        );
     }
 
     /// End to end from the ledger: $100,000 of ordinary income posted and mapped
@@ -950,8 +1182,22 @@ mod tests {
             date: NaiveDate::from_ymd_opt(FORM_TAX_YEAR, 6, 1).unwrap(),
             memo: "seed".into(),
             lines: vec![
-                JournalLineData { line_id: "e1-0".into(), account_id: "cash".into(), amount: 10_000_000, currency: "USD".into(), exchange_rate: None, memo: None },
-                JournalLineData { line_id: "e1-1".into(), account_id: "sales".into(), amount: -10_000_000, currency: "USD".into(), exchange_rate: None, memo: None },
+                JournalLineData {
+                    line_id: "e1-0".into(),
+                    account_id: "cash".into(),
+                    amount: 10_000_000,
+                    currency: "USD".into(),
+                    exchange_rate: None,
+                    memo: None,
+                },
+                JournalLineData {
+                    line_id: "e1-1".into(),
+                    account_id: "sales".into(),
+                    amount: -10_000_000,
+                    currency: "USD".into(),
+                    exchange_rate: None,
+                    memo: None,
+                },
             ],
             reference: None,
             source: None,
@@ -960,7 +1206,7 @@ mod tests {
         store.apply_projection(&stored).unwrap();
 
         // Map sales to gross receipts, with no expenses — ordinary income = 100,000.
-        set_account_line(store.connection(), "sales", "l1a").unwrap();
+        set_account_line(store.connection(), "sales", "l1a", 0).unwrap();
 
         pc::set_profile(&mut store, "u", &profile()).unwrap();
         pc::admit_partner(
@@ -979,14 +1225,123 @@ mod tests {
         )
         .unwrap();
 
-        let bundle =
-            build_from_ledger(store.connection(), FORM_TAX_YEAR, &Il1065Settings::default()).unwrap();
+        let bundle = build_from_ledger(
+            store.connection(),
+            FORM_TAX_YEAR,
+            &Il1065Settings::default(),
+        )
+        .unwrap();
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
-        assert_eq!(get_value(&doc, &map, f::L1_ORDINARY).as_deref(), Some("100,000"));
-        assert_eq!(get_value(&doc, &map, f::L35_BASE_INCOME).as_deref(), Some("100,000"));
-        assert_eq!(get_value(&doc, &map, f::L54_REPLACEMENT).as_deref(), Some("1,500"));
+        assert_eq!(
+            get_value(&doc, &map, f::L1_ORDINARY).as_deref(),
+            Some("100,000")
+        );
+        assert_eq!(
+            get_value(&doc, &map, f::L35_BASE_INCOME).as_deref(),
+            Some("100,000")
+        );
+        assert_eq!(
+            get_value(&doc, &map, f::L54_REPLACEMENT).as_deref(),
+            Some("1,500")
+        );
         // The sole partner's 100% share of base income lands on Schedule B.
-        assert_eq!(get_value(&doc, &map, &member(1, M_COL_E_SHARE)).as_deref(), Some("100,000"));
+        assert_eq!(
+            get_value(&doc, &map, &member(1, M_COL_E_SHARE)).as_deref(),
+            Some("100,000")
+        );
+    }
+
+    /// A year Illinois publishes no carried form for is refused, not substituted.
+    ///
+    /// The vendored blank says on its own first page that it is for tax years
+    /// ending on or after 31 December 2025 and before 31 December 2026. Filled
+    /// with 2023's figures it produces a document that contradicts itself about
+    /// which year it is — and Illinois renumbers between revisions exactly as the
+    /// IRS does, so the figures would not even be on the lines the labels name.
+    ///
+    /// Only the current revision is carried: Illinois publishes prior years but
+    /// not at a URL this program could fetch, and a blank nobody has read against
+    /// its own boxes is one nothing should be written to.
+    #[test]
+    fn a_year_with_no_carried_revision_is_refused() {
+        let fed = Form1065Lines::default();
+        let settings = Il1065Settings::default();
+
+        // Every carried year builds.
+        for year in supported_years() {
+            assert!(
+                build(&profile(), &[], &fed, &settings, year).is_ok(),
+                "{year} is carried and must build"
+            );
+        }
+
+        for year in [2019, 2022, FORM_TAX_YEAR + 1] {
+            match build(&profile(), &[], &fed, &settings, year) {
+                Err(FormError::NoFormForYear {
+                    form,
+                    year: got,
+                    available,
+                }) => {
+                    assert_eq!(form, "Form IL-1065", "the refusal names the right form");
+                    assert_eq!(got, year);
+                    assert!(
+                        available.contains(&FORM_TAX_YEAR.to_string()),
+                        "the refusal has to name what it does have: {available:?}"
+                    );
+                }
+                other => panic!("{year} must be refused, got ok={}", other.is_ok()),
+            }
+        }
+    }
+
+    /// Every revision carried is a real form, and the current year is one of them.
+    #[test]
+    fn the_current_year_has_a_carried_revision() {
+        assert!(!IL1065_YEARS.is_empty());
+        for r in IL1065_YEARS {
+            let doc = Document::load_mem(r.form).expect("the blank loads");
+            assert!(
+                doc.get_pages().len() >= 5,
+                "{}: not the full bundle",
+                r.year
+            );
+        }
+        assert!(il1065_year(FORM_TAX_YEAR).is_some());
+    }
+
+    /// The blank says which years it is for, and that is the year carried.
+    ///
+    /// Read off the paper rather than trusted to the table: the whole reason this
+    /// form is year-gated is the sentence printed on its first page, and a table
+    /// that drifted from it would gate the wrong year.
+    #[test]
+    fn the_carried_blank_is_for_the_year_the_table_claims() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("accountir-il-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("il1065.pdf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(IL1065)
+            .unwrap();
+        let out = std::process::Command::new("pdftotext")
+            .args(["-f", "1", "-l", "1", "-layout"])
+            .arg(&path)
+            .arg("-")
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(out) = out else { return };
+        let text = String::from_utf8_lossy(&out.stdout);
+
+        let year = crate::tax::form1065::FORM_TAX_YEAR;
+        assert!(
+            text.contains(&format!("{year} Form IL-1065")),
+            "the blank does not call itself the {year} form"
+        );
+        assert!(
+            text.contains(&format!("ending on or after December 31, {year}")),
+            "the blank does not say it is for tax years ending in {year}"
+        );
     }
 }

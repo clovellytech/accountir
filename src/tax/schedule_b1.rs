@@ -187,7 +187,13 @@ pub fn contradictions(answers: &super::schedule_b::ScheduleB, owners: &[Owner<'_
 
         let named = over
             .iter()
-            .map(|o| format!("{} at {}%", o.partner.name, percent(largest_ppm(&o.constructive))))
+            .map(|o| {
+                format!(
+                    "{} at {}%",
+                    o.partner.name,
+                    percent(largest_ppm(&o.constructive))
+                )
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -261,7 +267,12 @@ pub fn build(
         set_text(&mut doc, &map, cols[1], o.tin.unwrap_or(""))?;
         set_text(&mut doc, &map, cols[2], &p.entity_type)?;
         set_text(&mut doc, &map, cols[3], &country_of(p))?;
-        set_text(&mut doc, &map, cols[4], &percent(largest_ppm(&o.constructive)))?;
+        set_text(
+            &mut doc,
+            &map,
+            cols[4],
+            &percent(largest_ppm(&o.constructive)),
+        )?;
         if o.tin.is_none() {
             warnings.push(format!(
                 "Schedule B-1: no identifying number is held on this machine for {}, so column \
@@ -277,7 +288,12 @@ pub fn build(
         set_text(&mut doc, &map, cols[0], &p.name)?;
         set_text(&mut doc, &map, cols[1], o.tin.unwrap_or(""))?;
         set_text(&mut doc, &map, cols[2], &country_of(p))?;
-        set_text(&mut doc, &map, cols[3], &percent(largest_ppm(&o.constructive)))?;
+        set_text(
+            &mut doc,
+            &map,
+            cols[3],
+            &percent(largest_ppm(&o.constructive)),
+        )?;
         if o.tin.is_none() {
             warnings.push(format!(
                 "Schedule B-1: no identifying number is held on this machine for {}, so column \
@@ -328,6 +344,7 @@ mod tests {
 
     fn partner(name: &str, entity_type: &str, profit: f64, loss: f64, capital: f64) -> Partner {
         Partner {
+            history: Vec::new(),
             partner_id: name.to_lowercase(),
             name: name.to_string(),
             partner_type: PartnerType::General,
@@ -380,7 +397,13 @@ mod tests {
 
     #[test]
     fn individuals_and_estates_go_to_part_two_and_everything_else_to_part_one() {
-        assert!(is_individual_or_estate(&partner("A", "Individual", 50.0, 50.0, 50.0)));
+        assert!(is_individual_or_estate(&partner(
+            "A",
+            "Individual",
+            50.0,
+            50.0,
+            50.0
+        )));
         assert!(is_individual_or_estate(&partner(
             "B",
             "Estate of Deceased Partner",
@@ -388,10 +411,24 @@ mod tests {
             50.0,
             50.0
         )));
-        assert!(!is_individual_or_estate(&partner("C", "S Corporation", 50.0, 50.0, 50.0)));
-        assert!(!is_individual_or_estate(&partner("D", "Trust", 50.0, 50.0, 50.0)));
+        assert!(!is_individual_or_estate(&partner(
+            "C",
+            "S Corporation",
+            50.0,
+            50.0,
+            50.0
+        )));
+        assert!(!is_individual_or_estate(&partner(
+            "D", "Trust", 50.0, 50.0, 50.0
+        )));
         // Unrecognised text is treated as an entity — see the doc comment.
-        assert!(!is_individual_or_estate(&partner("E", "Grantor Vehicle", 50.0, 50.0, 50.0)));
+        assert!(!is_individual_or_estate(&partner(
+            "E",
+            "Grantor Vehicle",
+            50.0,
+            50.0,
+            50.0
+        )));
     }
 
     #[test]
@@ -447,7 +484,10 @@ mod tests {
         // Both in Part II (individuals), both reported at 60.
         assert_eq!(get_value(&doc, &map, PART_II[0][0]).as_deref(), Some("Zak"));
         assert_eq!(get_value(&doc, &map, PART_II[0][3]).as_deref(), Some("60"));
-        assert_eq!(get_value(&doc, &map, PART_II[1][0]).as_deref(), Some("Wife"));
+        assert_eq!(
+            get_value(&doc, &map, PART_II[1][0]).as_deref(),
+            Some("Wife")
+        );
         assert_eq!(get_value(&doc, &map, PART_II[1][3]).as_deref(), Some("60"));
     }
 
@@ -475,18 +515,39 @@ mod tests {
         let doc = doc.unwrap();
         let map = field_map(&doc);
 
-        assert_eq!(get_value(&doc, &map, PARTNERSHIP_NAME).as_deref(), Some("Acme LLP"));
-        assert_eq!(get_value(&doc, &map, PARTNERSHIP_EIN).as_deref(), Some("12-3456789"));
+        assert_eq!(
+            get_value(&doc, &map, PARTNERSHIP_NAME).as_deref(),
+            Some("Acme LLP")
+        );
+        assert_eq!(
+            get_value(&doc, &map, PARTNERSHIP_EIN).as_deref(),
+            Some("12-3456789")
+        );
 
         // Part I row 1: the entity.
-        assert_eq!(get_value(&doc, &map, PART_I[0][0]).as_deref(), Some("Holdings LLC"));
-        assert_eq!(get_value(&doc, &map, PART_I[0][1]).as_deref(), Some("98-7654321"));
-        assert_eq!(get_value(&doc, &map, PART_I[0][2]).as_deref(), Some("Partnership"));
+        assert_eq!(
+            get_value(&doc, &map, PART_I[0][0]).as_deref(),
+            Some("Holdings LLC")
+        );
+        assert_eq!(
+            get_value(&doc, &map, PART_I[0][1]).as_deref(),
+            Some("98-7654321")
+        );
+        assert_eq!(
+            get_value(&doc, &map, PART_I[0][2]).as_deref(),
+            Some("Partnership")
+        );
         assert_eq!(get_value(&doc, &map, PART_I[0][4]).as_deref(), Some("60"));
 
         // Part II row 1: the individual, with no type column.
-        assert_eq!(get_value(&doc, &map, PART_II[0][0]).as_deref(), Some("Dana Whitlock"));
-        assert_eq!(get_value(&doc, &map, PART_II[0][1]).as_deref(), Some("111-22-3333"));
+        assert_eq!(
+            get_value(&doc, &map, PART_II[0][0]).as_deref(),
+            Some("Dana Whitlock")
+        );
+        assert_eq!(
+            get_value(&doc, &map, PART_II[0][1]).as_deref(),
+            Some("111-22-3333")
+        );
         assert_eq!(get_value(&doc, &map, PART_II[0][3]).as_deref(), Some("55"));
     }
 
@@ -540,12 +601,18 @@ mod tests {
         }
         for row in PART_I {
             for f in row {
-                assert!(map.find(f).is_some(), "f1065sb1.pdf has no Part I field {f}");
+                assert!(
+                    map.find(f).is_some(),
+                    "f1065sb1.pdf has no Part I field {f}"
+                );
             }
         }
         for row in PART_II {
             for f in row {
-                assert!(map.find(f).is_some(), "f1065sb1.pdf has no Part II field {f}");
+                assert!(
+                    map.find(f).is_some(),
+                    "f1065sb1.pdf has no Part II field {f}"
+                );
             }
         }
     }
@@ -670,5 +737,121 @@ mod tests {
         a.set("b2a", NO);
         a.set("b2b", NO);
         assert!(contradictions(&a, &owners).is_empty());
+    }
+
+    /// Every cell sits in the column its heading names, and on its own row.
+    ///
+    /// # Why a name check is not enough here either
+    ///
+    /// This schedule is a grid, and a grid is where an off-by-one hides best:
+    /// shift `PART_I` by one and every partner's EIN prints in the "type of
+    /// entity" column while their name prints where the row number goes. Every
+    /// name still exists, every row still has five of them, and the page looks
+    /// filled in. The Form 4562 had exactly this shape of defect and carried it
+    /// through two revisions.
+    ///
+    /// The bands come off the printed headings: (i) name at x=36, (ii) EIN at
+    /// 238, (iii) type at 325, (iv) country at 411, (v) percentage at 497. Part
+    /// II has no type column, so its country box spans (iii) and (iv).
+    #[test]
+    fn every_cell_is_in_the_column_its_heading_names() {
+        let mut doc = Document::load_mem(F1065_SB1).unwrap();
+        strip_xfa(&mut doc);
+        let map = field_map(&doc);
+
+        let left = |name: &str| -> (f64, f64) {
+            let id = map
+                .find(name)
+                .unwrap_or_else(|| panic!("the schedule has no {name}"));
+            let d = doc.get_object(id).and_then(lopdf::Object::as_dict).unwrap();
+            let r = d.get(b"Rect").and_then(lopdf::Object::as_array).unwrap();
+            let n = |i: usize| {
+                r[i].as_float()
+                    .map(f64::from)
+                    .unwrap_or_else(|_| r[i].as_i64().unwrap() as f64)
+            };
+            (n(0), n(1))
+        };
+
+        // Part I: five columns, seven rows, each row strictly below the last.
+        let mut previous_row: Option<f64> = None;
+        for (r, row) in PART_I.iter().enumerate() {
+            let xs = [36.0, 238.0, 325.0, 411.0, 497.0];
+            let mut y = None;
+            for (c, (name, want_x)) in row.iter().zip(xs).enumerate() {
+                let (x, at) = left(name);
+                assert!(
+                    (x - want_x).abs() < 4.0,
+                    "Part I row {r} column {c} ({name}) is at x={x:.0}, not the {want_x:.0} \
+                     column its heading is over"
+                );
+                match y {
+                    None => y = Some(at),
+                    Some(first) => assert!(
+                        (at - first).abs() < 3.0,
+                        "Part I row {r} column {c} ({name}) is on a different row from its \
+                         own row's first cell"
+                    ),
+                }
+            }
+            if let (Some(previous), Some(this)) = (previous_row, y) {
+                assert!(this < previous, "Part I row {r} is not below row {}", r - 1);
+            }
+            previous_row = y;
+        }
+
+        // Part II: four columns — no "type of entity", because the part is the
+        // type — so its third box spans what Part I splits into (iii) and (iv).
+        let mut previous_row: Option<f64> = None;
+        for (r, row) in PART_II.iter().enumerate() {
+            let xs = [36.0, 238.0, 325.0, 497.0];
+            let mut y = None;
+            for (c, (name, want_x)) in row.iter().zip(xs).enumerate() {
+                let (x, at) = left(name);
+                assert!(
+                    (x - want_x).abs() < 4.0,
+                    "Part II row {r} column {c} ({name}) is at x={x:.0}, not the {want_x:.0} \
+                     column its heading is over"
+                );
+                match y {
+                    None => y = Some(at),
+                    Some(first) => assert!((at - first).abs() < 3.0),
+                }
+            }
+            if let (Some(previous), Some(this)) = (previous_row, y) {
+                assert!(
+                    this < previous,
+                    "Part II row {r} is not below row {}",
+                    r - 1
+                );
+            }
+            previous_row = y;
+        }
+
+        // Part II must sit below Part I: they are different parts of the page,
+        // and a table that overlapped them would put an individual on an
+        // entity's row.
+        assert!(
+            left(PART_II[0][0]).1 < left(PART_I[ROWS - 1][0]).1,
+            "Part II starts above the end of Part I"
+        );
+    }
+
+    /// No two cells write the same box.
+    #[test]
+    fn no_two_cells_share_a_box() {
+        let mut seen = std::collections::HashSet::new();
+        for row in PART_I.iter() {
+            for f in row {
+                assert!(seen.insert(*f), "{f} is used twice");
+            }
+        }
+        for row in PART_II.iter() {
+            for f in row {
+                assert!(seen.insert(*f), "{f} is used twice");
+            }
+        }
+        assert!(seen.insert(PARTNERSHIP_NAME));
+        assert!(seen.insert(PARTNERSHIP_EIN));
     }
 }

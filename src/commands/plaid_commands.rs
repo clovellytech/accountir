@@ -1516,9 +1516,14 @@ mod tests {
 
         let accounts: i64 = store
             .connection()
-            .query_row("SELECT COUNT(*) FROM plaid_local_accounts", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM plaid_local_accounts", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(accounts, 1, "the bank's accounts never reached the projection");
+        assert_eq!(
+            accounts, 1,
+            "the bank's accounts never reached the projection"
+        );
 
         // And the institution is the one that was linked, so the page can name it.
         let name: String = store

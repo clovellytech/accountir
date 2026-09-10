@@ -30,6 +30,10 @@ pub fn router() -> Router<SyncState> {
             post(submit_clear_mapping),
         )
         .route(
+            "/sync/commands/set-deduction-limit",
+            post(submit_set_deduction_limit),
+        )
+        .route(
             "/sync/commands/set-schedule-b-answer",
             post(submit_set_answer),
         )
@@ -38,6 +42,13 @@ pub fn router() -> Router<SyncState> {
 #[derive(Serialize, Deserialize)]
 pub struct SetTaxLineMappingRequest {
     pub expected_head_seq: i64,
+    /// The first tax year this applies to.
+    ///
+    /// Defaulted so a client built before assignments were dated still submits a
+    /// valid request — it means [`crate::events::types::ANY_YEAR`], which is what
+    /// such a client intended: every year.
+    #[serde(default)]
+    pub effective_from: i32,
     pub account_id: String,
     /// A key from `tax::lines::MAPPABLE_LINES` — `l21`, `k13a`, `sl1`. The key
     /// and not the printed number, because the IRS renumbers between revisions.
@@ -47,6 +58,13 @@ pub struct SetTaxLineMappingRequest {
 #[derive(Serialize, Deserialize)]
 pub struct ClearTaxLineMappingRequest {
     pub expected_head_seq: i64,
+    /// The first tax year this applies to.
+    ///
+    /// Defaulted so a client built before assignments were dated still submits a
+    /// valid request — it means [`crate::events::types::ANY_YEAR`], which is what
+    /// such a client intended: every year.
+    #[serde(default)]
+    pub effective_from: i32,
     pub account_id: String,
 }
 
@@ -83,6 +101,7 @@ async fn submit_set_mapping(
         Event::TaxLineMappingSet {
             account_id: req.account_id,
             line_key: req.line_key,
+            effective_from: req.effective_from,
         },
     )
 }
@@ -101,8 +120,62 @@ async fn submit_clear_mapping(
         actor,
         Event::TaxLineMappingCleared {
             account_id: req.account_id,
+            effective_from: req.effective_from,
         },
     )
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SetDeductionLimitRequest {
+    pub expected_head_seq: i64,
+    /// The first tax year this applies to.
+    ///
+    /// Defaulted so a client built before assignments were dated still submits a
+    /// valid request — it means [`crate::events::types::ANY_YEAR`], which is what
+    /// such a client intended: every year.
+    #[serde(default)]
+    pub effective_from: i32,
+    pub account_id: String,
+    /// How much of the balance the law lets you deduct — 50 for §274(n) meals,
+    /// 0 for an entertainment account. 100 clears the limit rather than storing
+    /// it, because "all of it" is the absence of a rule.
+    pub deductible_pct: u8,
+}
+
+/// Say how much of an account's balance the law lets you deduct.
+///
+/// Over 100 is a malformed request rather than a refused command: there is no
+/// percentage of a balance greater than the balance, and telling a client its
+/// limit was rejected on a domain rule would send them looking at the ledger.
+async fn submit_set_deduction_limit(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetDeductionLimitRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    if req.account_id.trim().is_empty() {
+        return Err(ApiError::bad_request("account_id is required"));
+    }
+    if req.deductible_pct > 100 {
+        return Err(ApiError::bad_request(
+            "deductible_pct is a percentage between 0 and 100",
+        ));
+    }
+    // 100 clears rather than stores, exactly as the local command does — the two
+    // paths have to leave the books in the same state or a group's return and a
+    // member's differ on which accounts carry a rule at all.
+    let event = if req.deductible_pct >= 100 {
+        Event::TaxDeductionLimitCleared {
+            account_id: req.account_id,
+            effective_from: req.effective_from,
+        }
+    } else {
+        Event::TaxDeductionLimitSet {
+            account_id: req.account_id,
+            deductible_pct: req.deductible_pct,
+            effective_from: req.effective_from,
+        }
+    };
+    append(st, req.expected_head_seq, actor, event)
 }
 
 async fn submit_set_answer(
@@ -238,7 +311,7 @@ mod tests {
 
         let guard = store.lock().unwrap();
         assert_eq!(
-            crate::tax::lines::load_mapping(guard.connection())
+            crate::tax::lines::load_mapping(guard.connection(), 2025)
                 .get("checking")
                 .map(String::as_str),
             Some("sl1"),
@@ -266,7 +339,7 @@ mod tests {
         assert_eq!(r.status(), 200);
 
         let guard = store.lock().unwrap();
-        assert!(crate::tax::lines::load_mapping(guard.connection()).is_empty());
+        assert!(crate::tax::lines::load_mapping(guard.connection(), 2025).is_empty());
     }
 
     #[tokio::test]
@@ -350,5 +423,94 @@ mod tests {
         )
         .await;
         assert_eq!(r.status(), 409);
+    }
+
+    /// The year an assignment is for crosses the wire, so a group agrees which
+    /// years a remap touches.
+    ///
+    /// Without it every member's copy would apply the change to every year,
+    /// including ones already filed — which is the defect being fixed, arriving
+    /// by a different door.
+    #[tokio::test]
+    async fn a_dated_mapping_reaches_the_instance_and_leaves_earlier_years_alone() {
+        let (base, store) = serve().await;
+
+        let first = post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "account_id": "6100",
+                "line_key": "l21",
+                "effective_from": 2023,
+            }),
+        )
+        .await;
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+        let second = post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "account_id": "6100",
+                "line_key": "l11",
+                "effective_from": 2026,
+            }),
+        )
+        .await;
+        assert_eq!(second.status(), reqwest::StatusCode::OK);
+
+        let s = store.lock().unwrap();
+        let line = |year| {
+            crate::tax::lines::load_mapping(s.connection(), year)
+                .get("6100")
+                .cloned()
+        };
+        assert_eq!(
+            line(2023).as_deref(),
+            Some("l21"),
+            "the year it was filed on"
+        );
+        assert_eq!(
+            line(2025).as_deref(),
+            Some("l21"),
+            "and every year until the change"
+        );
+        assert_eq!(
+            line(2026).as_deref(),
+            Some("l11"),
+            "the change applies forward"
+        );
+    }
+
+    /// A client built before assignments were dated still submits a valid
+    /// request, and its assignment applies to every year — which is what it
+    /// meant.
+    #[tokio::test]
+    async fn a_request_without_a_year_still_works_and_means_every_year() {
+        let (base, store) = serve().await;
+        let r = post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "account_id": "6100",
+                "line_key": "l21",
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+
+        let s = store.lock().unwrap();
+        for year in [2019, 2023, 2099] {
+            assert_eq!(
+                crate::tax::lines::load_mapping(s.connection(), year)
+                    .get("6100")
+                    .map(String::as_str),
+                Some("l21"),
+                "{year}"
+            );
+        }
     }
 }

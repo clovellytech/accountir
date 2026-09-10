@@ -212,7 +212,11 @@ pub(crate) fn build_apply_payment_in_txn(
         .optional()?;
     let (amount, amount_paid, status) = match bill {
         Some(b) => b,
-        None => return Ok(BillStep::Reject(BillCommandError::NotFound(cmd.bill_id.clone()))),
+        None => {
+            return Ok(BillStep::Reject(BillCommandError::NotFound(
+                cmd.bill_id.clone(),
+            )))
+        }
     };
     if status == "void" {
         return Ok(BillStep::Reject(BillCommandError::Voided));
@@ -297,7 +301,11 @@ pub(crate) fn build_void_bill_in_txn(
         .optional()?;
     let (amount_paid, status, entry_id) = match bill {
         Some(b) => b,
-        None => return Ok(BillStep::Reject(BillCommandError::NotFound(cmd.bill_id.clone()))),
+        None => {
+            return Ok(BillStep::Reject(BillCommandError::NotFound(
+                cmd.bill_id.clone(),
+            )))
+        }
     };
     if status == "void" {
         return Ok(BillStep::Reject(BillCommandError::Voided));
@@ -582,7 +590,10 @@ mod tests {
             .optional()
             .unwrap()
             .unwrap_or(false);
-        assert!(entry_exists, "BillReceived.entry_id must reference a posted entry");
+        assert!(
+            entry_exists,
+            "BillReceived.entry_id must reference a posted entry"
+        );
     }
 
     #[test]
@@ -595,10 +606,12 @@ mod tests {
         // Deactivate the expense account (zero balance, so it's allowed) so the
         // in-txn fence must reject the bill.
         AccountCommands::new(&mut store, "u".to_string())
-            .deactivate_account(crate::commands::account_commands::DeactivateAccountCommand {
-                account_id: expense.clone(),
-                reason: None,
-            })
+            .deactivate_account(
+                crate::commands::account_commands::DeactivateAccountCommand {
+                    account_id: expense.clone(),
+                    reason: None,
+                },
+            )
             .unwrap();
 
         let before = store.count().unwrap();

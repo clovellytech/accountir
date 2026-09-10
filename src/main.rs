@@ -1,6 +1,7 @@
 use accountir::commands::account_commands::{AccountCommands, CreateAccountCommand};
 use accountir::commands::bill_commands::{
-    ApplyBillPaymentCommand, BillCommands as BillCommandHandler, ReceiveBillCommand, VoidBillCommand,
+    ApplyBillPaymentCommand, BillCommands as BillCommandHandler, ReceiveBillCommand,
+    VoidBillCommand,
 };
 use accountir::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
 use accountir::commands::invoice_commands::{
@@ -202,6 +203,63 @@ enum PartnershipCliCommands {
         year: Option<i32>,
     },
 
+    /// Say that a ledger account holds a partner's capital.
+    ///
+    /// Item L on a Schedule K-1 — the partner's capital account analysis — is
+    /// built from these links. Without them a K-1 shows the partner's share of
+    /// this year's income and nothing else: no opening balance, no
+    /// contributions, no draws.
+    ///
+    /// The role says which side of item L the account belongs on: "contribution"
+    /// for money in (row 2), "draw" for money out (row 5). An account can be
+    /// linked to one partner only; linking it again moves it.
+    EquityLink {
+        partner_id: String,
+        /// The account's number, e.g. 4005, or its id
+        account: String,
+        /// "contribution" or "draw"
+        #[arg(long, default_value = "contribution")]
+        role: String,
+    },
+
+    /// Stop treating an account as a partner's capital
+    EquityUnlink {
+        partner_id: String,
+        /// The account's number, e.g. 4005, or its id
+        account: String,
+    },
+
+    /// Show which accounts hold each partner's capital, and which hold nobody's
+    Equity,
+
+    /// Record what a partner's percentages became, and from when.
+    ///
+    /// The partnership's split changes: somebody leaves, somebody is admitted,
+    /// the agreement is renegotiated. Each change is recorded with the date it
+    /// took effect, so a prior year's return keeps being built on the split that
+    /// was in force during that year rather than on today's.
+    SetShares {
+        partner_id: String,
+        /// The first day the new percentages apply, YYYY-MM-DD
+        #[arg(long)]
+        from: String,
+        /// Share of profit, as a percentage
+        #[arg(long)]
+        profit: f64,
+        /// Share of loss, as a percentage. Defaults to the profit share
+        #[arg(long)]
+        loss: Option<f64>,
+        /// Share of capital, as a percentage. Defaults to the profit share
+        #[arg(long)]
+        capital: Option<f64>,
+    },
+
+    /// Show a partner's percentages over time
+    ShareHistory {
+        /// Only this partner. Omit for everybody
+        partner_id: Option<String>,
+    },
+
     /// Record that a partner has left
     RemovePartner {
         partner_id: String,
@@ -211,10 +269,7 @@ enum PartnershipCliCommands {
     },
 
     /// Set a partner's TIN on this machine. Never written to the event log
-    SetTin {
-        partner_id: String,
-        tin: String,
-    },
+    SetTin { partner_id: String, tin: String },
 
     /// Record a family tie between two partners, for Schedule B-1's §267(c)
     /// constructive-ownership test. Two spouses at 40% and 20% then each own 60%
@@ -280,10 +335,17 @@ enum TaxCliCommands {
 #[derive(Subcommand)]
 enum AmazonCliCommands {
     /// Import an Amazon Business "Order History Report" CSV. Posts one entry per
-    /// card charge, clearing the mapped `amazon_clearing` account. Idempotent.
+    /// shipment, clearing the mapped `amazon_clearing` account. Idempotent.
     Orders {
         /// Path to the order history CSV, e.g. orders_from_20250529_to_20260629_*.csv
         file: PathBuf,
+    },
+    /// Pair the Amazon clearing account's card charges against the imported
+    /// orders, and list what neither side can explain.
+    Reconcile {
+        /// Show every unmatched line rather than the first few of each kind.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -706,17 +768,106 @@ fn handle_amazon_command(store: &mut EventStore, cmd: AmazonCliCommands) -> Resu
                 "  {} charges seen · {} cancelled order(s) skipped · {} pending order(s) skipped",
                 s.charges_seen, s.cancelled_orders, s.pending_orders
             );
+            if s.restated_payments > 0 {
+                println!(
+                    "  {} payment(s) Amazon had already reported under another reference — \
+                     dropped, which is what makes those orders foot to their net total",
+                    s.restated_payments
+                );
+            }
             if s.reconciled_charges > 0 {
                 println!(
-                    "  ⚠ {} charge(s) had line items that didn't foot to the payment total — \
+                    "  ⚠ {} charge(s) had line items that didn't foot to what was paid — \
                      review the 'reconciling difference' lines",
                     s.reconciled_charges
                 );
             }
         }
+        AmazonCliCommands::Reconcile { all } => {
+            print_amazon_reconciliation(store, all);
+        }
     }
 
     Ok(())
+}
+
+/// Print the clearing-account reconciliation: what pairs, what does not, and
+/// which card each order was settled on.
+fn print_amazon_reconciliation(store: &EventStore, all: bool) {
+    use accountir::commands::amazon_reconcile::{reconcile_amazon, ClearingLine};
+
+    let r = reconcile_amazon(store.connection());
+    if r.missing_mapping {
+        println!(
+            "No `amazon_clearing` account mapping is set, so there is nothing to \
+             reconcile against. Set it on the Imports page first."
+        );
+        return;
+    }
+
+    let dollars = |c: i64| format!("${:.2}", c as f64 / 100.0);
+    println!(
+        "Amazon clearing: {} charge(s) paired ({}), balance {}",
+        r.matched,
+        dollars(r.matched_cents),
+        dollars(r.clearing_balance_cents)
+    );
+
+    let show = |title: &str, note: &str, lines: &[ClearingLine], total: i64| {
+        if lines.is_empty() {
+            println!("\n{title}: none");
+            return;
+        }
+        println!("\n{} — {} line(s), {}", title, lines.len(), dollars(total));
+        println!("  {note}");
+        let limit = if all { lines.len() } else { 15 };
+        for l in lines.iter().take(limit) {
+            let memo: String = l.memo.chars().take(58).collect();
+            println!("    {}  {:>10}  {}", l.date, dollars(l.amount_cents), memo);
+        }
+        if lines.len() > limit {
+            println!(
+                "    … and {} more (--all to list them)",
+                lines.len() - limit
+            );
+        }
+    };
+
+    show(
+        "Card charges with no order",
+        "Amazon charged the card for something the Business account never ordered: \
+         a personal Amazon account paid with the business card, or a charge that is \
+         not an order at all (Prime, AWS, a subscription).",
+        &r.charges_without_orders,
+        r.charges_without_orders_cents(),
+    );
+    show(
+        "Orders with no card charge",
+        "The Business account ordered it and something paid for it, but no card feed \
+         in these books shows the money leaving: a personal card on the business \
+         Amazon account, or a statement never imported.",
+        &r.orders_without_charges,
+        r.orders_without_charges_cents(),
+    );
+
+    if !r.cards.is_empty() {
+        println!("\nPayment instruments across the imported orders:");
+        for c in &r.cards {
+            println!(
+                "  {:<26} {:>4} charge(s)  {:>11}   {} → {}{}",
+                c.card,
+                c.charges,
+                dollars(c.total_cents),
+                c.first,
+                c.last,
+                if c.unmatched > 0 {
+                    format!("   ⚠ {} unpaid by any card feed", c.unmatched)
+                } else {
+                    String::new()
+                }
+            );
+        }
+    }
 }
 
 fn handle_square_command(store: &mut EventStore, cmd: SquareCliCommands) -> Result<()> {
@@ -727,7 +878,11 @@ fn handle_square_command(store: &mut EventStore, cmd: SquareCliCommands) -> Resu
             "Square {}: {} entr{} posted, {} skipped (already imported)",
             label,
             summary.entries_posted,
-            if summary.entries_posted == 1 { "y" } else { "ies" },
+            if summary.entries_posted == 1 {
+                "y"
+            } else {
+                "ies"
+            },
             summary.skipped_duplicates
         );
     };
@@ -736,7 +891,10 @@ fn handle_square_command(store: &mut EventStore, cmd: SquareCliCommands) -> Resu
         SquareCliCommands::Sales { file } => {
             let content = std::fs::read_to_string(&file)
                 .map_err(|e| anyhow::anyhow!("read {}: {}", file.display(), e))?;
-            let name = file.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+            let name = file
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
             let summary = square_commands::ingest_square_sales(store, "cli", &content, name)?;
             report(summary, "sales");
         }
@@ -1569,10 +1727,22 @@ fn handle_bill_command(store: &mut EventStore, cmd: BillCliCommands) -> Result<(
             println!("AP Aging Report (as of {})", today);
             println!("{}", "-".repeat(60));
             println!("  Current (not yet due): {}", format_amount(aging.current));
-            println!("  1-30 days overdue:     {}", format_amount(aging.days_1_30));
-            println!("  31-60 days overdue:    {}", format_amount(aging.days_31_60));
-            println!("  61-90 days overdue:    {}", format_amount(aging.days_61_90));
-            println!("  Over 90 days:          {}", format_amount(aging.days_over_90));
+            println!(
+                "  1-30 days overdue:     {}",
+                format_amount(aging.days_1_30)
+            );
+            println!(
+                "  31-60 days overdue:    {}",
+                format_amount(aging.days_31_60)
+            );
+            println!(
+                "  61-90 days overdue:    {}",
+                format_amount(aging.days_61_90)
+            );
+            println!(
+                "  Over 90 days:          {}",
+                format_amount(aging.days_over_90)
+            );
             println!("{}", "-".repeat(60));
             println!("  Total:                 {}", format_amount(aging.total));
         }
@@ -1686,10 +1856,7 @@ fn handle_invoice_command(store: &mut EventStore, cmd: InvoiceCliCommands) -> Re
                 invoice_id: invoice_id.clone(),
                 reason,
             })?;
-            println!(
-                "Invoice {} voided",
-                &invoice_id[..8.min(invoice_id.len())]
-            );
+            println!("Invoice {} voided", &invoice_id[..8.min(invoice_id.len())]);
         }
         InvoiceCliCommands::Aging => {
             let queries = ApArQueries::new(store.connection());
@@ -1699,10 +1866,22 @@ fn handle_invoice_command(store: &mut EventStore, cmd: InvoiceCliCommands) -> Re
             println!("AR Aging Report (as of {})", today);
             println!("{}", "-".repeat(60));
             println!("  Current (not yet due): {}", format_amount(aging.current));
-            println!("  1-30 days overdue:     {}", format_amount(aging.days_1_30));
-            println!("  31-60 days overdue:    {}", format_amount(aging.days_31_60));
-            println!("  61-90 days overdue:    {}", format_amount(aging.days_61_90));
-            println!("  Over 90 days:          {}", format_amount(aging.days_over_90));
+            println!(
+                "  1-30 days overdue:     {}",
+                format_amount(aging.days_1_30)
+            );
+            println!(
+                "  31-60 days overdue:    {}",
+                format_amount(aging.days_31_60)
+            );
+            println!(
+                "  61-90 days overdue:    {}",
+                format_amount(aging.days_61_90)
+            );
+            println!(
+                "  Over 90 days:          {}",
+                format_amount(aging.days_over_90)
+            );
             println!("{}", "-".repeat(60));
             println!("  Total:                 {}", format_amount(aging.total));
         }
@@ -1714,16 +1893,46 @@ fn handle_invoice_command(store: &mut EventStore, cmd: InvoiceCliCommands) -> Re
 // Partnership & tax forms
 // ---------------------------------------------------------------------------
 
+/// Find an account by its number or its id.
+///
+/// Numbers are what people have in front of them — 4005 is written on the chart
+/// of accounts and the id is a UUID nobody has memorised — so the number is
+/// accepted first and the id still works for scripts.
+fn resolve_account(conn: &rusqlite::Connection, needle: &str) -> Result<String> {
+    let accounts = AccountQueries::new(conn).get_all_accounts()?;
+    if let Some(a) = accounts.iter().find(|a| a.account_number == needle) {
+        return Ok(a.id.clone());
+    }
+    if let Some(a) = accounts.iter().find(|a| a.id == needle) {
+        return Ok(a.id.clone());
+    }
+    // Named rather than a bare "not found": the usual cause is a number typed
+    // from memory, and the near misses are the useful part of the answer.
+    let close: Vec<String> = accounts
+        .iter()
+        .filter(|a| a.account_number.starts_with(needle.get(..1).unwrap_or("")))
+        .take(8)
+        .map(|a| format!("{} {}", a.account_number, a.name))
+        .collect();
+    anyhow::bail!(
+        "No account {needle:?}.{}",
+        if close.is_empty() {
+            String::new()
+        } else {
+            format!(" Did you mean one of: {}?", close.join(", "))
+        }
+    )
+}
+
 fn parse_cli_date(s: &str, what: &str) -> Result<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|_| anyhow::anyhow!("{what} must be YYYY-MM-DD, got {s:?}"))
 }
 
-fn handle_partnership_command(
-    store: &mut EventStore,
-    cmd: PartnershipCliCommands,
-) -> Result<()> {
+fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommands) -> Result<()> {
     use accountir::commands::partnership_commands as pc;
+    use accountir::commands::share_period_commands as spc;
+    use accountir::domain::format_ppm;
     use accountir::domain::{Address, BusinessProfile, PartnerType, Residency, Shares};
 
     match cmd {
@@ -1833,12 +2042,15 @@ fn handle_partnership_command(
             };
             let (id, _) = pc::admit_partner(store, "cli-user", &cmd)?;
             println!("Added partner {} ({})", cmd.name, id);
-            report_share_totals(store.connection());
+            report_share_totals(store.connection(), None);
         }
 
         PartnershipCliCommands::Partners { year } => {
             let partners = match year {
-                Some(y) => pc::partners_for_year(store.connection(), y),
+                Some(y) => accountir::commands::share_period_commands::partners_for_year(
+                    store.connection(),
+                    y,
+                ),
                 None => pc::list_partners(store.connection()),
             };
             if partners.is_empty() {
@@ -1847,7 +2059,129 @@ fn handle_partnership_command(
             for p in &partners {
                 print_partner(store.connection(), p);
             }
-            report_share_totals(store.connection());
+            report_share_totals(store.connection(), year);
+        }
+
+        PartnershipCliCommands::EquityLink {
+            partner_id,
+            account,
+            role,
+        } => {
+            let account_id = resolve_account(store.connection(), &account)?;
+            pc::link_equity_account(store, "cli-user", &partner_id, &account_id, &role)?;
+            println!("{account} now holds {partner_id}'s capital, as a {role}.");
+        }
+
+        PartnershipCliCommands::EquityUnlink {
+            partner_id,
+            account,
+        } => {
+            let account_id = resolve_account(store.connection(), &account)?;
+            pc::unlink_equity_account(store, "cli-user", &partner_id, &account_id)?;
+            println!("{account} no longer holds {partner_id}'s capital.");
+        }
+
+        PartnershipCliCommands::Equity => {
+            let conn = store.connection();
+            let links = accountir::tax::capital::load_partner_equity_accounts(conn);
+            let accounts = AccountQueries::new(conn)
+                .get_all_accounts()
+                .unwrap_or_default();
+            let named = |id: &str| {
+                accounts
+                    .iter()
+                    .find(|a| a.id == id)
+                    .map(|a| format!("{} {}", a.account_number, a.name))
+                    .unwrap_or_else(|| id.to_string())
+            };
+            for p in pc::list_partners(conn) {
+                println!("{} ({})", p.name, p.partner_id);
+                let mine: Vec<_> = links
+                    .iter()
+                    .filter(|l| l.partner_id == p.partner_id)
+                    .collect();
+                if mine.is_empty() {
+                    println!("  no accounts linked — item L on their K-1 will show only their");
+                    println!("  share of this year's income, with no opening balance or draws");
+                }
+                for l in mine {
+                    println!("  {:<12} {}", l.role.as_str(), named(&l.account_id));
+                }
+            }
+            // The accounts nobody claims are the point of the listing: an equity
+            // account with a balance and no partner behind it is capital missing
+            // from somebody's item L, and it is invisible until it is named.
+            let orphans: Vec<&accountir::domain::Account> = accounts
+                .iter()
+                .filter(|a| a.account_type == accountir::domain::AccountType::Equity)
+                .filter(|a| !links.iter().any(|l| l.account_id == a.id))
+                .collect();
+            if !orphans.is_empty() {
+                println!("\nEquity accounts linked to nobody:");
+                for a in orphans {
+                    println!("  {} {}", a.account_number, a.name);
+                }
+                println!("Anything here that is a partner's capital is missing from their item L.");
+            }
+        }
+
+        PartnershipCliCommands::SetShares {
+            partner_id,
+            from,
+            profit,
+            loss,
+            capital,
+        } => {
+            let effective_from = parse_cli_date(&from, "--from")?;
+            let shares = accountir::domain::Shares::from_percents(
+                profit,
+                loss.unwrap_or(profit),
+                capital.unwrap_or(profit),
+            );
+            // Said before the write, because the point is to let somebody stop.
+            if let Some(w) = spc::retrospective_warning(store.connection(), effective_from) {
+                eprintln!("warning: {w}");
+            }
+            spc::set_partner_shares(store, "cli-user", &partner_id, effective_from, shares)?;
+            println!(
+                "From {effective_from}, {partner_id} takes {} of profit, {} of loss, {} of capital.",
+                format_ppm(shares.profit_ppm),
+                format_ppm(shares.loss_ppm),
+                format_ppm(shares.capital_ppm)
+            );
+            // The split has to add up on the day it changed, not across a list
+            // that mixes partners who were never in the partnership at once.
+            let partners = spc::list_partners_with_history(store.connection());
+            for problem in spc::problems_on(&partners, effective_from) {
+                eprintln!("warning: {problem}");
+            }
+        }
+
+        PartnershipCliCommands::ShareHistory { partner_id } => {
+            let partners = spc::list_partners_with_history(store.connection());
+            for p in partners
+                .iter()
+                .filter(|p| partner_id.as_ref().is_none_or(|id| &p.partner_id == id))
+            {
+                println!("{} ({})", p.name, p.partner_id);
+                if p.history.is_empty() {
+                    println!(
+                        "  no recorded changes — treated as {} / {} / {} for every year",
+                        format_ppm(p.shares.profit_ppm),
+                        format_ppm(p.shares.loss_ppm),
+                        format_ppm(p.shares.capital_ppm)
+                    );
+                }
+                for period in &p.history {
+                    println!(
+                        "  from {}: {} / {} / {}",
+                        period.effective_from,
+                        format_ppm(period.shares.profit_ppm),
+                        format_ppm(period.shares.loss_ppm),
+                        format_ppm(period.shares.capital_ppm)
+                    );
+                }
+            }
         }
 
         PartnershipCliCommands::RemovePartner { partner_id, on } => {
@@ -1866,11 +2200,13 @@ fn handle_partnership_command(
             related_partner_id,
             kind,
         } => {
-            let kind = accountir::domain::RelationshipKind::parse(&kind).ok_or_else(|| {
-                anyhow::anyhow!("--kind must be spouse, sibling, or parent_of")
-            })?;
+            let kind = accountir::domain::RelationshipKind::parse(&kind)
+                .ok_or_else(|| anyhow::anyhow!("--kind must be spouse, sibling, or parent_of"))?;
             pc::set_relationship(store, "cli-user", &partner_id, &related_partner_id, kind)?;
-            println!("Recorded: {partner_id} is {} {related_partner_id}", kind.label());
+            println!(
+                "Recorded: {partner_id} is {} {related_partner_id}",
+                kind.label()
+            );
         }
 
         PartnershipCliCommands::Unrelate {
@@ -1933,16 +2269,37 @@ fn handle_partnership_command(
     }
 
     /// Say so the moment the shares stop adding up, rather than at filing time.
-    fn report_share_totals(conn: &rusqlite::Connection) {
-        use accountir::commands::partnership_commands as pc;
-        use accountir::domain::Shares;
-        let shares: Vec<Shares> = pc::list_partners(conn).iter().map(|p| p.shares).collect();
-        if shares.is_empty() {
+    ///
+    /// # Why this asks about a day
+    ///
+    /// It used to sum the current percentages across every partner ever
+    /// recorded, which meant that from the day somebody left, this fired
+    /// permanently and could not be cleared — their percentages are still on
+    /// file, so the sum counted a partner who was gone. It also described a
+    /// different set of partners from the list printed above it whenever
+    /// `--year` was given. The split has to add up on each day it was in force,
+    /// and that is a question with an answer.
+    fn report_share_totals(conn: &rusqlite::Connection, year: Option<i32>) {
+        use accountir::commands::share_period_commands as spc;
+        let partners = spc::list_partners_with_history(conn);
+        if partners.is_empty() {
             return;
         }
-        let totals = Shares::sums_to_whole(&shares);
-        if !totals.is_whole() {
-            println!("\nwarning: {}", totals.discrepancies().join(", "));
+        let days = match year {
+            Some(y) => {
+                let (start, end) = accountir::commands::partnership_commands::calendar_year(y);
+                spc::days_to_check(&partners, start, end)
+            }
+            None => vec![chrono::Local::now().date_naive()],
+        };
+        let mut said: Vec<String> = Vec::new();
+        for day in days {
+            for problem in spc::problems_on(&partners, day) {
+                if !said.contains(&problem) {
+                    said.push(problem.clone());
+                    println!("\nwarning: {problem}");
+                }
+            }
         }
     }
 
@@ -1951,7 +2308,7 @@ fn handle_partnership_command(
 
 fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()> {
     use accountir::commands::partnership_commands as pc;
-    use accountir::tax::{PartnerFiling, ReturnRequest, build_return_from_ledger};
+    use accountir::tax::{build_return_from_ledger, PartnerFiling, ReturnRequest};
 
     match cmd {
         TaxCliCommands::Form1065 { year, output } => {
@@ -1962,13 +2319,14 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
                 )
             })?;
 
-            let partners: Vec<PartnerFiling> = pc::partners_for_year(conn, year)
-                .into_iter()
-                .map(|partner| PartnerFiling {
-                    tin: pc::get_tin(conn, &partner.partner_id),
-                    partner,
-                })
-                .collect();
+            let partners: Vec<PartnerFiling> =
+                accountir::commands::share_period_commands::partners_for_year(conn, year)
+                    .into_iter()
+                    .map(|partner| PartnerFiling {
+                        tin: pc::get_tin(conn, &partner.partner_id),
+                        partner,
+                    })
+                    .collect();
 
             // The ledger entry point, not `build_return`: the latter fills identity
             // only and leaves every money line blank.
@@ -1988,6 +2346,8 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
                     // the connection and reads them from the books.
                     assets: Vec::new(),
                     schedule_l: None,
+                    capital: Default::default(),
+                    segments: Vec::new(),
                     detail: Default::default(),
                     options: Default::default(),
                     book_income_cents: 0,
@@ -2013,7 +2373,8 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
 
         TaxCliCommands::Il1065 { year, output } => {
             let settings = pc::get_il1065_settings(store.connection());
-            let bundle = accountir::tax::il1065::build_from_ledger(store.connection(), year, &settings)?;
+            let bundle =
+                accountir::tax::il1065::build_from_ledger(store.connection(), year, &settings)?;
             std::fs::write(&output, &bundle.pdf)?;
             println!(
                 "Wrote {} ({} pages) — Illinois IL-1065, {}{}.",

@@ -50,18 +50,18 @@
 //! shared predicate under the client's `expected_head_seq`, map the outcome.
 
 use crate::commands::partnership_commands::{
-    AdmitPartner, PartnerStep, PartnershipError, UpdatePartner, build_admit_partner_in_txn,
-    build_clear_relationship_in_txn, build_set_il1065_settings_event, build_set_profile_event,
-    build_set_relationship_in_txn, build_update_partner_in_txn, build_withdraw_partner_in_txn,
+    build_admit_partner_in_txn, build_clear_relationship_in_txn, build_link_equity_account_in_txn,
+    build_set_il1065_settings_event, build_set_profile_event, build_set_relationship_in_txn,
+    build_unlink_equity_account_in_txn, build_update_partner_in_txn, build_withdraw_partner_in_txn,
     check_admit_partner_pure, check_set_profile_pure, check_set_relationship_pure,
-    check_update_partner_pure,
+    check_update_partner_pure, AdmitPartner, PartnerStep, PartnershipError, UpdatePartner,
 };
 use crate::domain::{
     Address, BusinessProfile, Il1065Settings, PartnerType, RelationshipKind, Residency, Shares,
 };
 use crate::store::event_store::{CheckedOutcome, Verdict};
-use crate::sync::{ApiError, AuthedUser, SyncState, outcome_to_response, project, stamp};
-use axum::{Json, Router, extract::State, routing::post};
+use crate::sync::{outcome_to_response, project, stamp, ApiError, AuthedUser, SyncState};
+use axum::{extract::State, routing::post, Json, Router};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +84,18 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/clear-partner-relationship",
             post(submit_clear_relationship),
+        )
+        .route(
+            "/sync/commands/set-partner-shares",
+            post(submit_set_partner_shares),
+        )
+        .route(
+            "/sync/commands/link-equity-account",
+            post(submit_link_equity_account),
+        )
+        .route(
+            "/sync/commands/unlink-equity-account",
+            post(submit_unlink_equity_account),
         )
         .route(
             "/sync/commands/set-il1065-settings",
@@ -111,7 +123,8 @@ fn parse_partner_type(s: &str) -> Result<PartnerType, ApiError> {
 }
 
 fn parse_residency(s: &str) -> Result<Residency, ApiError> {
-    Residency::parse(s).ok_or_else(|| ApiError::bad_request("residency must be domestic or foreign"))
+    Residency::parse(s)
+        .ok_or_else(|| ApiError::bad_request("residency must be domestic or foreign"))
 }
 
 // ---------------------------------------------------------------------------
@@ -167,10 +180,12 @@ async fn submit_set_profile(
     let outcome = store
         .append_checked(
             req.expected_head_seq,
-            move |_tx| Ok(Verdict::<_, PartnershipError>::Append(stamp(
-                build_set_profile_event(&profile),
-                &actor,
-            ))),
+            move |_tx| {
+                Ok(Verdict::<_, PartnershipError>::Append(stamp(
+                    build_set_profile_event(&profile),
+                    &actor,
+                )))
+            },
             project,
         )
         .map_err(ApiError::store)?;
@@ -334,6 +349,150 @@ async fn submit_withdraw_partner(
     outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct SetPartnerSharesRequest {
+    pub expected_head_seq: i64,
+    pub partner_id: String,
+    /// The first day the new percentages apply.
+    pub effective_from: NaiveDate,
+    pub shares: Shares,
+}
+
+/// Record what a partner's percentages became, and from when.
+///
+/// # Why this appends two events sometimes
+///
+/// A partner with nothing recorded yet gets their *existing* split written down
+/// first, dated from the day they joined. Without it the series would begin at
+/// the change, and `Partner::shares_on` answers a date before the earliest entry
+/// with that entry — so every prior year would silently take the new figure,
+/// which is the exact thing recording a dated change exists to prevent.
+///
+/// Both events go in under one head check, so a second member cannot land a
+/// change between the opening period and the one that supersedes it.
+async fn submit_set_partner_shares(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetPartnerSharesRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            req.expected_head_seq,
+            move |tx| match crate::commands::share_period_commands::build_set_partner_shares_in_txn(
+                tx,
+                &req.partner_id,
+                req.effective_from,
+                req.shares,
+            ) {
+                Ok(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
+                Err(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    many_outcome_to_response(outcome)
+}
+
+/// Map a composite (`append_checked_many`) outcome to a response.
+///
+/// The new head is the last appended event's seq — the batch goes in in order,
+/// so the final row is the log head.
+fn many_outcome_to_response(
+    outcome: CheckedOutcome<Vec<crate::events::types::StoredEvent>, PartnershipError>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    match outcome {
+        CheckedOutcome::Appended(events) => Ok(Json(crate::sync::SubmitResponse {
+            head: events
+                .last()
+                .map(|s| s.id)
+                .expect("a composite command appends at least one event"),
+        })),
+        CheckedOutcome::HeadMismatch { actual, .. } => Err(ApiError::conflict(actual)),
+        CheckedOutcome::Rejected(e) => Err(ApiError::domain(e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Partner capital accounts — for item L of a Schedule K-1
+// ---------------------------------------------------------------------------
+//
+// Which ledger account holds whose capital is a fact about the books, not about
+// a person, so it crosses this boundary like the partners themselves do. A TIN
+// does not; see the module docs.
+
+#[derive(Serialize, Deserialize)]
+pub struct LinkEquityAccountRequest {
+    pub expected_head_seq: i64,
+    pub partner_id: String,
+    pub account_id: String,
+    /// "contribution" (item L row 2) or "draw" (row 5).
+    pub role: String,
+}
+
+/// Say that a ledger account holds a partner's capital.
+async fn submit_link_equity_account(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<LinkEquityAccountRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    // A `400` rather than a `422`, as with the partner-type words: an
+    // unrecognised role is a malformed request, not a link the books refused.
+    if crate::tax::capital::Role::parse(&req.role).is_none() {
+        return Err(ApiError::bad_request("role must be contribution or draw"));
+    }
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_link_equity_account_in_txn(
+                tx,
+                &req.partner_id,
+                &req.account_id,
+                &req.role,
+            )? {
+                PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UnlinkEquityAccountRequest {
+    pub expected_head_seq: i64,
+    pub partner_id: String,
+    pub account_id: String,
+}
+
+/// Stop treating an account as a partner's capital.
+async fn submit_unlink_equity_account(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<UnlinkEquityAccountRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_unlink_equity_account_in_txn(
+                tx,
+                &req.partner_id,
+                &req.account_id,
+            )? {
+                PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
+
 // ---------------------------------------------------------------------------
 // Partner relationships — for Schedule B-1's §267(c) constructive-ownership test
 // ---------------------------------------------------------------------------
@@ -360,7 +519,8 @@ async fn submit_set_relationship(
     Json(req): Json<SetRelationshipRequest>,
 ) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
     let kind = parse_relationship(&req.relationship)?;
-    check_set_relationship_pure(&req.partner_id, &req.related_partner_id).map_err(ApiError::domain)?;
+    check_set_relationship_pure(&req.partner_id, &req.related_partner_id)
+        .map_err(ApiError::domain)?;
 
     let mut store = st.store.lock().unwrap();
     let outcome = store
@@ -670,6 +830,148 @@ mod tests {
         );
     }
 
+    /// A dated change through the group server keeps prior years where they were.
+    ///
+    /// The whole point of the feature, tested at the boundary it will actually
+    /// cross: two members share a set of books, one records a renegotiation, and
+    /// the year before it must still read the old split.
+    #[tokio::test]
+    async fn a_dated_change_leaves_the_years_before_it_alone() {
+        let base = serve().await;
+        set_profile(&base).await;
+        let alice = admit(&base, "Alice Example", 50.0).await;
+        let id = alice["partner_id"].as_str().unwrap().to_string();
+
+        let r = post(
+            &base,
+            "set-partner-shares",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "partner_id": id,
+                "effective_from": "2024-07-01",
+                "shares": shares(70.0),
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::OK);
+
+        let dump = events(&base).await;
+        assert!(
+            dump.matches("partner_shares_changed").count() == 2,
+            "the split in force before the change has to be captured too, or every \
+             prior year silently takes the new figure: {dump}"
+        );
+        assert!(
+            dump.contains("2021-07-01"),
+            "opening period dated from the start: {dump}"
+        );
+        assert!(dump.contains("700000"), "the change itself: {dump}");
+    }
+
+    /// A change dated before the partner existed is refused, not stored.
+    #[tokio::test]
+    async fn shares_cannot_start_before_the_partner_did() {
+        let base = serve().await;
+        set_profile(&base).await;
+        let alice = admit(&base, "Alice Example", 50.0).await;
+        let id = alice["partner_id"].as_str().unwrap().to_string();
+
+        let r = post(
+            &base,
+            "set-partner-shares",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "partner_id": id,
+                "effective_from": "2019-01-01",
+                "shares": shares(70.0),
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// An account holds one partner's capital, and linking it again moves it
+    /// rather than letting two partners both claim the same balance.
+    #[tokio::test]
+    async fn an_equity_account_belongs_to_one_partner_at_a_time() {
+        let base = serve().await;
+        set_profile(&base).await;
+        let alice = admit(&base, "Alice Example", 50.0).await;
+        let bob = admit(&base, "Bob Example", 50.0).await;
+        let (a, b) = (
+            alice["partner_id"].as_str().unwrap().to_string(),
+            bob["partner_id"].as_str().unwrap().to_string(),
+        );
+
+        for who in [&a, &b] {
+            let r = post(
+                &base,
+                "link-equity-account",
+                serde_json::json!({
+                    "expected_head_seq": head_of(&base).await,
+                    "partner_id": who,
+                    "account_id": "4002",
+                    "role": "contribution",
+                }),
+            )
+            .await;
+            assert_eq!(r.status(), reqwest::StatusCode::OK);
+        }
+
+        // The projection is the authority on who holds it now.
+        let r = post(
+            &base,
+            "unlink-equity-account",
+            serde_json::json!({
+                "expected_head_seq": head_of(&base).await,
+                "partner_id": a,
+                "account_id": "4002",
+            }),
+        )
+        .await;
+        assert_eq!(
+            r.status(),
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "Alice no longer holds it — Bob's link moved it"
+        );
+    }
+
+    /// A role word this program did not write is a malformed request, not a link
+    /// the books refused — so a 400, and nothing is appended.
+    #[tokio::test]
+    async fn an_unknown_capital_role_is_a_bad_request() {
+        let base = serve().await;
+        set_profile(&base).await;
+        let alice = admit(&base, "Alice Example", 50.0).await;
+        let before = head_of(&base).await;
+        let r = post(
+            &base,
+            "link-equity-account",
+            serde_json::json!({
+                "expected_head_seq": before,
+                "partner_id": alice["partner_id"].as_str().unwrap(),
+                "account_id": "4002",
+                "role": "withdrawl",
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(head_of(&base).await, before, "nothing was appended");
+    }
+
+    async fn events(base: &str) -> String {
+        reqwest::Client::new()
+            .get(format!("{base}/sync/events?since=0&limit=100"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+            .to_string()
+    }
+
     /// A second departure would silently move which year the partner's final K-1
     /// falls in.
     #[tokio::test]
@@ -918,7 +1220,10 @@ mod tests {
 
         assert_ne!(alice.partner_id, bob.partner_id);
         assert!(uuid::Uuid::parse_str(&alice.partner_id).is_ok());
-        assert!(bob.head > alice.head, "the head must advance with each write");
+        assert!(
+            bob.head > alice.head,
+            "the head must advance with each write"
+        );
 
         // Editing and withdrawing go through the same cached head.
         client
@@ -934,14 +1239,20 @@ mod tests {
             .await
             .unwrap();
         let head = client
-            .withdraw_partner(&bob.partner_id, NaiveDate::from_ymd_opt(2025, 6, 30).unwrap())
+            .withdraw_partner(
+                &bob.partner_id,
+                NaiveDate::from_ymd_opt(2025, 6, 30).unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(head, head_of(&base).await);
 
         // And the domain refusal reaches the caller as one.
         let err = client
-            .withdraw_partner(&bob.partner_id, NaiveDate::from_ymd_opt(2025, 9, 1).unwrap())
+            .withdraw_partner(
+                &bob.partner_id,
+                NaiveDate::from_ymd_opt(2025, 9, 1).unwrap(),
+            )
             .await
             .unwrap_err();
         assert!(

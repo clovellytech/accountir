@@ -66,6 +66,15 @@ pub enum ReplicaError {
     /// user is told.
     #[error("this copy has {local} events but the server only has {server} — it has diverged and must be reset")]
     LocalAhead { local: i64, server: i64 },
+    /// Asked to adopt a whole log into a store that already has one. There is no
+    /// merge: two logs both start at seq 1, so the result could not be a prefix
+    /// of either. An initial share is the only moment adoption is unambiguous.
+    #[error(
+        "these books cannot be taken over: the group already holds {head} event(s) of its own. \
+         Sharing an existing set of books is only possible into a group that has never been \
+         written to."
+    )]
+    NotEmpty { head: i64 },
     #[error("storage error while applying the group's events: {0}")]
     Store(#[from] EventStoreError),
     #[error("could not rebuild the local views from the group's events: {0}")]
@@ -265,6 +274,76 @@ fn to_mirror_event(e: &SyncEvent) -> Result<MirrorEvent, ReplicaError> {
         actor_id: e.actor_id.clone(),
         received_at: e.received_at,
         hash,
+    })
+}
+
+/// Turn a ledger's own stored events into mirror events, so one store can adopt
+/// another's log verbatim.
+///
+/// # Why this is the same operation as following a server
+///
+/// A replica trusts the server's ids and hashes and writes them unchanged; a
+/// group adopting a set of local books does exactly that in the other direction.
+/// Both go through [`EventStore::append_mirrored`], which re-derives every hash
+/// and refuses the batch whole if one disagrees — so "adopt these books" cannot
+/// become a way to write a log nobody can verify.
+pub fn mirror_from_stored(events: &[StoredEvent]) -> Vec<MirrorEvent> {
+    events
+        .iter()
+        .map(|e| MirrorEvent {
+            seq: e.id,
+            event: e.event.clone(),
+            user_id: e.user_id.clone(),
+            timestamp: e.timestamp,
+            actor_id: e.actor_id.clone(),
+            received_at: e.received_at,
+            hash: e.hash.clone(),
+        })
+        .collect()
+}
+
+/// A ledger's whole log as newline-delimited JSON — the wire format for both
+/// leaving a group and joining one.
+///
+/// One definition, used by the server's `/export/events.ndjson` and by a client
+/// handing its books over, because an export a group cannot adopt is not a
+/// portable export.
+pub fn to_ndjson(store: &EventStore) -> Result<String, ReplicaError> {
+    let events: Vec<StoredEvent> = store.get_all()?;
+    let mut out = String::new();
+    for event in &events {
+        // One unserializable event must not quietly shorten the file: a short
+        // log that looks complete is worse than a failed request.
+        let line = serde_json::to_string(event)
+            .map_err(|e| ReplicaError::Store(EventStoreError::SerializationError(e.to_string())))?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Adopt a whole log into an empty store, keeping its ids, hashes and times.
+///
+/// Refused unless the target is empty. That is the entire safety argument: two
+/// logs both start at seq 1, so there is no way to interleave them, and no way
+/// to tell afterwards which events came from where. An initial share is the one
+/// moment when "these books become the group's books" is unambiguous.
+pub fn adopt_log(
+    store: &mut EventStore,
+    events: &[StoredEvent],
+) -> Result<AppliedRange, ReplicaError> {
+    let existing = local_cursor(store)?;
+    if existing != 0 {
+        return Err(ReplicaError::NotEmpty { head: existing });
+    }
+    let mirrored = mirror_from_stored(events);
+    let stored = store
+        .append_mirrored(&mirrored, super::project)
+        .map_err(map_store_error)?;
+    Ok(AppliedRange {
+        from: stored.first().map(|s| s.id).unwrap_or_default(),
+        to: stored.last().map(|s| s.id).unwrap_or_default(),
+        applied: stored.len(),
     })
 }
 

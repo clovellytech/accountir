@@ -61,7 +61,8 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             validate_non_empty(new_value, "new_value")?;
         }
         Event::BusinessProfileSet(d) => {
-            let (legal_name, address, ein, naics_code) = (&d.legal_name, &d.address, &d.ein, &d.naics_code);
+            let (legal_name, address, ein, naics_code) =
+                (&d.legal_name, &d.address, &d.ein, &d.naics_code);
             validate_non_empty(legal_name, "legal_name")?;
             // Checked for shape, and only when there is one to check. A sole
             // proprietorship may have no EIN, because many never need to apply
@@ -297,6 +298,7 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::TaxLineMappingSet {
             account_id,
             line_key,
+            ..
         } => {
             validate_non_empty(account_id, "account_id")?;
             // Checked against the catalogue, not merely for emptiness: a key
@@ -312,7 +314,74 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                 )));
             }
         }
-        Event::TaxLineMappingCleared { account_id } => {
+        Event::TaxLineMappingCleared { account_id, .. } => {
+            validate_non_empty(account_id, "account_id")?;
+        }
+        Event::TaxDeductionLimitSet {
+            account_id,
+            deductible_pct,
+            ..
+        } => {
+            validate_non_empty(account_id, "account_id")?;
+            // A percentage outside 0-100 is not a limit, it is arithmetic that
+            // would invent or destroy a deduction. Refused at the door rather
+            // than clamped, because a clamp hides the mistake that made it.
+            if *deductible_pct > 100 {
+                return Err(ValidationError::InvalidValue(format!(
+                    "deductible_pct: {deductible_pct} is not a percentage between 0 and 100"
+                )));
+            }
+        }
+        Event::TaxDeductionLimitCleared { account_id, .. } => {
+            validate_non_empty(account_id, "account_id")?;
+        }
+        Event::AccountDeleted { account_id } => {
+            validate_non_empty(account_id, "account_id")?;
+        }
+        Event::PartnerSharesChanged {
+            partner_id,
+            profit_ppm,
+            loss_ppm,
+            capital_ppm,
+            ..
+        } => {
+            validate_non_empty(partner_id, "partner_id")?;
+            // A percentage outside 0-100% is not a share of anything. Refused at
+            // the door: a negative or >100% figure would foot on the form while
+            // meaning nothing, which is the shape of error this file exists for.
+            for (what, ppm) in [
+                ("profit_ppm", profit_ppm),
+                ("loss_ppm", loss_ppm),
+                ("capital_ppm", capital_ppm),
+            ] {
+                if !(0..=1_000_000).contains(ppm) {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "{what}: {ppm} is not a percentage between 0 and 100"
+                    )));
+                }
+            }
+        }
+        Event::PartnerEquityAccountLinked {
+            partner_id,
+            account_id,
+            role,
+        } => {
+            validate_non_empty(partner_id, "partner_id")?;
+            validate_non_empty(account_id, "account_id")?;
+            // Item L wants contributions and withdrawals on their own lines, so
+            // an account has to say which it is. An unknown role would land in
+            // neither and go missing from the capital account silently.
+            if !matches!(role.as_str(), "contribution" | "draw") {
+                return Err(ValidationError::InvalidValue(format!(
+                    "role: {role:?} is neither \"contribution\" nor \"draw\""
+                )));
+            }
+        }
+        Event::PartnerEquityAccountUnlinked {
+            partner_id,
+            account_id,
+        } => {
+            validate_non_empty(partner_id, "partner_id")?;
             validate_non_empty(account_id, "account_id")?;
         }
         Event::ScheduleBAnswerSet {

@@ -1,21 +1,21 @@
 pub mod account;
 pub mod ap_ar;
+pub mod depreciation;
 pub mod fiscal_period;
 pub mod journal_entry;
 pub mod money;
-pub mod depreciation;
 pub mod partnership;
 pub mod reconciliation;
-pub mod sole_proprietor;
 pub mod reporting;
+pub mod sole_proprietor;
 
 pub use account::*;
 pub use ap_ar::*;
+pub use depreciation::*;
 pub use fiscal_period::*;
 pub use journal_entry::*;
 pub use money::*;
-pub use depreciation::*;
 pub use partnership::*;
 pub use reconciliation::*;
-pub use sole_proprietor::*;
 pub use reporting::*;
+pub use sole_proprietor::*;

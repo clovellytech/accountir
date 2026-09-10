@@ -649,10 +649,16 @@ mod tests {
         assert_eq!(qip.recovery_years(System::Gds), 15.0);
         assert_eq!(not_qip.recovery_years(System::Gds), 39.0);
 
-        assert!(qip.bonus_eligible(), "15 years is inside the 20-year ceiling");
+        assert!(
+            qip.bonus_eligible(),
+            "15 years is inside the 20-year ceiling"
+        );
         assert!(!not_qip.bonus_eligible(), "39 years is not");
 
-        assert!(!qip.uses_mid_month(), "15-year property is half-year or mid-quarter");
+        assert!(
+            !qip.uses_mid_month(),
+            "15-year property is half-year or mid-quarter"
+        );
         assert!(not_qip.uses_mid_month());
 
         assert_eq!(qip.section_179(), Section179Eligibility::Eligible);
@@ -708,9 +714,17 @@ mod tests {
     #[test]
     fn every_class_round_trips_through_its_stored_string() {
         for class in PropertyClass::ALL {
-            assert_eq!(PropertyClass::parse(class.as_str()), Some(class), "{class:?}");
+            assert_eq!(
+                PropertyClass::parse(class.as_str()),
+                Some(class),
+                "{class:?}"
+            );
         }
-        assert_eq!(PropertyClass::parse("fifteen_year"), None, "no bare life key");
+        assert_eq!(
+            PropertyClass::parse("fifteen_year"),
+            None,
+            "no bare life key"
+        );
     }
 
     #[test]
@@ -727,7 +741,10 @@ mod tests {
         a.disposed_on = Some(date(2025, 4, 1));
 
         assert!(a.held_during(2024));
-        assert!(a.held_during(2025), "still held for part of the year it went");
+        assert!(
+            a.held_during(2025),
+            "still held for part of the year it went"
+        );
         assert!(!a.held_during(2026));
         assert!(a.disposed_during(2025));
         assert!(!a.placed_and_disposed_same_year());
@@ -735,7 +752,16 @@ mod tests {
 
     #[test]
     fn quarters_are_read_from_the_placed_in_service_month() {
-        for (month, quarter) in [(1, 1), (3, 1), (4, 2), (6, 2), (7, 3), (9, 3), (10, 4), (12, 4)] {
+        for (month, quarter) in [
+            (1, 1),
+            (3, 1),
+            (4, 2),
+            (6, 2),
+            (7, 3),
+            (9, 3),
+            (10, 4),
+            (12, 4),
+        ] {
             let a = asset(PropertyClass::FiveYear, date(2025, month, 15));
             assert_eq!(a.quarter_placed(), quarter, "month {month}");
         }

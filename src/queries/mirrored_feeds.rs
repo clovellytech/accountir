@@ -172,7 +172,11 @@ pub fn mirrored_feeds(conn: &Connection) -> Result<Vec<MirroredFeed>, rusqlite::
                 let mut matched = 0usize;
                 let mut amount_cents = 0i64;
                 for ((date, amount), n) in &child.keys {
-                    let available = parent.keys.get(&(date.clone(), *amount)).copied().unwrap_or(0);
+                    let available = parent
+                        .keys
+                        .get(&(date.clone(), *amount))
+                        .copied()
+                        .unwrap_or(0);
                     let pairs = (*n).min(available);
                     matched += pairs;
                     amount_cents += amount.abs() * pairs as i64;
@@ -221,7 +225,12 @@ mod tests {
         // Both mapped, which is the state that produces the problem: an
         // unmapped account posts nothing and is not worth warning about.
         for (acct, name, local, num) in [
-            ("central", "Central Bill Account - 3552", "l-central", "5003"),
+            (
+                "central",
+                "Central Bill Account - 3552",
+                "l-central",
+                "5003",
+            ),
             ("card", "Business Credit Card - 1549", "l-card", "5013"),
         ] {
             conn.execute(
@@ -276,8 +285,14 @@ mod tests {
         let found = mirrored_feeds(&conn).unwrap();
         assert_eq!(found.len(), 1, "one pair, named once: {found:?}");
         let f = &found[0];
-        assert_eq!(f.child_name, "Business Credit Card - 1549", "unlink the card");
-        assert_eq!(f.parent_name, "Central Bill Account - 3552", "keep the roll-up");
+        assert_eq!(
+            f.child_name, "Business Credit Card - 1549",
+            "unlink the card"
+        );
+        assert_eq!(
+            f.parent_name, "Central Bill Account - 3552",
+            "keep the roll-up"
+        );
         assert_eq!(f.matched, 5);
         assert_eq!(f.child_total, 5);
         assert_eq!(f.amount_cents, 3321 + 11130 + 1896 + 1649 + 2317);
@@ -350,7 +365,10 @@ mod tests {
         for i in 0..10 {
             stage(&conn, "central", "2026-07-01", -900 - i, &format!("c{i}"));
         }
-        assert!(mirrored_feeds(&conn).unwrap().is_empty(), "two is coincidence");
+        assert!(
+            mirrored_feeds(&conn).unwrap().is_empty(),
+            "two is coincidence"
+        );
     }
 
     /// Counted as a multiset: two identical charges on one day need two on the

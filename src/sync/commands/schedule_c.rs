@@ -28,8 +28,8 @@
 use crate::commands::partnership_commands::PartnershipError;
 use crate::events::types::{Event, SoleProprietorData};
 use crate::store::event_store::Verdict;
-use crate::sync::{ApiError, AuthedUser, SyncState, outcome_to_response, project, stamp};
-use axum::{Json, Router, extract::State, routing::post};
+use crate::sync::{outcome_to_response, project, stamp, ApiError, AuthedUser, SyncState};
+use axum::{extract::State, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<SyncState> {
@@ -368,7 +368,10 @@ mod tests {
         .await;
         assert!(r.status().is_success());
         let s = store.lock().unwrap();
-        assert_eq!(crate::tax::schedule_c::load(s.connection(), 2025).get("g"), None);
+        assert_eq!(
+            crate::tax::schedule_c::load(s.connection(), 2025).get("g"),
+            None
+        );
     }
 
     /// A caller's mistake gets a 400 that names the field, not a 500 from deep

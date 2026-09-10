@@ -40,8 +40,8 @@ use chrono::{Datelike, Days, NaiveDate};
 use rusqlite::Connection;
 
 use crate::commands::entry_commands::{EntryLine, PostEntryCommand};
-use crate::commands::ingest_commands::{IngestError, check_idempotent, load_ingest_mappings};
 use crate::commands::import_commands::{parse_amount, parse_delimited_line};
+use crate::commands::ingest_commands::{check_idempotent, load_ingest_mappings, IngestError};
 use crate::events::types::JournalEntrySource;
 
 /// How much of the export goes into one journal entry.
@@ -227,7 +227,8 @@ fn period_end(date: NaiveDate, grain: Grain) -> NaiveDate {
         // ISO weeks start Monday, so the end is the following Sunday.
         Grain::Week => {
             let from_monday = date.weekday().num_days_from_monday() as u64;
-            date.checked_add_days(Days::new(6 - from_monday)).unwrap_or(date)
+            date.checked_add_days(Days::new(6 - from_monday))
+                .unwrap_or(date)
         }
         Grain::Month => {
             let (y, m) = (date.year(), date.month());
@@ -474,7 +475,10 @@ Stripe Fees at Checkout,Sawyer Fees at Checkout,Net Amt to Provider from Checkou
         let o = &p.orders[0];
         assert_eq!(o.order_id, "6261591");
         assert_eq!(o.date, NaiveDate::from_ymd_opt(2025, 9, 19).unwrap());
-        assert_eq!((o.net_order, o.stripe_fees, o.to_provider), (3000, 117, 2883));
+        assert_eq!(
+            (o.net_order, o.stripe_fees, o.to_provider),
+            (3000, 117, 2883)
+        );
     }
 
     /// A refunded order comes back already net, and the fee it cost is still
@@ -525,10 +529,7 @@ Stripe Fees at Checkout,Sawyer Fees at Checkout,Net Amt to Provider from Checkou
     /// the assumption it still means what it used to.
     #[test]
     fn a_row_that_does_not_add_up_is_reported() {
-        let p = parse_orders(&csv(&[
-            "9,2025-09-19 09:10:38 -0400,30.00,1.17,0.00,99.99",
-        ]))
-        .unwrap();
+        let p = parse_orders(&csv(&["9,2025-09-19 09:10:38 -0400,30.00,1.17,0.00,99.99"])).unwrap();
         assert!(p.orders.is_empty());
         assert_eq!(p.problems.len(), 1);
         assert!(p.problems[0].contains("order 9"), "{:?}", p.problems);
@@ -580,8 +581,14 @@ Stripe Fees at Checkout,Sawyer Fees at Checkout,Net Amt to Provider from Checkou
 
     #[test]
     fn the_reference_records_which_grain_was_chosen() {
-        assert_eq!(reference_for(Grain::Month, "2025-09"), "sawyer-month-2025-09");
-        assert_eq!(reference_for(Grain::Transaction, "6261591"), "sawyer-order-6261591");
+        assert_eq!(
+            reference_for(Grain::Month, "2025-09"),
+            "sawyer-month-2025-09"
+        );
+        assert_eq!(
+            reference_for(Grain::Transaction, "6261591"),
+            "sawyer-order-6261591"
+        );
         assert_ne!(
             reference_for(Grain::Month, "2025-09"),
             reference_for(Grain::Year, "2025-09")

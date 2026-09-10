@@ -66,7 +66,13 @@ impl BusinessPickerView {
                 let cands = scan_cwd_for_dbs();
                 if cands.is_empty() {
                     let _ = registry.set_bool("first_run_scanned", true);
-                    (PickerMode::List, Vec::new(), Vec::new(), select_first(&active), ListState::default())
+                    (
+                        PickerMode::List,
+                        Vec::new(),
+                        Vec::new(),
+                        select_first(&active),
+                        ListState::default(),
+                    )
                 } else {
                     let sel = vec![true; cands.len()];
                     let mut import_st = ListState::default();
@@ -171,7 +177,9 @@ impl BusinessPickerView {
             }
             KeyCode::Char('a') => {
                 if let Some(b) = self.selected_business() {
-                    self.mode = PickerMode::ConfirmArchive { biz_id: b.id.clone() };
+                    self.mode = PickerMode::ConfirmArchive {
+                        biz_id: b.id.clone(),
+                    };
                 }
             }
             KeyCode::Char('r') => {
@@ -201,7 +209,9 @@ impl BusinessPickerView {
             }
             KeyCode::Char('R') => {
                 if let Some(b) = self.selected_archived() {
-                    self.mode = PickerMode::ConfirmRestore { biz_id: b.id.clone() };
+                    self.mode = PickerMode::ConfirmRestore {
+                        biz_id: b.id.clone(),
+                    };
                 }
             }
             _ => {}
@@ -284,7 +294,11 @@ impl BusinessPickerView {
                     _ => return,
                 };
                 let trimmed = self.input_buffer.trim();
-                let new_name: Option<&str> = if trimmed.is_empty() { None } else { Some(trimmed) };
+                let new_name: Option<&str> = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
                 match registry.rename(&biz_id, new_name) {
                     Ok(()) => {
                         self.status_message = Some(if new_name.is_some() {
@@ -313,17 +327,19 @@ impl BusinessPickerView {
             _ => return,
         };
         match key {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => match registry.archive(&biz_id) {
-                Ok(new_path) => {
-                    self.status_message = Some(format!("Archived to {}", new_path.display()));
-                    self.mode = PickerMode::List;
-                    self.refresh(registry);
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                match registry.archive(&biz_id) {
+                    Ok(new_path) => {
+                        self.status_message = Some(format!("Archived to {}", new_path.display()));
+                        self.mode = PickerMode::List;
+                        self.refresh(registry);
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Archive failed: {}", e));
+                        self.mode = PickerMode::List;
+                    }
                 }
-                Err(e) => {
-                    self.error_message = Some(format!("Archive failed: {}", e));
-                    self.mode = PickerMode::List;
-                }
-            },
+            }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.mode = PickerMode::List;
             }
@@ -337,23 +353,25 @@ impl BusinessPickerView {
             _ => return,
         };
         match key {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => match registry.restore(&biz_id) {
-                Ok(path) => {
-                    self.status_message = Some(format!("Restored to {}", path.display()));
-                    self.refresh(registry);
-                    self.mode = if self.archived.is_empty() {
-                        self.list_state = select_first(&self.active);
-                        PickerMode::List
-                    } else {
-                        self.list_state = select_first(&self.archived);
-                        PickerMode::ArchivedList
-                    };
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                match registry.restore(&biz_id) {
+                    Ok(path) => {
+                        self.status_message = Some(format!("Restored to {}", path.display()));
+                        self.refresh(registry);
+                        self.mode = if self.archived.is_empty() {
+                            self.list_state = select_first(&self.active);
+                            PickerMode::List
+                        } else {
+                            self.list_state = select_first(&self.archived);
+                            PickerMode::ArchivedList
+                        };
+                    }
+                    Err(e) => {
+                        self.error_message = Some(format!("Restore failed: {}", e));
+                        self.mode = PickerMode::ArchivedList;
+                    }
                 }
-                Err(e) => {
-                    self.error_message = Some(format!("Restore failed: {}", e));
-                    self.mode = PickerMode::ArchivedList;
-                }
-            },
+            }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.mode = PickerMode::ArchivedList;
             }
@@ -407,7 +425,9 @@ impl BusinessPickerView {
     }
 
     fn selected_archived(&self) -> Option<&Business> {
-        self.list_state.selected().and_then(|i| self.archived.get(i))
+        self.list_state
+            .selected()
+            .and_then(|i| self.archived.get(i))
     }
 
     // --- drawing ---
@@ -455,7 +475,9 @@ impl BusinessPickerView {
             Line::from(""),
             Line::from(Span::styled(
                 "  A C C O U N T I R",
-                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -467,7 +489,11 @@ impl BusinessPickerView {
     }
 
     fn draw_list(&self, frame: &mut Frame, area: Rect, theme: &Theme, archived: bool) {
-        let businesses = if archived { &self.archived } else { &self.active };
+        let businesses = if archived {
+            &self.archived
+        } else {
+            &self.active
+        };
         let title = if archived {
             " Archived "
         } else {
@@ -602,7 +628,11 @@ impl BusinessPickerView {
         biz_id: &str,
         restore: bool,
     ) {
-        let pool = if restore { &self.archived } else { &self.active };
+        let pool = if restore {
+            &self.archived
+        } else {
+            &self.active
+        };
         let biz = pool.iter().find(|b| b.id == biz_id);
         let (title, action_desc, dest_desc) = if restore {
             let dest = biz
@@ -629,7 +659,9 @@ impl BusinessPickerView {
                 Span::raw("  Are you sure you want to "),
                 Span::styled(
                     action_desc,
-                    Style::default().fg(theme.header).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.header)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" \""),
                 Span::styled(label, Style::default().fg(theme.fg)),

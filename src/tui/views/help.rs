@@ -121,7 +121,11 @@ impl HelpModal {
             Line::from(""),
             Self::key_line("  ↑/↓ or j/k", "Navigate businesses", theme),
             Self::key_line("  Enter", "Open the selected business", theme),
-            Self::key_line("  + or n", "Add a business (new file or import existing)", theme),
+            Self::key_line(
+                "  + or n",
+                "Add a business (new file or import existing)",
+                theme,
+            ),
             Self::key_line("  a", "Archive the selected business", theme),
             Self::key_line("  r", "Rename (set a custom display name)", theme),
             Self::key_line("  v", "Toggle archived list", theme),

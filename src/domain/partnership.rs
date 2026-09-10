@@ -49,7 +49,12 @@ impl PartnerType {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_lowercase().replace(['-', '_', ' '], "").as_str() {
+        match s
+            .trim()
+            .to_lowercase()
+            .replace(['-', '_', ' '], "")
+            .as_str()
+        {
             "general" | "generalpartner" | "membermanager" | "gp" => Some(PartnerType::General),
             "limited" | "limitedpartner" | "member" | "lp" => Some(PartnerType::Limited),
             _ => None,
@@ -432,7 +437,11 @@ pub fn format_ppm(ppm: i64) -> String {
     // `-0` cannot survive the trim to a bare "-", so only the empty case needs
     // guarding — "0.0000" trims to "0", not to nothing.
     let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
-    if s.is_empty() { "0".to_string() } else { s }
+    if s.is_empty() {
+        "0".to_string()
+    } else {
+        s
+    }
 }
 
 /// The partnership, as the head of Form 1065 describes it.
@@ -504,6 +513,33 @@ pub struct Partner {
     /// `None` while the partner is still in. Set on the day they leave, which is
     /// what makes their K-1 a final one.
     pub end_date: Option<NaiveDate>,
+    /// The percentages as they stand now.
+    ///
+    /// Kept alongside [`history`] rather than derived from it because almost
+    /// every reader wants today's split, and making them all walk a series to
+    /// get it would be a lot of code paying for a case most of them do not have.
+    /// When `history` is populated this is its last entry.
+    ///
+    /// [`history`]: Partner::history
+    pub shares: Shares,
+    /// What the percentages were, and from when, oldest first.
+    ///
+    /// Empty on books that have never recorded a change, where `shares` has
+    /// always been the whole truth — so this deserialises absent and every older
+    /// event still replays.
+    #[serde(default)]
+    pub history: Vec<SharePeriod>,
+}
+
+/// One dated step in a partner's percentages.
+///
+/// A start date and no end: the split in force on a day is the latest step on or
+/// before it. A from-and-until pair can be written with a gap or an overlap —
+/// two steps both claiming the 3rd of June, or neither — and nothing downstream
+/// could resolve that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharePeriod {
+    pub effective_from: NaiveDate,
     pub shares: Shares,
 }
 
@@ -524,28 +560,94 @@ impl Partner {
         self.end_date.is_some_and(|e| e <= year_end)
     }
 
-    /// The partner's shares at the start and end of a tax year.
+    /// The partner's shares for item J's beginning and ending columns.
     ///
-    /// Item J has a beginning and an ending column, and they differ precisely
-    /// when a partner joined or left mid-year: somebody who joined in March
-    /// began the year holding nothing, and somebody who left in March ends it
-    /// holding nothing. A partner present throughout shows the same figure
-    /// twice, which is what the form expects and not an omission.
+    /// # What the form asks for, which is not what this used to give
+    ///
+    /// This returned zero for a partner who joined during the year and zero for
+    /// one who left, on the reasoning that they held nothing at that end of it.
+    /// The instructions for item J say otherwise: for a partner admitted during
+    /// the year, enter the percentages **immediately after admission** in the
+    /// beginning column; for one whose interest terminated, the percentages
+    /// **immediately before termination** in the ending column.
+    ///
+    /// The old rule produced a K-1 that contradicted itself. A partner who both
+    /// joined and left inside one year got 0% in all six item-J boxes on a K-1
+    /// carrying a real allocation in Part III — a return asserting that somebody
+    /// who owned nothing all year was nonetheless allocated income. Nothing
+    /// checked item J against Part III, so it went out looking finished.
+    ///
+    /// A partner present at both ends shows the same figure twice, which is what
+    /// the form expects and not an omission — unless their percentages changed
+    /// during the year, in which case the two columns differ, which is the whole
+    /// point of the column pair.
     pub fn shares_over(&self, year_start: NaiveDate, year_end: NaiveDate) -> (Shares, Shares) {
-        let joined_midyear = self.start_date > year_start;
-        let left_by_year_end = self.end_date.is_some_and(|e| e <= year_end);
+        // Clamped into the partner's own tenure, so a joiner is asked about
+        // their first day and a leaver about their last, rather than about a
+        // date on which `shares_on` would correctly answer "nothing".
+        let beginning_on = year_start.max(self.start_date);
+        let ending_on = match self.end_date {
+            Some(e) if e < year_end => e,
+            _ => year_end,
+        };
+        (self.shares_on(beginning_on), self.shares_on(ending_on))
+    }
 
-        let beginning = if joined_midyear {
-            Shares::default()
-        } else {
-            self.shares
-        };
-        let ending = if left_by_year_end {
-            Shares::default()
-        } else {
-            self.shares
-        };
-        (beginning, ending)
+    /// The percentages in force on a given day.
+    ///
+    /// # Why this is not simply `self.shares`
+    ///
+    /// It used to be, and that is what made a prior year's Schedule K-1 show
+    /// *this* year's split in item J: a partnership that went from three equal
+    /// partners to two at 51/49 filed both years on today's figures, and the
+    /// return footed perfectly while describing a partnership that did not exist
+    /// in the year being filed.
+    ///
+    /// With no recorded history the answer is still `self.shares`, because on
+    /// books that have never recorded a change that *is* what was true
+    /// throughout. Before the first recorded step the earliest one applies: a
+    /// history that begins after the date asked about is missing its opening
+    /// entry, and the oldest split known is a better answer than today's.
+    pub fn shares_on(&self, on: NaiveDate) -> Shares {
+        if on < self.start_date || self.end_date.is_some_and(|e| on > e) {
+            return Shares::default();
+        }
+        match self
+            .history
+            .iter()
+            .filter(|p| p.effective_from <= on)
+            .max_by_key(|p| p.effective_from)
+        {
+            Some(p) => p.shares,
+            // `min_by_key`, not `first()`. The reader orders by date and the doc
+            // on `history` says oldest-first, but a struct literal in a test or a
+            // future reader that forgets to sort would make this quietly answer
+            // with whichever step happened to be written down first.
+            None => self
+                .history
+                .iter()
+                .min_by_key(|p| p.effective_from)
+                .map_or(self.shares, |p| p.shares),
+        }
+    }
+
+    /// Days inside a tax year on which this partner's percentages changed.
+    ///
+    /// The boundaries a varying-interest allocation splits the year at — see
+    /// §706(d). Joining and leaving count: a partner who arrives in March
+    /// changes the split for everybody on that day.
+    pub fn change_dates_in(&self, year_start: NaiveDate, year_end: NaiveDate) -> Vec<NaiveDate> {
+        let mut out: Vec<NaiveDate> = self
+            .history
+            .iter()
+            .map(|p| p.effective_from)
+            .chain(std::iter::once(self.start_date))
+            .chain(self.end_date.and_then(|e| e.succ_opt()))
+            .filter(|d| *d > year_start && *d <= year_end)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
@@ -589,6 +691,7 @@ mod tests {
 
     fn partner(start: NaiveDate, end: Option<NaiveDate>) -> Partner {
         Partner {
+            history: Vec::new(),
             partner_id: "p1".into(),
             name: "A Partner".into(),
             partner_type: PartnerType::General,
@@ -633,23 +736,39 @@ mod tests {
         assert!(!Shares::from_percents(50.0, 101.0, 50.0).is_in_range());
     }
 
-    /// A partner who joined mid-year began it holding nothing.
+    /// A partner admitted during the year shows what they held on arrival.
+    ///
+    /// Not zero. Item J's instruction for a partner admitted during the year is
+    /// to enter the percentages *immediately after admission* in the beginning
+    /// column, and a K-1 that says 0% while Part III allocates income to them is
+    /// a return that contradicts itself.
     #[test]
-    fn joining_midyear_shows_a_beginning_share_of_nothing() {
+    fn joining_midyear_shows_the_share_held_on_arrival() {
         let p = partner(day(2025, 3, 1), None);
         let (begin, end) = p.shares_over(day(2025, 1, 1), day(2025, 12, 31));
-        assert_eq!(begin.profit_ppm, 0, "was not a partner on 1 January");
+        assert_eq!(begin.profit_ppm, 500_000, "what they held on 1 March");
         assert_eq!(end.profit_ppm, 500_000);
     }
 
-    /// A partner who left mid-year ends it holding nothing.
+    /// A partner who left shows what they held on their last day.
     #[test]
-    fn leaving_midyear_shows_an_ending_share_of_nothing() {
+    fn leaving_midyear_shows_the_share_held_immediately_before_leaving() {
         let p = partner(day(2020, 1, 1), Some(day(2025, 6, 30)));
         let (begin, end) = p.shares_over(day(2025, 1, 1), day(2025, 12, 31));
         assert_eq!(begin.profit_ppm, 500_000);
-        assert_eq!(end.profit_ppm, 0);
+        assert_eq!(end.profit_ppm, 500_000, "what they held on 30 June");
         assert!(p.is_final_for(day(2025, 12, 31)), "their last K-1");
+    }
+
+    /// The case that made the old rule indefensible: in and out inside one year.
+    ///
+    /// All six item-J boxes read zero while Part III carried a real allocation.
+    #[test]
+    fn joining_and_leaving_in_one_year_still_states_a_real_interest() {
+        let p = partner(day(2025, 3, 1), Some(day(2025, 9, 30)));
+        let (begin, end) = p.shares_over(day(2025, 1, 1), day(2025, 12, 31));
+        assert_eq!(begin.profit_ppm, 500_000);
+        assert_eq!(end.profit_ppm, 500_000);
     }
 
     #[test]
@@ -714,7 +833,11 @@ mod tests {
     #[test]
     fn percentages_round_rather_than_truncate() {
         assert_eq!(percent_to_ppm(33.3333), 333_333);
-        assert_eq!(percent_to_ppm(0.00005), 1, "rounds up rather than to nothing");
+        assert_eq!(
+            percent_to_ppm(0.00005),
+            1,
+            "rounds up rather than to nothing"
+        );
         assert_eq!(percent_to_ppm(100.0), FULL_SHARE);
     }
 

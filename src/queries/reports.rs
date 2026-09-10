@@ -717,8 +717,22 @@ mod tests {
                 date: NaiveDate::from_ymd_opt(2024, 1, 10).unwrap(),
                 memo: "sales".to_string(),
                 lines: vec![
-                    JournalLineData { line_id: "s1a".to_string(), account_id: "cash".to_string(), amount: 1_500_000, currency: "USD".to_string(), exchange_rate: None, memo: None },
-                    JournalLineData { line_id: "s1b".to_string(), account_id: "sales".to_string(), amount: -1_500_000, currency: "USD".to_string(), exchange_rate: None, memo: None },
+                    JournalLineData {
+                        line_id: "s1a".to_string(),
+                        account_id: "cash".to_string(),
+                        amount: 1_500_000,
+                        currency: "USD".to_string(),
+                        exchange_rate: None,
+                        memo: None,
+                    },
+                    JournalLineData {
+                        line_id: "s1b".to_string(),
+                        account_id: "sales".to_string(),
+                        amount: -1_500_000,
+                        currency: "USD".to_string(),
+                        exchange_rate: None,
+                        memo: None,
+                    },
                 ],
                 reference: None,
                 source: None,
@@ -734,8 +748,22 @@ mod tests {
                 date: NaiveDate::from_ymd_opt(2024, 1, 20).unwrap(),
                 memo: "refund".to_string(),
                 lines: vec![
-                    JournalLineData { line_id: "r1a".to_string(), account_id: "refunds".to_string(), amount: 400_000, currency: "USD".to_string(), exchange_rate: None, memo: None },
-                    JournalLineData { line_id: "r1b".to_string(), account_id: "cash".to_string(), amount: -400_000, currency: "USD".to_string(), exchange_rate: None, memo: None },
+                    JournalLineData {
+                        line_id: "r1a".to_string(),
+                        account_id: "refunds".to_string(),
+                        amount: 400_000,
+                        currency: "USD".to_string(),
+                        exchange_rate: None,
+                        memo: None,
+                    },
+                    JournalLineData {
+                        line_id: "r1b".to_string(),
+                        account_id: "cash".to_string(),
+                        amount: -400_000,
+                        currency: "USD".to_string(),
+                        exchange_rate: None,
+                        memo: None,
+                    },
                 ],
                 reference: None,
                 source: None,
@@ -755,7 +783,12 @@ mod tests {
         assert_eq!(pl.revenue.total, 1_100_000);
         assert_eq!(pl.net_income, 1_100_000);
         // The refunds line itself reads negative (contra-revenue).
-        let refunds = pl.revenue.lines.iter().find(|l| l.account_id == "refunds").unwrap();
+        let refunds = pl
+            .revenue
+            .lines
+            .iter()
+            .find(|l| l.account_id == "refunds")
+            .unwrap();
         assert_eq!(refunds.balance, -400_000);
     }
 

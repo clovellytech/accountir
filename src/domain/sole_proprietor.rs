@@ -44,7 +44,9 @@
 use serde::{Deserialize, Serialize};
 
 /// Which return these books file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum BusinessType {
     /// Form 1065, with a Schedule K-1 for each partner.
@@ -97,7 +99,9 @@ impl std::fmt::Display for BusinessType {
 }
 
 /// Schedule C line F — the method the books are kept on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AccountingMethod {
     #[default]

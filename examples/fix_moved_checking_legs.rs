@@ -74,7 +74,9 @@ fn original_checking_line(store: &EventStore, entry_id: &str) -> Option<String> 
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let db_path = args.get(1).expect("usage: fix_moved_checking_legs <db_path> [--apply]");
+    let db_path = args
+        .get(1)
+        .expect("usage: fix_moved_checking_legs <db_path> [--apply]");
     let apply = args.iter().any(|a| a == "--apply");
 
     let mut store = EventStore::open(db_path)?;
@@ -82,7 +84,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("DB: {}", db_path);
     println!("affected entries: {}", entries.len());
-    println!("checking balance before: {:.2}", checking_balance(&store) as f64 / 100.0);
+    println!(
+        "checking balance before: {:.2}",
+        checking_balance(&store) as f64 / 100.0
+    );
     println!("mode: {}\n", if apply { "APPLY" } else { "DRY RUN" });
 
     let (mut fixed, mut skipped) = (0usize, 0usize);
@@ -98,7 +103,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .connection()
                 .prepare("SELECT id, account_id FROM journal_lines WHERE entry_id=?1")?;
             let v = stmt
-                .query_map([entry_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .query_map([entry_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
                 .filter_map(|r| r.ok())
                 .collect::<Vec<_>>();
             v
@@ -109,14 +116,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         // The category account is where the original checking line now sits.
-        let category = lines.iter().find(|(id, _)| id == &chk_line).map(|(_, a)| a.clone());
+        let category = lines
+            .iter()
+            .find(|(id, _)| id == &chk_line)
+            .map(|(_, a)| a.clone());
         let other = lines.iter().find(|(id, _)| id != &chk_line).cloned();
         let (Some(category), Some((other_line, other_acct))) = (category, other) else {
             println!("  SKIP {entry_id}: could not resolve legs");
             skipped += 1;
             continue;
         };
-        println!("  {entry_id}: chk_line→Checking, counterpart→{}", &category[..8]);
+        println!(
+            "  {entry_id}: chk_line→Checking, counterpart→{}",
+            &category[..8]
+        );
         if apply {
             let mut cmds = EntryCommands::new(&mut store, "correction".to_string());
             if category != CHECKING {
@@ -137,7 +150,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fixed += 1;
     }
 
-    println!("\n{}: {} fixed, {} skipped", if apply { "applied" } else { "would fix" }, fixed, skipped);
-    println!("checking balance after:  {:.2}", checking_balance(&store) as f64 / 100.0);
+    println!(
+        "\n{}: {} fixed, {} skipped",
+        if apply { "applied" } else { "would fix" },
+        fixed,
+        skipped
+    );
+    println!(
+        "checking balance after:  {:.2}",
+        checking_balance(&store) as f64 / 100.0
+    );
     Ok(())
 }

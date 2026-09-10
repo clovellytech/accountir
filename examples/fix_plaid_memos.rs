@@ -19,7 +19,9 @@ use accountir::store::event_store::EventStore;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    let db_path = args.get(1).expect("usage: fix_plaid_memos <db_path> [--apply]");
+    let db_path = args
+        .get(1)
+        .expect("usage: fix_plaid_memos <db_path> [--apply]");
     let apply = args.iter().any(|a| a == "--apply");
 
     let store = EventStore::open(db_path)?;
@@ -36,14 +38,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let out = stmt
             .query_map([], |r| {
-                Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get(2)?, r.get(3)?))
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get(2)?,
+                    r.get(3)?,
+                ))
             })?
             .filter_map(|r| r.ok())
             .collect::<Vec<_>>();
         out
     };
 
-    println!("DB: {}\nimported entries: {}\nmode: {}\n", db_path, rows.len(), if apply { "APPLY" } else { "DRY RUN" });
+    println!(
+        "DB: {}\nimported entries: {}\nmode: {}\n",
+        db_path,
+        rows.len(),
+        if apply { "APPLY" } else { "DRY RUN" }
+    );
 
     let mut changed = 0usize;
     for (entry_id, memo, name, merchant) in &rows {
@@ -60,17 +72,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  \"{}\"  →  \"{}\"", memo, truncate(&correct, 60));
             }
             if apply {
-                conn.execute("UPDATE journal_entries SET memo=?1 WHERE id=?2", rusqlite::params![correct, entry_id])?;
+                conn.execute(
+                    "UPDATE journal_entries SET memo=?1 WHERE id=?2",
+                    rusqlite::params![correct, entry_id],
+                )?;
             }
         }
     }
     if changed > 12 {
         println!("  … and {} more", changed - 12);
     }
-    println!("\n{}: {} memos", if apply { "updated" } else { "would update" }, changed);
+    println!(
+        "\n{}: {} memos",
+        if apply { "updated" } else { "would update" },
+        changed
+    );
     Ok(())
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() } else { format!("{}…", s.chars().take(n).collect::<String>()) }
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
 }

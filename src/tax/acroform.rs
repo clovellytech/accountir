@@ -49,6 +49,30 @@ pub enum FormError {
     },
     #[error("{0}")]
     Malformed(String),
+    #[error(
+        "The {0} Form 1065 re-paginates the form — a new Schedule A takes page 1, so the income \
+         page becomes page 2 and Schedule K page 6 — and its boxes have not been matched to this \
+         program's field names yet. Every name this program uses still resolves in that file, \
+         which is exactly why nothing may be written to it: the figures would land in real boxes \
+         on the wrong schedule, and the result would foot correctly while being wrong. The \
+         year's figures are on the Form 1065 page's preview, which needs no blank form."
+    )]
+    UnmappedRevision(i32),
+    #[error(
+        "No {form} is carried for {year}. The years available are {available}. A {year} return \
+         cannot be produced from another year's blank: the boxes move between revisions, so the \
+         figures would land in the wrong ones, and the form would carry another year in \
+         pre-printed type — a {year} return that says it is a different year. Vendor that year's \
+         blank and add it to the form's year table."
+    )]
+    NoFormForYear {
+        /// Which form is missing, named as a filer would name it — "Form 1065",
+        /// "Schedule C", "Form IL-1065". Without it the message told an Illinois
+        /// filer to go and find an IRS file.
+        form: &'static str,
+        year: i32,
+        available: String,
+    },
 }
 
 /// A PDF text string: either PDFDocEncoded bytes or UTF-16BE behind a byte-order
@@ -84,7 +108,12 @@ fn encode_pdf_string(s: &str) -> Object {
 }
 
 fn acroform_ref(doc: &Document) -> Option<ObjectId> {
-    doc.catalog().ok()?.get(b"AcroForm").ok()?.as_reference().ok()
+    doc.catalog()
+        .ok()?
+        .get(b"AcroForm")
+        .ok()?
+        .as_reference()
+        .ok()
 }
 
 fn acroform_dict(doc: &Document) -> Option<Dictionary> {
@@ -146,9 +175,9 @@ fn walk_field(doc: &Document, obj: &Object, prefix: &str, out: &mut BTreeMap<Str
         .and_then(|k| doc.dereference(k).ok())
         .and_then(|(_, o)| o.as_array().ok().cloned());
     if let Some(kids) = kids {
-        let has_named = kids.iter().any(|k| {
-            matches!(doc.dereference(k), Ok((_, Object::Dictionary(d))) if d.has(b"T"))
-        });
+        let has_named = kids
+            .iter()
+            .any(|k| matches!(doc.dereference(k), Ok((_, Object::Dictionary(d))) if d.has(b"T")));
         if has_named {
             for k in &kids {
                 walk_field(doc, k, &name, out);
@@ -214,7 +243,25 @@ impl FieldMap {
     /// "No field named `f1_9[0]`" is actively misleading when the truth is that
     /// a bundle has three of them, one per Schedule K-1 — it sends a reader
     /// looking for a renamed box instead of reaching for a namespace.
+    ///
+    /// A name that matches nothing is tried once more under the other
+    /// zero-padding convention — see [`padding_variant`].
     pub fn resolve(&self, name: &str) -> Result<ObjectId, FormError> {
+        match self.resolve_exact(name) {
+            Err(FormError::NoSuchField(_)) => match padding_variant(name) {
+                // Reported under the name the *caller* asked for: the variant is
+                // an implementation detail of the IRS's file, and naming it in
+                // the error would send a reader looking for the wrong box.
+                Some(other) => self
+                    .resolve_exact(&other)
+                    .map_err(|_| FormError::NoSuchField(name.to_string())),
+                None => Err(FormError::NoSuchField(name.to_string())),
+            },
+            other => other,
+        }
+    }
+
+    fn resolve_exact(&self, name: &str) -> Result<ObjectId, FormError> {
         if let Some(id) = self.0.get(name) {
             return Ok(*id);
         }
@@ -227,6 +274,48 @@ impl FieldMap {
             (None, _) => Err(FormError::NoSuchField(name.to_string())),
         }
     }
+}
+
+/// The same box written under the other zero-padding convention, for a name of
+/// the IRS's `f<page>_<number>[<index>]` shape.
+///
+/// A *spelling* normaliser within one document, not a bridge between revisions:
+/// it never points a name at a different box, only at the same box written the
+/// other way. Page one and Schedule B no longer need it — each revision's table
+/// names its own PDF's spelling — but Schedule K, Schedule L and Schedule M
+/// still share one set of constants, because their boxes are in the same place
+/// on every revision carried and only the padding differs.
+///
+/// # Why this is needed at all
+///
+/// The revisions disagree with themselves about padding. The 2023 and 2025 Form
+/// 1065 write `f1_04[0]`, `f5_01[0]`, `f6_01[0]`; the 2024 and 2026-draft
+/// revisions write `f1_4[0]`, `f5_1[0]`, `f6_1[0]`. It alternates, so it cannot
+/// be derived from the year — and it is the *same box*, not a renumbering.
+///
+/// Only the single-digit numbers can differ, and only by one leading zero, so
+/// this is a narrow rewrite rather than a fuzzy match: a name that already means
+/// something else in the file will not be reached by it, because `f1_14[0]` and
+/// `f1_4[0]` are not padding variants of each other.
+pub fn padding_variant(name: &str) -> Option<String> {
+    let (head, rest) = name.split_once('_')?;
+    if !head.starts_with('f') || !head[1..].chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let (number, index) = rest.split_once('[')?;
+    let variant = match number.strip_prefix('0') {
+        // `f1_04[0]` → `f1_4[0]`, but never `f1_00[0]` → `f1_[0]`.
+        Some(bare) if bare.len() == 1 && bare.chars().all(|c| c.is_ascii_digit()) => {
+            bare.to_string()
+        }
+        Some(_) => return None,
+        // `f1_4[0]` → `f1_04[0]`, single digits only: `f1_14[0]` is a different box.
+        None if number.len() == 1 && number.chars().all(|c| c.is_ascii_digit()) => {
+            format!("0{number}")
+        }
+        None => return None,
+    };
+    Some(format!("{head}_{variant}[{index}"))
 }
 
 /// The character limit a field declares, if it declares one.
@@ -256,8 +345,15 @@ pub fn max_len(doc: &Document, map: &FieldMap, name: &str) -> Option<usize> {
 /// truncate it on load and others hold it but will not display it, so a figure
 /// can disappear from a printed return with nothing reporting an error
 /// anywhere. Refusing here turns that into something a caller can act on.
-pub fn set_text(doc: &mut Document, map: &FieldMap, name: &str, value: &str) -> Result<(), FormError> {
-    let id = map.find(name).ok_or_else(|| FormError::NoSuchField(name.into()))?;
+pub fn set_text(
+    doc: &mut Document,
+    map: &FieldMap,
+    name: &str,
+    value: &str,
+) -> Result<(), FormError> {
+    let id = map
+        .find(name)
+        .ok_or_else(|| FormError::NoSuchField(name.into()))?;
     // Counted in UTF-16 code units, which is what /MaxLen bounds — a name with
     // an accent in it costs the same as its ASCII neighbour, but an emoji does
     // not, and the field is the one that decides.
@@ -286,7 +382,12 @@ pub fn set_text(doc: &mut Document, map: &FieldMap, name: &str, value: &str) -> 
 /// `on_state` is the appearance state the widget was built with — `1` and `2` on
 /// these forms, not the `Yes` that most PDFs use. [`on_states`] reads them out
 /// of a document rather than guessing.
-pub fn set_check(doc: &mut Document, map: &FieldMap, name: &str, on_state: &str) -> Result<(), FormError> {
+pub fn set_check(
+    doc: &mut Document,
+    map: &FieldMap,
+    name: &str,
+    on_state: &str,
+) -> Result<(), FormError> {
     let id = map.resolve(name)?;
     let state = Object::Name(on_state.trim_start_matches('/').as_bytes().to_vec());
     let dict = doc.get_object_mut(id)?.as_dict_mut()?;
@@ -438,7 +539,11 @@ pub fn append_document(base: &mut Document, mut other: Document) -> Result<(), F
     // Re-parent the incoming pages onto this document's page tree; a page whose
     // /Parent still points into the old tree is one viewers refuse to render.
     let pages_root = base.catalog()?.get(b"Pages")?.as_reference()?;
-    let mut kids = base.get_dictionary(pages_root)?.get(b"Kids")?.as_array()?.clone();
+    let mut kids = base
+        .get_dictionary(pages_root)?
+        .get(b"Kids")?
+        .as_array()?
+        .clone();
     for p in &pages {
         kids.push(Object::Reference(*p));
         if let Ok(d) = base.get_object_mut(*p).and_then(|o| o.as_dict_mut()) {
@@ -489,7 +594,11 @@ fn read_value(doc: &Document, id: ObjectId) -> Option<String> {
 /// Existing entries win: where both forms define `/Helv` they mean the same
 /// font, and replacing the base's would repoint every field already using it at
 /// an object from another document for no gain.
-fn merge_dr_fonts(base: &mut Document, af: ObjectId, incoming: Dictionary) -> Result<(), FormError> {
+fn merge_dr_fonts(
+    base: &mut Document,
+    af: ObjectId,
+    incoming: Dictionary,
+) -> Result<(), FormError> {
     let dr_ref = base.get_dictionary(af)?.get(b"DR").ok().cloned();
     let dr = match dr_ref.as_ref().map(|dr| base.dereference(dr)) {
         Some(Ok((id, Object::Dictionary(d)))) => Some((id, d.clone())),

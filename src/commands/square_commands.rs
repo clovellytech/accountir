@@ -171,7 +171,11 @@ impl SalesSummary {
     /// off. Anything left out here shows up as a reconciliation warning rather
     /// than as a quietly wrong deposit.
     fn net_to_balance(&self) -> i64 {
-        self.revenue + self.tax + self.tips + self.deposits + self.gift_cards
+        self.revenue
+            + self.tax
+            + self.tips
+            + self.deposits
+            + self.gift_cards
             + self.refunds_by_amount
             + self.deposit_timing
             - self.fees
@@ -825,7 +829,12 @@ Net total,\"$12,833.39\"\n";
         );
 
         // And on the right side, which balancing alone does not prove.
-        let of = |a: &str| cmd.lines.iter().find(|l| l.account_id == a).map(|l| l.amount);
+        let of = |a: &str| {
+            cmd.lines
+                .iter()
+                .find(|l| l.account_id == a)
+                .map(|l| l.amount)
+        };
         assert_eq!(of("tips"), Some(10000), "a refunded tip is a debit");
         assert_eq!(of("deposits"), Some(60000), "releasing deposits is a debit");
         assert_eq!(of("refunds"), Some(4500), "a refund debits contra-revenue");
@@ -858,9 +867,16 @@ Total payments collected,\"$6,310.00\"\n\
 Fees,($216.59)\n\
 Net total,\"$6,093.41\"\n";
         let s = parse_sales_summary(csv);
-        assert_eq!(s.deposit_timing, -7500, "collected less than it sold, by $75.00");
+        assert_eq!(
+            s.deposit_timing, -7500,
+            "collected less than it sold, by $75.00"
+        );
         assert_eq!(s.deposits, 10000 - 20000, "the named columns, unchanged");
-        assert_eq!(s.deposits_total(), -17500, "both belong on customer deposits");
+        assert_eq!(
+            s.deposits_total(),
+            -17500,
+            "both belong on customer deposits"
+        );
 
         // The whole point: it reconciles to the report's own figure now.
         assert_eq!(s.net_to_balance(), 609341);
@@ -935,7 +951,10 @@ Fees,$0.00\n\
 Net total,\"$1,234.00\"\n";
         let s = parse_sales_summary(csv);
         let problem = s.reconciliation.expect("should not reconcile");
-        assert!(problem.contains("$1,234.00") || problem.contains("$1234.00"), "{problem}");
+        assert!(
+            problem.contains("$1,234.00") || problem.contains("$1234.00"),
+            "{problem}"
+        );
 
         // And the planner refuses it rather than posting.
         let store = crate::store::event_store::EventStore::in_memory().unwrap();
@@ -946,7 +965,10 @@ Net total,\"$1,234.00\"\n";
             "sales-summary-2025-01-01-2025-01-31.csv",
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("not being accounted for"), "{err}");
+        assert!(
+            format!("{err}").contains("not being accounted for"),
+            "{err}"
+        );
     }
 
     #[test]

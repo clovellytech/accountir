@@ -3,7 +3,9 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    },
     Frame,
 };
 use std::collections::HashMap;
@@ -65,7 +67,9 @@ impl MappingEditorState {
     }
 
     pub fn current_key(&self) -> Option<&str> {
-        self.missing_keys.get(self.current_key_index).map(|s| s.as_str())
+        self.missing_keys
+            .get(self.current_key_index)
+            .map(|s| s.as_str())
     }
 
     pub fn advance_or_close(&mut self) {
@@ -113,9 +117,10 @@ impl MappingEditorState {
                 ServiceStagedAction::None
             }
             KeyCode::Enter => {
-                if let (Some(key_name), Some(account)) =
-                    (self.current_key().map(|s| s.to_string()), self.selected_account())
-                {
+                if let (Some(key_name), Some(account)) = (
+                    self.current_key().map(|s| s.to_string()),
+                    self.selected_account(),
+                ) {
                     let account_id = account.id.clone();
                     ServiceStagedAction::SaveMapping {
                         key: key_name,
@@ -200,7 +205,7 @@ impl MappingEditorState {
 
         let chunks = Layout::vertical([
             Constraint::Length(1), // Filter input
-            Constraint::Min(3),   // Account list
+            Constraint::Min(3),    // Account list
             Constraint::Length(1), // Help
         ])
         .split(inner);
@@ -359,7 +364,7 @@ impl StagedEventsView {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let chunks = Layout::vertical([
             Constraint::Length(3), // Summary
-            Constraint::Min(5),   // Event table
+            Constraint::Min(5),    // Event table
             Constraint::Length(1), // Help / status
         ])
         .split(area);
@@ -387,10 +392,7 @@ impl StagedEventsView {
             .title_style(Style::default().fg(theme.accent));
 
         let line = Line::from(vec![
-            Span::styled(
-                format!("{} staged", total),
-                Style::default().fg(theme.fg),
-            ),
+            Span::styled(format!("{} staged", total), Style::default().fg(theme.fg)),
             Span::raw("  |  "),
             Span::styled(
                 format!("{} ready", ready),

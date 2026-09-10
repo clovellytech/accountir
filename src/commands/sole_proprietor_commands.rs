@@ -20,10 +20,10 @@
 //! a number that reached them by a route nobody intended.
 
 use chrono::Datelike;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
-use crate::domain::{AccountingMethod, BusinessType, SoleProprietor, is_valid_tin};
+use crate::domain::{is_valid_tin, AccountingMethod, BusinessType, SoleProprietor};
 use crate::events::types::{Event, SoleProprietorData, StoredEvent};
 use crate::store::event_store::EventStore;
 
@@ -290,14 +290,15 @@ pub fn build_from_ledger(
     // and they are edited in one place; a person filling in a Schedule C has no
     // reason to guess that place is Settings, still less that a panel headed
     // "partnership details" was the one they wanted.
-    let profile = crate::commands::partnership_commands::get_profile(conn)
-        .ok_or_else(|| SoleProprietorError::Invalid(
+    let profile = crate::commands::partnership_commands::get_profile(conn).ok_or_else(|| {
+        SoleProprietorError::Invalid(
             "the business details have not been set. Schedule C takes its header from them — \
              the business name (line C), the address (line E), the business code (line B), the \
              EIN (line D) and the principal business (line A). They are on the Settings page, \
              under Business details, and are the same details Form 1065 uses."
                 .to_string(),
-        ))?;
+        )
+    })?;
 
     let (start, end) = (
         chrono::NaiveDate::from_ymd_opt(year, 1, 1).expect("January 1 exists in every year"),
@@ -307,8 +308,9 @@ pub fn build_from_ledger(
         .income_statement(start, end)
         .map_err(|e| SoleProprietorError::Store(format!("income statement: {e}")))?;
 
-    let mapping = crate::tax::lines::load_mapping(conn);
-    let computed = crate::tax::schedule_c::compute(&statement, &mapping);
+    let mapping = crate::tax::lines::load_effective_mapping(conn, year);
+    let limits = crate::tax::lines::load_effective_limits(conn, year);
+    let computed = crate::tax::schedule_c::compute(&statement, &mapping, &limits);
     let proprietor = get_proprietor(conn);
     let ssn = get_ssn(conn);
     let answers = crate::tax::schedule_c::load(conn, year);
@@ -329,7 +331,10 @@ pub fn build_from_ledger(
     // which is the part that tells somebody what to do about it.
     let stale = stale_mappings(conn);
     if !stale.is_empty() {
-        let named: Vec<String> = stale.iter().map(|(_, name, form)| format!("{name} ({form})")).collect();
+        let named: Vec<String> = stale
+            .iter()
+            .map(|(_, name, form)| format!("{name} ({form})"))
+            .collect();
         bundle.warnings.push(format!(
             "{} account(s) are still mapped to lines of a form these books no longer file, so \
              none of their balances reach this return: {}. Remap them to Schedule C lines.",
@@ -435,7 +440,10 @@ mod tests {
     fn the_type_can_be_set_before_the_business_details_are() {
         let mut s = store();
         set_business_type(&mut s, "u", BusinessType::SoleProprietorship).unwrap();
-        assert_eq!(business_type(s.connection()), BusinessType::SoleProprietorship);
+        assert_eq!(
+            business_type(s.connection()),
+            BusinessType::SoleProprietorship
+        );
 
         // And filling the header afterwards must not quietly undo it.
         let mut s2 = with_profile();
@@ -550,7 +558,10 @@ mod tests {
         assert!(bundle.pdf.len() > 1000);
         // No answers given, so the form says so rather than looking answered.
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("blank answer is not a No")),
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("blank answer is not a No")),
             "{:?}",
             bundle.warnings
         );
@@ -572,7 +583,10 @@ mod tests {
         let mut s = store();
 
         set_business_type(&mut s, "u", BusinessType::SoleProprietorship).unwrap();
-        assert_eq!(business_type(s.connection()), BusinessType::SoleProprietorship);
+        assert_eq!(
+            business_type(s.connection()),
+            BusinessType::SoleProprietorship
+        );
         assert!(
             crate::commands::partnership_commands::get_profile(s.connection()).is_none(),
             "a stub row must not read as a filled-in header"
@@ -687,10 +701,19 @@ mod tests {
             principal_product: None,
         };
 
-        assert!(check_set_profile_pure(&profile("")).is_ok(), "absent is allowed");
+        assert!(
+            check_set_profile_pure(&profile("")).is_ok(),
+            "absent is allowed"
+        );
         assert!(check_set_profile_pure(&profile("12-3456789")).is_ok());
-        assert!(check_set_profile_pure(&profile("123456789")).is_err(), "no hyphen");
-        assert!(check_set_profile_pure(&profile("12-345678")).is_err(), "too short");
+        assert!(
+            check_set_profile_pure(&profile("123456789")).is_err(),
+            "no hyphen"
+        );
+        assert!(
+            check_set_profile_pure(&profile("12-345678")).is_err(),
+            "too short"
+        );
     }
 
     #[test]
@@ -711,6 +734,9 @@ mod tests {
             Some("yes")
         );
         set_answer(&mut s, "u", 2025, "g", "").unwrap();
-        assert_eq!(crate::tax::schedule_c::load(s.connection(), 2025).get("g"), None);
+        assert_eq!(
+            crate::tax::schedule_c::load(s.connection(), 2025).get("g"),
+            None
+        );
     }
 }

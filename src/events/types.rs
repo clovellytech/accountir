@@ -251,6 +251,19 @@ impl From<EventAccountType> for crate::domain::AccountType {
     }
 }
 
+/// An assignment that predates dated assignments: it applies to every year
+/// until a later one supersedes it.
+///
+/// Zero rather than a real year because it is not one — it means "as far back as
+/// these books go". Rows carrying it are the ones written before assignments
+/// were dated, and the desktop says so rather than printing "from year 0".
+pub const ANY_YEAR: i32 = 0;
+
+/// Whether a year is the undated sentinel, for `skip_serializing_if`.
+fn is_any_year(year: &i32) -> bool {
+    *year == ANY_YEAR
+}
+
 /// All event types in the accounting system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -304,10 +317,94 @@ pub enum Event {
     TaxLineMappingSet {
         account_id: String,
         line_key: String,
+        /// The first tax year this assignment applies to.
+        ///
+        /// Resolution is "the greatest `effective_from` at or before the year
+        /// being filed", so an assignment made in 2026 does not reach back into
+        /// a 2023 return that was filed on the old one, and a year with no
+        /// assignment of its own inherits the most recent earlier one rather
+        /// than starting blank.
+        ///
+        /// # Why this is skipped when it is [`ANY_YEAR`]
+        ///
+        /// Events written before assignments were dated carry no such field.
+        /// Replication re-serialises an event to re-derive its hash, so a field
+        /// that appeared on the way back out would change the JSON and every
+        /// historical mapping event would fail verification. Defaulting to
+        /// `ANY_YEAR` and omitting it again reproduces the original bytes
+        /// exactly — pinned by
+        /// `a_mapping_event_written_before_years_existed_reserialises_byte_for_byte`.
+        #[serde(default, skip_serializing_if = "is_any_year")]
+        effective_from: i32,
+    },
+    /// What a partner's percentages became, and from when.
+    ///
+    /// Percentages change — a partner leaves, another is admitted, the agreement
+    /// is renegotiated — and a return for a past year has to show what was true
+    /// *then*. Recorded as a dated change rather than an edit for the same
+    /// reason the ledger records entries rather than balances.
+    PartnerSharesChanged {
+        partner_id: String,
+        effective_from: chrono::NaiveDate,
+        profit_ppm: i64,
+        loss_ppm: i64,
+        capital_ppm: i64,
+    },
+    /// A ledger account holds this partner's capital, in the named role.
+    ///
+    /// `role` is "contribution" or "draw". A partner may own several accounts:
+    /// keeping what was put in apart from what was taken out is ordinary
+    /// bookkeeping, and Schedule K-1 item L wants both.
+    PartnerEquityAccountLinked {
+        partner_id: String,
+        account_id: String,
+        role: String,
+    },
+    /// An account is no longer a partner's capital.
+    PartnerEquityAccountUnlinked {
+        partner_id: String,
+        account_id: String,
+    },
+    /// An account created in error is removed from the chart entirely.
+    ///
+    /// Distinct from deactivating. A deactivated account is one that *was* used
+    /// and no longer is — its history still has to be readable, so the row
+    /// stays. This is for the account that was never used at all: a typo, a
+    /// duplicate, a category somebody thought they needed. Refused unless
+    /// nothing whatsoever points at it, so it can never orphan anything.
+    AccountDeleted {
+        account_id: String,
+    },
+    /// How much of an account's balance the law lets you deduct, as a
+    /// percentage. Absent means all of it.
+    ///
+    /// Its own event rather than a field on `TaxLineMappingSet` because it is a
+    /// separate fact with a separate life: which line an expense reports on is
+    /// a property of the form, how much of it is deductible is a property of
+    /// §274 and changes without the line changing.
+    TaxDeductionLimitSet {
+        account_id: String,
+        deductible_pct: u8,
+        /// The first tax year this limit applies to. See
+        /// [`Event::TaxLineMappingSet`] for why it is skipped at [`ANY_YEAR`].
+        #[serde(default, skip_serializing_if = "is_any_year")]
+        effective_from: i32,
+    },
+    /// An account goes back to being fully deductible.
+    TaxDeductionLimitCleared {
+        account_id: String,
+        /// The first tax year the account is fully deductible again. See
+        /// [`Event::TaxLineMappingSet`].
+        #[serde(default, skip_serializing_if = "is_any_year")]
+        effective_from: i32,
     },
     /// An account is taken off the return.
     TaxLineMappingCleared {
         account_id: String,
+        /// The first tax year the account is off the return. See
+        /// [`Event::TaxLineMappingSet`].
+        #[serde(default, skip_serializing_if = "is_any_year")]
+        effective_from: i32,
     },
     /// One Schedule B answer is given, for one tax year.
     ///
@@ -720,6 +817,12 @@ impl Event {
             Event::PartnerDetailsUpdated(_) => "partner_details_updated",
             Event::TaxLineMappingSet { .. } => "tax_line_mapping_set",
             Event::TaxLineMappingCleared { .. } => "tax_line_mapping_cleared",
+            Event::PartnerSharesChanged { .. } => "partner_shares_changed",
+            Event::PartnerEquityAccountLinked { .. } => "partner_equity_account_linked",
+            Event::PartnerEquityAccountUnlinked { .. } => "partner_equity_account_unlinked",
+            Event::AccountDeleted { .. } => "account_deleted",
+            Event::TaxDeductionLimitSet { .. } => "tax_deduction_limit_set",
+            Event::TaxDeductionLimitCleared { .. } => "tax_deduction_limit_cleared",
             Event::ScheduleBAnswerSet { .. } => "schedule_b_answer_set",
             Event::ScheduleBAnswerCleared { .. } => "schedule_b_answer_cleared",
             Event::PartnerWithdrawn { .. } => "partner_withdrawn",
@@ -785,7 +888,13 @@ impl Event {
             Event::PartnerAdmitted(d) => Some(&d.partner_id),
             Event::PartnerDetailsUpdated(d) => Some(&d.partner_id),
             Event::TaxLineMappingSet { account_id, .. } => Some(account_id),
-            Event::TaxLineMappingCleared { account_id } => Some(account_id),
+            Event::TaxLineMappingCleared { account_id, .. } => Some(account_id),
+            Event::PartnerSharesChanged { partner_id, .. } => Some(partner_id),
+            Event::PartnerEquityAccountLinked { partner_id, .. } => Some(partner_id),
+            Event::PartnerEquityAccountUnlinked { partner_id, .. } => Some(partner_id),
+            Event::AccountDeleted { account_id } => Some(account_id),
+            Event::TaxDeductionLimitSet { account_id, .. } => Some(account_id),
+            Event::TaxDeductionLimitCleared { account_id, .. } => Some(account_id),
             // Keyed by (year, question), so no single id names the thing changed.
             Event::ScheduleBAnswerSet { .. } => None,
             Event::ScheduleBAnswerCleared { .. } => None,
@@ -1249,7 +1358,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod partnership_event_shape {
     use super::*;
@@ -1320,5 +1428,53 @@ mod partnership_event_shape {
             Event::BusinessProfileSet(d) => assert_eq!(d.ein, "12-3456789"),
             other => panic!("round-tripped into {other:?}"),
         }
+    }
+
+    /// An event written before assignments were dated re-serialises byte for byte.
+    ///
+    /// # Why this is load-bearing rather than tidy
+    ///
+    /// Replication does not trust the hash it is sent: it deserialises the
+    /// event, re-serialises it, re-derives the hash and compares. So a field
+    /// that appeared on the way back out — even one defaulted on the way in —
+    /// would change the JSON of every mapping event ever written, and every one
+    /// of them would fail verification on a replica.
+    ///
+    /// `skip_serializing_if` is what stops that, and it only holds while the new
+    /// field is last in declaration order and the default is the value being
+    /// skipped. Both are easy to break without noticing, which is what this
+    /// pins.
+    #[test]
+    fn a_mapping_event_written_before_years_existed_reserialises_byte_for_byte() {
+        for legacy in [
+            r#"{"type":"tax_line_mapping_set","account_id":"6100","line_key":"l21"}"#,
+            r#"{"type":"tax_line_mapping_cleared","account_id":"6100"}"#,
+            r#"{"type":"tax_deduction_limit_set","account_id":"3055","deductible_pct":50}"#,
+            r#"{"type":"tax_deduction_limit_cleared","account_id":"3055"}"#,
+        ] {
+            let event: Event = serde_json::from_str(legacy).expect("an old event still reads");
+            let again = serde_json::to_string(&event).expect("and writes");
+            assert_eq!(
+                again, legacy,
+                "re-serialising changed the bytes, so every historical event of this \
+                 type would fail hash verification on a replica"
+            );
+        }
+    }
+
+    /// A dated event carries its year, so the two are told apart on the wire.
+    #[test]
+    fn a_dated_mapping_event_carries_its_year() {
+        let event = Event::TaxLineMappingSet {
+            account_id: "6100".into(),
+            line_key: "l21".into(),
+            effective_from: 2026,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""effective_from":2026"#), "{json}");
+
+        // And it survives the round trip the replica makes.
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 }

@@ -7,8 +7,9 @@
 //! their answers, and the IRS links a preparer needs while answering them.
 
 pub mod acroform;
-pub mod attachments;
 pub mod allocate;
+pub mod attachments;
+pub mod capital;
 pub mod constructive;
 pub mod depreciation;
 pub mod form1065;
@@ -22,15 +23,16 @@ pub mod schedule_c;
 pub mod schedule_l;
 pub mod schedule_m;
 pub mod statement;
+pub mod varying;
 
+pub use attachments::{Attachment, Provenance};
 pub use form1065::{
-    Bundle, PartnerFiling, ReturnOptions, ReturnRequest, build_return, build_return_from_ledger,
+    build_return, build_return_from_ledger, Bundle, PartnerFiling, ReturnOptions, ReturnRequest,
 };
-pub use lines::{Form1065Lines, MAPPABLE_LINES, TaxLineDef};
+pub use lines::{Form1065Lines, TaxLineDef, MAPPABLE_LINES};
 pub use schedule_b::{ScheduleB, PARTNERSHIP_REP, QUESTIONS as SCHEDULE_B_QUESTIONS};
 pub use schedule_l::ScheduleL;
 pub use schedule_m::ScheduleM;
-pub use attachments::{Attachment, Provenance};
 
 /// The definition of a line key on **either** return.
 ///
@@ -103,7 +105,9 @@ pub(crate) mod warning_shape {
     /// source and not from the author.
     pub fn problem(warning: &str) -> Option<String> {
         if warning.contains('\n') {
-            return Some("contains a line break — the string literal is missing a trailing `\\`".into());
+            return Some(
+                "contains a line break — the string literal is missing a trailing `\\`".into(),
+            );
         }
         if warning.contains('\t') {
             return Some("contains a tab".into());
@@ -139,7 +143,10 @@ pub(crate) mod warning_shape {
                 panic!("a warning {problem}:\n  {w:?}");
             }
         }
-        assert!(checked > 0, "no warnings were checked — the scenario produced none");
+        assert!(
+            checked > 0,
+            "no warnings were checked — the scenario produced none"
+        );
     }
 
     #[cfg(test)]

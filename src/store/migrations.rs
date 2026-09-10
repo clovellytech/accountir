@@ -90,7 +90,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             include_str!("../../migrations/022_event_service_reporting.sql"),
         ),
         (23, include_str!("../../migrations/023_partnership.sql")),
-        (24, include_str!("../../migrations/024_tax_line_mappings.sql")),
+        (
+            24,
+            include_str!("../../migrations/024_tax_line_mappings.sql"),
+        ),
         (
             25,
             include_str!("../../migrations/025_config_tables_have_no_projection_fk.sql"),
@@ -107,10 +110,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             28,
             include_str!("../../migrations/028_partner_relationships.sql"),
         ),
-        (
-            29,
-            include_str!("../../migrations/029_il1065_settings.sql"),
-        ),
+        (29, include_str!("../../migrations/029_il1065_settings.sql")),
         (
             30,
             include_str!("../../migrations/030_depreciable_assets.sql"),
@@ -123,6 +123,22 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
         (
             34,
             include_str!("../../migrations/034_stripe_payouts_clear.sql"),
+        ),
+        (
+            35,
+            include_str!("../../migrations/035_deduction_limits.sql"),
+        ),
+        (
+            36,
+            include_str!("../../migrations/036_partner_share_periods.sql"),
+        ),
+        (
+            37,
+            include_str!("../../migrations/037_partner_equity_accounts.sql"),
+        ),
+        (
+            38,
+            include_str!("../../migrations/038_dated_tax_line_assignments.sql"),
         ),
     ];
 
@@ -657,14 +673,57 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         -- No foreign key to `accounts`, deliberately — see migration 025.
         -- Event-sourced since migration 027 — `updated_at_event` names the event
         -- that put the row here, exactly as `business_profile` does.
+        -- Dated since migration 038: the assignment in force for a year is the
+        -- row with the greatest `effective_from` at or before it, and `0` means
+        -- "as far back as these books go" — written before assignments were
+        -- dated.
         CREATE TABLE IF NOT EXISTS tax_line_mappings (
-            account_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            effective_from INTEGER NOT NULL DEFAULT 0,
             line_key TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at_event INTEGER REFERENCES events(id)
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (account_id, effective_from)
         );
 
         CREATE INDEX IF NOT EXISTS idx_tax_line_mappings_line ON tax_line_mappings(line_key);
+
+        -- How much of an account's balance the law lets you deduct (migration
+        -- 035). Sparse: an account with no row is fully deductible, which is
+        -- almost all of them.
+        -- A partner's percentages, and from when (migration 036).
+        CREATE TABLE IF NOT EXISTS partner_share_periods (
+            partner_id      TEXT NOT NULL,
+            effective_from  TEXT NOT NULL,
+            profit_ppm      INTEGER NOT NULL,
+            loss_ppm        INTEGER NOT NULL,
+            capital_ppm     INTEGER NOT NULL,
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (partner_id, effective_from)
+        );
+
+        -- Which ledger accounts hold a partner's capital (migration 037).
+        CREATE TABLE IF NOT EXISTS partner_equity_accounts (
+            partner_id  TEXT NOT NULL,
+            account_id  TEXT NOT NULL,
+            role        TEXT NOT NULL,
+            updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (partner_id, account_id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_equity_accounts_account
+            ON partner_equity_accounts(account_id);
+
+        -- Dated since migration 038, like `tax_line_mappings`.
+        CREATE TABLE IF NOT EXISTS tax_deduction_limits (
+            account_id TEXT NOT NULL,
+            effective_from INTEGER NOT NULL DEFAULT 0,
+            deductible_pct INTEGER NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (account_id, effective_from)
+        );
 
         -- Local only, never replicated — see migration 023.
         -- No foreign key to `partners`, deliberately — see migration 025. This

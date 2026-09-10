@@ -18,17 +18,17 @@
 //! route nobody intended.
 
 use crate::domain::{
-    Address, BusinessProfile, Il1065Settings, Partner, PartnerRelationship, PartnerType,
-    RelationshipKind, Residency, Shares, is_valid_tin,
+    is_valid_tin, Address, BusinessProfile, Il1065Settings, Partner, PartnerRelationship,
+    PartnerType, RelationshipKind, Residency, Shares,
 };
 use crate::events::types::{
-    AddressData, BusinessProfileData, Event, EventEnvelope, Il1065SettingsData, PartnerAdmittedData,
-    PartnerDetailsData, ShareData, StoredEvent,
+    AddressData, BusinessProfileData, Event, EventEnvelope, Il1065SettingsData,
+    PartnerAdmittedData, PartnerDetailsData, ShareData, StoredEvent,
 };
 use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::Projector;
 use chrono::NaiveDate;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -40,7 +40,9 @@ pub enum PartnershipError {
     NoSuchPartner(String),
     #[error("Partner {0} has already left")]
     AlreadyWithdrawn(String),
-    #[error("Partner {partner_id} joined on {start_date} and cannot leave on {end_date}, before that")]
+    #[error(
+        "Partner {partner_id} joined on {start_date} and cannot leave on {end_date}, before that"
+    )]
     LeftBeforeJoining {
         partner_id: String,
         start_date: NaiveDate,
@@ -50,6 +52,8 @@ pub enum PartnershipError {
     PartnerExists(String),
     #[error("No relationship between partners {0} and {1}")]
     NoSuchRelationship(String, String),
+    #[error("{1} does not hold {0}'s capital, so there is no link to remove")]
+    NoSuchEquityLink(String, String),
     #[error("The partnership's details have not been set yet")]
     NoProfile,
     #[error(
@@ -388,13 +392,13 @@ pub(crate) fn build_withdraw_partner_in_txn(
             // caller because the start date is the log's, not theirs.
             let start_date = parse_stored_date(&start);
             match start_date {
-                Some(start_date) if end_date < start_date => Ok(PartnerStep::Reject(
-                    PartnershipError::LeftBeforeJoining {
+                Some(start_date) if end_date < start_date => {
+                    Ok(PartnerStep::Reject(PartnershipError::LeftBeforeJoining {
                         partner_id: partner_id.to_string(),
                         start_date,
                         end_date,
-                    },
-                )),
+                    }))
+                }
                 _ => Ok(PartnerStep::Append(Event::PartnerWithdrawn {
                     partner_id: partner_id.to_string(),
                     end_date,
@@ -564,7 +568,9 @@ pub fn set_il1065_settings(
     settings: &Il1065Settings,
 ) -> Result<StoredEvent, PartnershipError> {
     append_checked_locally(store, user_id, |_tx| {
-        Ok(PartnerStep::Append(build_set_il1065_settings_event(settings)))
+        Ok(PartnerStep::Append(build_set_il1065_settings_event(
+            settings,
+        )))
     })
 }
 
@@ -724,6 +730,121 @@ pub fn clear_relationship(
     append_checked_locally(store, user_id, |tx| {
         build_clear_relationship_in_txn(tx, partner_id, related_partner_id)
     })
+}
+
+/// Say that an account holds a partner's capital, and on which side.
+///
+/// `role` is `"contribution"` or `"draw"` — [`crate::tax::capital::Role`] names
+/// them — and is checked in [`crate::events::validation`] rather than here, so
+/// the same rule guards a command from this machine and one that arrived over
+/// the sync transport.
+///
+/// Linking an account a second time moves it: the projector deletes any prior
+/// claim on the account before writing the new one, because an account whose
+/// balance appeared in two partners' item L would put the same money on two K-1s.
+/// So this is how a mis-linked account is corrected, and no unlink is needed
+/// first.
+pub fn link_equity_account(
+    store: &mut EventStore,
+    user_id: &str,
+    partner_id: &str,
+    account_id: &str,
+    role: &str,
+) -> Result<StoredEvent, PartnershipError> {
+    append_checked_locally(store, user_id, |tx| {
+        build_link_equity_account_in_txn(tx, partner_id, account_id, role)
+    })
+}
+
+/// Stop treating an account as a partner's capital.
+///
+/// Refused when the link is not there, the same no-op refusal
+/// [`clear_relationship`] makes: the projector's `DELETE` matches no rows, the
+/// append succeeds, and the log gains an event that changed nothing — which
+/// later reads as evidence somebody unlinked an account they never had.
+pub fn unlink_equity_account(
+    store: &mut EventStore,
+    user_id: &str,
+    partner_id: &str,
+    account_id: &str,
+) -> Result<StoredEvent, PartnershipError> {
+    append_checked_locally(store, user_id, |tx| {
+        build_unlink_equity_account_in_txn(tx, partner_id, account_id)
+    })
+}
+
+/// Link an account to a partner, against write-locked state.
+///
+/// The partner has to exist. `partner_equity_accounts.partner_id` is a foreign
+/// key, so without this the append still fails — but as a projection error, which
+/// is an opaque `500` on the sync path where the truth is that the caller named a
+/// partner nobody admitted.
+pub(crate) fn build_link_equity_account_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    partner_id: &str,
+    account_id: &str,
+    role: &str,
+) -> Result<PartnerStep, EventStoreError> {
+    let exists: bool = tx
+        .query_row("SELECT 1 FROM partners WHERE id = ?1", [partner_id], |_| {
+            Ok(true)
+        })
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        return Ok(PartnerStep::Reject(PartnershipError::NoSuchPartner(
+            partner_id.to_string(),
+        )));
+    }
+    Ok(PartnerStep::Append(Event::PartnerEquityAccountLinked {
+        partner_id: partner_id.to_string(),
+        account_id: account_id.to_string(),
+        role: role.to_string(),
+    }))
+}
+
+/// Unlink an account from a partner, against write-locked state.
+pub(crate) fn build_unlink_equity_account_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    partner_id: &str,
+    account_id: &str,
+) -> Result<PartnerStep, EventStoreError> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM partner_equity_accounts WHERE partner_id = ?1 AND account_id = ?2",
+            [partner_id, account_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        // Named the way it is written on the chart of accounts. The id is a UUID,
+        // and a refusal a person has to look up in another table before they can
+        // act on it is a refusal that does not say what is wrong.
+        let account = tx
+            .query_row(
+                "SELECT account_number || ' ' || name FROM accounts WHERE id = ?1",
+                [account_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| account_id.to_string());
+        let partner = tx
+            .query_row(
+                "SELECT name FROM partners WHERE id = ?1",
+                [partner_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| partner_id.to_string());
+        return Ok(PartnerStep::Reject(PartnershipError::NoSuchEquityLink(
+            partner, account,
+        )));
+    }
+    Ok(PartnerStep::Append(Event::PartnerEquityAccountUnlinked {
+        partner_id: partner_id.to_string(),
+        account_id: account_id.to_string(),
+    }))
 }
 
 /// Every recorded family tie between partners.
@@ -940,8 +1061,11 @@ pub fn get_tin(conn: &Connection, partner_id: &str) -> Option<String> {
 
 /// Forget a partner's TIN on this machine.
 pub fn clear_tin(conn: &Connection, partner_id: &str) -> Result<(), PartnershipError> {
-    conn.execute("DELETE FROM partner_tins WHERE partner_id = ?1", [partner_id])
-        .map_err(|e| PartnershipError::StoreError(e.to_string()))?;
+    conn.execute(
+        "DELETE FROM partner_tins WHERE partner_id = ?1",
+        [partner_id],
+    )
+    .map_err(|e| PartnershipError::StoreError(e.to_string()))?;
     Ok(())
 }
 
@@ -996,6 +1120,9 @@ fn row_to_partner(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<Partner, Str
         },
         start_date,
         end_date,
+        // Filled by `share_periods::attach_history`, which reads the dated
+        // series in one query for all partners rather than one per row.
+        history: Vec::new(),
         shares: Shares {
             profit_ppm: r.get(13)?,
             loss_ppm: r.get(14)?,
@@ -1149,7 +1276,10 @@ mod tests {
         p2.legal_name = "Renamed LLC".into();
         set_profile(&mut s, "u", &p2).unwrap();
 
-        assert_eq!(get_profile(s.connection()).unwrap().legal_name, "Renamed LLC");
+        assert_eq!(
+            get_profile(s.connection()).unwrap().legal_name,
+            "Renamed LLC"
+        );
         let n: i64 = s
             .connection()
             .query_row("SELECT COUNT(*) FROM business_profile", [], |r| r.get(0))
@@ -1206,7 +1336,10 @@ mod tests {
         cmd.tin = Some("123456789".into());
 
         let err = admit_partner(&mut s, "u", &cmd).unwrap_err();
-        assert!(matches!(err, PartnershipError::InvalidData(_)), "got {err:?}");
+        assert!(
+            matches!(err, PartnershipError::InvalidData(_)),
+            "got {err:?}"
+        );
         assert!(
             list_partners(s.connection()).is_empty(),
             "nothing was admitted"
@@ -1271,7 +1404,10 @@ mod tests {
         assert_eq!(after.partner_type, PartnerType::Limited);
         assert_eq!(after.residency, Residency::Foreign);
         assert_eq!(after.shares.profit_ppm, 600_000);
-        assert_eq!(after.start_date, before.start_date, "dates are not editable");
+        assert_eq!(
+            after.start_date, before.start_date,
+            "dates are not editable"
+        );
         assert_eq!(after.end_date, before.end_date);
     }
 
@@ -1293,7 +1429,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(matches!(err, PartnershipError::NoSuchPartner(_)), "got {err:?}");
+        assert!(
+            matches!(err, PartnershipError::NoSuchPartner(_)),
+            "got {err:?}"
+        );
     }
 
     /// The second lock on the door the server's id-minting is the first lock on.
@@ -1470,7 +1609,10 @@ mod tests {
         );
 
         let err = withdraw_partner(&mut s, "u", &id, day(2025, 9, 1)).unwrap_err();
-        assert!(matches!(err, PartnershipError::AlreadyWithdrawn(_)), "got {err:?}");
+        assert!(
+            matches!(err, PartnershipError::AlreadyWithdrawn(_)),
+            "got {err:?}"
+        );
         assert_eq!(
             get_partner(s.connection(), &id).unwrap().end_date,
             Some(day(2025, 6, 30)),
@@ -1504,7 +1646,10 @@ mod tests {
             .map(|p| p.partner_id)
             .collect();
         assert!(ids.contains(&stayed_id));
-        assert!(ids.contains(&joined_id), "joined in March, still gets a K-1");
+        assert!(
+            ids.contains(&joined_id),
+            "joined in March, still gets a K-1"
+        );
         assert!(!ids.contains(&left_id), "left before 2025 began");
     }
 
@@ -1517,7 +1662,10 @@ mod tests {
         admit_partner(&mut s, "u", &a_partner("Alice")).unwrap();
         admit_partner(&mut s, "u", &b).unwrap();
 
-        let shares: Vec<Shares> = list_partners(s.connection()).iter().map(|p| p.shares).collect();
+        let shares: Vec<Shares> = list_partners(s.connection())
+            .iter()
+            .map(|p| p.shares)
+            .collect();
         let totals = Shares::sums_to_whole(&shares);
         assert_eq!(totals.profit_ppm, FULL_SHARE);
         assert!(totals.is_whole());
@@ -1557,7 +1705,11 @@ mod tests {
         let (a, b) = two_partners(&mut s);
         set_relationship(&mut s, "u", &a, &b, RelationshipKind::Spouse).unwrap();
         set_relationship(&mut s, "u", &b, &a, RelationshipKind::Spouse).unwrap();
-        assert_eq!(list_relationships(s.connection()).len(), 1, "one marriage, one row");
+        assert_eq!(
+            list_relationships(s.connection()).len(),
+            1,
+            "one marriage, one row"
+        );
     }
 
     #[test]
@@ -1574,9 +1726,16 @@ mod tests {
     fn a_relationship_to_a_partner_who_does_not_exist_is_refused() {
         let mut s = store();
         let (a, _) = two_partners(&mut s);
-        let err = set_relationship(&mut s, "u", &a, "nobody", RelationshipKind::Spouse).unwrap_err();
-        assert!(matches!(err, PartnershipError::NoSuchPartner(_)), "got {err:?}");
-        assert!(list_relationships(s.connection()).is_empty(), "nothing was recorded");
+        let err =
+            set_relationship(&mut s, "u", &a, "nobody", RelationshipKind::Spouse).unwrap_err();
+        assert!(
+            matches!(err, PartnershipError::NoSuchPartner(_)),
+            "got {err:?}"
+        );
+        assert!(
+            list_relationships(s.connection()).is_empty(),
+            "nothing was recorded"
+        );
     }
 
     #[test]
@@ -1584,7 +1743,10 @@ mod tests {
         let mut s = store();
         let (a, _) = two_partners(&mut s);
         let err = set_relationship(&mut s, "u", &a, &a, RelationshipKind::Spouse).unwrap_err();
-        assert!(matches!(err, PartnershipError::InvalidData(_)), "got {err:?}");
+        assert!(
+            matches!(err, PartnershipError::InvalidData(_)),
+            "got {err:?}"
+        );
     }
 
     /// Clearing a tie that is not there is a refusal, not a no-op append — the
@@ -1594,7 +1756,10 @@ mod tests {
         let mut s = store();
         let (a, b) = two_partners(&mut s);
         let err = clear_relationship(&mut s, "u", &a, &b).unwrap_err();
-        assert!(matches!(err, PartnershipError::NoSuchRelationship(..)), "got {err:?}");
+        assert!(
+            matches!(err, PartnershipError::NoSuchRelationship(..)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1609,7 +1774,10 @@ mod tests {
         set_il1065_settings(
             &mut s,
             "u",
-            &Il1065Settings { apportions_outside_illinois: true, elects_pte_tax: true },
+            &Il1065Settings {
+                apportions_outside_illinois: true,
+                elects_pte_tax: true,
+            },
         )
         .unwrap();
         let got = get_il1065_settings(s.connection());
@@ -1620,7 +1788,10 @@ mod tests {
         set_il1065_settings(
             &mut s,
             "u",
-            &Il1065Settings { apportions_outside_illinois: false, elects_pte_tax: true },
+            &Il1065Settings {
+                apportions_outside_illinois: false,
+                elects_pte_tax: true,
+            },
         )
         .unwrap();
         let got = get_il1065_settings(s.connection());
@@ -1648,6 +1819,109 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(log.contains("partner_relationship_set"), "the tie is not in the log: {log}");
+        assert!(
+            log.contains("partner_relationship_set"),
+            "the tie is not in the log: {log}"
+        );
+    }
+
+    // --- linking a partner's capital accounts -------------------------------
+
+    fn a_partnership_with_one_partner() -> (EventStore, String) {
+        let mut s = store();
+        set_profile(&mut s, "u", &profile()).unwrap();
+        let (id, _) = admit_partner(&mut s, "u", &a_partner("Zak")).unwrap();
+        (s, id)
+    }
+
+    #[test]
+    fn a_link_reaches_the_table_the_return_reads() {
+        let (mut s, zak) = a_partnership_with_one_partner();
+        link_equity_account(&mut s, "u", &zak, "4002", "contribution").unwrap();
+        link_equity_account(&mut s, "u", &zak, "4005", "draw").unwrap();
+
+        let links = crate::tax::capital::load_partner_equity_accounts(s.connection());
+        assert_eq!(links.len(), 2);
+        assert!(links
+            .iter()
+            .any(|l| l.account_id == "4005" && l.role == crate::tax::capital::Role::Draw));
+    }
+
+    /// An account claimed by two partners would put the same money on two K-1s.
+    /// Linking it again moves it, which is also how a mis-link is corrected.
+    #[test]
+    fn linking_an_account_a_second_time_moves_it_rather_than_sharing_it() {
+        let mut s = store();
+        set_profile(&mut s, "u", &profile()).unwrap();
+        let (zak, _) = admit_partner(&mut s, "u", &a_partner("Zak")).unwrap();
+        let (jinny, _) = admit_partner(&mut s, "u", &a_partner("Jinny")).unwrap();
+
+        link_equity_account(&mut s, "u", &zak, "4002", "contribution").unwrap();
+        link_equity_account(&mut s, "u", &jinny, "4002", "contribution").unwrap();
+
+        let links = crate::tax::capital::load_partner_equity_accounts(s.connection());
+        assert_eq!(links.len(), 1, "one account, one partner: {links:?}");
+        assert_eq!(links[0].partner_id, jinny);
+    }
+
+    #[test]
+    fn unlinking_removes_the_link() {
+        let (mut s, zak) = a_partnership_with_one_partner();
+        link_equity_account(&mut s, "u", &zak, "4002", "contribution").unwrap();
+        unlink_equity_account(&mut s, "u", &zak, "4002").unwrap();
+        assert!(crate::tax::capital::load_partner_equity_accounts(s.connection()).is_empty());
+    }
+
+    /// A no-op append is a write that reports success and changed nothing, and
+    /// later reads as evidence somebody unlinked an account they never had.
+    #[test]
+    fn unlinking_an_account_that_is_not_linked_is_refused() {
+        let (mut s, zak) = a_partnership_with_one_partner();
+        let err = unlink_equity_account(&mut s, "u", &zak, "4002").unwrap_err();
+        assert!(
+            matches!(err, PartnershipError::NoSuchEquityLink(..)),
+            "got {err:?}"
+        );
+    }
+
+    /// The foreign key would refuse this anyway — as a projection failure, which
+    /// on the sync path is a 500 where the truth is a partner nobody admitted.
+    #[test]
+    fn linking_an_account_to_a_partner_who_does_not_exist_is_refused() {
+        let mut s = store();
+        set_profile(&mut s, "u", &profile()).unwrap();
+        let err = link_equity_account(&mut s, "u", "nobody", "4002", "contribution").unwrap_err();
+        assert!(
+            matches!(err, PartnershipError::NoSuchPartner(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// Half of item L is the difference between the two roles, so a third word
+    /// has nowhere to go. Refused by validation, which guards this command and
+    /// the sync path with one rule.
+    #[test]
+    fn a_role_that_is_neither_word_is_refused() {
+        let (mut s, zak) = a_partnership_with_one_partner();
+        assert!(link_equity_account(&mut s, "u", &zak, "4002", "withdrawal").is_err());
+        assert!(crate::tax::capital::load_partner_equity_accounts(s.connection()).is_empty());
+    }
+
+    /// The point of putting these in the log: a second machine replaying it has
+    /// to arrive at the same links, and an unlink has to replay as an unlink
+    /// rather than quietly coming back.
+    #[test]
+    fn links_survive_a_rebuild_and_an_unlink_stays_unlinked() {
+        let (mut s, zak) = a_partnership_with_one_partner();
+        link_equity_account(&mut s, "u", &zak, "4002", "contribution").unwrap();
+        link_equity_account(&mut s, "u", &zak, "4005", "draw").unwrap();
+        unlink_equity_account(&mut s, "u", &zak, "4005").unwrap();
+
+        let events = s.get_all().unwrap();
+        Projector::new(s.connection()).rebuild(&events).unwrap();
+
+        let links = crate::tax::capital::load_partner_equity_accounts(s.connection());
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].account_id, "4002");
     }
 }

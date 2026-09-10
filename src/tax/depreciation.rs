@@ -306,7 +306,10 @@ impl YearSchedule<'_> {
     /// the partnership level something the statute deducts at the partner level,
     /// and would double-count it against the K-1 box 12 the partner also gets.
     pub fn line_16a_cents(&self) -> i64 {
-        self.rows.iter().map(|r| r.bonus_cents + r.macrs_cents).sum()
+        self.rows
+            .iter()
+            .map(|r| r.bonus_cents + r.macrs_cents)
+            .sum()
     }
 
     /// Schedule K line 12, and K-1 box 12: the §179 election, separately stated.
@@ -359,11 +362,7 @@ impl YearSchedule<'_> {
 ///
 /// Used for Schedule L's opening column, which needs the position a year earlier
 /// than the one being computed.
-fn accumulated_through(
-    asset: &DepreciableAsset,
-    through_year: i32,
-    mid_quarter: bool,
-) -> i64 {
+fn accumulated_through(asset: &DepreciableAsset, through_year: i32, mid_quarter: bool) -> i64 {
     let Some(last) = asset.recovery_year(through_year) else {
         return 0;
     };
@@ -379,7 +378,12 @@ fn accumulated_through(
         first_year_fraction(convention, asset.placed_in_service),
         life,
     );
-    let schedule = schedule_cents(macrs_basis, life, asset.class.method(asset.system), &fractions);
+    let schedule = schedule_cents(
+        macrs_basis,
+        life,
+        asset.class.method(asset.system),
+        &fractions,
+    );
 
     let mut total = section_179 + bonus;
     for year in 1..=last {
@@ -480,8 +484,12 @@ pub fn compute_year<'a>(assets: &'a [DepreciableAsset], tax_year: i32) -> YearSc
             first_year_fraction(convention, asset.placed_in_service),
             life,
         );
-        let schedule =
-            schedule_cents(macrs_basis, life, asset.class.method(asset.system), &fractions);
+        let schedule = schedule_cents(
+            macrs_basis,
+            life,
+            asset.class.method(asset.system),
+            &fractions,
+        );
 
         let mut macrs = schedule
             .get((recovery_year - 1) as usize)
@@ -820,7 +828,11 @@ mod tests {
     /// since a wrong rate, a missed convention or a missing straight-line switch
     /// all move a year by whole points.
     fn assert_matches_table(got: &[f64], table: &[f64], what: &str) {
-        assert_eq!(got.len(), table.len(), "{what}: wrong number of years — {got:?}");
+        assert_eq!(
+            got.len(),
+            table.len(),
+            "{what}: wrong number of years — {got:?}"
+        );
         for (year, (g, t)) in got.iter().zip(table).enumerate() {
             assert!(
                 (g - t).abs() <= 0.011,
@@ -832,7 +844,10 @@ mod tests {
         // the basis. Asserted here on the published figures, and separately on
         // the computed cents in `every_class_recovers_the_whole_basis_and_no_more`.
         let total: f64 = table.iter().sum();
-        assert!((total - 100.0).abs() < 1e-9, "{what}: table sums to {total}");
+        assert!(
+            (total - 100.0).abs() < 1e-9,
+            "{what}: table sums to {total}"
+        );
     }
 
     /// Pub. 946 Table A-1, 5-year property, half-year convention.
@@ -874,10 +889,14 @@ mod tests {
     #[test]
     fn fifteen_year_land_improvements_reproduce_table_a1() {
         assert_matches_table(
-            &percentages(PropertyClass::FifteenYearLandImprovement, Convention::HalfYear, 6),
+            &percentages(
+                PropertyClass::FifteenYearLandImprovement,
+                Convention::HalfYear,
+                6,
+            ),
             &[
-                5.00, 9.50, 8.55, 7.70, 6.93, 6.23, 5.90, 5.90, 5.91, 5.90, 5.91, 5.90, 5.91,
-                5.90, 5.91, 2.95,
+                5.00, 9.50, 8.55, 7.70, 6.93, 6.23, 5.90, 5.90, 5.91, 5.90, 5.91, 5.90, 5.91, 5.90,
+                5.91, 2.95,
             ],
             "15-year land improvement",
         );
@@ -983,13 +1002,21 @@ mod tests {
         let late = asset(PropertyClass::SevenYear, date(2025, 11, 1), 200_000);
         let assets = vec![early, late];
 
-        assert!(mid_quarter_applies(&assets, 2025), "200k of 300k is over 40%");
+        assert!(
+            mid_quarter_applies(&assets, 2025),
+            "200k of 300k is over 40%"
+        );
 
         // And it reaches the asset that arrived in February, not only the one
         // that arrived in November.
         let s = compute_year(&assets, 2025);
         for row in &s.rows {
-            assert_eq!(row.convention, Convention::MidQuarter, "{}", row.asset.description);
+            assert_eq!(
+                row.convention,
+                Convention::MidQuarter,
+                "{}",
+                row.asset.description
+            );
         }
     }
 
@@ -1017,7 +1044,11 @@ mod tests {
             "the building is not personal property and is not in the fraction"
         );
         let s = compute_year(&assets, 2025);
-        let b = s.rows.iter().find(|r| r.asset.class == PropertyClass::Nonresidential).unwrap();
+        let b = s
+            .rows
+            .iter()
+            .find(|r| r.asset.class == PropertyClass::Nonresidential)
+            .unwrap();
         assert_eq!(b.convention, Convention::MidMonth);
     }
 
@@ -1136,7 +1167,11 @@ mod tests {
         let mut a = asset(PropertyClass::FiveYear, date(2026, 3, 1), 1_000_000);
         a.acquired_on = date(2025, 3, 1);
         a.bonus = BonusElection::Take;
-        assert_eq!(bonus_rate(&a), 1.00, "not the 20% 2026 would otherwise give");
+        assert_eq!(
+            bonus_rate(&a),
+            1.00,
+            "not the 20% 2026 would otherwise give"
+        );
     }
 
     #[test]
@@ -1161,8 +1196,10 @@ mod tests {
         let s = compute_year(&assets, 2025);
         assert_eq!(s.bonus_cents(), 0);
         assert!(
-            s.warnings.iter().any(|w| w.contains("recovery period")
-                && w.contains("qualified improvement property")),
+            s.warnings
+                .iter()
+                .any(|w| w.contains("recovery period")
+                    && w.contains("qualified improvement property")),
             "{:?}",
             s.warnings
         );
@@ -1172,7 +1209,11 @@ mod tests {
     /// leasehold question decides.
     #[test]
     fn the_same_improvement_as_qip_takes_the_whole_hundred_percent() {
-        let mut a = asset(PropertyClass::QualifiedImprovement, date(2025, 6, 1), 10_000_000);
+        let mut a = asset(
+            PropertyClass::QualifiedImprovement,
+            date(2025, 6, 1),
+            10_000_000,
+        );
         a.acquired_on = date(2025, 6, 1);
         a.bonus = BonusElection::Take;
 
@@ -1211,7 +1252,9 @@ mod tests {
         let s = compute_year(&assets, 2025);
         assert_eq!(s.section_179_cents(), 100_000, "allowed, not refused");
         assert!(
-            s.warnings.iter().any(|w| w.contains("§179(f)") && w.contains("security systems")),
+            s.warnings
+                .iter()
+                .any(|w| w.contains("§179(f)") && w.contains("security systems")),
             "{:?}",
             s.warnings
         );
@@ -1281,7 +1324,9 @@ mod tests {
         let s = compute_year(&assets, 2025);
         assert_eq!(s.total_cents(), 0);
         assert!(
-            s.warnings.iter().any(|w| w.contains("no depreciation is allowable")),
+            s.warnings
+                .iter()
+                .any(|w| w.contains("no depreciation is allowable")),
             "{:?}",
             s.warnings
         );

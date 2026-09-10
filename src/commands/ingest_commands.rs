@@ -88,20 +88,90 @@ pub fn is_bank_feed_account(conn: &Connection, account_id: &str) -> bool {
 /// Canonical list of ingest account-mapping keys — the single source of truth
 /// shared by the server's validation and the desktop mapping editor.
 pub const MAPPING_DEFS: &[MappingDef] = &[
-    MappingDef { key: "pos_square", label: "Square balance (asset)", group: "Square", note: "" },
-    MappingDef { key: "pos_stripe", label: "Stripe balance (asset)", group: "Stripe", note: "" },
-    MappingDef { key: "pos_revenue", label: "Sales revenue", group: "Square sales", note: "" },
-    MappingDef { key: "refunds", label: "Refunds / returns (contra-revenue)", group: "Square sales", note: "" },
-    MappingDef { key: "square_fees", label: "Processing fees (expense)", group: "Square sales", note: "" },
-    MappingDef { key: "sales_tax_payable", label: "Sales tax payable (liability)", group: "Square sales", note: "" },
-    MappingDef { key: "tips_payable", label: "Tips payable (liability)", group: "Square sales", note: "" },
-    MappingDef { key: "customer_deposits", label: "Customer deposits held (liability)", group: "Square sales", note: "" },
-    MappingDef { key: "gift_card_liability", label: "Gift cards outstanding (liability)", group: "Square sales", note: "" },
-    MappingDef { key: "sawyer_clearing", label: "Sawyer balance owed to you (asset)", group: "Sawyer", note: "" },
-    MappingDef { key: "sawyer_revenue", label: "Class and camp revenue", group: "Sawyer", note: "" },
-    MappingDef { key: "sawyer_fees", label: "Sawyer platform fees (expense)", group: "Sawyer", note: "" },
-    MappingDef { key: "stripe_fees", label: "Stripe processing fees (expense)", group: "Stripe", note: "" },
-    MappingDef { key: "stripe_revenue", label: "Stripe sales revenue", group: "Stripe", note: "" },
+    MappingDef {
+        key: "pos_square",
+        label: "Square balance (asset)",
+        group: "Square",
+        note: "",
+    },
+    MappingDef {
+        key: "pos_stripe",
+        label: "Stripe balance (asset)",
+        group: "Stripe",
+        note: "",
+    },
+    MappingDef {
+        key: "pos_revenue",
+        label: "Sales revenue",
+        group: "Square sales",
+        note: "",
+    },
+    MappingDef {
+        key: "refunds",
+        label: "Refunds / returns (contra-revenue)",
+        group: "Square sales",
+        note: "",
+    },
+    MappingDef {
+        key: "square_fees",
+        label: "Processing fees (expense)",
+        group: "Square sales",
+        note: "",
+    },
+    MappingDef {
+        key: "sales_tax_payable",
+        label: "Sales tax payable (liability)",
+        group: "Square sales",
+        note: "",
+    },
+    MappingDef {
+        key: "tips_payable",
+        label: "Tips payable (liability)",
+        group: "Square sales",
+        note: "",
+    },
+    MappingDef {
+        key: "customer_deposits",
+        label: "Customer deposits held (liability)",
+        group: "Square sales",
+        note: "",
+    },
+    MappingDef {
+        key: "gift_card_liability",
+        label: "Gift cards outstanding (liability)",
+        group: "Square sales",
+        note: "",
+    },
+    MappingDef {
+        key: "sawyer_clearing",
+        label: "Sawyer balance owed to you (asset)",
+        group: "Sawyer",
+        note: "",
+    },
+    MappingDef {
+        key: "sawyer_revenue",
+        label: "Class and camp revenue",
+        group: "Sawyer",
+        note: "",
+    },
+    MappingDef {
+        key: "sawyer_fees",
+        label: "Sawyer platform fees (expense)",
+        group: "Sawyer",
+        note: "",
+    },
+    MappingDef {
+        key: "stripe_fees",
+        label: "Stripe processing fees (expense)",
+        group: "Stripe",
+        note: "",
+    },
+    MappingDef {
+        key: "stripe_revenue",
+        label: "Stripe sales revenue",
+        group: "Stripe",
+        note: "",
+    },
     MappingDef {
         key: "stripe_payouts_in_transit",
         label: "Stripe payouts in transit (clearing asset)",
@@ -110,15 +180,60 @@ pub const MAPPING_DEFS: &[MappingDef] = &[
                your bank feed brings in each deposit as it lands. Both post here, and the \
                balance returns to zero once a payout has arrived.",
     },
-    MappingDef { key: "payroll_wages_expense", label: "Wages expense", group: "Square payroll", note: "" },
-    MappingDef { key: "payroll_tax_expense", label: "Employer payroll taxes (expense)", group: "Square payroll", note: "" },
-    MappingDef { key: "payroll_taxes_payable", label: "Payroll taxes payable (liability)", group: "Square payroll", note: "" },
-    MappingDef { key: "pos_cash", label: "Cash (POS)", group: "Point of sale", note: "" },
-    MappingDef { key: "cogs", label: "Cost of goods sold (expense)", group: "Inventory", note: "" },
-    MappingDef { key: "inventory", label: "Inventory (asset)", group: "Inventory", note: "" },
-    MappingDef { key: "inventory_adjustment", label: "Inventory adjustment", group: "Inventory", note: "" },
-    MappingDef { key: "accounts_payable", label: "Accounts payable (liability)", group: "Inventory", note: "" },
-    MappingDef { key: "amazon_clearing", label: "Amazon clearing/liability", group: "Amazon", note: "" },
+    MappingDef {
+        key: "payroll_wages_expense",
+        label: "Wages expense",
+        group: "Square payroll",
+        note: "",
+    },
+    MappingDef {
+        key: "payroll_tax_expense",
+        label: "Employer payroll taxes (expense)",
+        group: "Square payroll",
+        note: "",
+    },
+    MappingDef {
+        key: "payroll_taxes_payable",
+        label: "Payroll taxes payable (liability)",
+        group: "Square payroll",
+        note: "",
+    },
+    MappingDef {
+        key: "pos_cash",
+        label: "Cash (POS)",
+        group: "Point of sale",
+        note: "",
+    },
+    MappingDef {
+        key: "cogs",
+        label: "Cost of goods sold (expense)",
+        group: "Inventory",
+        note: "",
+    },
+    MappingDef {
+        key: "inventory",
+        label: "Inventory (asset)",
+        group: "Inventory",
+        note: "",
+    },
+    MappingDef {
+        key: "inventory_adjustment",
+        label: "Inventory adjustment",
+        group: "Inventory",
+        note: "",
+    },
+    MappingDef {
+        key: "accounts_payable",
+        label: "Accounts payable (liability)",
+        group: "Inventory",
+        note: "",
+    },
+    MappingDef {
+        key: "amazon_clearing",
+        label: "Amazon clearing/liability",
+        group: "Amazon",
+        note: "",
+    },
 ];
 
 /// All valid ingest mapping keys.
@@ -221,7 +336,10 @@ fn resolve_tenders(
     expected_total: i64,
 ) -> Result<Vec<(&'static str, i64)>, IngestError> {
     let tenders: Vec<(IngestPaymentMethod, i64)> = if !payments.is_empty() {
-        payments.iter().map(|p| (p.method, p.amount_cents)).collect()
+        payments
+            .iter()
+            .map(|p| (p.method, p.amount_cents))
+            .collect()
     } else if let Some(m) = legacy {
         vec![(m, expected_total)]
     } else {
@@ -336,7 +454,11 @@ pub fn parse_ingest_date(s: &str) -> Result<NaiveDate, IngestError> {
     let s = s.trim();
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .ok()
-        .or_else(|| chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.date_naive()))
+        .or_else(|| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.date_naive())
+        })
         .or_else(|| {
             s.get(..10)
                 .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
@@ -491,13 +613,12 @@ pub fn post_planned_bill(
     let mut bill_cmds = BillCommands::new(store, user_id.to_string());
     let (entry_id, was_duplicate) = match bill_cmds.receive_bill(cmd) {
         Ok(stored) => {
-            let entry_id = if let crate::events::types::Event::BillReceived { entry_id, .. } =
-                &stored.event
-            {
-                entry_id.clone()
-            } else {
-                String::new()
-            };
+            let entry_id =
+                if let crate::events::types::Event::BillReceived { entry_id, .. } = &stored.event {
+                    entry_id.clone()
+                } else {
+                    String::new()
+                };
             (entry_id, false)
         }
         Err(BillCommandError::DuplicateReference {
@@ -543,8 +664,16 @@ pub fn plan_sale(
     let date = parse_ingest_date(&data.date)?;
     let tax = data.tax_collected_cents.unwrap_or(0);
 
-    let total_revenue: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_price_cents).sum();
-    let total_cogs: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
+    let total_revenue: i64 = data
+        .items
+        .iter()
+        .map(|i| i.qty as i64 * i.unit_price_cents)
+        .sum();
+    let total_cogs: i64 = data
+        .items
+        .iter()
+        .map(|i| i.qty as i64 * i.unit_cost_cents)
+        .sum();
     let amount_received = total_revenue + tax;
 
     // Split tender: one debit per payment method (or the legacy single method),
@@ -566,14 +695,16 @@ pub fn plan_sale(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let memo = data.memo.unwrap_or_else(|| format!("POS Sale: {}", items_desc));
+    let memo = data
+        .memo
+        .unwrap_or_else(|| format!("POS Sale: {}", items_desc));
 
-    let mut lines = vec![EntryLine::credit(&mappings["pos_revenue"], total_revenue, "USD")
-        .with_memo("Sales revenue")];
+    let mut lines = vec![
+        EntryLine::credit(&mappings["pos_revenue"], total_revenue, "USD")
+            .with_memo("Sales revenue"),
+    ];
     for (key, amount) in &tenders {
-        lines.push(
-            EntryLine::debit(&mappings[*key], *amount, "USD").with_memo("Payment received"),
-        );
+        lines.push(EntryLine::debit(&mappings[*key], *amount, "USD").with_memo("Payment received"));
     }
 
     if tax > 0 {
@@ -585,8 +716,7 @@ pub fn plan_sale(
 
     if total_cogs > 0 {
         lines.push(
-            EntryLine::debit(&mappings["cogs"], total_cogs, "USD")
-                .with_memo("Cost of goods sold"),
+            EntryLine::debit(&mappings["cogs"], total_cogs, "USD").with_memo("Cost of goods sold"),
         );
         lines.push(
             EntryLine::credit(&mappings["inventory"], total_cogs, "USD")
@@ -630,8 +760,16 @@ pub fn plan_refund(
     let date = parse_ingest_date(&data.date)?;
     let tax = data.tax_refunded_cents.unwrap_or(0);
 
-    let total_revenue: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_price_cents).sum();
-    let total_cost: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
+    let total_revenue: i64 = data
+        .items
+        .iter()
+        .map(|i| i.qty as i64 * i.unit_price_cents)
+        .sum();
+    let total_cost: i64 = data
+        .items
+        .iter()
+        .map(|i| i.qty as i64 * i.unit_cost_cents)
+        .sum();
     let amount_returned = total_revenue + tax;
     // Only restock when asked *and* the items carry a cost — otherwise there's
     // nothing to move and no need for the inventory/cogs mappings.
@@ -658,14 +796,14 @@ pub fn plan_refund(
         .map(|i| format!("{}x {}", i.qty, i.name))
         .collect::<Vec<_>>()
         .join(", ");
-    let memo = data.memo.unwrap_or_else(|| format!("POS Refund: {}", items_desc));
+    let memo = data
+        .memo
+        .unwrap_or_else(|| format!("POS Refund: {}", items_desc));
 
     let mut lines = vec![EntryLine::debit(&mappings["refunds"], total_revenue, "USD")
         .with_memo("Refund of sales revenue")];
     for (key, amount) in &tenders {
-        lines.push(
-            EntryLine::credit(&mappings[*key], *amount, "USD").with_memo("Refund issued"),
-        );
+        lines.push(EntryLine::credit(&mappings[*key], *amount, "USD").with_memo("Refund issued"));
     }
 
     if tax > 0 {
@@ -735,7 +873,11 @@ pub fn plan_purchase_order(
         }
     };
 
-    let total_cost: i64 = data.items.iter().map(|i| i.qty as i64 * i.unit_cost_cents).sum();
+    let total_cost: i64 = data
+        .items
+        .iter()
+        .map(|i| i.qty as i64 * i.unit_cost_cents)
+        .sum();
 
     let items_desc: String = data
         .items
@@ -750,13 +892,11 @@ pub fn plan_purchase_order(
     });
 
     let lines = vec![
-        EntryLine::debit(&inventory_account, total_cost, "USD")
-            .with_memo("Inventory received"),
-        EntryLine::credit(&credit_account, total_cost, "USD")
-            .with_memo(match payment {
-                IngestPurchasePayment::Cash => "Cash payment",
-                IngestPurchasePayment::OnCredit => "Accounts payable",
-            }),
+        EntryLine::debit(&inventory_account, total_cost, "USD").with_memo("Inventory received"),
+        EntryLine::credit(&credit_account, total_cost, "USD").with_memo(match payment {
+            IngestPurchasePayment::Cash => "Cash payment",
+            IngestPurchasePayment::OnCredit => "Accounts payable",
+        }),
     ];
 
     Ok(PostEntryCommand {
@@ -791,7 +931,11 @@ pub fn plan_inventory_adjustment(
 
     let mappings = load_ingest_mappings(conn, &["inventory", "inventory_adjustment"])?;
 
-    let net: i64 = data.items.iter().map(|i| i.qty_delta as i64 * i.unit_cost_cents).sum();
+    let net: i64 = data
+        .items
+        .iter()
+        .map(|i| i.qty_delta as i64 * i.unit_cost_cents)
+        .sum();
 
     if net == 0 {
         return Err(IngestError::ZeroAdjustment);
@@ -807,7 +951,9 @@ pub fn plan_inventory_adjustment(
         .collect::<Vec<_>>()
         .join(", ");
 
-    let memo = data.memo.unwrap_or_else(|| format!("Inventory adjustment: {}", items_desc));
+    let memo = data
+        .memo
+        .unwrap_or_else(|| format!("Inventory adjustment: {}", items_desc));
 
     let abs_net = net.unsigned_abs() as i64;
 
@@ -934,13 +1080,12 @@ pub fn ingest_goods_received(
     let mut bill_cmds = BillCommands::new(store, user_id.to_string());
     let (entry_id, was_duplicate) = match bill_cmds.receive_bill(cmd) {
         Ok(stored) => {
-            let entry_id = if let crate::events::types::Event::BillReceived { entry_id, .. } =
-                &stored.event
-            {
-                entry_id.clone()
-            } else {
-                String::new()
-            };
+            let entry_id =
+                if let crate::events::types::Event::BillReceived { entry_id, .. } = &stored.event {
+                    entry_id.clone()
+                } else {
+                    String::new()
+                };
             (entry_id, false)
         }
         Err(BillCommandError::DuplicateReference {
@@ -1006,7 +1151,9 @@ mod tests {
             .prepare("SELECT account_id, amount FROM journal_lines WHERE entry_id = ?1")
             .unwrap();
         for row in stmt
-            .query_map([entry_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .query_map([entry_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })
             .unwrap()
             .flatten()
         {
@@ -1021,11 +1168,41 @@ mod tests {
         init_schema(store.connection()).unwrap();
 
         mk_account(&mut store, "cash", EventAccountType::Asset, "1000", "Cash");
-        mk_account(&mut store, "stripe", EventAccountType::Asset, "1060", "Stripe");
-        mk_account(&mut store, "square", EventAccountType::Asset, "1050", "Square");
-        mk_account(&mut store, "rev", EventAccountType::Revenue, "4000", "Sales");
-        mk_account(&mut store, "inv", EventAccountType::Asset, "1200", "Inventory");
-        mk_account(&mut store, "cogs", EventAccountType::Expense, "5000", "COGS");
+        mk_account(
+            &mut store,
+            "stripe",
+            EventAccountType::Asset,
+            "1060",
+            "Stripe",
+        );
+        mk_account(
+            &mut store,
+            "square",
+            EventAccountType::Asset,
+            "1050",
+            "Square",
+        );
+        mk_account(
+            &mut store,
+            "rev",
+            EventAccountType::Revenue,
+            "4000",
+            "Sales",
+        );
+        mk_account(
+            &mut store,
+            "inv",
+            EventAccountType::Asset,
+            "1200",
+            "Inventory",
+        );
+        mk_account(
+            &mut store,
+            "cogs",
+            EventAccountType::Expense,
+            "5000",
+            "COGS",
+        );
         {
             let conn = store.connection();
             set_account_mapping(conn, "pos_cash", "cash").unwrap();
@@ -1048,8 +1225,14 @@ mod tests {
                 unit_cost_cents: 6000,
             }],
             payments: vec![
-                IngestPayment { method: IngestPaymentMethod::Stripe, amount_cents: 3000 },
-                IngestPayment { method: IngestPaymentMethod::Square, amount_cents: 7000 },
+                IngestPayment {
+                    method: IngestPaymentMethod::Stripe,
+                    amount_cents: 3000,
+                },
+                IngestPayment {
+                    method: IngestPaymentMethod::Square,
+                    amount_cents: 7000,
+                },
             ],
             payment_method: None,
             tax_collected_cents: None,
@@ -1092,11 +1275,41 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         init_schema(store.connection()).unwrap();
 
-        mk_account(&mut store, "refunds", EventAccountType::Revenue, "4900", "Refunds");
-        mk_account(&mut store, "square", EventAccountType::Asset, "1050", "Square");
-        mk_account(&mut store, "inv", EventAccountType::Asset, "1200", "Inventory");
-        mk_account(&mut store, "cogs", EventAccountType::Expense, "5000", "COGS");
-        mk_account(&mut store, "tax", EventAccountType::Liability, "2200", "Sales tax");
+        mk_account(
+            &mut store,
+            "refunds",
+            EventAccountType::Revenue,
+            "4900",
+            "Refunds",
+        );
+        mk_account(
+            &mut store,
+            "square",
+            EventAccountType::Asset,
+            "1050",
+            "Square",
+        );
+        mk_account(
+            &mut store,
+            "inv",
+            EventAccountType::Asset,
+            "1200",
+            "Inventory",
+        );
+        mk_account(
+            &mut store,
+            "cogs",
+            EventAccountType::Expense,
+            "5000",
+            "COGS",
+        );
+        mk_account(
+            &mut store,
+            "tax",
+            EventAccountType::Liability,
+            "2200",
+            "Sales tax",
+        );
         {
             let conn = store.connection();
             set_account_mapping(conn, "refunds", "refunds").unwrap();
@@ -1106,9 +1319,13 @@ mod tests {
             set_account_mapping(conn, "sales_tax_payable", "tax").unwrap();
         }
 
-        let res =
-            ingest_refund(&mut store, "test", refund_data(), JournalEntrySource::EventService)
-                .unwrap();
+        let res = ingest_refund(
+            &mut store,
+            "test",
+            refund_data(),
+            JournalEntrySource::EventService,
+        )
+        .unwrap();
         assert!(!res.was_duplicate);
 
         // account_id -> signed (debit-positive) amount for the posted entry.
@@ -1137,9 +1354,13 @@ mod tests {
         assert_eq!(amt.values().sum::<i64>(), 0, "entry must balance");
 
         // Same reference re-ingests as a no-op duplicate.
-        let dup =
-            ingest_refund(&mut store, "test", refund_data(), JournalEntrySource::EventService)
-                .unwrap();
+        let dup = ingest_refund(
+            &mut store,
+            "test",
+            refund_data(),
+            JournalEntrySource::EventService,
+        )
+        .unwrap();
         assert!(dup.was_duplicate, "same reference must dedupe");
     }
 
@@ -1149,9 +1370,15 @@ mod tests {
         // Plain date
         assert_eq!(parse_ingest_date("2026-07-03").unwrap(), expected);
         // Full ISO-8601 / RFC-3339 with millis + Z (what the POS sends)
-        assert_eq!(parse_ingest_date("2026-07-03T14:30:00.000Z").unwrap(), expected);
+        assert_eq!(
+            parse_ingest_date("2026-07-03T14:30:00.000Z").unwrap(),
+            expected
+        );
         // With an explicit offset
-        assert_eq!(parse_ingest_date("2026-07-03T09:30:00-05:00").unwrap(), expected);
+        assert_eq!(
+            parse_ingest_date("2026-07-03T09:30:00-05:00").unwrap(),
+            expected
+        );
         // Datetime without offset (leading-10 fallback)
         assert_eq!(parse_ingest_date("2026-07-03T14:30:00").unwrap(), expected);
         // Whitespace tolerated

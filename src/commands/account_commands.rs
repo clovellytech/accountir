@@ -20,6 +20,10 @@ pub enum AccountCommandError {
     InvalidData(String),
     #[error("Account has balance, cannot deactivate")]
     HasBalance,
+    /// Something still points at the account, so removing it would leave a
+    /// dangling reference. Carries what, so the message can say.
+    #[error("{0}")]
+    StillInUse(String),
 }
 
 /// Find or create the "Uncategorized" expense account.
@@ -410,6 +414,156 @@ pub(crate) fn build_update_account_in_txn(
 /// so both enforce the SAME fences under the write lock (audit
 /// `AccountDeactivated`, HIGH — a concurrent posting must not sneak a nonzero
 /// balance in after the check).
+/// Everything that can stop an account being deleted, checked in one place.
+///
+/// # Why every reference and not just the journal
+///
+/// "No transactions" is the rule a person has in mind, and it is necessary but
+/// not sufficient. An account with no journal lines can still be the target of
+/// an import mapping, a vendor rule, a recurring transfer, a bank feed, or a
+/// depreciation schedule — and it can be the *parent* of twenty-seven others.
+/// On these books `3000 Expenses` is exactly that: not one line posted to it any
+/// more, twenty-seven children hanging off it. Deleting on the journal test
+/// alone would take the chart of accounts with it.
+///
+/// So the rule is inverted: an account may be deleted when *nothing at all*
+/// refers to it. Each check names itself, because "cannot delete" without a
+/// reason is a dead end.
+fn deletion_blockers(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<Vec<String>, EventStoreError> {
+    let count = |sql: &str| -> Result<i64, EventStoreError> {
+        Ok(conn.query_row(sql, [account_id], |r| r.get(0))?)
+    };
+    let mut blockers = Vec::new();
+
+    // The journal, voided entries included: a void is still a record of the
+    // account having been used, and the entry has to stay readable.
+    let lines = count("SELECT COUNT(*) FROM journal_lines WHERE account_id = ?1")?;
+    if lines > 0 {
+        blockers.push(format!(
+            "{lines} journal line{} post{} to it",
+            if lines == 1 { "" } else { "s" },
+            if lines == 1 { "s" } else { "" }
+        ));
+    }
+
+    let children = count("SELECT COUNT(*) FROM accounts WHERE parent_id = ?1")?;
+    if children > 0 {
+        blockers.push(format!(
+            "{children} account{} sit{} under it",
+            if children == 1 { "" } else { "s" },
+            if children == 1 { "s" } else { "" }
+        ));
+    }
+
+    // Everything else that names an account id. Each is a setting somebody made
+    // that would silently stop working.
+    for (sql, what) in [
+        (
+            "SELECT COUNT(*) FROM tax_line_mappings WHERE account_id = ?1",
+            "a Form 1065 line assignment",
+        ),
+        (
+            "SELECT COUNT(*) FROM tax_deduction_limits WHERE account_id = ?1",
+            "a deduction limit",
+        ),
+        (
+            "SELECT COUNT(*) FROM ingest_account_mappings WHERE account_id = ?1",
+            "an import mapping",
+        ),
+        (
+            "SELECT COUNT(*) FROM vendor_account_rules WHERE account_id = ?1",
+            "a vendor rule",
+        ),
+        (
+            "SELECT COUNT(*) FROM bank_accounts WHERE account_id = ?1",
+            "a bank account",
+        ),
+        (
+            "SELECT COUNT(*) FROM reconciliations WHERE account_id = ?1",
+            "a reconciliation",
+        ),
+        (
+            "SELECT COUNT(*) FROM pending_imports WHERE account_id = ?1",
+            "a pending import",
+        ),
+        (
+            "SELECT COUNT(*) FROM plaid_local_accounts WHERE local_account_id = ?1",
+            "a Plaid account",
+        ),
+        (
+            "SELECT COUNT(*) FROM plaid_staged_transactions WHERE local_account_id = ?1",
+            "a staged Plaid transaction",
+        ),
+        (
+            "SELECT COUNT(*) FROM recurring_transfer_rules \
+             WHERE source_account_id = ?1 OR dest_account_id = ?1",
+            "a recurring transfer",
+        ),
+        (
+            "SELECT COUNT(*) FROM depreciable_assets \
+             WHERE asset_account_id = ?1 OR expense_account_id = ?1 \
+                OR accumulated_account_id = ?1 OR section_179_account_id = ?1",
+            "a depreciation schedule",
+        ),
+    ] {
+        // A table a migration has not reached yet is not a blocker; treat a
+        // missing table as zero rather than refusing every deletion.
+        if count(sql).unwrap_or(0) > 0 {
+            blockers.push(format!("{what} points at it"));
+        }
+    }
+
+    Ok(blockers)
+}
+
+/// Why this account may not be deleted, or `None` if it may.
+///
+/// Read-only, so it serves both the command — which re-runs it inside its append
+/// transaction, where the answer is authoritative — and a UI asking in advance.
+/// One function, because a page that offers a delete the ledger will refuse is
+/// worse than one that does not offer it.
+pub fn deletion_refusal(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<Option<AccountCommandError>, EventStoreError> {
+    let name: Option<String> = conn
+        .query_row(
+            "SELECT name FROM accounts WHERE id = ?1",
+            [account_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(name) = name else {
+        return Ok(Some(AccountCommandError::NotFound(account_id.to_string())));
+    };
+
+    let blockers = deletion_blockers(conn, account_id)?;
+    if blockers.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AccountCommandError::StillInUse(format!(
+        "{name} cannot be deleted because {}. Deleting is for an account created in error and \
+         never used; an account that has been used should be deactivated instead, so its history \
+         stays readable.",
+        blockers.join(", and ")
+    ))))
+}
+
+pub(crate) fn build_delete_account_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+) -> Result<AccountStep, EventStoreError> {
+    match deletion_refusal(tx, account_id)? {
+        Some(e) => Ok(AccountStep::Reject(e)),
+        None => Ok(AccountStep::Append(Event::AccountDeleted {
+            account_id: account_id.to_string(),
+        })),
+    }
+}
+
 pub(crate) fn build_deactivate_account_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &DeactivateAccountCommand,
@@ -552,6 +706,39 @@ impl<'a> AccountCommands<'a> {
     /// has a zero net balance (audit `AccountDeactivated`, HIGH — a concurrent
     /// posting must not sneak a nonzero balance in after the check). Retries on a
     /// head move.
+    /// Remove an account that was created in error and never used.
+    ///
+    /// The checks run *inside* the append transaction, not before it, so a
+    /// journal entry posted between "is it empty?" and "delete it" loses the
+    /// race rather than being orphaned by it.
+    pub fn delete_account(&mut self, account_id: &str) -> Result<StoredEvent, AccountCommandError> {
+        let user_id = self.user_id.clone();
+        let account_id = account_id.to_string();
+        loop {
+            let head = self.store.latest_id()?.unwrap_or(0);
+            let outcome = self.store.append_checked(
+                head,
+                |tx| match build_delete_account_in_txn(tx, &account_id)? {
+                    AccountStep::Append(event) => {
+                        Ok(Verdict::Append(EventEnvelope::new(event, user_id.clone())))
+                    }
+                    AccountStep::Reject(e) => Ok(Verdict::Reject(e)),
+                },
+                |tx, stored| {
+                    Projector::new(tx)
+                        .apply(stored)
+                        .map_err(|e| EventStoreError::Projection(e.to_string()))
+                },
+            )?;
+
+            match outcome {
+                CheckedOutcome::Appended(stored) => return Ok(stored),
+                CheckedOutcome::HeadMismatch { .. } => continue,
+                CheckedOutcome::Rejected(e) => return Err(e),
+            }
+        }
+    }
+
     pub fn deactivate_account(
         &mut self,
         cmd: DeactivateAccountCommand,
@@ -877,6 +1064,129 @@ mod tests {
         let mut store = EventStore::in_memory().unwrap();
         store.init_schema().unwrap();
         store
+    }
+
+    fn make(store: &mut EventStore, number: &str, name: &str, parent: Option<&str>) -> String {
+        let stored = AccountCommands::new(store, "test".to_string())
+            .create_account(CreateAccountCommand {
+                account_type: AccountType::Expense,
+                account_number: number.to_string(),
+                name: name.to_string(),
+                parent_id: parent.map(str::to_string),
+                currency: None,
+                description: None,
+            })
+            .unwrap();
+        match &stored.event {
+            Event::AccountCreated { account_id, .. } => account_id.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// The case this exists for: an account created by mistake, never used.
+    #[test]
+    fn an_account_that_was_never_used_can_be_deleted() {
+        let mut store = setup();
+        let typo = make(&mut store, "3099", "Staff meals", None);
+
+        assert!(
+            deletion_refusal(store.connection(), &typo)
+                .unwrap()
+                .is_none(),
+            "an unused account should be deletable"
+        );
+        AccountCommands::new(&mut store, "test".to_string())
+            .delete_account(&typo)
+            .expect("delete an unused account");
+
+        let left: i64 = store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE id = ?1",
+                [&typo],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "the row is gone from the chart");
+    }
+
+    /// A parent is not deletable however empty it is. On the real books
+    /// `3000 Expenses` had every line moved off it and still had 27 children —
+    /// deleting on the journal test alone would have taken the chart with it.
+    #[test]
+    fn a_parent_cannot_be_deleted_however_empty_it_is() {
+        let mut store = setup();
+        let parent = make(&mut store, "3000", "Expenses", None);
+        let _child = make(&mut store, "3001", "Supplies", Some(&parent));
+
+        let refusal = deletion_refusal(store.connection(), &parent)
+            .unwrap()
+            .expect("a parent must be refused")
+            .to_string();
+        assert!(refusal.contains("sits under it"), "{refusal}");
+
+        let err = AccountCommands::new(&mut store, "test".to_string())
+            .delete_account(&parent)
+            .expect_err("the command must refuse too, not just the probe");
+        assert!(err.to_string().contains("sits under it"), "{err}");
+    }
+
+    /// One posting either way is enough. The refusal has to say so, and has to
+    /// point at deactivating instead — that is what the user actually wants for
+    /// an account with history.
+    #[test]
+    fn an_account_with_any_transaction_cannot_be_deleted() {
+        let mut store = setup();
+        let cash = make(&mut store, "1001", "Cash", None);
+        let rent = make(&mut store, "3002", "Rent", None);
+        crate::commands::entry_commands::EntryCommands::new(&mut store, "test".to_string())
+            .post_entry(crate::commands::entry_commands::PostEntryCommand {
+                date: chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                memo: "rent".to_string(),
+                lines: vec![
+                    crate::commands::entry_commands::EntryLine::debit(&rent, 1000, "USD"),
+                    crate::commands::entry_commands::EntryLine::credit(&cash, 1000, "USD"),
+                ],
+                reference: None,
+                source: None,
+            })
+            .unwrap();
+
+        for account in [&cash, &rent] {
+            let refusal = deletion_refusal(store.connection(), account)
+                .unwrap()
+                .expect("an account with a posting must be refused")
+                .to_string();
+            assert!(refusal.contains("journal line"), "{refusal}");
+            assert!(
+                refusal.contains("deactivated"),
+                "the refusal must name the thing to do instead: {refusal}"
+            );
+        }
+    }
+
+    /// A settings row is a reference too, and one nobody would think to look
+    /// for. Deleting under it leaves an import pointing at nothing.
+    #[test]
+    fn a_setting_that_names_the_account_blocks_deletion() {
+        let mut store = setup();
+        let acct = make(&mut store, "3045", "Staff meals", None);
+        crate::tax::lines::set_account_line(store.connection(), &acct, "l21", 0).unwrap();
+
+        let refusal = deletion_refusal(store.connection(), &acct)
+            .unwrap()
+            .expect("a mapped account must be refused")
+            .to_string();
+        assert!(refusal.contains("Form 1065 line assignment"), "{refusal}");
+    }
+
+    #[test]
+    fn deleting_an_account_that_is_not_there_says_so() {
+        let mut store = setup();
+        let err = AccountCommands::new(&mut store, "test".to_string())
+            .delete_account("nope")
+            .expect_err("a missing account is not a silent success");
+        assert!(matches!(err, AccountCommandError::NotFound(_)), "{err}");
     }
 
     #[test]

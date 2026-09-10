@@ -95,7 +95,11 @@ impl SyncResultsModal {
         frame.render_widget(Clear, modal_area);
 
         let has_errors = self.summary.errors > 0;
-        let border_color = if has_errors { theme.error } else { theme.accent };
+        let border_color = if has_errors {
+            theme.error
+        } else {
+            theme.accent
+        };
 
         let title = format!(" Sync Results: {} ", self.service_name);
         let block = Block::default()
@@ -119,7 +123,7 @@ impl SyncResultsModal {
 
         let chunks = Layout::vertical([
             Constraint::Length(3), // Summary
-            Constraint::Min(3),   // Event list
+            Constraint::Min(3),    // Event list
             Constraint::Length(1), // Help
         ])
         .split(inner);
@@ -205,10 +209,7 @@ impl SyncResultsModal {
                     };
 
                     Line::from(vec![
-                        Span::styled(
-                            format!(" {} ", icon),
-                            status_style,
-                        ),
+                        Span::styled(format!(" {} ", icon), status_style),
                         Span::styled(
                             format!("{:<20} ", r.event_type),
                             Style::default().fg(theme.fg_dim),
@@ -228,8 +229,7 @@ impl SyncResultsModal {
             // Scrollbar
             if self.results.len() > visible_height {
                 let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-                let mut scrollbar_state = ScrollbarState::new(self.results.len())
-                    .position(scroll);
+                let mut scrollbar_state = ScrollbarState::new(self.results.len()).position(scroll);
                 let scrollbar_area = Rect {
                     x: chunks[1].x + chunks[1].width.saturating_sub(1),
                     y: chunks[1].y,

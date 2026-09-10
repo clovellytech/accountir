@@ -177,6 +177,13 @@ pub fn fold(
                     continue;
                 }
                 let oriented = orient * line.balance;
+                // Deliberately on no line — see `lines::OFF_RETURN`. Skipped
+                // before `lookup`, which would call it unmapped and report it.
+                if mapping.get(&line.account_id).map(String::as_str)
+                    == Some(super::lines::OFF_RETURN)
+                {
+                    continue;
+                }
                 match mapping.get(&line.account_id).and_then(|k| lookup(k)) {
                     Some(def) => {
                         let signed = match def.sense {
@@ -267,10 +274,7 @@ pub fn fill(
         return Ok(warnings);
     }
 
-    for def in MAPPABLE_LINES
-        .iter()
-        .filter(|d| d.schedule == Schedule::L)
-    {
+    for def in MAPPABLE_LINES.iter().filter(|d| d.schedule == Schedule::L) {
         let Field::Period { begin, end } = def.field else {
             // Guarded by `only_the_profit_and_loss_schedules_are_totalled_from_activity`
             // in `super::lines`, so this is unreachable rather than merely unlikely.
@@ -288,11 +292,31 @@ pub fn fill(
     // reader goes looking for, and a blank total reads as an unfinished page
     // rather than as a nil balance sheet.
     let assets = sched.total_assets();
-    set_text(doc, map, derived::TOTAL_ASSETS.0, &format_dollars(assets.begin))?;
-    set_text(doc, map, derived::TOTAL_ASSETS.1, &format_dollars(assets.end))?;
+    set_text(
+        doc,
+        map,
+        derived::TOTAL_ASSETS.0,
+        &format_dollars(assets.begin),
+    )?;
+    set_text(
+        doc,
+        map,
+        derived::TOTAL_ASSETS.1,
+        &format_dollars(assets.end),
+    )?;
     let lc = sched.total_liabilities_and_capital();
-    set_text(doc, map, derived::TOTAL_LIABS_CAPITAL.0, &format_dollars(lc.begin))?;
-    set_text(doc, map, derived::TOTAL_LIABS_CAPITAL.1, &format_dollars(lc.end))?;
+    set_text(
+        doc,
+        map,
+        derived::TOTAL_LIABS_CAPITAL.0,
+        &format_dollars(lc.begin),
+    )?;
+    set_text(
+        doc,
+        map,
+        derived::TOTAL_LIABS_CAPITAL.1,
+        &format_dollars(lc.end),
+    )?;
 
     if !required {
         warnings.push(
@@ -324,7 +348,9 @@ pub fn fill(
         let named: Vec<String> = sched
             .unmapped
             .iter()
-            .map(|(num, name, c)| format!("{num} {name} ({})", format_dollars(cents_to_dollars(*c))))
+            .map(|(num, name, c)| {
+                format!("{num} {name} ({})", format_dollars(cents_to_dollars(*c)))
+            })
             .collect();
         warnings.push(format!(
             "{} balance-sheet account(s) are on no Schedule L line and are missing from it: {}.",
@@ -356,8 +382,8 @@ fn write_money(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queries::reports::{BalanceSheetLine, BalanceSheetSection};
     use crate::domain::AccountType;
+    use crate::queries::reports::{BalanceSheetLine, BalanceSheetSection};
 
     fn line(id: &str, num: &str, name: &str, t: AccountType, balance: i64) -> BalanceSheetLine {
         BalanceSheetLine {
@@ -381,9 +407,21 @@ mod tests {
         let te: i64 = equity.iter().map(|l| -l.balance).sum();
         BalanceSheet {
             as_of_date: date,
-            assets: BalanceSheetSection { name: "Assets".into(), lines: assets, total: ta },
-            liabilities: BalanceSheetSection { name: "Liabilities".into(), lines: liabilities, total: tl },
-            equity: BalanceSheetSection { name: "Equity".into(), lines: equity, total: te },
+            assets: BalanceSheetSection {
+                name: "Assets".into(),
+                lines: assets,
+                total: ta,
+            },
+            liabilities: BalanceSheetSection {
+                name: "Liabilities".into(),
+                lines: liabilities,
+                total: tl,
+            },
+            equity: BalanceSheetSection {
+                name: "Equity".into(),
+                lines: equity,
+                total: te,
+            },
             total_assets: ta,
             total_liabilities_and_equity: tl + te,
             is_balanced: ta == tl + te,
@@ -409,25 +447,76 @@ mod tests {
         let begin = sheet(
             d(2024, 12, 31),
             vec![line("cash", "1000", "Checking", AccountType::Asset, 500_00)],
-            vec![line("ap", "2000", "Accounts Payable", AccountType::Liability, -200_00)],
-            vec![line("cap", "3000", "Partners Capital", AccountType::Equity, -300_00)],
+            vec![line(
+                "ap",
+                "2000",
+                "Accounts Payable",
+                AccountType::Liability,
+                -200_00,
+            )],
+            vec![line(
+                "cap",
+                "3000",
+                "Partners Capital",
+                AccountType::Equity,
+                -300_00,
+            )],
         );
         let end = sheet(
             d(2025, 12, 31),
             vec![line("cash", "1000", "Checking", AccountType::Asset, 800_00)],
-            vec![line("ap", "2000", "Accounts Payable", AccountType::Liability, -300_00)],
-            vec![line("cap", "3000", "Partners Capital", AccountType::Equity, -500_00)],
+            vec![line(
+                "ap",
+                "2000",
+                "Accounts Payable",
+                AccountType::Liability,
+                -300_00,
+            )],
+            vec![line(
+                "cap",
+                "3000",
+                "Partners Capital",
+                AccountType::Equity,
+                -500_00,
+            )],
         );
         let m = mapping(&[("cash", "sl1"), ("ap", "sl15"), ("cap", "sl21")]);
         let s = fold(&begin, &end, &m);
 
-        assert_eq!(s.get("sl1"), Period { begin: 500, end: 800 });
-        assert_eq!(s.get("sl15"), Period { begin: 200, end: 300 });
-        assert_eq!(s.get("sl21"), Period { begin: 300, end: 500 });
-        assert_eq!(s.total_assets(), Period { begin: 500, end: 800 });
+        assert_eq!(
+            s.get("sl1"),
+            Period {
+                begin: 500,
+                end: 800
+            }
+        );
+        assert_eq!(
+            s.get("sl15"),
+            Period {
+                begin: 200,
+                end: 300
+            }
+        );
+        assert_eq!(
+            s.get("sl21"),
+            Period {
+                begin: 300,
+                end: 500
+            }
+        );
+        assert_eq!(
+            s.total_assets(),
+            Period {
+                begin: 500,
+                end: 800
+            }
+        );
         assert_eq!(
             s.total_liabilities_and_capital(),
-            Period { begin: 500, end: 800 }
+            Period {
+                begin: 500,
+                end: 800
+            }
         );
         assert_eq!(s.balances(), (true, true));
     }
@@ -438,15 +527,39 @@ mod tests {
     fn the_opening_column_is_last_years_closing_position() {
         let begin = sheet(
             d(2024, 12, 31),
-            vec![line("cash", "1000", "Checking", AccountType::Asset, 1_000_00)],
+            vec![line(
+                "cash",
+                "1000",
+                "Checking",
+                AccountType::Asset,
+                1_000_00,
+            )],
             vec![],
-            vec![line("cap", "3000", "Capital", AccountType::Equity, -1_000_00)],
+            vec![line(
+                "cap",
+                "3000",
+                "Capital",
+                AccountType::Equity,
+                -1_000_00,
+            )],
         );
         let end = sheet(
             d(2025, 12, 31),
-            vec![line("cash", "1000", "Checking", AccountType::Asset, 1_500_00)],
+            vec![line(
+                "cash",
+                "1000",
+                "Checking",
+                AccountType::Asset,
+                1_500_00,
+            )],
             vec![],
-            vec![line("cap", "3000", "Capital", AccountType::Equity, -1_500_00)],
+            vec![line(
+                "cap",
+                "3000",
+                "Capital",
+                AccountType::Equity,
+                -1_500_00,
+            )],
         );
         let s = fold(&begin, &end, &mapping(&[("cash", "sl1"), ("cap", "sl21")]));
         // 1000 opening, not the 500 the year moved.
@@ -465,7 +578,13 @@ mod tests {
                     line("bldg", "1500", "Buildings", AccountType::Asset, gross),
                     // Accumulated depreciation is a contra asset: credit balance
                     // on an asset account, so it comes through negative.
-                    line("accum", "1590", "Accum. Depreciation", AccountType::Asset, accum),
+                    line(
+                        "accum",
+                        "1590",
+                        "Accum. Depreciation",
+                        AccountType::Asset,
+                        accum,
+                    ),
                 ],
                 vec![],
                 vec![],
@@ -479,7 +598,13 @@ mod tests {
         );
 
         // 9b prints as a positive number...
-        assert_eq!(s.get("sl9b"), Period { begin: 400, end: 500 });
+        assert_eq!(
+            s.get("sl9b"),
+            Period {
+                begin: 400,
+                end: 500
+            }
+        );
         // ...and is taken away from the section.
         assert_eq!(
             s.total_assets(),
@@ -500,7 +625,11 @@ mod tests {
                 vec![],
             )
         };
-        let s = fold(&bs(d(2024, 12, 31), 100_00), &bs(d(2025, 12, 31), 900_00), &BTreeMap::new());
+        let s = fold(
+            &bs(d(2024, 12, 31), 100_00),
+            &bs(d(2025, 12, 31), 900_00),
+            &BTreeMap::new(),
+        );
         assert_eq!(s.unmapped.len(), 1, "{:?}", s.unmapped);
         // Reported at its larger balance, so the figure names the exposure.
         assert_eq!(s.unmapped[0].2, 900_00);
@@ -562,7 +691,9 @@ mod tests {
             let map = crate::tax::acroform::field_map(&doc);
             let warnings = fill(&mut doc, &map, &ScheduleL::default(), required).unwrap();
             assert!(
-                warnings.iter().any(|w| w.contains("no balance-sheet account is mapped")),
+                warnings
+                    .iter()
+                    .any(|w| w.contains("no balance-sheet account is mapped")),
                 "required={required} produced {warnings:?}"
             );
         }

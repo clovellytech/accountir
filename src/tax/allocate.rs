@@ -40,6 +40,7 @@
 //! K-1s.
 
 use crate::domain::Partner;
+use chrono::NaiveDate;
 
 /// Parts per million of the whole; 100% is 1,000,000.
 pub const PPM_WHOLE: i64 = 1_000_000;
@@ -72,18 +73,53 @@ pub struct Share {
 /// about shares that do not add up, and silently scaling them here would hide
 /// the fact that they do not.
 pub fn allocate(total: i64, partners: &[&Partner], basis: Basis) -> Vec<Share> {
+    allocate_as_of(total, partners, basis, None)
+}
+
+/// Split `total` on the percentages that were in force on `on`.
+///
+/// # Why a date belongs here
+///
+/// [`allocate`] splits on `Partner::shares`, which is the split as it stands
+/// *now*. Rebuilding a 2023 return in 2026 therefore allocated 2023's income on
+/// 2026's percentages — and once item J started reading the dated series, the
+/// two halves of the same K-1 disagreed: the header said a third and box 1 said
+/// 51%. Passing the year's own date keeps the whole page describing one
+/// partnership.
+///
+/// `None` means "as they stand now", which is what a projection of the year in
+/// progress wants and what books with no recorded history have always given.
+///
+/// # What this is not
+///
+/// One date, so one split for the whole year. A partnership whose percentages
+/// changed mid-year needs the year divided at the change and each segment
+/// allocated on its own split — §706(d), by interim closing of the books or by
+/// proration if elected. That is a larger piece of work; until it lands,
+/// `split_across_partners` warns when a year contains a change rather than
+/// letting a single-split allocation pass for a segmented one.
+pub fn allocate_as_of(
+    total: i64,
+    partners: &[&Partner],
+    basis: Basis,
+    on: Option<NaiveDate>,
+) -> Vec<Share> {
     if partners.is_empty() {
         return Vec::new();
     }
 
     let ppm_of = |p: &Partner| -> i64 {
+        let shares = match on {
+            Some(day) => p.shares_on(day),
+            None => p.shares,
+        };
         match basis {
-            Basis::Capital => p.shares.capital_ppm,
+            Basis::Capital => shares.capital_ppm,
             Basis::ProfitOrLoss => {
                 if total < 0 {
-                    p.shares.loss_ppm
+                    shares.loss_ppm
                 } else {
-                    p.shares.profit_ppm
+                    shares.profit_ppm
                 }
             }
         }
@@ -106,21 +142,86 @@ pub fn allocate(total: i64, partners: &[&Partner], basis: Basis) -> Vec<Share> {
     }
 
     let assigned: i64 = floors.iter().sum();
-    let mut leftover = total - assigned;
+    // What the percentages *as given* come to, before rounding. On a split that
+    // totals the whole this is `total`; on one that does not it is the smaller
+    // figure the percentages actually describe, and the difference between it
+    // and `total` is the shortfall — which is not this loop's to hand out.
+    let sum_ppm: i128 = partners.iter().map(|p| ppm_of(p) as i128).sum();
+    let intended = (total as i128 * sum_ppm / PPM_WHOLE as i128) as i64;
+    let mut leftover = intended - assigned;
 
-    // Hand the leftover out a dollar at a time, largest fractional part first.
-    // `sort_by` is stable, so equal remainders keep partner order and the same
-    // books produce the same return every time.
+    // Hand the *rounding* leftover out a dollar at a time, largest fractional
+    // part first. `sort_by` is stable, so equal remainders keep partner order
+    // and the same books produce the same return every time.
+    //
+    // # Why the loop is bounded, and why it skips zero shares
+    //
+    // Splitting on percentages that do not total 100% leaves a shortfall that is
+    // not rounding — 80% of a thousand dollars leaves two hundred — and the
+    // unbounded version of this loop handed that shortfall out too, cycling
+    // until the figures footed. The result was neither the percentages as given
+    // nor a proportional scaling of them but an arbitrary round robin, and the
+    // worst case was silent: two partners with a **0% loss share** were each
+    // allocated half of a ten-thousand-dollar loss, out of nothing.
+    //
+    // So the leftover handed out here is measured against what the percentages
+    // come to, not against `total`. That difference is under one dollar per
+    // partner by construction, which is what rounding leftover means — and each
+    // partner can receive at most one of it, so the loop cannot cycle. The
+    // shortfall is left unallocated, so the total does not foot: what the doc
+    // comment above promises, and what `form1065::check` warns about, rather
+    // than being papered over by a return that adds up and is wrong.
     remainders.sort_by_key(|r| std::cmp::Reverse(r.0));
+    remainders.retain(|(_, i)| ppm_of(partners[*i]) != 0);
     let step = if leftover < 0 { -1 } else { 1 };
     let mut idx = 0;
-    while leftover != 0 && !remainders.is_empty() {
-        let (_, who) = remainders[idx % remainders.len()];
+    while leftover != 0 && idx < remainders.len() {
+        let (_, who) = remainders[idx];
         floors[who] += step;
         leftover -= step;
         idx += 1;
     }
 
+    floors
+        .into_iter()
+        .enumerate()
+        .map(|(partner, dollars)| Share { partner, dollars })
+        .collect()
+}
+
+/// Split `total` on percentages given directly.
+///
+/// The same exact arithmetic as [`allocate`], but taking the percentages rather
+/// than reading them off partners — for [`crate::tax::varying`], which computes
+/// an effective split over a year divided at each change of interest. Sharing
+/// the loop rather than copying it keeps the guarantee that the shares sum to
+/// `total` in one place.
+pub fn allocate_on_ppm(total: i64, ppm: &[i64]) -> Vec<Share> {
+    if ppm.is_empty() {
+        return Vec::new();
+    }
+    let mut floors: Vec<i64> = Vec::with_capacity(ppm.len());
+    let mut remainders: Vec<(i64, usize)> = Vec::with_capacity(ppm.len());
+    for (i, share) in ppm.iter().enumerate() {
+        let exact = total * share;
+        let floor = exact / PPM_WHOLE;
+        remainders.push(((exact - floor * PPM_WHOLE).abs(), i));
+        floors.push(floor);
+    }
+    let assigned: i64 = floors.iter().sum();
+    let sum_ppm: i128 = ppm.iter().map(|p| *p as i128).sum();
+    let intended = (total as i128 * sum_ppm / PPM_WHOLE as i128) as i64;
+    let mut leftover = intended - assigned;
+
+    remainders.sort_by_key(|r| std::cmp::Reverse(r.0));
+    remainders.retain(|(_, i)| ppm[*i] != 0);
+    let step = if leftover < 0 { -1 } else { 1 };
+    let mut idx = 0;
+    while leftover != 0 && idx < remainders.len() {
+        floors[remainders[idx].1] += step;
+        leftover -= step;
+        idx += 1;
+    }
     floors
         .into_iter()
         .enumerate()
@@ -134,7 +235,9 @@ pub fn allocate(total: i64, partners: &[&Partner], basis: Basis) -> Vec<Share> {
 /// return, and the preparer should confirm the split matches the partnership
 /// agreement.
 pub fn profit_and_loss_shares_differ(partners: &[&Partner]) -> bool {
-    partners.iter().any(|p| p.shares.profit_ppm != p.shares.loss_ppm)
+    partners
+        .iter()
+        .any(|p| p.shares.profit_ppm != p.shares.loss_ppm)
 }
 
 #[cfg(test)]
@@ -145,6 +248,7 @@ mod tests {
 
     fn partner(name: &str, profit: i64, loss: i64, capital: i64) -> Partner {
         Partner {
+            history: Vec::new(),
             partner_id: name.to_string(),
             name: name.to_string(),
             partner_type: PartnerType::General,
@@ -251,18 +355,69 @@ mod tests {
         assert!(allocate(100, &[], Basis::ProfitOrLoss).is_empty());
     }
 
-    /// Shares that do not total the whole are apportioned as given — the
-    /// shortfall is somebody's data problem and hiding it here would remove the
-    /// only evidence of it.
+    /// Shares that do not total the whole are apportioned as given.
+    ///
+    /// This test used to assert `sum == 1000` and comment that "80% of the total
+    /// was allocated" — while the code allocated 100% of it. The name said the
+    /// right thing, the assertion passed, and the behaviour was the opposite of
+    /// both: the leftover loop handed the missing fifth out a dollar at a time
+    /// until the figures footed, so 40/40 became 50/50 on the return.
     #[test]
     fn shares_that_do_not_total_the_whole_are_not_silently_scaled() {
         let a = partner("A", 400_000, 400_000, 400_000);
         let b = partner("B", 400_000, 400_000, 400_000);
         let ps = [&a, &b];
         let shares = allocate(1000, &ps, Basis::ProfitOrLoss);
-        // 80% of the total was allocated, and the arithmetic still ties to the
-        // figure passed in, so the missing fifth shows up rather than vanishing.
-        assert_eq!(sum(&shares), 1000);
+        assert_eq!(shares[0].dollars, 400, "40% of a thousand is four hundred");
+        assert_eq!(shares[1].dollars, 400);
+        assert_eq!(
+            sum(&shares),
+            800,
+            "the missing fifth stays missing, which is the only evidence of it"
+        );
+    }
+
+    /// The worst shape the old leftover loop produced.
+    ///
+    /// Two partners with a **0% loss share** and a ten-thousand-dollar loss: the
+    /// loop gave them five thousand each, allocated out of nothing, on a K-1
+    /// that footed perfectly to Schedule K.
+    #[test]
+    fn a_zero_share_is_allocated_nothing_however_large_the_loss() {
+        let a = partner("A", 500_000, 0, 500_000);
+        let b = partner("B", 500_000, 0, 500_000);
+        let shares = allocate(-10_000, &[&a, &b], Basis::ProfitOrLoss);
+        assert_eq!(shares[0].dollars, 0);
+        assert_eq!(shares[1].dollars, 0);
+    }
+
+    /// A shortfall leaks nothing at all, not even the first dollar.
+    ///
+    /// The bounded loop still handed out one dollar per partner before it
+    /// stopped, so a sole partner at 50% of ten thousand got 5,001. The leftover
+    /// is now measured against what the percentages come to rather than against
+    /// the total, so on a shortfall there is no rounding leftover to hand out.
+    #[test]
+    fn a_shortfall_does_not_leak_even_a_single_dollar() {
+        let a = partner("A", 500_000, 500_000, 500_000);
+        assert_eq!(
+            allocate(10_000, &[&a], Basis::ProfitOrLoss)[0].dollars,
+            5_000
+        );
+        let b = partner("B", 100_000, 100_000, 100_000);
+        let shares = allocate(10_000, &[&a, &b], Basis::ProfitOrLoss);
+        assert_eq!(sum(&shares), 6_000, "60% of ten thousand, and no more");
+    }
+
+    /// The percentages the real book uses, so the ordinary case stays exact.
+    #[test]
+    fn a_whole_split_still_foots_to_the_figure_it_was_given() {
+        let a = partner("A", 510_000, 0, 0);
+        let b = partner("B", 490_000, 1_000_000, 1_000_000);
+        for total in [287_925_i64, -287_925, 1, 0, 999_999] {
+            let shares = allocate(total, &[&a, &b], Basis::ProfitOrLoss);
+            assert_eq!(sum(&shares), total, "total {total} did not foot");
+        }
     }
 
     #[test]
@@ -279,7 +434,13 @@ mod tests {
     fn a_sole_partner_takes_everything() {
         let a = partner("A", PPM_WHOLE, PPM_WHOLE, PPM_WHOLE);
         let ps = [&a];
-        assert_eq!(allocate(12_345, &ps, Basis::ProfitOrLoss)[0].dollars, 12_345);
-        assert_eq!(allocate(-12_345, &ps, Basis::ProfitOrLoss)[0].dollars, -12_345);
+        assert_eq!(
+            allocate(12_345, &ps, Basis::ProfitOrLoss)[0].dollars,
+            12_345
+        );
+        assert_eq!(
+            allocate(-12_345, &ps, Basis::ProfitOrLoss)[0].dollars,
+            -12_345
+        );
     }
 }

@@ -21,11 +21,16 @@
 //! renumbered the form under us.
 
 use super::acroform::{
-    FieldMap, FormError, append_document, field_map, namespace_fields, set_check, set_text,
-    strip_xfa,
+    append_document, field_map, namespace_fields, set_check, set_text, strip_xfa, FieldMap,
+    FormError,
 };
-use super::lines::{Form1065Lines, format_dollars};
-use crate::domain::{BusinessProfile, Partner, PartnerType, Residency, Shares, format_ppm};
+use super::lines::{format_dollars, Form1065Lines};
+use crate::commands::share_period_commands as spc;
+use crate::domain::{format_ppm, BusinessProfile, Partner, PartnerType, Residency};
+// Only the tests still name it directly; the checks that used to sum shares here
+// now ask `share_period_commands` about a date instead.
+#[cfg(test)]
+use crate::domain::Shares;
 use chrono::{Datelike, NaiveDate};
 use lopdf::Document;
 
@@ -37,11 +42,117 @@ use lopdf::Document;
 const F1065: &[u8] = include_bytes!("../../assets/irs/f1065.pdf");
 const F1065_SK1: &[u8] = include_bytes!("../../assets/irs/f1065sk1.pdf");
 
-/// The tax year the vendored forms are for.
-///
-/// Checked against the year being filed so that filing 2024 with the 2025 form
-/// is a message rather than a quietly wrong return.
+/// The tax year the *current* forms are for — the ones in `assets/irs` itself
+/// rather than in a year directory.
 pub const FORM_TAX_YEAR: i32 = 2025;
+
+/// One tax year's blank forms.
+pub struct FormYear {
+    pub year: i32,
+    pub f1065: &'static [u8],
+    pub sk1: &'static [u8],
+    /// A draft the IRS has published but not finalised. Filing one is not
+    /// allowed, so anything built on it is a projection and has to say so.
+    pub draft: bool,
+    /// Schedule B's questions on this revision, or `None` where they have not
+    /// been transcribed. Which questions the year asks, what it numbers them,
+    /// and which box each answer goes in are all one fact about one form.
+    pub schedule_b: Option<&'static [super::schedule_b::QuestionBoxes]>,
+    /// Page one's boxes on this revision, or `None` where they have not been
+    /// transcribed. The income block moves between revisions, so this is a
+    /// complete table rather than a set of exceptions to another year's.
+    pub page1: Option<&'static Page1>,
+    /// Whether this revision's pages line up with the ones the field constants
+    /// were written against.
+    ///
+    /// The 2026 draft inserts a Schedule A ahead of page 1, so every page shifts
+    /// and `f5_*` — Schedule K in every prior revision — is Schedule B in it.
+    /// Those names all still resolve, which is exactly the danger: the figures
+    /// would land in real boxes on the wrong schedule. A revision that has not
+    /// been mapped fills identity only, and says so.
+    pub mapped: bool,
+}
+
+/// Every year this program can produce a return for, oldest first.
+///
+/// Each year gets its own blank because the IRS renumbers boxes between
+/// revisions — see `assets/irs/README.md`. Carrying them all is the only way a
+/// prior-year return is the prior year's *form* rather than this year's form
+/// with last year's figures on it.
+pub const FORM_YEARS: &[FormYear] = &[
+    FormYear {
+        year: 2023,
+        page1: Some(&PAGE1_2023),
+        schedule_b: Some(super::schedule_b::SCHEDULE_B_2023),
+        f1065: include_bytes!("../../assets/irs/2023/f1065.pdf"),
+        sk1: include_bytes!("../../assets/irs/2023/f1065sk1.pdf"),
+        draft: false,
+        // The paid-preparer block sits one label row higher than in 2025, so its
+        // first box is f1_49 rather than f1_57. Confirmed by matching the field
+        // rectangle against the position of the printed "preparer's name" label.
+        // 2023 ends at question 31 and has neither the "reserved" 10e nor the
+        // subchapter-K election, which the IRS added later.
+        mapped: true,
+    },
+    FormYear {
+        year: 2024,
+        page1: Some(&PAGE1_2024),
+        schedule_b: Some(super::schedule_b::SCHEDULE_B_2024),
+        f1065: include_bytes!("../../assets/irs/2024/f1065.pdf"),
+        sk1: include_bytes!("../../assets/irs/2024/f1065sk1.pdf"),
+        draft: false,
+        // Same box, same place, but this revision writes it as the second
+        // widget of f1_49 rather than the first.
+        mapped: true,
+    },
+    FormYear {
+        year: FORM_TAX_YEAR,
+        page1: Some(&PAGE1_2025),
+        schedule_b: Some(super::schedule_b::SCHEDULE_B_2025),
+        f1065: F1065,
+        sk1: F1065_SK1,
+        draft: false,
+        mapped: true,
+    },
+    FormYear {
+        year: 2026,
+        // The draft inserts a Schedule A ahead of page 1; nothing has been
+        // transcribed for it, and `mapped: false` refuses the year before this
+        // is reached.
+        page1: None,
+        schedule_b: None,
+        f1065: include_bytes!("../../assets/irs/2026/f1065.pdf"),
+        sk1: include_bytes!("../../assets/irs/2026/f1065sk1.pdf"),
+        draft: true,
+        // Re-paginated: a new Schedule A takes page 1, so the income page is
+        // page 2 (`f2_*`), Schedule K is page 6 (`f6_*`) and Analysis page 7.
+        // Until each box is matched to its new number this cannot fill figures.
+        mapped: false,
+    },
+];
+
+/// The blanks for `year`, or `None` if no form is carried for it.
+pub fn form_year(year: i32) -> Option<&'static FormYear> {
+    FORM_YEARS.iter().find(|f| f.year == year)
+}
+
+/// Where [`FORM_TAX_YEAR`]'s blanks sit in [`FORM_YEARS`] — the fallback for a
+/// year nothing is carried for, alongside a warning saying so.
+// Only the test that pins `FORM_TAX_YEAR` to the table still names it: nothing
+// falls back to "the current revision" any more, because a return built on
+// another year's blank carries that year in pre-printed type.
+#[cfg(test)]
+const CURRENT_FORM_INDEX: usize = 2;
+
+/// Roughly how many Schedule B boxes a prior revision renumbers, for the message
+/// that has to explain why the schedule is blank. Measured, not guessed: 19 on
+/// the 2023 form, 13 on 2024.
+const UNMAPPED_SCHEDULE_B_BOXES: &str = "a dozen or more";
+
+/// The years a return can be produced for, oldest first.
+pub fn supported_years() -> Vec<i32> {
+    FORM_YEARS.iter().map(|f| f.year).collect()
+}
 
 /// The 1065's own root subform, which keeps the name the IRS gave it.
 pub const FORM_ROOT: &str = "topmostSubform[0]";
@@ -57,95 +168,222 @@ pub fn k1_namespace(n: usize) -> String {
 
 // --- Form 1065, page 1 ------------------------------------------------------
 // Descriptions are from docs/form-1065-fields.md.
-mod f1065 {
-    /// "Name of partnership."
-    pub const LEGAL_NAME: &str = "f1_04[0]";
-    /// "Number and street."
-    pub const STREET: &str = "f1_05[0]";
-    /// "Room or suite no."
-    pub const SUITE: &str = "f1_06[0]";
-    /// "City or town."
-    pub const CITY: &str = "f1_07[0]";
-    /// "State or province."
-    pub const STATE: &str = "f1_08[0]";
-    /// "Country."
-    pub const COUNTRY: &str = "f1_09[0]";
-    /// "Z I P or foreign postal code."
-    pub const POSTAL_CODE: &str = "f1_10[0]";
-    /// "A. Principal business activity."
-    pub const PRINCIPAL_ACTIVITY: &str = "f1_11[0]";
-    /// "B. Principal product or service."
-    pub const PRINCIPAL_PRODUCT: &str = "f1_12[0]";
-    /// "C. Business code number." — the NAICS code.
-    pub const NAICS: &str = "f1_13[0]";
-    /// "D. Employer identification number."
-    pub const EIN: &str = "f1_14[0]";
-    /// "E. Date business started."
-    pub const DATE_STARTED: &str = "f1_15[0]";
-    /// "I. Number of Schedules K-1."
-    pub const K1_COUNT: &str = "f1_18[0]";
-
-    // --- Income, lines 1a-8 ---
-    /// "1a. Gross receipts or sales."
-    pub const L1A_GROSS_RECEIPTS: &str = "f1_19[0]";
-    /// "1b. Less returns and allowances."
-    pub const L1B_RETURNS: &str = "f1_20[0]";
-    /// "1c. Balance." — derived.
-    pub const L1C_BALANCE: &str = "f1_21[0]";
-    /// "2. Cost of goods sold (attach Form 1125-A)."
-    pub const L2_COGS: &str = "f1_22[0]";
-    /// "3. Gross profit. Subtract line 2 from line 1c." — derived.
-    pub const L3_GROSS_PROFIT: &str = "f1_23[0]";
-    /// "4. Ordinary income (loss) from other partnerships, estates, and trusts."
-    pub const L4_OTHER_PARTNERSHIPS: &str = "f1_24[0]";
-    /// "5. Net farm profit (loss)."
-    pub const L5_FARM: &str = "f1_25[0]";
-    /// "6. Net gain (loss) from Form 4797, Part II, line 17."
-    pub const L6_FORM_4797: &str = "f1_26[0]";
-    /// "7. Other income (loss)."
-    pub const L7_OTHER_INCOME: &str = "f1_27[0]";
-    /// "8. Total income (loss). Combine lines 3 through 7." — derived.
-    pub const L8_TOTAL_INCOME: &str = "f1_28[0]";
-
-    // --- Deductions, lines 9-23 ---
-    /// "9. Salaries and wages (other than to partners) (less employment credits)."
-    pub const L9_SALARIES: &str = "f1_29[0]";
-    /// "10. Guaranteed payments to partners."
-    pub const L10_GUARANTEED: &str = "f1_30[0]";
-    /// "11. Repairs and maintenance."
-    pub const L11_REPAIRS: &str = "f1_31[0]";
-    /// "12. Bad debts."
-    pub const L12_BAD_DEBTS: &str = "f1_32[0]";
-    /// "13. Rent."
-    pub const L13_RENT: &str = "f1_33[0]";
-    /// "14. Taxes and licenses."
-    pub const L14_TAXES: &str = "f1_34[0]";
-    /// "15. Interest (see instructions)."
-    pub const L15_INTEREST: &str = "f1_35[0]";
-    /// "16a. Depreciation (if required, attach Form 4562)."
-    pub const L16A_DEPRECIATION: &str = "f1_36[0]";
-    /// "16b. Less depreciation reported on Form 1125-A and elsewhere on return."
-    pub const L16B_DEPRECIATION_ELSEWHERE: &str = "f1_37[0]";
-    /// "16c. Amount." — derived, 16a less 16b.
-    pub const L16C_DEPRECIATION_NET: &str = "f1_38[0]";
-    /// "17. Depletion (Do not deduct oil and gas depletion.)."
-    pub const L17_DEPLETION: &str = "f1_39[0]";
-    /// "18. Retirement plans, etc."
-    pub const L18_RETIREMENT: &str = "f1_40[0]";
-    /// "19. Employee benefit programs."
-    pub const L19_BENEFITS: &str = "f1_41[0]";
-    /// "20. Energy efficient commercial buildings deduction (attach Form 7205)."
-    pub const L20_ENERGY: &str = "f1_42[0]";
-    /// "21. Other deductions (attach statement)."
-    pub const L21_OTHER_DEDUCTIONS: &str = "f1_43[0]";
-    /// "22. Total deductions. Add the amounts shown ... for lines 9 through 21." — derived.
-    pub const L22_TOTAL_DEDUCTIONS: &str = "f1_44[0]";
-    /// "23. Ordinary business income (loss). Subtract line 22 from line 8." — derived.
-    pub const L23_ORDINARY_INCOME: &str = "f1_45[0]";
-
-    /// "Paid Preparer Use Only. Enter preparer's name."
-    pub const PREPARER_NAME: &str = "f1_57[0]";
+/// Page one's boxes on one revision of the form.
+///
+/// # Why this is a table per revision rather than a set of constants
+///
+/// The income and deduction block moves. The 2025 form numbers gross receipts
+/// `f1_19[0]`; the 2023 and 2024 forms number it `f1_15[0]`, because their
+/// header uses four fewer boxes. Every one of the twenty-seven lines below is
+/// displaced by the same four — and on the 2023 form by five from line 21 down,
+/// because its energy-efficient-buildings line is a second widget of `f1_37`
+/// rather than a new number.
+///
+/// Every one of those names exists on every revision, so nothing that checks
+/// names could see it. What it produced was a 2023 return with gross receipts
+/// printed on line 3, total deductions on "Other taxes", and the ordinary
+/// business income on **line 28, Total balance due** — a page that totals to
+/// nothing a reader could follow, on boxes that are all real.
+pub struct Page1 {
+    pub legal_name: &'static str,
+    pub street: &'static str,
+    /// The suite or room line. `None` on revisions that print no separate box
+    /// for it — which is also the revisions that combine the address below.
+    pub suite: Option<&'static str>,
+    /// City. On a revision that prints one combined "City or town, state or
+    /// province, country, and ZIP or foreign postal code" box, this is that box
+    /// and the three below are `None`. The caller asks whether `state` is
+    /// present rather than carrying a separate flag, so the two cannot disagree.
+    pub city: &'static str,
+    pub state: Option<&'static str>,
+    pub country: Option<&'static str>,
+    pub postal_code: Option<&'static str>,
+    pub principal_activity: &'static str,
+    pub principal_product: &'static str,
+    pub naics: &'static str,
+    pub ein: &'static str,
+    pub date_started: &'static str,
+    pub k1_count: &'static str,
+    pub preparer_name: &'static str,
+    pub lines: Page1Lines,
 }
+
+/// The income and deduction lines, 1a through 23.
+pub struct Page1Lines {
+    pub l1a_gross_receipts: &'static str,
+    pub l1b_returns: &'static str,
+    pub l1c_balance: &'static str,
+    pub l2_cogs: &'static str,
+    pub l3_gross_profit: &'static str,
+    pub l4_other_partnerships: &'static str,
+    pub l5_farm: &'static str,
+    pub l6_form_4797: &'static str,
+    pub l7_other_income: &'static str,
+    pub l8_total_income: &'static str,
+    pub l9_salaries: &'static str,
+    pub l10_guaranteed: &'static str,
+    pub l11_repairs: &'static str,
+    pub l12_bad_debts: &'static str,
+    pub l13_rent: &'static str,
+    pub l14_taxes: &'static str,
+    pub l15_interest: &'static str,
+    pub l16a_depreciation: &'static str,
+    pub l16b_depreciation_elsewhere: &'static str,
+    pub l16c_depreciation_net: &'static str,
+    pub l17_depletion: &'static str,
+    pub l18_retirement: &'static str,
+    pub l19_benefits: &'static str,
+    pub l20_energy: &'static str,
+    pub l21_other_deductions: &'static str,
+    pub l22_total_deductions: &'static str,
+    pub l23_ordinary_income: &'static str,
+}
+
+/// The 2023 revision. Header in the left column, one combined address line, and
+/// the income block starting at `f1_15[0]`.
+pub const PAGE1_2023: Page1 = Page1 {
+    legal_name: "f1_04[0]",
+    street: "f1_05[0]",
+    suite: None,
+    city: "f1_06[0]",
+    state: None,
+    country: None,
+    postal_code: None,
+    principal_activity: "f1_07[0]",
+    principal_product: "f1_08[0]",
+    naics: "f1_09[0]",
+    ein: "f1_10[0]",
+    date_started: "f1_11[0]",
+    k1_count: "f1_14[0]",
+    preparer_name: "f1_49[0]",
+    lines: Page1Lines {
+        l1a_gross_receipts: "f1_15[0]",
+        l1b_returns: "f1_16[0]",
+        l1c_balance: "f1_17[0]",
+        l2_cogs: "f1_18[0]",
+        l3_gross_profit: "f1_19[0]",
+        l4_other_partnerships: "f1_20[0]",
+        l5_farm: "f1_21[0]",
+        l6_form_4797: "f1_22[0]",
+        l7_other_income: "f1_23[0]",
+        l8_total_income: "f1_24[0]",
+        l9_salaries: "f1_25[0]",
+        l10_guaranteed: "f1_26[0]",
+        l11_repairs: "f1_27[0]",
+        l12_bad_debts: "f1_28[0]",
+        l13_rent: "f1_29[0]",
+        l14_taxes: "f1_30[0]",
+        l15_interest: "f1_31[0]",
+        l16a_depreciation: "f1_32[0]",
+        l16b_depreciation_elsewhere: "f1_33[0]",
+        l16c_depreciation_net: "f1_34[0]",
+        l17_depletion: "f1_35[0]",
+        l18_retirement: "f1_36[0]",
+        l19_benefits: "f1_37[0]",
+        // A second widget of `f1_37`, not a number of its own — which is why the
+        // three lines below it are displaced by five rather than four.
+        l20_energy: "f1_37[1]",
+        l21_other_deductions: "f1_38[0]",
+        l22_total_deductions: "f1_39[0]",
+        l23_ordinary_income: "f1_40[0]",
+    },
+};
+
+/// The 2024 revision. Identical to 2023 down to line 19; from line 20 the energy
+/// line gets a number of its own and everything below shifts by one.
+pub const PAGE1_2024: Page1 = Page1 {
+    legal_name: "f1_4[0]",
+    street: "f1_5[0]",
+    suite: None,
+    city: "f1_6[0]",
+    state: None,
+    country: None,
+    postal_code: None,
+    principal_activity: "f1_7[0]",
+    principal_product: "f1_8[0]",
+    naics: "f1_9[0]",
+    ein: "f1_10[0]",
+    date_started: "f1_11[0]",
+    k1_count: "f1_14[0]",
+    preparer_name: "f1_49[1]",
+    lines: Page1Lines {
+        l1a_gross_receipts: "f1_15[0]",
+        l1b_returns: "f1_16[0]",
+        l1c_balance: "f1_17[0]",
+        l2_cogs: "f1_18[0]",
+        l3_gross_profit: "f1_19[0]",
+        l4_other_partnerships: "f1_20[0]",
+        l5_farm: "f1_21[0]",
+        l6_form_4797: "f1_22[0]",
+        l7_other_income: "f1_23[0]",
+        l8_total_income: "f1_24[0]",
+        l9_salaries: "f1_25[0]",
+        l10_guaranteed: "f1_26[0]",
+        l11_repairs: "f1_27[0]",
+        l12_bad_debts: "f1_28[0]",
+        l13_rent: "f1_29[0]",
+        l14_taxes: "f1_30[0]",
+        l15_interest: "f1_31[0]",
+        l16a_depreciation: "f1_32[0]",
+        l16b_depreciation_elsewhere: "f1_33[0]",
+        l16c_depreciation_net: "f1_34[0]",
+        l17_depletion: "f1_35[0]",
+        l18_retirement: "f1_36[0]",
+        l19_benefits: "f1_37[0]",
+        l20_energy: "f1_38[0]",
+        l21_other_deductions: "f1_39[0]",
+        l22_total_deductions: "f1_40[0]",
+        l23_ordinary_income: "f1_41[0]",
+    },
+};
+
+/// The 2025 revision. The header splits the address into four boxes and takes
+/// four more numbers than 2023's, which is what displaces everything below it.
+pub const PAGE1_2025: Page1 = Page1 {
+    legal_name: "f1_04[0]",
+    street: "f1_05[0]",
+    suite: Some("f1_06[0]"),
+    city: "f1_07[0]",
+    state: Some("f1_08[0]"),
+    country: Some("f1_09[0]"),
+    postal_code: Some("f1_10[0]"),
+    principal_activity: "f1_11[0]",
+    principal_product: "f1_12[0]",
+    naics: "f1_13[0]",
+    ein: "f1_14[0]",
+    date_started: "f1_15[0]",
+    k1_count: "f1_18[0]",
+    preparer_name: "f1_57[0]",
+    lines: Page1Lines {
+        l1a_gross_receipts: "f1_19[0]",
+        l1b_returns: "f1_20[0]",
+        l1c_balance: "f1_21[0]",
+        l2_cogs: "f1_22[0]",
+        l3_gross_profit: "f1_23[0]",
+        l4_other_partnerships: "f1_24[0]",
+        l5_farm: "f1_25[0]",
+        l6_form_4797: "f1_26[0]",
+        l7_other_income: "f1_27[0]",
+        l8_total_income: "f1_28[0]",
+        l9_salaries: "f1_29[0]",
+        l10_guaranteed: "f1_30[0]",
+        l11_repairs: "f1_31[0]",
+        l12_bad_debts: "f1_32[0]",
+        l13_rent: "f1_33[0]",
+        l14_taxes: "f1_34[0]",
+        l15_interest: "f1_35[0]",
+        l16a_depreciation: "f1_36[0]",
+        l16b_depreciation_elsewhere: "f1_37[0]",
+        l16c_depreciation_net: "f1_38[0]",
+        l17_depletion: "f1_39[0]",
+        l18_retirement: "f1_40[0]",
+        l19_benefits: "f1_41[0]",
+        l20_energy: "f1_42[0]",
+        l21_other_deductions: "f1_43[0]",
+        l22_total_deductions: "f1_44[0]",
+        l23_ordinary_income: "f1_45[0]",
+    },
+};
 
 /// What goes in the paid preparer's name box.
 ///
@@ -203,6 +441,71 @@ mod k1 {
     pub const CAPITAL_BEGIN: &str = "f1_18[0]";
     pub const CAPITAL_END: &str = "f1_19[0]";
 
+    // --- Item L, "Partner's Capital Account Analysis" ---
+    //
+    // Matched by rectangle against the printed labels, not by the names in
+    // `docs/form-1065-fields.md`. A name that resolves proves nothing about what
+    // the box means — that is how the 2023 header ended up written into the wrong
+    // boxes — and item L is six boxes in one column where being one row out is an
+    // arithmetic error nobody can see, because the column still adds up.
+    //
+    // The evidence, identical on all four revisions carried in `assets/irs`
+    // (2023, 2024, 2025, and the 2026 draft, where the K-1 is page 2 because a
+    // Schedule A was inserted ahead of it): one column of six boxes at x=194.4,
+    // width 108, on rows y=156, 144, 132, 120, 108, 96, each with its label
+    // ending by x=170 and a printed "$" at x=189.5 immediately to its left.
+    //
+    //   y=156  "Beginning capital account"                      f1_26
+    //   y=144  "Capital contributed during the year"            f1_27
+    //   y=132  "Current year net income (loss)"                 f1_28
+    //   y=120  "Other increase (decrease) (attach explanation)" f1_29
+    //   y=108  "Withdrawals and distributions"                  f1_30
+    //   y= 96  "Ending capital account"                         f1_31
+    //
+    // So no year needs an alias for item L. The 2026 draft rewords row 3 to
+    // "Current-year net income (loss)" and moves nothing.
+    pub const L_BEGIN: &str = "f1_26[0]";
+    pub const L_CONTRIBUTED: &str = "f1_27[0]";
+    pub const L_NET_INCOME: &str = "f1_28[0]";
+    pub const L_OTHER: &str = "f1_29[0]";
+    /// Row 5's box starts at x=197.7 rather than 194.4: the "$" beside it is
+    /// followed by the opening parenthesis the form prints around a withdrawal,
+    /// which is why the figure written here is a magnitude and not a negative.
+    pub const L_WITHDRAWN: &str = "f1_30[0]";
+    pub const L_ENDING: &str = "f1_31[0]";
+
+    // --- Boxes this program deliberately leaves blank ---
+    //
+    // Named here rather than left unmentioned, because "there is no constant for
+    // it" and "we decided not to fill it" look identical from outside, and the
+    // second is the one that has been reviewed.
+    //
+    // The header's tax-year boxes (`ForCalendarYear[0].f1_1` through `f1_5`) sit
+    // under "For calendar year 2025, or tax year beginning ... ending ...". They
+    // are the *fiscal year* boxes: a calendar-year filer leaves them blank and
+    // the pre-printed year on the form is their year. Every return this program
+    // builds runs January to December on that year's own blank, so filling them
+    // would turn a calendar-year return into a fiscal-year one. Page 1's
+    // equivalent boxes are left blank for the same reason.
+    //
+    // Item K (`f1_20`-`f1_25`) is the partner's share of partnership liabilities,
+    // split three ways — nonrecourse, qualified nonrecourse financing, recourse.
+    // The books hold the liabilities but not that classification: which of the
+    // three a loan is depends on who bears the economic risk of loss under
+    // §752, which lives in the loan documents and the partnership agreement. A
+    // total split on the profit percentage would land in real boxes, foot against
+    // Schedule L, and be an assertion about guarantees nobody made.
+    //
+    // Item N (`f1_32`, `f1_33`) is net unrecognized §704(c) gain or loss, which
+    // needs each contributed asset's basis *and* its fair market value on the day
+    // it was contributed. A general ledger records the first and never the
+    // second.
+    //
+    // Item J's "decrease due to sale or exchange" pair (`c1_8[0]`, `c1_8[1]`) is
+    // a reason, not a fact: the percentages falling is visible, but a fall caused
+    // by a sale, by a redemption, and by another partner being admitted look
+    // identical in the ledger, and the box asks which.
+
     /// The appearance state these forms use for a ticked box. Not `Yes`, which
     /// is what most PDFs use and what guessing would produce.
     pub const ON: &str = "1";
@@ -247,19 +550,97 @@ mod k1 {
     /// wrong is not. Every `None` produces a warning naming the box, so nobody
     /// has to notice the gap themselves.
     pub const CODED_BOXES: &[CodedBox] = &[
-        CodedBox { line_key: "k11",  number: "11",  code: None,      code_field: "f1_50[0]",  amount_field: "f1_51[0]" },
-        CodedBox { line_key: "k13a", number: "13a", code: None,      code_field: "Line13[0]", amount_field: "f1_55[0]" },
-        CodedBox { line_key: "k13b", number: "13b", code: None,      code_field: "f1_56[0]",  amount_field: "f1_57[0]" },
-        CodedBox { line_key: "k13c", number: "13c", code: None,      code_field: "f1_58[0]",  amount_field: "f1_59[0]" },
-        CodedBox { line_key: "k14a", number: "14a", code: Some("A"), code_field: "Line14[0]", amount_field: "f1_60[0]" },
-        CodedBox { line_key: "k14b", number: "14b", code: Some("B"), code_field: "f1_61[0]",  amount_field: "f1_62[0]" },
-        CodedBox { line_key: "k18a", number: "18a", code: Some("A"), code_field: "Line18[0]", amount_field: "f1_84[0]" },
-        CodedBox { line_key: "k18b", number: "18b", code: Some("B"), code_field: "f1_85[0]",  amount_field: "f1_86[0]" },
-        CodedBox { line_key: "k18c", number: "18c", code: Some("C"), code_field: "f1_87[0]",  amount_field: "f1_88[0]" },
-        CodedBox { line_key: "k19a", number: "19a", code: Some("A"), code_field: "Line19[0]", amount_field: "f1_89[0]" },
-        CodedBox { line_key: "k19b", number: "19b", code: None,      code_field: "f1_90[0]",  amount_field: "f1_91[0]" },
-        CodedBox { line_key: "k20a", number: "20a", code: Some("A"), code_field: "Line20[0]", amount_field: "f1_92[0]" },
-        CodedBox { line_key: "k20b", number: "20b", code: Some("B"), code_field: "f1_93[0]",  amount_field: "f1_94[0]" },
+        CodedBox {
+            line_key: "k11",
+            number: "11",
+            code: None,
+            code_field: "f1_50[0]",
+            amount_field: "f1_51[0]",
+        },
+        CodedBox {
+            line_key: "k13a",
+            number: "13a",
+            code: None,
+            code_field: "Line13[0]",
+            amount_field: "f1_55[0]",
+        },
+        CodedBox {
+            line_key: "k13b",
+            number: "13b",
+            code: None,
+            code_field: "f1_56[0]",
+            amount_field: "f1_57[0]",
+        },
+        CodedBox {
+            line_key: "k13c",
+            number: "13c",
+            code: None,
+            code_field: "f1_58[0]",
+            amount_field: "f1_59[0]",
+        },
+        CodedBox {
+            line_key: "k14a",
+            number: "14a",
+            code: Some("A"),
+            code_field: "Line14[0]",
+            amount_field: "f1_60[0]",
+        },
+        CodedBox {
+            line_key: "k14b",
+            number: "14b",
+            code: Some("B"),
+            code_field: "f1_61[0]",
+            amount_field: "f1_62[0]",
+        },
+        CodedBox {
+            line_key: "k18a",
+            number: "18a",
+            code: Some("A"),
+            code_field: "Line18[0]",
+            amount_field: "f1_84[0]",
+        },
+        CodedBox {
+            line_key: "k18b",
+            number: "18b",
+            code: Some("B"),
+            code_field: "f1_85[0]",
+            amount_field: "f1_86[0]",
+        },
+        CodedBox {
+            line_key: "k18c",
+            number: "18c",
+            code: Some("C"),
+            code_field: "f1_87[0]",
+            amount_field: "f1_88[0]",
+        },
+        CodedBox {
+            line_key: "k19a",
+            number: "19a",
+            code: Some("A"),
+            code_field: "Line19[0]",
+            amount_field: "f1_89[0]",
+        },
+        CodedBox {
+            line_key: "k19b",
+            number: "19b",
+            code: None,
+            code_field: "f1_90[0]",
+            amount_field: "f1_91[0]",
+        },
+        CodedBox {
+            line_key: "k20a",
+            number: "20a",
+            code: Some("A"),
+            code_field: "Line20[0]",
+            amount_field: "f1_92[0]",
+        },
+        CodedBox {
+            line_key: "k20b",
+            number: "20b",
+            code: Some("B"),
+            code_field: "f1_93[0]",
+            amount_field: "f1_94[0]",
+        },
     ];
 
     pub struct CodedBox {
@@ -313,6 +694,26 @@ pub struct ReturnRequest {
     /// present-but-empty one means "computed, and nothing was mapped", which is
     /// worth a warning.
     pub schedule_l: Option<super::schedule_l::ScheduleL>,
+    /// Each partner's Schedule K-1 item L, when the books were read for it.
+    ///
+    /// Default-empty rather than optional, unlike [`schedule_l`]: an item L that
+    /// nobody computed and an item L over a partnership with no equity accounts
+    /// linked both leave the same six blank boxes, and [`capital::Capital`] says
+    /// which in its own warnings rather than making the absence of a value mean
+    /// it. Filled by [`build_return_from_ledger`] when the caller leaves it
+    /// empty, the way Schedule L and the asset register are.
+    ///
+    /// [`schedule_l`]: ReturnRequest::schedule_l
+    /// [`capital::Capital`]: super::capital::Capital
+    pub capital: super::capital::Capital,
+    /// The year's figures cut at each date a partner's percentages changed.
+    ///
+    /// Empty is the ordinary case — either nothing changed, or the caller has no
+    /// ledger to close the books against. When it is empty and the year *did*
+    /// contain a change, `split_across_partners` prorates the annual figures by
+    /// days instead, and says which method it used. Filled by
+    /// [`build_return_from_ledger`], the only entry point with books to read.
+    pub segments: Vec<super::varying::Segment>,
     /// Family ties between the partners, for Schedule B-1's §267(c) constructive
     /// ownership test. Empty is the ordinary case — no relationships recorded, so
     /// every partner is attributed only their own direct share. A spouse pair here
@@ -393,8 +794,9 @@ pub fn build_return_from_ledger(
     let statement = crate::queries::reports::Reports::new(conn)
         .income_statement(year_start, year_end)
         .map_err(|e| FormError::Malformed(format!("income statement: {e}")))?;
-    let mapping = super::lines::load_mapping(conn);
-    let computed = super::lines::compute(&statement, &mapping);
+    let mapping = super::lines::load_effective_mapping(conn, req.year);
+    let limits = super::lines::load_effective_limits(conn, req.year);
+    let computed = super::lines::compute(&statement, &mapping, &limits);
 
     // Schedule L comes from the ledger too, and this is the only entry point
     // that has one. Computed here rather than demanded from the caller: every
@@ -412,6 +814,64 @@ pub fn build_return_from_ledger(
     if owned.assets.is_empty() {
         owned.assets = crate::commands::depreciation_commands::list_assets(conn);
     }
+    // Item L, read here for the reason Schedule L is: this is the only entry
+    // point with a ledger, and a caller that forgot would ship K-1s whose capital
+    // accounts are blank with nothing saying why.
+    //
+    // Split from the Analysis of Net Income and not from page one's line 23:
+    // item L's "current year net income (loss)" is the partner's share of the
+    // *whole* of Schedule K, so a partnership with capital gains or charitable
+    // contributions would otherwise close the year on a capital account short by
+    // exactly those.
+    if owned.capital.is_empty() {
+        owned.capital =
+            super::capital::for_return(conn, req.year, &req.partners, computed.lines.k_analysis());
+    }
+    // §706(d) interim closing: the year cut at each change of interest, with each
+    // part's figures read from the books for those dates. Done here for the
+    // reason Schedule L is — this is the only entry point with a ledger, and the
+    // alternative when it is absent is proration, which is an election the filer
+    // has to have actually made.
+    if owned.segments.is_empty() {
+        // Only the dated series comes from the books — not the whole record.
+        // Replacing it would overwrite whatever the caller passed in, and a
+        // projection built on hypothetical percentages would quietly be built on
+        // the stored ones instead.
+        let periods = crate::commands::share_period_commands::load_share_periods(conn);
+        let on_return: Vec<crate::domain::Partner> = req
+            .partners
+            .iter()
+            .map(|f| {
+                let mut p = f.partner.clone();
+                if p.history.is_empty() {
+                    p.history = periods
+                        .iter()
+                        .filter(|(id, _)| *id == p.partner_id)
+                        .map(|(_, period)| *period)
+                        .collect();
+                }
+                p
+            })
+            .collect();
+        let spans = super::varying::segments(&on_return, year_start, year_end);
+        if spans.len() > 1 {
+            owned.segments = spans
+                .iter()
+                .map(|(from, to)| {
+                    let lines = crate::queries::reports::Reports::new(conn)
+                        .income_statement(*from, *to)
+                        .ok()
+                        .map(|s| super::lines::compute(&s, &mapping, &limits).lines);
+                    super::varying::Segment {
+                        from: *from,
+                        to: *to,
+                        lines,
+                    }
+                })
+                .collect();
+        }
+    }
+
     // The statements are built from this, and only this path knows it.
     owned.detail = computed.detail;
     // Schedule M-1 line 1. Read here rather than demanded from the caller, for
@@ -443,10 +903,7 @@ pub fn build_return_from_ledger(
 /// set of books. Not the filing path: [`build_return_from_ledger`] is, and it is
 /// the only one that computes the figures from anything real.
 #[doc(hidden)]
-pub fn build_for_preview(
-    req: &ReturnRequest,
-    lines: &Form1065Lines,
-) -> Result<Bundle, FormError> {
+pub fn build_for_preview(req: &ReturnRequest, lines: &Form1065Lines) -> Result<Bundle, FormError> {
     build_return_inner(req, lines, Vec::new())
 }
 
@@ -495,12 +952,63 @@ fn build_return_inner(
     }
 
     // --- page one ---
-    let mut doc = Document::load_mem(F1065)?;
+    // The year's own blank, not this year's. A prior-year return on the current
+    // revision is a form whose boxes have moved under the figures written into
+    // them, and it foots perfectly while being wrong.
+    //
+    // Refused rather than substituted. This used to fall back to the current
+    // revision with a warning, which produced a complete, plausible PDF whose
+    // page 1 and every K-1 carried the *current* year in pre-printed type. A
+    // 2022 return that says 2025 at the top is not a return with a caveat; it is
+    // the wrong form, and the caveat scrolls past in a list of a dozen others.
+    let blanks = form_year(req.year).ok_or_else(|| FormError::NoFormForYear {
+        form: "Form 1065",
+        year: req.year,
+        available: supported_years()
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    })?;
+    if !blanks.mapped {
+        return Err(FormError::UnmappedRevision(blanks.year));
+    }
+    // The revision's own page-one table. A revision with none is refused above,
+    // so this is an invariant of `mapped` rather than a case to handle.
+    let page1 = blanks
+        .page1
+        .ok_or(FormError::UnmappedRevision(blanks.year))?;
+    let mut doc = Document::load_mem(blanks.f1065)?;
     strip_xfa(&mut doc);
-    let map = field_map(&doc);
-    warnings.extend(fill_1065(&mut doc, &map, &req.profile, filed.len(), lines)?);
+    let mut map = field_map(&doc);
+    let map = map;
+    warnings.extend(fill_1065(
+        &mut doc,
+        &map,
+        page1,
+        &req.profile,
+        filed.len(),
+        lines,
+    )?);
     warnings.extend(fill_schedule_k(&mut doc, &map, lines)?);
-    warnings.extend(super::schedule_b::fill(&mut doc, &map, &req.schedule_b)?);
+    // The revision's own question table. A year with none has no Schedule B —
+    // there is no "mapped" flag to keep in step with a list of exceptions.
+    match blanks.schedule_b {
+        Some(table) => {
+            warnings.extend(super::schedule_b::fill(
+                &mut doc,
+                &map,
+                &req.schedule_b,
+                table,
+            )?);
+        }
+        None if !req.schedule_b.is_empty() => warnings.push(format!(
+            "Schedule B is left blank: this program does not carry the {} revision's question \
+             table. The answers on file are kept.",
+            blanks.year
+        )),
+        None => {}
+    }
 
     // Schedules L, M-1 and M-2. Question 4 excuses them; the option decides
     // whether to take the excuse, and it defaults to no — see `ReturnOptions`.
@@ -523,11 +1031,7 @@ fn build_return_inner(
             ),
         }
 
-        let m = super::schedule_m::reconcile(
-            req.book_income_cents,
-            lines,
-            req.schedule_l.as_ref(),
-        );
+        let m = super::schedule_m::reconcile(req.book_income_cents, lines, req.schedule_l.as_ref());
         warnings.extend(super::schedule_m::fill(&mut doc, &map, &m, !exempt)?);
     } else {
         warnings.push(
@@ -537,14 +1041,20 @@ fn build_return_inner(
         );
     }
 
+    // Said once for the return rather than once per K-1: what a beginning capital
+    // account here does and does not include is a fact about the books, not about
+    // any one partner. The per-partner ones — an unsupported loss, a partner with
+    // no accounts linked — come out of `fill_k1` beside the K-1 they concern.
+    warnings.extend(req.capital.warnings());
+
     // Split Schedule K before any K-1 is built, so every partner's share comes
     // out of one apportionment and the shares add back to the totals above.
-    let (shares, split_warnings) = split_across_partners(lines, &filed);
+    let (shares, split_warnings) = split_across_partners(lines, &filed, req.year, &req.segments);
     warnings.extend(split_warnings);
 
     // --- one K-1 per partner ---
     for (i, filing) in filed.iter().enumerate() {
-        let mut sched = Document::load_mem(F1065_SK1)?;
+        let mut sched = Document::load_mem(blanks.sk1)?;
         strip_xfa(&mut sched);
         // Namespace this copy before anything is written into it, so partner
         // two's boxes are not partner one's under another name.
@@ -556,6 +1066,7 @@ fn build_return_inner(
             &req.profile,
             filing,
             &shares[i],
+            req.capital.for_partner(&filing.partner.partner_id),
             year_start,
             year_end,
         )?);
@@ -644,7 +1155,7 @@ fn build_return_inner(
         .clone()
         .unwrap_or_else(|| req.profile.legal_name.clone());
     let (form_4562, f4562_warnings) =
-        super::form4562::build(&req.profile, &year_schedule, &activity)?;
+        super::form4562::build(&req.profile, &year_schedule, &activity, req.year)?;
     warnings.extend(f4562_warnings);
     if let Some(filled) = form_4562 {
         append_document(&mut doc, filled.document)?;
@@ -750,29 +1261,47 @@ fn check(req: &ReturnRequest, filed: &[&PartnerFiling]) -> Vec<String> {
         );
     }
 
-    if req.year != FORM_TAX_YEAR {
-        out.push(format!(
-            "The bundled forms are the {FORM_TAX_YEAR} revision, but this is a {} return. \
-             Replace assets/irs/*.pdf with that year's forms and regenerate \
-             docs/form-1065-fields.md.",
-            req.year
-        ));
+    match form_year(req.year) {
+        // Refused in `build_return_inner`, which is where the blank is chosen.
+        // Nothing reaches a filed return on the wrong year's form.
+        None => {}
+        Some(f) if f.draft => out.push(format!(
+            "The {} Form 1065 is an IRS draft, which may not be filed. This is a projection of \
+             what the year is heading for, not a return — check for the final form before \
+             filing anything on it.",
+            f.year
+        )),
+        Some(_) => {}
     }
 
     // Shares are checked here rather than when a partner is saved: a partnership
     // passes through states where they do not total the whole, and this is the
     // point at which they have to.
-    // Over the partners actually on this return. A partner who left in a prior
-    // year still holds a share in the books, and counting theirs would report a
-    // split that does not add up for a return they are not on.
-    let shares: Vec<Shares> = filed.iter().map(|p| p.partner.shares).collect();
-    if !shares.is_empty() {
-        let totals = Shares::sums_to_whole(&shares);
-        if !totals.is_whole() {
-            out.push(format!(
-                "Partner shares do not total 100%: {}. Every K-1 will be filed with these figures.",
-                totals.discrepancies().join(", ")
-            ));
+    //
+    // # Why this asks about days rather than summing the list
+    //
+    // It used to sum the current percentages across everybody on the return and
+    // complain when they did not reach 100%. On a partnership whose membership
+    // changed during the year that check is wrong in both directions at once: a
+    // partner who left in June is still on the return and still has percentages
+    // on file, so the sum counts somebody who was gone for half of it, and the
+    // warning fires on books that are entirely correct — while a genuine gap in
+    // one half of the year hides inside a total that happens to reach 100%.
+    //
+    // The split has to add up on each day it was in force. Checking the first
+    // day, the last, and every day it changed covers every distinct split the
+    // year contained, because between two changes nothing moves.
+    let owned: Vec<Partner> = filed.iter().map(|p| p.partner.clone()).collect();
+    let (year_start, year_end) = crate::commands::partnership_commands::calendar_year(req.year);
+    let mut said: Vec<String> = Vec::new();
+    for day in spc::days_to_check(&owned, year_start, year_end) {
+        for problem in spc::problems_on(&owned, day) {
+            if !said.contains(&problem) {
+                said.push(problem.clone());
+                out.push(format!(
+                    "{problem} Every K-1 covering that date will be filed with these figures."
+                ));
+            }
         }
     }
 
@@ -787,31 +1316,77 @@ fn check(req: &ReturnRequest, filed: &[&PartnerFiling]) -> Vec<String> {
     out
 }
 
+/// City, state, country and ZIP as the older forms want them: one line.
+///
+/// Comma-separated the way an address is written, and empty parts dropped, so a
+/// partnership with no country entered does not get a stray comma on its return.
+fn one_line_address(addr: &crate::domain::Address) -> String {
+    // Punctuated the way an address is written rather than as a comma-joined
+    // list: "Chicago, IL 60625", not "Chicago, IL, 60625". This prints on a
+    // filed form, so it should read like an address.
+    let commas: Vec<&str> = [
+        Some(addr.city.as_str()),
+        Some(addr.state.as_str()),
+        addr.country.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .collect();
+    let head = commas.join(", ");
+    let zip = addr.postal_code.trim();
+    match (head.is_empty(), zip.is_empty()) {
+        (true, _) => zip.to_string(),
+        (false, true) => head,
+        (false, false) => format!("{head} {zip}"),
+    }
+}
+
 fn fill_1065(
     doc: &mut Document,
     map: &FieldMap,
+    page1: &Page1,
     profile: &BusinessProfile,
     k1_count: usize,
     lines: &Form1065Lines,
 ) -> Result<Vec<String>, FormError> {
     let addr = &profile.address;
-    set_text(doc, map, f1065::LEGAL_NAME, &profile.legal_name)?;
-    set_text(doc, map, f1065::STREET, &addr.street)?;
-    set_text(doc, map, f1065::SUITE, addr.suite.as_deref().unwrap_or(""))?;
-    set_text(doc, map, f1065::CITY, &addr.city)?;
-    set_text(doc, map, f1065::STATE, &addr.state)?;
-    set_text(doc, map, f1065::COUNTRY, addr.country.as_deref().unwrap_or(""))?;
-    set_text(doc, map, f1065::POSTAL_CODE, &addr.postal_code)?;
-    set_text(doc, map, f1065::NAICS, &profile.naics_code)?;
-    set_text(doc, map, f1065::EIN, &profile.ein)?;
-    set_text(doc, map, f1065::DATE_STARTED, &us_date(profile.formation_date))?;
-    set_text(doc, map, f1065::K1_COUNT, &k1_count.to_string())?;
+    set_text(doc, map, page1.legal_name, &profile.legal_name)?;
+    set_text(doc, map, page1.street, &addr.street)?;
+    // A revision with no separate state box prints one line labelled "City or
+    // town, state or province, country, and ZIP or foreign postal code", and the
+    // whole address goes in it. Asked of the table rather than carried as a
+    // flag beside it, so the two cannot disagree about which form this is.
+    match (page1.state, page1.country, page1.postal_code) {
+        (Some(state), country, Some(postal)) => {
+            if let Some(suite) = page1.suite {
+                set_text(doc, map, suite, addr.suite.as_deref().unwrap_or(""))?;
+            }
+            set_text(doc, map, page1.city, &addr.city)?;
+            set_text(doc, map, state, &addr.state)?;
+            if let Some(country) = country {
+                set_text(doc, map, country, addr.country.as_deref().unwrap_or(""))?;
+            }
+            set_text(doc, map, postal, &addr.postal_code)?;
+        }
+        _ => set_text(doc, map, page1.city, &one_line_address(addr))?,
+    }
+    set_text(doc, map, page1.naics, &profile.naics_code)?;
+    set_text(doc, map, page1.ein, &profile.ein)?;
+    set_text(
+        doc,
+        map,
+        page1.date_started,
+        &us_date(profile.formation_date),
+    )?;
+    set_text(doc, map, page1.k1_count, &k1_count.to_string())?;
 
     if let Some(a) = profile.principal_activity.as_deref() {
-        set_text(doc, map, f1065::PRINCIPAL_ACTIVITY, a)?;
+        set_text(doc, map, page1.principal_activity, a)?;
     }
     if let Some(p) = profile.principal_product.as_deref() {
-        set_text(doc, map, f1065::PRINCIPAL_PRODUCT, p)?;
+        set_text(doc, map, page1.principal_product, p)?;
     }
 
     // The tax-year boxes at the top are deliberately left blank. The form reads
@@ -819,7 +1394,7 @@ fn fill_1065(
     // filer fills in nothing; writing the dates in would assert a fiscal year
     // that was never chosen.
 
-    set_text(doc, map, f1065::PREPARER_NAME, SELF_PREPARED)?;
+    set_text(doc, map, page1.preparer_name, SELF_PREPARED)?;
 
     // The PTIN, firm name, firm EIN, firm address and phone beside it stay blank,
     // and the "check if self-employed" box stays unticked: all of them describe a
@@ -827,7 +1402,7 @@ fn fill_1065(
     // return with the preparer shown below?" — a question about somebody who does
     // not exist here, and one whose answer is the signer's to give.
 
-    fill_income_lines(doc, map, lines)
+    fill_income_lines(doc, map, page1, lines)
 }
 
 /// Write page one's income and deduction lines.
@@ -841,38 +1416,39 @@ fn fill_1065(
 fn fill_income_lines(
     doc: &mut Document,
     map: &FieldMap,
+    page1: &Page1,
     lines: &Form1065Lines,
 ) -> Result<Vec<String>, FormError> {
     let mut warnings = Vec::new();
     let mapped = [
-        (f1065::L1A_GROSS_RECEIPTS, lines.get("l1a")),
-        (f1065::L1B_RETURNS, lines.get("l1b")),
-        (f1065::L2_COGS, lines.get("l2")),
-        (f1065::L4_OTHER_PARTNERSHIPS, lines.get("l4")),
-        (f1065::L5_FARM, lines.get("l5")),
-        (f1065::L6_FORM_4797, lines.get("l6")),
-        (f1065::L7_OTHER_INCOME, lines.get("l7")),
-        (f1065::L9_SALARIES, lines.get("l9")),
-        (f1065::L10_GUARANTEED, lines.get("l10")),
-        (f1065::L11_REPAIRS, lines.get("l11")),
-        (f1065::L12_BAD_DEBTS, lines.get("l12")),
-        (f1065::L13_RENT, lines.get("l13")),
-        (f1065::L14_TAXES, lines.get("l14")),
-        (f1065::L15_INTEREST, lines.get("l15")),
-        (f1065::L16A_DEPRECIATION, lines.get("l16a")),
-        (f1065::L16B_DEPRECIATION_ELSEWHERE, lines.get("l16b")),
-        (f1065::L17_DEPLETION, lines.get("l17")),
-        (f1065::L18_RETIREMENT, lines.get("l18")),
-        (f1065::L19_BENEFITS, lines.get("l19")),
-        (f1065::L20_ENERGY, lines.get("l20")),
-        (f1065::L21_OTHER_DEDUCTIONS, lines.get("l21")),
+        (page1.lines.l1a_gross_receipts, lines.get("l1a")),
+        (page1.lines.l1b_returns, lines.get("l1b")),
+        (page1.lines.l2_cogs, lines.get("l2")),
+        (page1.lines.l4_other_partnerships, lines.get("l4")),
+        (page1.lines.l5_farm, lines.get("l5")),
+        (page1.lines.l6_form_4797, lines.get("l6")),
+        (page1.lines.l7_other_income, lines.get("l7")),
+        (page1.lines.l9_salaries, lines.get("l9")),
+        (page1.lines.l10_guaranteed, lines.get("l10")),
+        (page1.lines.l11_repairs, lines.get("l11")),
+        (page1.lines.l12_bad_debts, lines.get("l12")),
+        (page1.lines.l13_rent, lines.get("l13")),
+        (page1.lines.l14_taxes, lines.get("l14")),
+        (page1.lines.l15_interest, lines.get("l15")),
+        (page1.lines.l16a_depreciation, lines.get("l16a")),
+        (page1.lines.l16b_depreciation_elsewhere, lines.get("l16b")),
+        (page1.lines.l17_depletion, lines.get("l17")),
+        (page1.lines.l18_retirement, lines.get("l18")),
+        (page1.lines.l19_benefits, lines.get("l19")),
+        (page1.lines.l20_energy, lines.get("l20")),
+        (page1.lines.l21_other_deductions, lines.get("l21")),
         // Derived. Written on the same non-zero rule so a page with no COGS does
         // not carry a gross-profit line restating gross receipts.
-        (f1065::L1C_BALANCE, lines.line_1c()),
-        (f1065::L3_GROSS_PROFIT, lines.line_3()),
-        (f1065::L8_TOTAL_INCOME, lines.line_8()),
-        (f1065::L16C_DEPRECIATION_NET, lines.line_16c()),
-        (f1065::L22_TOTAL_DEDUCTIONS, lines.line_22()),
+        (page1.lines.l1c_balance, lines.line_1c()),
+        (page1.lines.l3_gross_profit, lines.line_3()),
+        (page1.lines.l8_total_income, lines.line_8()),
+        (page1.lines.l16c_depreciation_net, lines.line_16c()),
+        (page1.lines.l22_total_deductions, lines.line_22()),
     ];
 
     for (field, dollars) in mapped {
@@ -886,7 +1462,7 @@ fn fill_income_lines(
     write_money(
         doc,
         map,
-        f1065::L23_ORDINARY_INCOME,
+        page1.lines.l23_ordinary_income,
         lines.line_23(),
         &mut warnings,
     )?;
@@ -957,8 +1533,20 @@ fn fill_schedule_k(
         sched_k::L1_ORDINARY,
         &super::lines::format_dollars(lines.k_line_1()),
     )?;
-    write_money(doc, map, sched_k::L3C_NET_RENTAL, lines.k_line_3c(), &mut warnings)?;
-    write_money(doc, map, sched_k::L4C_TOTAL_GUARANTEED, lines.k_line_4c(), &mut warnings)?;
+    write_money(
+        doc,
+        map,
+        sched_k::L3C_NET_RENTAL,
+        lines.k_line_3c(),
+        &mut warnings,
+    )?;
+    write_money(
+        doc,
+        map,
+        sched_k::L4C_TOTAL_GUARANTEED,
+        lines.k_line_4c(),
+        &mut warnings,
+    )?;
     set_text(
         doc,
         map,
@@ -1002,10 +1590,13 @@ impl PartnerShares {
 fn split_across_partners(
     lines: &Form1065Lines,
     filed: &[&PartnerFiling],
+    year: i32,
+    segments: &[super::varying::Segment],
 ) -> (Vec<PartnerShares>, Vec<String>) {
-    use super::allocate::{allocate, profit_and_loss_shares_differ, Basis};
+    use super::allocate::{allocate_as_of, profit_and_loss_shares_differ, Basis};
 
     let partners: Vec<&Partner> = filed.iter().map(|f| &f.partner).collect();
+    let (year_start, year_end) = crate::commands::partnership_commands::calendar_year(year);
     let mut out: Vec<PartnerShares> = (0..filed.len())
         .map(|_| PartnerShares {
             by_line: std::collections::BTreeMap::new(),
@@ -1029,25 +1620,134 @@ fn split_across_partners(
         }
     }
 
+    // §706(d): a year whose percentages moved cannot honestly be split on any one
+    // day's figures. `segments` divides it at each change and turns the parts
+    // into one effective percentage per partner per line, which the ordinary
+    // allocator then applies to the year's own total — so the shares still foot
+    // to Schedule K exactly while describing who held what, when.
+    let owned: Vec<Partner> = partners.iter().map(|p| (*p).clone()).collect();
+    let spans = super::varying::segments(&owned, year_start, year_end);
+    let changed = spans.len() > 1;
+    let (segs, method) = if !changed {
+        (Vec::new(), None)
+    } else if segments.is_empty() {
+        (
+            super::varying::prorate(lines, &spans),
+            Some(super::varying::Method::Proration),
+        )
+    } else {
+        (
+            segments.to_vec(),
+            Some(super::varying::Method::InterimClosing),
+        )
+    };
+
+    let mut fell_back: Vec<&'static str> = Vec::new();
     for (key, total) in figures {
         if total == 0 {
             continue;
         }
-        for share in allocate(total, &partners, Basis::ProfitOrLoss) {
+        let effective = if segs.is_empty() {
+            None
+        } else {
+            super::varying::effective_ppm(&partners, &segs, key, Basis::ProfitOrLoss)
+        };
+        let shares = match effective {
+            Some(ppm) => allocate_with(total, &ppm),
+            // A line every segment carries nothing on gives no basis for
+            // preferring one partner's percentage to another's. The year-end
+            // split is the fallback, and it is named rather than assumed.
+            None => {
+                if changed {
+                    fell_back.push(key);
+                }
+                allocate_as_of(total, &partners, Basis::ProfitOrLoss, Some(year_end))
+            }
+        };
+        for share in shares {
             out[share.partner].by_line.insert(key, share.dollars);
         }
     }
 
     let mut warnings = Vec::new();
-    if profit_and_loss_shares_differ(&partners) {
-        warnings.push(
-            "Profit and loss percentages differ for at least one partner, so income items and loss \
-             items were split on different percentages. Check each K-1 against the partnership \
-             agreement."
-                .to_string(),
-        );
+    // Named, with their percentages. The unnamed version of this fired on every
+    // build for any partnership with a special allocation — which is a permanent,
+    // deliberate, correctly-recorded state — and said nothing a preparer could
+    // act on. A warning that can never be resolved teaches people to skip the
+    // panel, and the panel also carries the ones that matter.
+    let special: Vec<String> = partners
+        .iter()
+        .filter(|p| {
+            let s = p.shares_on(year_end);
+            s.profit_ppm != s.loss_ppm
+        })
+        .map(|p| {
+            let s = p.shares_on(year_end);
+            format!(
+                "{} takes {} of profit but {} of loss",
+                p.name,
+                format_ppm(s.profit_ppm),
+                format_ppm(s.loss_ppm)
+            )
+        })
+        .collect();
+    if !special.is_empty() {
+        warnings.push(format!(
+            "Special allocation: {}. Income items and loss items were split on different \
+             percentages — confirm once that this matches the partnership agreement.",
+            special.join("; ")
+        ));
     }
+
+    // The method has to be stated, because §706(d) offers two and the return does
+    // not say on its face which one produced the figures. Proration in
+    // particular is available only by election, so a preparer who did not know
+    // it had been used would be filing an election they never made.
+    if let Some(method) = method {
+        let dates = spans
+            .iter()
+            .skip(1)
+            .map(|(from, _)| from.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        warnings.push(match method {
+            super::varying::Method::InterimClosing => format!(
+                "The partners' percentages changed during {year} ({dates}), so the year was \
+                 divided there and each part allocated on the percentages in force during it — \
+                 §706(d), by interim closing of the books, which is the default method. Each \
+                 part's figures came from the ledger for those dates."
+            ),
+            super::varying::Method::Proration => format!(
+                "The partners' percentages changed during {year} ({dates}), so the year was \
+                 divided there and each part allocated on the percentages in force during it. \
+                 This return was built from figures rather than from the books, so each part's \
+                 share of the year was set by its length in days — the proration method, which \
+                 §706(d) allows only by election. Either make that election or rebuild the \
+                 return from the ledger, which closes the books at each change instead."
+            ),
+        });
+    }
+    if !fell_back.is_empty() {
+        warnings.push(format!(
+            "Line(s) {} carried nothing in any part of {year} taken separately, although the year \
+             as a whole does. They were split on the percentages in force at 31 December rather \
+             than over the year — check those figures on each K-1 by hand.",
+            fell_back.join(", ")
+        ));
+    }
+    let _ = profit_and_loss_shares_differ(&partners);
     (out, warnings)
+}
+
+/// Split `total` on percentages given directly, rather than read from partners.
+///
+/// The same exact largest-remainder arithmetic as [`super::allocate::allocate`],
+/// applied to an effective split computed over a segmented year. Written as a
+/// thin adapter rather than by duplicating the loop: the guarantee that matters
+/// — the shares sum to `total` — lives in one place, and a second copy of it is
+/// a second place for it to stop being true.
+fn allocate_with(total: i64, ppm: &[i64]) -> Vec<super::allocate::Share> {
+    super::allocate::allocate_on_ppm(total, ppm)
 }
 
 fn fill_k1(
@@ -1056,6 +1756,7 @@ fn fill_k1(
     profile: &BusinessProfile,
     filing: &PartnerFiling,
     shares: &PartnerShares,
+    capital: Option<&super::capital::CapitalAccount>,
     year_start: NaiveDate,
     year_end: NaiveDate,
 ) -> Result<Vec<String>, FormError> {
@@ -1071,7 +1772,12 @@ fn fill_k1(
 
     // Blank rather than absent when this machine holds no TIN: a visibly empty
     // box is a form somebody notices, which a plausible-looking wrong one is not.
-    set_text(doc, map, k1::PARTNER_TIN, filing.tin.as_deref().unwrap_or(""))?;
+    set_text(
+        doc,
+        map,
+        k1::PARTNER_TIN,
+        filing.tin.as_deref().unwrap_or(""),
+    )?;
     set_text(doc, map, k1::PARTNER_ADDRESS, &p.address.as_block(&p.name))?;
     set_text(doc, map, k1::ENTITY_TYPE, &p.entity_type)?;
 
@@ -1102,6 +1808,31 @@ fn fill_k1(
 
     // --- Part III: this partner's share of each Schedule K line ---
     let mut warnings = Vec::new();
+
+    // --- Item L: the partner's capital account ---
+    //
+    // All six rows or none of them. Item L is an identity — opening, plus what
+    // went in, plus this year's result, less what came out, equals closing — and
+    // a reader checks it by adding the column. Writing only the rows that carry a
+    // figure leaves a column that does not add up unless you know a blank means
+    // zero, and one that does not add up is the first thing an examiner asks
+    // about. `None` is the return built without a ledger, where every row is left
+    // blank and editable, exactly as page one's figures are.
+    if let Some(cap) = capital {
+        for (field, dollars) in [
+            (k1::L_BEGIN, cap.beginning),
+            (k1::L_CONTRIBUTED, cap.contributed),
+            (k1::L_NET_INCOME, cap.net_income),
+            (k1::L_OTHER, cap.other),
+            // The magnitude: this box's parentheses are printed on the form, and
+            // a minus sign inside them reads as the opposite of what it is.
+            (k1::L_WITHDRAWN, cap.withdrawals),
+            (k1::L_ENDING, cap.ending()),
+        ] {
+            write_money(doc, map, field, dollars, &mut warnings)?;
+        }
+        warnings.extend(cap.warnings());
+    }
 
     for (line_key, field) in k1::PART_III {
         // Line 1 is written even at zero, matching Schedule K: it is the figure
@@ -1175,6 +1906,7 @@ mod tests {
 
     fn partner(name: &str, t: PartnerType, r: Residency, pct: f64) -> Partner {
         Partner {
+            history: Vec::new(),
             partner_id: name.to_lowercase(),
             name: name.into(),
             partner_type: t,
@@ -1196,6 +1928,7 @@ mod tests {
 
     fn two_partner_request() -> ReturnRequest {
         ReturnRequest {
+            segments: Vec::new(),
             year: FORM_TAX_YEAR,
             profile: profile(),
             partners: vec![
@@ -1212,6 +1945,7 @@ mod tests {
             relationships: Vec::new(),
             assets: Vec::new(),
             schedule_l: None,
+            capital: Default::default(),
             detail: Default::default(),
             options: Default::default(),
             book_income_cents: 0,
@@ -1225,56 +1959,168 @@ mod tests {
     /// It fails the day somebody drops in a new revision of the form, which is
     /// exactly when it should — the numbering shifts between tax years, and a
     /// stale constant fills a neighbouring box in silence.
+    /// Run against **every** year carried, not just the current one. A prior
+    /// year whose boxes moved is not a compile error and not a runtime error —
+    /// it is a return with figures in the wrong boxes, and this is the only
+    /// thing standing between that and a filing.
     #[test]
     fn every_field_this_module_names_exists_in_the_vendored_forms() {
-        let doc = Document::load_mem(F1065).unwrap();
-        let map = field_map(&doc);
-        for name in [
-            f1065::LEGAL_NAME,
-            f1065::STREET,
-            f1065::SUITE,
-            f1065::CITY,
-            f1065::STATE,
-            f1065::COUNTRY,
-            f1065::POSTAL_CODE,
-            f1065::PRINCIPAL_ACTIVITY,
-            f1065::PRINCIPAL_PRODUCT,
-            f1065::NAICS,
-            f1065::EIN,
-            f1065::DATE_STARTED,
-            f1065::K1_COUNT,
-            f1065::L1A_GROSS_RECEIPTS,
-            f1065::L1B_RETURNS,
-            f1065::L1C_BALANCE,
-            f1065::L2_COGS,
-            f1065::L3_GROSS_PROFIT,
-            f1065::L4_OTHER_PARTNERSHIPS,
-            f1065::L5_FARM,
-            f1065::L6_FORM_4797,
-            f1065::L7_OTHER_INCOME,
-            f1065::L8_TOTAL_INCOME,
-            f1065::L9_SALARIES,
-            f1065::L10_GUARANTEED,
-            f1065::L11_REPAIRS,
-            f1065::L12_BAD_DEBTS,
-            f1065::L13_RENT,
-            f1065::L14_TAXES,
-            f1065::L15_INTEREST,
-            f1065::L16A_DEPRECIATION,
-            f1065::L16B_DEPRECIATION_ELSEWHERE,
-            f1065::L16C_DEPRECIATION_NET,
-            f1065::L17_DEPLETION,
-            f1065::L18_RETIREMENT,
-            f1065::L19_BENEFITS,
-            f1065::L20_ENERGY,
-            f1065::L21_OTHER_DEDUCTIONS,
-            f1065::L22_TOTAL_DEDUCTIONS,
-            f1065::L23_ORDINARY_INCOME,
-        ] {
-            assert!(map.find(name).is_some(), "f1065.pdf has no field {name}");
+        for blanks in FORM_YEARS {
+            // An unmapped revision is one whose boxes are known *not* to line up
+            // — checking its names would pass, because they all exist and mean
+            // something else. `mapped` records that, and
+            // `an_unmapped_revision_fills_identity_only` covers it instead.
+            if blanks.mapped {
+                check_year(blanks);
+            }
+        }
+    }
+
+    /// Every `fN_M[i]` / `cN_M[i]` field name a module's source names.
+    ///
+    /// Scanned rather than listed. The alternative — each module exporting a
+    /// hand-written array — is a second place to remember, and the whole reason
+    /// this check exists is that somebody did not remember.
+    fn field_literals(src: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes: Vec<char> = src.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != '"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != '"' {
+                j += 1;
+            }
+            let lit: String = bytes[start..j].iter().collect();
+            // fN_MM[i] or cN_MM[i], and nothing else.
+            let looks_like_field = {
+                let mut cs = lit.chars();
+                matches!(cs.next(), Some('f' | 'c'))
+                    && lit.contains('_')
+                    && lit.ends_with(']')
+                    && lit[1..]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || c == '_' || c == '[' || c == ']')
+            };
+            if looks_like_field && !out.contains(&lit) {
+                out.push(lit);
+            }
+            i = j + 1;
+        }
+        out
+    }
+
+    fn check_year(blanks: &FormYear) {
+        let year = blanks.year;
+        let Some(page1) = blanks.page1 else { return };
+        let doc = Document::load_mem(blanks.f1065).unwrap();
+        let mut map = field_map(&doc);
+        let mut names: Vec<&str> = vec![
+            page1.legal_name,
+            page1.street,
+            page1.city,
+            page1.principal_activity,
+            page1.principal_product,
+            page1.naics,
+            page1.ein,
+            page1.date_started,
+            page1.k1_count,
+            page1.lines.l1a_gross_receipts,
+            page1.lines.l1b_returns,
+            page1.lines.l1c_balance,
+            page1.lines.l2_cogs,
+            page1.lines.l3_gross_profit,
+            page1.lines.l4_other_partnerships,
+            page1.lines.l5_farm,
+            page1.lines.l6_form_4797,
+            page1.lines.l7_other_income,
+            page1.lines.l8_total_income,
+            page1.lines.l9_salaries,
+            page1.lines.l10_guaranteed,
+            page1.lines.l11_repairs,
+            page1.lines.l12_bad_debts,
+            page1.lines.l13_rent,
+            page1.lines.l14_taxes,
+            page1.lines.l15_interest,
+            page1.lines.l16a_depreciation,
+            page1.lines.l16b_depreciation_elsewhere,
+            page1.lines.l16c_depreciation_net,
+            page1.lines.l17_depletion,
+            page1.lines.l18_retirement,
+            page1.lines.l19_benefits,
+            page1.lines.l20_energy,
+            page1.lines.l21_other_deductions,
+            page1.lines.l22_total_deductions,
+            page1.lines.l23_ordinary_income,
+            // Written by `fill_1065` and `fill_schedule_k` but missing from this
+            // list until a 2023 build failed on the preparer box — a name that
+            // nothing checked, in a revision nothing had opened.
+            page1.preparer_name,
+            sched_k::L1_ORDINARY,
+            sched_k::L3C_NET_RENTAL,
+            sched_k::L4C_TOTAL_GUARANTEED,
+            sched_k::ANALYSIS,
+        ];
+        names.extend(
+            [page1.suite, page1.state, page1.country, page1.postal_code]
+                .into_iter()
+                .flatten(),
+        );
+        for name in names {
+            assert!(
+                map.find(name).is_some(),
+                "the {year} Form 1065 has no field {name}"
+            );
         }
 
-        let sched = Document::load_mem(F1065_SK1).unwrap();
+        // The schedules that write into this same document. Their field names live
+        // in their own modules, and *not checking them here* is how a 2023 return
+        // got as far as a user before failing on `c4_1[1]`: this test proved page
+        // one and Schedule K on every year and said nothing about the rest of the
+        // form.
+        //
+        // Read out of the source rather than from a list kept by hand, because a
+        // list kept by hand is what drifted.
+        for (module, src) in [
+            ("Schedule L", include_str!("schedule_l.rs")),
+            ("Schedule M", include_str!("schedule_m.rs")),
+        ] {
+            for name in field_literals(src) {
+                assert!(
+                    map.find(&name).is_some(),
+                    "the {year} Form 1065 has no {module} field {name}"
+                );
+            }
+        }
+
+        // Schedule B, against what filling it actually needs: every question the
+        // year *asks* must have its control boxes, or an answer would land in a
+        // neighbouring question's box. Follow-ups are allowed to be missing —
+        // older forms lay the partnership-representative block out differently,
+        // and `fill` reports that rather than failing.
+        if let Some(table) = blanks.schedule_b {
+            use crate::tax::schedule_b::Control;
+            for q in table {
+                let boxes: Vec<&str> = match &q.control {
+                    Control::YesNo { yes, no } => vec![yes, no],
+                    Control::Choice(opts) => opts.iter().map(|o| o.field).collect(),
+                    Control::Check { field } | Control::Entry { field, .. } => vec![field],
+                };
+                for b in boxes {
+                    assert!(
+                        map.find(b).is_some(),
+                        "the {year} Form 1065 asks question {} but has no box {b} for it",
+                        q.number
+                    );
+                }
+            }
+        }
+
+        let sched = Document::load_mem(blanks.sk1).unwrap();
         let smap = field_map(&sched);
 
         // Part III: every box a partner's share is written into. Catches the
@@ -1283,19 +2129,19 @@ mod tests {
         for (line_key, field) in k1::PART_III {
             assert!(
                 smap.find(field).is_some(),
-                "f1065sk1.pdf has no field {field} for Schedule K line {line_key}"
+                "the {year} Schedule K-1 has no field {field} for Schedule K line {line_key}"
             );
         }
         for b in k1::CODED_BOXES {
             assert!(
                 smap.find(b.amount_field).is_some(),
-                "f1065sk1.pdf has no amount box {} for line {}",
+                "the {year} Schedule K-1 has no amount box {} for line {}",
                 b.amount_field,
                 b.number
             );
             assert!(
                 smap.find(b.code_field).is_some(),
-                "f1065sk1.pdf has no code box {} for line {}",
+                "the {year} Schedule K-1 has no code box {} for line {}",
                 b.code_field,
                 b.number
             );
@@ -1317,8 +2163,17 @@ mod tests {
             k1::LOSS_END,
             k1::CAPITAL_BEGIN,
             k1::CAPITAL_END,
+            k1::L_BEGIN,
+            k1::L_CONTRIBUTED,
+            k1::L_NET_INCOME,
+            k1::L_OTHER,
+            k1::L_WITHDRAWN,
+            k1::L_ENDING,
         ] {
-            assert!(smap.find(name).is_some(), "f1065sk1.pdf has no field {name}");
+            assert!(
+                smap.find(name).is_some(),
+                "the {year} Schedule K-1 has no field {name}"
+            );
         }
     }
 
@@ -1327,7 +2182,10 @@ mod tests {
     fn the_checkbox_states_are_the_ones_the_form_was_built_with() {
         let sched = Document::load_mem(F1065_SK1).unwrap();
         let map = field_map(&sched);
-        assert_eq!(acroform::on_states(&sched, &map, k1::TYPE_GENERAL), [k1::ON]);
+        assert_eq!(
+            acroform::on_states(&sched, &map, k1::TYPE_GENERAL),
+            [k1::ON]
+        );
         assert_eq!(
             acroform::on_states(&sched, &map, k1::TYPE_LIMITED),
             [k1::ON_SECOND]
@@ -1346,16 +2204,17 @@ mod tests {
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
 
-        let get = |n: &str| {
-            acroform::get_value_in(&doc, &map, FORM_ROOT, n).unwrap_or_default()
-        };
-        assert_eq!(get(f1065::LEGAL_NAME), "Clovelly Technology Partners LLC");
-        assert_eq!(get(f1065::EIN), "88-1234567");
-        assert_eq!(get(f1065::NAICS), "541511");
-        assert_eq!(get(f1065::DATE_STARTED), "07/01/2021");
-        assert_eq!(get(f1065::CITY), "Cape Town");
-        assert_eq!(get(f1065::SUITE), "Suite 4");
-        assert_eq!(get(f1065::K1_COUNT), "2", "one K-1 per partner");
+        let get = |n: &str| acroform::get_value_in(&doc, &map, FORM_ROOT, n).unwrap_or_default();
+        assert_eq!(
+            get(PAGE1_2025.legal_name),
+            "Clovelly Technology Partners LLC"
+        );
+        assert_eq!(get(PAGE1_2025.ein), "88-1234567");
+        assert_eq!(get(PAGE1_2025.naics), "541511");
+        assert_eq!(get(PAGE1_2025.date_started), "07/01/2021");
+        assert_eq!(get(PAGE1_2025.city), "Cape Town");
+        assert_eq!(get(PAGE1_2025.suite.unwrap()), "Suite 4");
+        assert_eq!(get(PAGE1_2025.k1_count), "2", "one K-1 per partner");
     }
 
     /// The bug this whole design exists to prevent: two K-1s sharing a field
@@ -1367,7 +2226,8 @@ mod tests {
         let map = field_map(&doc);
 
         let tin = |n: usize| {
-            acroform::get_value_in(&doc, &map, &k1_namespace(n), k1::PARTNER_TIN).unwrap_or_default()
+            acroform::get_value_in(&doc, &map, &k1_namespace(n), k1::PARTNER_TIN)
+                .unwrap_or_default()
         };
         assert_eq!(tin(1), "123-45-6789");
         assert_eq!(tin(2), "987-65-4321");
@@ -1430,7 +2290,7 @@ mod tests {
 
         // Page one must agree with the pages behind it.
         assert_eq!(
-            acroform::get_value_in(&doc, &map, FORM_ROOT, f1065::K1_COUNT),
+            acroform::get_value_in(&doc, &map, FORM_ROOT, PAGE1_2025.k1_count),
             Some("2".into()),
             "the K-1 count still counted the departed partner"
         );
@@ -1460,10 +2320,7 @@ mod tests {
 
         let bundle = build_return(&req).unwrap();
         assert!(
-            !bundle
-                .warnings
-                .iter()
-                .any(|w| w.contains("do not total 100%")),
+            !bundle.warnings.iter().any(|w| w.contains("not 100%")),
             "a partner who is not on the return was counted into its shares: {:?}",
             bundle.warnings
         );
@@ -1539,6 +2396,58 @@ mod tests {
         );
     }
 
+    /// A prior-year return attaches that year's Form 4562, not this year's.
+    ///
+    /// The wiring test for the per-revision tables: `build_return_inner` passes
+    /// `req.year` through, `form4562` picks that year's blank, and the boxes it
+    /// writes are that revision's. Before the tables existed this attached the
+    /// 2025 blank to a 2023 return, where the first Section B column is named
+    /// `R4[0]` rather than `f1_26[0]` and every `f1_` number after it is off by
+    /// one — so the basis printed in the recovery-period column.
+    #[test]
+    fn a_prior_year_return_attaches_that_years_form_4562() {
+        use crate::domain::{BonusElection, DepreciableAsset, PropertyClass, System};
+
+        let mut req = two_partner_request();
+        req.year = 2023;
+        req.assets = vec![DepreciableAsset {
+            asset_id: "kiln".into(),
+            description: "Kiln".into(),
+            asset_account_id: "1500".into(),
+            expense_account_id: "6500".into(),
+            accumulated_account_id: "1590".into(),
+            section_179_account_id: None,
+            acquired_on: day(2023, 3, 1),
+            placed_in_service: day(2023, 3, 1),
+            cost_cents: 1_000_000,
+            class: PropertyClass::SevenYear,
+            system: System::Gds,
+            section_179_cents: 0,
+            bonus: BonusElection::Decline,
+            disposed_on: None,
+            notes: None,
+        }];
+
+        let bundle = build_return(&req).unwrap();
+        assert!(
+            !bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("No Form 4562 is attached")),
+            "2023 is carried, so the form must be attached: {:?}",
+            bundle.warnings
+        );
+
+        // The 2023 blank names its first Section B column `R4[0]`; the 2025
+        // blank has no such field at all. Finding it proves which blank went in.
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        assert!(
+            map.names().any(|n| n.ends_with("R6[0]")),
+            "the attached 4562 is not the 2023 revision"
+        );
+    }
+
     /// A merged form must carry the fonts its fields ask for.
     ///
     /// The Schedule K-1's fields name `HelveticaLTStd-Roman` in their /DA
@@ -1583,7 +2492,11 @@ mod tests {
             };
             let da = acroform::decode_pdf_string(da);
             // A /DA reads like "/HelveticaLTStd-Roman 9 Tf 0 g".
-            let Some(font) = da.split_whitespace().next().and_then(|t| t.strip_prefix('/')) else {
+            let Some(font) = da
+                .split_whitespace()
+                .next()
+                .and_then(|t| t.strip_prefix('/'))
+            else {
                 continue;
             };
             assert!(
@@ -1593,20 +2506,29 @@ mod tests {
         }
     }
 
+    /// A departing partner's K-1 is final, and item J states what they held.
+    ///
+    /// The ending column used to read 0%, on the reasoning that they held
+    /// nothing by 31 December. The instruction for item J is the percentages
+    /// *immediately before termination* — and the old rule produced a K-1
+    /// asserting a 0% interest beside a Part III allocating real income to it.
     #[test]
-    fn a_partner_who_left_gets_a_final_k1_and_an_ending_share_of_nothing() {
+    fn a_partner_who_left_gets_a_final_k1_stating_what_they_held() {
         let mut req = two_partner_request();
         req.partners[1].partner.end_date = Some(day(FORM_TAX_YEAR, 6, 30));
 
         let bundle = build_return(&req).unwrap();
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
-        let get = |f: &str| {
-            acroform::get_value_in(&doc, &map, &k1_namespace(2), f).unwrap_or_default()
-        };
+        let get =
+            |f: &str| acroform::get_value_in(&doc, &map, &k1_namespace(2), f).unwrap_or_default();
         assert_eq!(get(k1::FINAL), "/1", "a departing partner's K-1 is final");
         assert_eq!(get(k1::PROFIT_BEGIN), "50");
-        assert_eq!(get(k1::PROFIT_END), "0");
+        assert_eq!(
+            get(k1::PROFIT_END),
+            "50",
+            "what they held on 30 June, not what they held on 31 December"
+        );
     }
 
     /// Shares that do not add up are the classic silently-wrong return.
@@ -1617,7 +2539,10 @@ mod tests {
 
         let bundle = build_return(&req).unwrap();
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("do not total 100%")),
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("add up to 80.0000%, not 100%")),
             "got {:?}",
             bundle.warnings
         );
@@ -1638,7 +2563,10 @@ mod tests {
 
         let bundle = build_return(&req).unwrap();
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("No TIN") && w.contains("Bob")),
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("No TIN") && w.contains("Bob")),
             "got {:?}",
             bundle.warnings
         );
@@ -1653,7 +2581,6 @@ mod tests {
     }
 
     // --- the ledger-backed path -------------------------------------------
-
 
     /// Seed a ledger whose income statement is known by hand, so the figures on
     /// the finished page can be checked against arithmetic done on paper.
@@ -1695,6 +2622,7 @@ mod tests {
         .unwrap();
 
         let req = ReturnRequest {
+            segments: Vec::new(),
             year: FORM_TAX_YEAR,
             profile: profile(),
             partners: pc::partners_for_year(store.connection(), FORM_TAX_YEAR)
@@ -1705,6 +2633,7 @@ mod tests {
             relationships: Vec::new(),
             assets: Vec::new(),
             schedule_l: None,
+            capital: Default::default(),
             detail: Default::default(),
             options: Default::default(),
             book_income_cents: 0,
@@ -1771,10 +2700,20 @@ mod tests {
             ("cash", EventAccountType::Asset, "1000", "Cash"),
             ("sales", EventAccountType::Revenue, "4000", "Sales"),
             ("refunds", EventAccountType::Revenue, "4900", "Refunds"),
-            ("cogs", EventAccountType::Expense, "5000", "Cost of goods sold"),
+            (
+                "cogs",
+                EventAccountType::Expense,
+                "5000",
+                "Cost of goods sold",
+            ),
             ("wages", EventAccountType::Expense, "6000", "Wages"),
             ("rent", EventAccountType::Expense, "6100", "Rent"),
-            ("mystery", EventAccountType::Expense, "6999", "Unmapped expense"),
+            (
+                "mystery",
+                EventAccountType::Expense,
+                "6999",
+                "Unmapped expense",
+            ),
         ];
         for (id, ty, number, name) in accounts {
             let e = Event::AccountCreated {
@@ -1834,11 +2773,11 @@ mod tests {
 
     fn map_seeded_accounts(conn: &rusqlite::Connection) {
         use crate::tax::lines::set_account_line;
-        set_account_line(conn, "sales", "l1a").unwrap();
-        set_account_line(conn, "refunds", "l1b").unwrap();
-        set_account_line(conn, "cogs", "l2").unwrap();
-        set_account_line(conn, "wages", "l9").unwrap();
-        set_account_line(conn, "rent", "l13").unwrap();
+        set_account_line(conn, "sales", "l1a", 0).unwrap();
+        set_account_line(conn, "refunds", "l1b", 0).unwrap();
+        set_account_line(conn, "cogs", "l2", 0).unwrap();
+        set_account_line(conn, "wages", "l9", 0).unwrap();
+        set_account_line(conn, "rent", "l13", 0).unwrap();
         // "mystery" deliberately left unmapped.
     }
 
@@ -1850,8 +2789,7 @@ mod tests {
         let store = seeded_ledger();
         map_seeded_accounts(store.connection());
 
-        let bundle =
-            build_return_from_ledger(store.connection(), &two_partner_request()).unwrap();
+        let bundle = build_return_from_ledger(store.connection(), &two_partner_request()).unwrap();
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
         // The separators come off before parsing: the box carries "4,001" now, and
@@ -1867,26 +2805,37 @@ mod tests {
         };
 
         // Rounded once per line, away from zero.
-        assert_eq!(get(f1065::L1A_GROSS_RECEIPTS), 4001, "$4,000.50");
-        assert_eq!(get(f1065::L1B_RETURNS), 101, "refunds print positive");
-        assert_eq!(get(f1065::L2_COGS), 1001);
-        assert_eq!(get(f1065::L9_SALARIES), 801);
-        assert_eq!(get(f1065::L13_RENT), 201);
+        assert_eq!(get(PAGE1_2025.lines.l1a_gross_receipts), 4001, "$4,000.50");
+        assert_eq!(
+            get(PAGE1_2025.lines.l1b_returns),
+            101,
+            "refunds print positive"
+        );
+        assert_eq!(get(PAGE1_2025.lines.l2_cogs), 1001);
+        assert_eq!(get(PAGE1_2025.lines.l9_salaries), 801);
+        assert_eq!(get(PAGE1_2025.lines.l13_rent), 201);
 
         // Every total, recomputed from what the page itself shows.
-        let (l1a, l1b, l2) = (get(f1065::L1A_GROSS_RECEIPTS), get(f1065::L1B_RETURNS), get(f1065::L2_COGS));
-        let (l9, l13) = (get(f1065::L9_SALARIES), get(f1065::L13_RENT));
+        let (l1a, l1b, l2) = (
+            get(PAGE1_2025.lines.l1a_gross_receipts),
+            get(PAGE1_2025.lines.l1b_returns),
+            get(PAGE1_2025.lines.l2_cogs),
+        );
+        let (l9, l13) = (
+            get(PAGE1_2025.lines.l9_salaries),
+            get(PAGE1_2025.lines.l13_rent),
+        );
 
-        assert_eq!(get(f1065::L1C_BALANCE), l1a - l1b);
-        assert_eq!(get(f1065::L3_GROSS_PROFIT), (l1a - l1b) - l2);
-        assert_eq!(get(f1065::L8_TOTAL_INCOME), (l1a - l1b) - l2);
-        assert_eq!(get(f1065::L22_TOTAL_DEDUCTIONS), l9 + l13);
+        assert_eq!(get(PAGE1_2025.lines.l1c_balance), l1a - l1b);
+        assert_eq!(get(PAGE1_2025.lines.l3_gross_profit), (l1a - l1b) - l2);
+        assert_eq!(get(PAGE1_2025.lines.l8_total_income), (l1a - l1b) - l2);
+        assert_eq!(get(PAGE1_2025.lines.l22_total_deductions), l9 + l13);
         assert_eq!(
-            get(f1065::L23_ORDINARY_INCOME),
-            get(f1065::L8_TOTAL_INCOME) - get(f1065::L22_TOTAL_DEDUCTIONS),
+            get(PAGE1_2025.lines.l23_ordinary_income),
+            get(PAGE1_2025.lines.l8_total_income) - get(PAGE1_2025.lines.l22_total_deductions),
             "the bottom line must be the page's own arithmetic"
         );
-        assert_eq!(get(f1065::L23_ORDINARY_INCOME), 2899 - 1002);
+        assert_eq!(get(PAGE1_2025.lines.l23_ordinary_income), 2899 - 1002);
     }
 
     /// An expense with no line is money missing from the return. It must be
@@ -1896,8 +2845,7 @@ mod tests {
         let store = seeded_ledger();
         map_seeded_accounts(store.connection());
 
-        let bundle =
-            build_return_from_ledger(store.connection(), &two_partner_request()).unwrap();
+        let bundle = build_return_from_ledger(store.connection(), &two_partner_request()).unwrap();
         let joined = bundle.warnings.join(" ");
         assert!(joined.contains("6999"), "got {joined}");
         assert!(joined.contains("Unmapped expense"), "got {joined}");
@@ -1905,7 +2853,7 @@ mod tests {
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
         assert_eq!(
-            acroform::get_value_in(&doc, &map, FORM_ROOT, f1065::L21_OTHER_DEDUCTIONS),
+            acroform::get_value_in(&doc, &map, FORM_ROOT, PAGE1_2025.lines.l21_other_deductions),
             None,
             "the unmapped $50 must not have landed on other deductions"
         );
@@ -1916,11 +2864,13 @@ mod tests {
     #[test]
     fn an_unmapped_ledger_leaves_the_money_lines_blank_and_says_why() {
         let store = seeded_ledger();
-        let bundle =
-            build_return_from_ledger(store.connection(), &two_partner_request()).unwrap();
+        let bundle = build_return_from_ledger(store.connection(), &two_partner_request()).unwrap();
 
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("No accounts are mapped")),
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("No accounts are mapped")),
             "got {:?}",
             bundle.warnings
         );
@@ -1928,12 +2878,12 @@ mod tests {
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
         assert_eq!(
-            acroform::get_value_in(&doc, &map, FORM_ROOT, f1065::L1A_GROSS_RECEIPTS),
+            acroform::get_value_in(&doc, &map, FORM_ROOT, PAGE1_2025.lines.l1a_gross_receipts),
             None,
             "no figure was known, so no figure is claimed"
         );
         assert_eq!(
-            acroform::get_value_in(&doc, &map, FORM_ROOT, f1065::L23_ORDINARY_INCOME),
+            acroform::get_value_in(&doc, &map, FORM_ROOT, PAGE1_2025.lines.l23_ordinary_income),
             Some("0".into()),
             "the bottom line is always written"
         );
@@ -1946,11 +2896,11 @@ mod tests {
         let doc = Document::load_mem(&bundle.pdf).unwrap();
         let map = field_map(&doc);
         assert_eq!(
-            acroform::get_value_in(&doc, &map, FORM_ROOT, f1065::LEGAL_NAME),
+            acroform::get_value_in(&doc, &map, FORM_ROOT, PAGE1_2025.legal_name),
             Some("Clovelly Technology Partners LLC".into())
         );
         assert_eq!(
-            acroform::get_value_in(&doc, &map, FORM_ROOT, f1065::L1A_GROSS_RECEIPTS),
+            acroform::get_value_in(&doc, &map, FORM_ROOT, PAGE1_2025.lines.l1a_gross_receipts),
             None
         );
     }
@@ -1969,8 +2919,11 @@ mod tests {
         let mut doc = Document::load_mem(F1065).unwrap();
         strip_xfa(&mut doc);
         let map = field_map(&doc);
-        let warnings = fill_income_lines(&mut doc, &map, &lines).unwrap();
-        assert!(warnings.is_empty(), "nothing should have been refused: {warnings:?}");
+        let warnings = fill_income_lines(&mut doc, &map, &PAGE1_2025, &lines).unwrap();
+        assert!(
+            warnings.is_empty(),
+            "nothing should have been refused: {warnings:?}"
+        );
 
         // Round-trip through a real save/load, not just the in-memory dict.
         let mut bytes = Vec::new();
@@ -1979,10 +2932,10 @@ mod tests {
         let map = field_map(&doc);
         let get = |n: &str| acroform::get_value_in(&doc, &map, FORM_ROOT, n).unwrap_or_default();
 
-        assert_eq!(get(f1065::L1A_GROSS_RECEIPTS), "987,654,321");
-        assert_eq!(get(f1065::L9_SALARIES), "123,456,789");
+        assert_eq!(get(PAGE1_2025.lines.l1a_gross_receipts), "987,654,321");
+        assert_eq!(get(PAGE1_2025.lines.l9_salaries), "123,456,789");
         assert_eq!(
-            get(f1065::L23_ORDINARY_INCOME),
+            get(PAGE1_2025.lines.l23_ordinary_income),
             "864,197,532",
             "987,654,321 - 123,456,789"
         );
@@ -1996,17 +2949,17 @@ mod tests {
         let doc = Document::load_mem(F1065).unwrap();
         let map = field_map(&doc);
         for field in [
-            f1065::L1A_GROSS_RECEIPTS,
-            f1065::L1B_RETURNS,
-            f1065::L1C_BALANCE,
-            f1065::L2_COGS,
-            f1065::L3_GROSS_PROFIT,
-            f1065::L8_TOTAL_INCOME,
-            f1065::L9_SALARIES,
-            f1065::L16C_DEPRECIATION_NET,
-            f1065::L21_OTHER_DEDUCTIONS,
-            f1065::L22_TOTAL_DEDUCTIONS,
-            f1065::L23_ORDINARY_INCOME,
+            PAGE1_2025.lines.l1a_gross_receipts,
+            PAGE1_2025.lines.l1b_returns,
+            PAGE1_2025.lines.l1c_balance,
+            PAGE1_2025.lines.l2_cogs,
+            PAGE1_2025.lines.l3_gross_profit,
+            PAGE1_2025.lines.l8_total_income,
+            PAGE1_2025.lines.l9_salaries,
+            PAGE1_2025.lines.l16c_depreciation_net,
+            PAGE1_2025.lines.l21_other_deductions,
+            PAGE1_2025.lines.l22_total_deductions,
+            PAGE1_2025.lines.l23_ordinary_income,
         ] {
             assert_eq!(
                 acroform::max_len(&doc, &map, field),
@@ -2024,14 +2977,17 @@ mod tests {
         let doc = Document::load_mem(F1065).unwrap();
         let map = field_map(&doc);
         assert_eq!(
-            acroform::max_len(&doc, &map, f1065::EIN),
+            acroform::max_len(&doc, &map, PAGE1_2025.ein),
             Some(10),
             "an EIN is NN-NNNNNNN"
         );
 
         let sched = Document::load_mem(F1065_SK1).unwrap();
         let smap = field_map(&sched);
-        assert_eq!(acroform::max_len(&sched, &smap, k1::PARTNERSHIP_EIN), Some(10));
+        assert_eq!(
+            acroform::max_len(&sched, &smap, k1::PARTNERSHIP_EIN),
+            Some(10)
+        );
         assert_eq!(
             acroform::max_len(&sched, &smap, k1::PARTNER_TIN),
             Some(11),
@@ -2046,7 +3002,7 @@ mod tests {
         strip_xfa(&mut doc);
         let map = field_map(&doc);
 
-        let err = set_text(&mut doc, &map, f1065::EIN, "88-1234567-EXTRA").unwrap_err();
+        let err = set_text(&mut doc, &map, PAGE1_2025.ein, "88-1234567-EXTRA").unwrap_err();
         match err {
             FormError::ValueTooLong { len, max, .. } => {
                 assert_eq!(max, 10);
@@ -2055,7 +3011,7 @@ mod tests {
             other => panic!("expected ValueTooLong, got {other:?}"),
         }
         assert_eq!(
-            acroform::get_value_in(&doc, &map, FORM_ROOT, f1065::EIN),
+            acroform::get_value_in(&doc, &map, FORM_ROOT, PAGE1_2025.ein),
             None,
             "the box must be untouched, not holding a shortened EIN"
         );
@@ -2071,7 +3027,10 @@ mod tests {
 
         let mut sb = ScheduleB::default();
         sb.set("b1", "llp");
-        for q in ["b3a","b3b","b5","b6","b7","b8","b9","b12","b16a","b19","b20","b21","b23","b27","b30","b4"] {
+        for q in [
+            "b3a", "b3b", "b5", "b6", "b7", "b8", "b9", "b12", "b16a", "b19", "b20", "b21", "b23",
+            "b27", "b30", "b4",
+        ] {
             sb.set(q, schedule_b::NO);
         }
         // Both attachments, so the sample shows them.
@@ -2088,13 +3047,41 @@ mod tests {
 
         let mut req = two_partner_request();
         req.schedule_b = sb;
-        req.detail.insert("l21", vec![
-            LineDetail { account_id:"1".into(), account_number:"6100".into(), account_name:"Advertising and promotion".into(), cents: 12_450_00 },
-            LineDetail { account_id:"2".into(), account_number:"6200".into(), account_name:"Professional fees".into(), cents: 8_900_00 },
-            LineDetail { account_id:"3".into(), account_number:"6300".into(), account_name:"Software subscriptions".into(), cents: 4_215_00 },
-            LineDetail { account_id:"4".into(), account_number:"6400".into(), account_name:"Bank and merchant charges".into(), cents: 1_980_50 },
-            LineDetail { account_id:"5".into(), account_number:"6500".into(), account_name:"Office supplies".into(), cents: 2_104_50 },
-        ]);
+        req.detail.insert(
+            "l21",
+            vec![
+                LineDetail {
+                    account_id: "1".into(),
+                    account_number: "6100".into(),
+                    account_name: "Advertising and promotion".into(),
+                    cents: 12_450_00,
+                },
+                LineDetail {
+                    account_id: "2".into(),
+                    account_number: "6200".into(),
+                    account_name: "Professional fees".into(),
+                    cents: 8_900_00,
+                },
+                LineDetail {
+                    account_id: "3".into(),
+                    account_number: "6300".into(),
+                    account_name: "Software subscriptions".into(),
+                    cents: 4_215_00,
+                },
+                LineDetail {
+                    account_id: "4".into(),
+                    account_number: "6400".into(),
+                    account_name: "Bank and merchant charges".into(),
+                    cents: 1_980_50,
+                },
+                LineDetail {
+                    account_id: "5".into(),
+                    account_number: "6500".into(),
+                    account_name: "Office supplies".into(),
+                    cents: 2_104_50,
+                },
+            ],
+        );
 
         // A Schedule L with both columns and a paired gross/contra row, which is
         // the placement worth looking at on paper.
@@ -2110,9 +3097,19 @@ mod tests {
         req.book_income_cents = 133_950_00;
 
         let mut lines = crate::tax::lines::Form1065Lines::default();
-        for (k, v) in [("l1a", 480_000i64), ("l2", 150_000), ("l9", 120_000), ("l13", 36_000),
-                       ("l14", 18_400), ("l16a", 22_000), ("l21", 29_650),
-                       ("k5", 3_200), ("k13a", 5_000), ("k12", 14_000), ("k19a", 60_000)] {
+        for (k, v) in [
+            ("l1a", 480_000i64),
+            ("l2", 150_000),
+            ("l9", 120_000),
+            ("l13", 36_000),
+            ("l14", 18_400),
+            ("l16a", 22_000),
+            ("l21", 29_650),
+            ("k5", 3_200),
+            ("k13a", 5_000),
+            ("k12", 14_000),
+            ("k19a", 60_000),
+        ] {
             lines.set_for_test(k, v);
         }
 
@@ -2133,10 +3130,18 @@ mod tests {
         use crate::tax::schedule_b::{ScheduleB, YES};
 
         let mut req = two_partner_request();
-        let mut owner = partner("Holdings LLC", PartnerType::General, Residency::Domestic, 60.0);
+        let mut owner = partner(
+            "Holdings LLC",
+            PartnerType::General,
+            Residency::Domestic,
+            60.0,
+        );
         owner.entity_type = "Partnership".to_string();
         owner.shares = Shares::from_percents(60.0, 60.0, 60.0);
-        req.partners = vec![PartnerFiling { partner: owner, tin: Some("98-7654321".into()) }];
+        req.partners = vec![PartnerFiling {
+            partner: owner,
+            tin: Some("98-7654321".into()),
+        }];
 
         let mut sb = ScheduleB::default();
         sb.set("b2a", YES);
@@ -2162,7 +3167,10 @@ mod tests {
         assert!(text.contains("49842K"), "Schedule B-1 is not in the bundle");
         // And the constructive-ownership caveat travels with it.
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("family attribution")),
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("family attribution")),
             "{:?}",
             bundle.warnings
         );
@@ -2188,9 +3196,7 @@ mod tests {
     /// rendered string is where both forms of the defect look identical.
     #[test]
     fn every_warning_a_return_produces_reads_as_a_sentence() {
-        use crate::domain::{
-            BonusElection, DepreciableAsset, PropertyClass, Shares, System,
-        };
+        use crate::domain::{BonusElection, DepreciableAsset, PropertyClass, Shares, System};
         use crate::tax::schedule_b::{ScheduleB, NO, YES};
         use crate::tax::warning_shape;
 
@@ -2245,7 +3251,10 @@ mod tests {
         let mut req = two_partner_request();
         let mut owner = partner("Dana", PartnerType::General, Residency::Domestic, 60.0);
         owner.shares = Shares::from_percents(60.0, 40.0, 60.0);
-        req.partners = vec![PartnerFiling { partner: owner, tin: None }];
+        req.partners = vec![PartnerFiling {
+            partner: owner,
+            tin: None,
+        }];
         let mut sb = ScheduleB::default();
         sb.set("b2b", NO);
         // 4. …and question 31 Yes with a total that disagrees with the schedule.
@@ -2302,7 +3311,11 @@ mod tests {
         let mut lines = crate::tax::lines::Form1065Lines::default();
         lines.set_for_test("l16a", 0);
         lines.set_for_test("k12", 0);
-        all.extend(build_return_inner(&req, &lines, Vec::new()).unwrap().warnings);
+        all.extend(
+            build_return_inner(&req, &lines, Vec::new())
+                .unwrap()
+                .warnings,
+        );
 
         // 6. A balance sheet that *was* computed and has nothing mapped to it —
         //    a different warning from "nobody computed one", and reached only
@@ -2325,9 +3338,30 @@ mod tests {
                 .warnings,
         );
 
-        // 8. A year the bundled forms are not the revision for.
+        // 8. A year whose percentages changed mid-year, which cannot be
+        //    allocated on one split.
         let mut req = two_partner_request();
-        req.year = FORM_TAX_YEAR + 1;
+        let mid = day(FORM_TAX_YEAR, 7, 1);
+        req.partners[0].partner.history = vec![
+            crate::domain::SharePeriod {
+                effective_from: day(2020, 1, 1),
+                shares: crate::domain::Shares::from_percents(50.0, 50.0, 50.0),
+            },
+            crate::domain::SharePeriod {
+                effective_from: mid,
+                shares: crate::domain::Shares::from_percents(60.0, 60.0, 60.0),
+            },
+        ];
+        req.partners[1].partner.history = vec![
+            crate::domain::SharePeriod {
+                effective_from: day(2020, 1, 1),
+                shares: crate::domain::Shares::from_percents(50.0, 50.0, 50.0),
+            },
+            crate::domain::SharePeriod {
+                effective_from: mid,
+                shares: crate::domain::Shares::from_percents(40.0, 40.0, 40.0),
+            },
+        ];
         all.extend(
             build_return_inner(&req, &Default::default(), Vec::new())
                 .unwrap()
@@ -2352,8 +3386,7 @@ mod tests {
     fn a_partnership_with_no_ein_is_told_before_it_files() {
         let mut req = two_partner_request();
         req.profile.ein = String::new();
-        let bundle =
-            build_return_inner(&req, &Default::default(), Vec::new()).expect("a return");
+        let bundle = build_return_inner(&req, &Default::default(), Vec::new()).expect("a return");
         assert!(
             bundle.warnings.iter().any(|w| w.contains("no EIN")),
             "{:?}",
@@ -2475,7 +3508,10 @@ mod tests {
 
         let bundle = build_return_inner(&req, &Default::default(), Vec::new()).unwrap();
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("no partner in the books owns 50%")),
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("no partner in the books owns 50%")),
             "{:?}",
             bundle.warnings
         );
@@ -2527,8 +3563,14 @@ mod tests {
         // Matched on catalogue number, not on wording: Form 1065's own question
         // 2a says "Owning 50% or More" in the course of asking, so the phrase is
         // no evidence the schedule is attached.
-        assert!(!text.contains("49842K"), "an unrequested Schedule B-1 was attached");
-        assert!(!text.contains("69658K"), "an unrequested Schedule B-2 was attached");
+        assert!(
+            !text.contains("49842K"),
+            "an unrequested Schedule B-1 was attached"
+        );
+        assert!(
+            !text.contains("69658K"),
+            "an unrequested Schedule B-2 was attached"
+        );
     }
 
     /// The default: question 4 excuses L, M-1 and M-2, and they are completed
@@ -2584,7 +3626,10 @@ mod tests {
             "M-1 must be blank when the option is off"
         );
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("Nothing then checks")),
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("Nothing then checks")),
             "{:?}",
             bundle.warnings
         );
@@ -2636,9 +3681,24 @@ mod tests {
         req.detail.insert(
             "l21",
             vec![
-                LineDetail { account_id: "a".into(), account_number: "6100".into(), account_name: "Advertising".into(), cents: 1_200_00 },
-                LineDetail { account_id: "b".into(), account_number: "6200".into(), account_name: "Professional fees".into(), cents: 3_400_00 },
-                LineDetail { account_id: "c".into(), account_number: "6300".into(), account_name: "Software subscriptions".into(), cents: 900_00 },
+                LineDetail {
+                    account_id: "a".into(),
+                    account_number: "6100".into(),
+                    account_name: "Advertising".into(),
+                    cents: 1_200_00,
+                },
+                LineDetail {
+                    account_id: "b".into(),
+                    account_number: "6200".into(),
+                    account_name: "Professional fees".into(),
+                    cents: 3_400_00,
+                },
+                LineDetail {
+                    account_id: "c".into(),
+                    account_number: "6300".into(),
+                    account_name: "Software subscriptions".into(),
+                    cents: 900_00,
+                },
             ],
         );
         let mut lines = crate::tax::lines::Form1065Lines::default();
@@ -2654,10 +3714,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
 
-        assert!(text.contains("Advertising"), "statement page missing from the bundle");
+        assert!(
+            text.contains("Advertising"),
+            "statement page missing from the bundle"
+        );
         assert!(text.contains("Professional fees"));
         assert!(text.contains("Software subscriptions"));
-        assert!(text.contains("5,500"), "the statement must total to the box");
+        assert!(
+            text.contains("5,500"),
+            "the statement must total to the box"
+        );
     }
 
     /// A figure on line 21 with no detail behind it cannot be supported, and has
@@ -2708,7 +3774,7 @@ mod tests {
         lines.set_for_test("k13a", -101);
 
         let filed: Vec<&PartnerFiling> = req.partners.iter().collect();
-        let (shares, _) = split_across_partners(&lines, &filed);
+        let (shares, _) = split_across_partners(&lines, &filed, 2025, &[]);
 
         for key in ["k1", "k5", "k13a"] {
             let total: i64 = shares.iter().map(|s| s.get(key)).sum();
@@ -2727,25 +3793,39 @@ mod tests {
     /// and on the item's own sign — so one return can split two figures two ways.
     #[test]
     fn income_and_loss_items_travel_on_different_percentages() {
-        use crate::tax::lines::Form1065Lines;
         use crate::domain::Shares;
+        use crate::tax::lines::Form1065Lines;
 
         let mut a = partner("Alice", PartnerType::General, Residency::Domestic, 50.0);
-        a.shares = Shares { profit_ppm: 100_000, loss_ppm: 900_000, capital_ppm: 500_000 };
+        a.shares = Shares {
+            profit_ppm: 100_000,
+            loss_ppm: 900_000,
+            capital_ppm: 500_000,
+        };
         let mut b = partner("Bob", PartnerType::General, Residency::Domestic, 50.0);
-        b.shares = Shares { profit_ppm: 900_000, loss_ppm: 100_000, capital_ppm: 500_000 };
+        b.shares = Shares {
+            profit_ppm: 900_000,
+            loss_ppm: 100_000,
+            capital_ppm: 500_000,
+        };
 
         let filings = vec![
-            PartnerFiling { partner: a, tin: None },
-            PartnerFiling { partner: b, tin: None },
+            PartnerFiling {
+                partner: a,
+                tin: None,
+            },
+            PartnerFiling {
+                partner: b,
+                tin: None,
+            },
         ];
         let filed: Vec<&PartnerFiling> = filings.iter().collect();
 
         let mut lines = Form1065Lines::default();
-        lines.set_for_test("k5", 1000);      // income
-        lines.set_for_test("k10", -1000);    // loss
+        lines.set_for_test("k5", 1000); // income
+        lines.set_for_test("k10", -1000); // loss
 
-        let (shares, warnings) = split_across_partners(&lines, &filed);
+        let (shares, warnings) = split_across_partners(&lines, &filed, 2025, &[]);
         assert_eq!(shares[0].get("k5"), 100, "Alice takes 10% of the income");
         assert_eq!(shares[1].get("k5"), 900);
         assert_eq!(shares[0].get("k10"), -900, "Alice takes 90% of the loss");
@@ -2801,7 +3881,7 @@ mod tests {
             "13a cash contributions"
         );
         assert_eq!(
-            crate::tax::acroform::get_value(&doc, &map, f1065::L21_OTHER_DEDUCTIONS),
+            crate::tax::acroform::get_value(&doc, &map, PAGE1_2025.lines.l21_other_deductions),
             None,
             "line 21 must stay empty"
         );
@@ -2809,16 +3889,514 @@ mod tests {
 
     #[test]
     fn filing_a_year_the_bundled_forms_are_not_for_is_flagged() {
+        // A year that is carried and mapped gets its own form, and says nothing
+        // about the form it used.
+        for blanks in FORM_YEARS.iter().filter(|f| f.mapped) {
+            let req = ReturnRequest {
+                year: blanks.year,
+                ..two_partner_request()
+            };
+            let bundle = build_return(&req).unwrap();
+            assert!(
+                !bundle
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("No Form 1065 is carried")),
+                "{} is carried but was reported as missing: {:?}",
+                blanks.year,
+                bundle.warnings
+            );
+        }
+
+        // A year that is not is refused, not filled on another year's blank.
+        //
+        // This used to fall back to the current revision with a warning, and the
+        // result was a complete, plausible return whose page 1 and every K-1
+        // carried the current year in pre-printed type — a form that says one
+        // year and is filed as another, with the only evidence one line in a
+        // list of a dozen warnings.
+        let oldest = supported_years().first().copied().unwrap();
         let req = ReturnRequest {
-            year: FORM_TAX_YEAR - 1,
+            year: oldest - 1,
             ..two_partner_request()
         };
-        let bundle = build_return(&req).unwrap();
+        match build_return(&req) {
+            Err(FormError::NoFormForYear { year, .. }) => assert_eq!(year, oldest - 1),
+            Err(e) => panic!("refused, but for the wrong reason: {e}"),
+            Ok(b) => panic!(
+                "a year with no blank was filled on another year's form, with {} warning(s)",
+                b.warnings.len()
+            ),
+        }
+    }
+
+    /// The older forms take one address line, and it has to read like one.
+    #[test]
+    fn a_one_line_address_reads_like_an_address() {
+        use crate::domain::Address;
+        let mut a = Address {
+            street: "4541 N Lincoln Ave".into(),
+            suite: None,
+            city: "Chicago".into(),
+            state: "IL".into(),
+            postal_code: "60625".into(),
+            country: None,
+        };
+        assert_eq!(one_line_address(&a), "Chicago, IL 60625");
+        a.country = Some("United States".into());
+        assert_eq!(one_line_address(&a), "Chicago, IL, United States 60625");
+        // Nothing entered leaves no stray punctuation behind.
+        a.country = None;
+        a.postal_code = String::new();
+        assert_eq!(one_line_address(&a), "Chicago, IL");
+        a.city = String::new();
+        a.state = String::new();
+        a.postal_code = "60625".into();
+        assert_eq!(one_line_address(&a), "60625");
+    }
+
+    /// Every box on page one sits where its printed label says it does.
+    ///
+    /// # The two failures this exists to catch, both of which happened
+    ///
+    /// The header: on the 2023 form `f1_07[0]` is the *principal business
+    /// activity* box, not the city. Every name resolved, every test passed, and
+    /// the city, state, ZIP and business code came out blank on the paper while
+    /// their values sat in boxes A and B.
+    ///
+    /// The income block: the 2023 and 2024 forms number gross receipts
+    /// `f1_15[0]` where the 2025 form numbers it `f1_19[0]`, because their
+    /// header uses four fewer boxes. Filled with the 2025 names, a 2023 return
+    /// printed gross receipts on line 3, total deductions on "Other taxes", and
+    /// the ordinary business income on **line 28, Total balance due**. Every one
+    /// of those names exists on the 2023 form. Only the geometry said otherwise.
+    #[test]
+    fn every_page_one_box_sits_where_its_label_says() {
+        for blanks in FORM_YEARS.iter().filter(|f| f.mapped) {
+            let Some(page1) = blanks.page1 else { continue };
+            let year = blanks.year;
+            let doc = Document::load_mem(blanks.f1065).unwrap();
+            let mut map = field_map(&doc);
+
+            use lopdf::Object;
+            let rect = |name: &str| -> (f64, f64) {
+                let id = map
+                    .find(name)
+                    .unwrap_or_else(|| panic!("the {year} form has no {name}"));
+                let d = doc.get_object(id).and_then(Object::as_dict).unwrap();
+                let r = d.get(b"Rect").and_then(Object::as_array).unwrap();
+                let num = |i: usize| {
+                    r[i].as_float()
+                        .map(f64::from)
+                        .unwrap_or_else(|_| r[i].as_i64().unwrap() as f64)
+                };
+                (num(0), num(1))
+            };
+
+            // --- the header, by column ---
+            //
+            // A/B/C run down the left margin, the name and address occupy the
+            // middle, and the EIN and date started sit on the right. A box that
+            // has drifted between them is in the wrong place whatever it is called.
+            for (name, what) in [
+                (page1.principal_activity, "box A principal activity"),
+                (page1.principal_product, "box B principal product"),
+                (page1.naics, "box C NAICS code"),
+            ] {
+                let x = rect(name).0;
+                assert!(
+                    x < 80.0,
+                    "on the {year} form the {what} box is at x={x:.0}, not in the left \
+                     margin where its label is — it is pointing at another box"
+                );
+            }
+            for (name, what) in [
+                (page1.legal_name, "partnership name"),
+                (page1.street, "street"),
+                (page1.city, "city"),
+            ] {
+                let x = rect(name).0;
+                assert!(
+                    (100.0..420.0).contains(&x),
+                    "on the {year} form the {what} box is at x={x:.0}, outside the column \
+                     its label is in"
+                );
+            }
+            for (name, what) in [(page1.ein, "EIN"), (page1.date_started, "date started")] {
+                let x = rect(name).0;
+                assert!(
+                    x > 420.0,
+                    "on the {year} form the {what} box is at x={x:.0}, not in the right \
+                     column where its label is"
+                );
+            }
+
+            // --- the income and deduction block, by row ---
+            //
+            // Each line's box must sit on the printed row that carries its
+            // number, read off the page rather than tabulated here — a table
+            // written here is one more thing that can disagree with the paper,
+            // which is the whole failure being guarded against.
+            let rows = printed_line_rows(blanks.f1065);
+            assert!(
+                rows.len() > 15,
+                "{year}: read {} numbered rows; is pdftotext installed?",
+                rows.len()
+            );
+            let l = &page1.lines;
+            for (name, number) in [
+                (l.l1a_gross_receipts, "1a"),
+                (l.l2_cogs, "2"),
+                (l.l3_gross_profit, "3"),
+                (l.l4_other_partnerships, "4"),
+                (l.l5_farm, "5"),
+                (l.l6_form_4797, "6"),
+                (l.l7_other_income, "7"),
+                (l.l8_total_income, "8"),
+                (l.l9_salaries, "9"),
+                (l.l10_guaranteed, "10"),
+                (l.l11_repairs, "11"),
+                (l.l12_bad_debts, "12"),
+                (l.l13_rent, "13"),
+                (l.l14_taxes, "14"),
+                (l.l15_interest, "15"),
+                (l.l16a_depreciation, "16a"),
+                (l.l17_depletion, "17"),
+                (l.l18_retirement, "18"),
+                (l.l19_benefits, "19"),
+                (l.l20_energy, "20"),
+                (l.l21_other_deductions, "21"),
+                (l.l22_total_deductions, "22"),
+                (l.l23_ordinary_income, "23"),
+            ] {
+                let y = rect(name).1;
+                // A `Rect` names the bottom of the box; the printed number is
+                // centred in the row, about six points above it.
+                let printed: Vec<&str> = rows
+                    .iter()
+                    .filter(|(at, _)| (*at - (y + 6.0)).abs() < 5.0)
+                    .map(|(_, n)| n.as_str())
+                    .collect();
+                assert!(
+                    printed.contains(&number),
+                    "on the {year} form line {number} is written to {name} at y={y:.0}, \
+                     where the page prints line(s) {printed:?}"
+                );
+            }
+        }
+    }
+
+    /// The line numbers printed down the left of page one, by the y they sit at.
+    ///
+    /// A line number is a token that starts with a digit in the narrow column the
+    /// form reserves for it, which is what distinguishes "16a" the label from
+    /// "16a" appearing inside another line's wording.
+    fn printed_line_rows(bytes: &[u8]) -> Vec<(f64, String)> {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("accountir-1065-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f1065.pdf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        let out = std::process::Command::new("pdftotext")
+            .args(["-f", "1", "-l", "1", "-bbox-layout"])
+            .arg(&path)
+            .arg("-")
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(out) = out else { return Vec::new() };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let height: f64 = text
+            .split("height=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(792.0);
+
+        let mut rows = Vec::new();
+        for chunk in text.split("<word ").skip(1) {
+            let num = |key: &str| -> Option<f64> {
+                chunk
+                    .split(key)
+                    .nth(1)?
+                    .split('"')
+                    .next()?
+                    .parse::<f64>()
+                    .ok()
+            };
+            let (Some(x_min), Some(y_min), Some(y_max)) =
+                (num("xMin=\""), num("yMin=\""), num("yMax=\""))
+            else {
+                continue;
+            };
+            let Some(word) = chunk.split('>').nth(1).and_then(|s| s.split('<').next()) else {
+                continue;
+            };
+            // The number column. The form reserves the left margin for it and
+            // right-aligns, so a two-character number starts a few points left
+            // of a one-character one — 55 to 70 covers both on every revision.
+            // Anything further right is a number inside a sentence.
+            if !(50.0..75.0).contains(&x_min) {
+                continue;
+            }
+            let w = word.trim();
+            if w.len() > 3 || !w.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            rows.push((height - (y_min + y_max) / 2.0, w.to_string()));
+        }
+        rows
+    }
+
+    /// No two Schedule B questions may resolve to the same box.
+    ///
+    /// The failure this catches, found the hard way: aliasing a prior year's
+    /// yes/no rows into place is not enough on its own, because the questions
+    /// that are *not* yes/no — a lone "check this box", a "how many Forms 8865"
+    /// — sit outside those columns and shift with the page just the same. Leave
+    /// one un-aliased and it lands on a neighbour's box. Both halves of a yes/no
+    /// pair then come back ticked, which on a filed return is an answer nobody
+    /// gave.
+    #[test]
+    fn no_two_schedule_b_questions_share_a_box() {
+        use crate::tax::schedule_b::Control;
+        for blanks in FORM_YEARS.iter() {
+            let Some(table) = blanks.schedule_b else {
+                continue;
+            };
+            let doc = Document::load_mem(blanks.f1065).unwrap();
+            let mut map = field_map(&doc);
+            let mut owner: std::collections::HashMap<lopdf::ObjectId, &str> =
+                std::collections::HashMap::new();
+            for q in table {
+                let boxes: Vec<&str> = match &q.control {
+                    Control::YesNo { yes, no } => vec![yes, no],
+                    Control::Choice(opts) => opts.iter().map(|o| o.field).collect(),
+                    Control::Check { field } | Control::Entry { field, .. } => vec![field],
+                };
+                for b in boxes {
+                    let Some(id) = map.find(b) else { continue };
+                    if let Some(previous) = owner.insert(id, q.key) {
+                        assert_eq!(
+                            previous, q.key,
+                            "on the {} form, questions {previous} and {} both write {b}",
+                            blanks.year, q.key
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every Schedule B answer box sits on the row whose number the table claims.
+    ///
+    /// The yes and no columns are at fixed x on every revision, and the question
+    /// number is printed in the left margin — so a box's row can be read off the
+    /// page and compared with what the table says it is. This is the check that
+    /// makes a per-revision table trustworthy without deriving it from another
+    /// year's: each one is asserted against its own PDF.
+    #[test]
+    fn every_schedule_b_box_sits_on_the_row_its_number_is_printed_on() {
+        use crate::tax::schedule_b::Control;
+        for blanks in FORM_YEARS {
+            let Some(table) = blanks.schedule_b else {
+                continue;
+            };
+            let year = blanks.year;
+            let doc = Document::load_mem(blanks.f1065).unwrap();
+            let map = field_map(&doc);
+
+            // The margin as it reads: numbers in one column, sub-letters just
+            // right of them, walked top to bottom. A number sets the current
+            // question; a letter sets its part. That is how a person reads the
+            // page, and it is the only way to tell question 2's "a" from
+            // question 3's.
+            let mut printed: Vec<(u8, f64, String)> = Vec::new();
+            for page in 2u8..=4 {
+                let mut margin: Vec<(f64, bool, String)> = Vec::new();
+                for (y, x, word) in page_words(blanks.f1065, page) {
+                    if (40.0..=48.0).contains(&x)
+                        && word.len() <= 2
+                        && word.chars().all(|c| c.is_ascii_digit())
+                    {
+                        margin.push((y, true, word));
+                    } else if (48.0..=56.0).contains(&x)
+                        && word.len() == 1
+                        && word.chars().all(|c| c.is_ascii_lowercase())
+                    {
+                        margin.push((y, false, word));
+                    }
+                }
+                margin.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let mut number = String::new();
+                for (y, is_number, word) in margin {
+                    if is_number {
+                        number = word;
+                        printed.push((page, y, number.clone()));
+                    } else if !number.is_empty() {
+                        printed.push((page, y, format!("{number}{word}")));
+                    }
+                }
+            }
+
+            for q in table {
+                let Control::YesNo { yes, .. } = q.control else {
+                    continue;
+                };
+                let Some(id) = map.find(yes) else { continue };
+                // Which page the box is on, from its qualified name — the printed
+                // numbers restart on each page, so a row can only be matched
+                // against its own.
+                let suffix = format!(".{yes}");
+                let Some(page) = map
+                    .names()
+                    .find(|n| n.ends_with(&suffix) || *n == yes)
+                    .and_then(|n| n.split(".Page").nth(1))
+                    .and_then(|n| n.split('[').next())
+                    .and_then(|n| n.parse::<u8>().ok())
+                else {
+                    continue;
+                };
+                let d = doc.get_object(id).and_then(lopdf::Object::as_dict).unwrap();
+                let r = d.get(b"Rect").and_then(lopdf::Object::as_array).unwrap();
+                let y = r[1]
+                    .as_float()
+                    .map(f64::from)
+                    .unwrap_or_else(|_| r[1].as_i64().unwrap() as f64);
+
+                // The number for a row is the nearest one printed at or above it,
+                // because a question's number sits on its first line and its
+                // checkboxes on its last.
+                let nearest = printed
+                    .iter()
+                    .filter(|(pg, py, _)| *pg == page && *py >= y - 3.0)
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .map(|(_, _, n)| n.as_str());
+
+                if let Some(found) = nearest {
+                    assert!(
+                        found.starts_with(q.number) || q.number.starts_with(found),
+                        "on the {year} form question {} is written to {yes}, which sits on the \
+                         row the page numbers {found}",
+                        q.number
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every word on a page, as `(y from the bottom, x, text)`.
+    fn page_words(bytes: &[u8], page: u8) -> Vec<(f64, f64, String)> {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("accountir-sb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f1065.pdf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        let out = std::process::Command::new("pdftotext")
+            .args([
+                "-f",
+                &page.to_string(),
+                "-l",
+                &page.to_string(),
+                "-bbox-layout",
+            ])
+            .arg(&path)
+            .arg("-")
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(out) = out else { return Vec::new() };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let height: f64 = text
+            .split("height=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(792.0);
+        let mut out = Vec::new();
+        for chunk in text.split("<word ").skip(1) {
+            let num = |key: &str| -> Option<f64> {
+                chunk
+                    .split(key)
+                    .nth(1)?
+                    .split('"')
+                    .next()?
+                    .parse::<f64>()
+                    .ok()
+            };
+            let (Some(x), Some(y0), Some(y1)) = (num("xMin=\""), num("yMin=\""), num("yMax=\""))
+            else {
+                continue;
+            };
+            let Some(w) = chunk.split('>').nth(1).and_then(|s| s.split('<').next()) else {
+                continue;
+            };
+            if w.trim().is_empty() {
+                continue;
+            }
+            out.push((height - (y0 + y1) / 2.0, x, w.trim().to_string()));
+        }
+        out
+    }
+
+    /// A draft may not be filed, and a page that does not say so invites
+    /// somebody to post it to the IRS.
+    #[test]
+    fn a_draft_year_says_it_is_a_projection_and_not_a_return() {
+        let draft = FORM_YEARS
+            .iter()
+            .find(|f| f.draft && f.mapped)
+            .map(|f| f.year);
+        let Some(year) = draft else {
+            // Every draft carried is currently unmapped, which
+            // `an_unmapped_revision_is_refused_rather_than_half_filled` covers.
+            return;
+        };
+        let bundle = build_return(&ReturnRequest {
+            year,
+            ..two_partner_request()
+        })
+        .unwrap();
         assert!(
-            bundle.warnings.iter().any(|w| w.contains("revision")),
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("draft") && w.contains("may not be filed")),
             "got {:?}",
             bundle.warnings
         );
+    }
+
+    /// The trap this whole per-year apparatus exists for: on a re-paginated
+    /// revision every field name still resolves, so a build that went ahead
+    /// would fill real boxes on the wrong schedules and foot perfectly.
+    #[test]
+    fn an_unmapped_revision_is_refused_rather_than_half_filled() {
+        for blanks in FORM_YEARS.iter().filter(|f| !f.mapped) {
+            let msg = match build_return(&ReturnRequest {
+                year: blanks.year,
+                ..two_partner_request()
+            }) {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!(
+                    "the {} revision is not mapped but produced a form anyway",
+                    blanks.year
+                ),
+            };
+            assert!(msg.contains("wrong schedule"), "{msg}");
+            assert!(msg.contains("preview"), "no route to the figures: {msg}");
+        }
+    }
+
+    /// The fallback index has to point at the current year's blanks, or a year
+    /// nothing is carried for silently gets some other year's form.
+    #[test]
+    fn the_fallback_form_is_the_current_years() {
+        assert_eq!(FORM_YEARS[CURRENT_FORM_INDEX].year, FORM_TAX_YEAR);
     }
 
     #[test]
@@ -2838,5 +4416,252 @@ mod tests {
             1_000_000,
             "the unit shares are held in"
         );
+    }
+
+    // --- item L, the partner's capital account ------------------------------
+
+    /// The names above were matched to the printed labels by rectangle, on every
+    /// revision carried. This is the standing check that they are still there —
+    /// and that no revision needed an alias for them, which is the claim the
+    /// comment in `mod k1` makes and the one that would rot silently.
+    ///
+    /// Run over the 2026 draft too, unlike `check_year`. The draft re-paginates
+    /// the 1065 and moves the K-1 onto page 2 of its own file, so its `f5_*`
+    /// names mean something else — but item L's six boxes are not on the 1065 at
+    /// all, and the whole point of a geometric match is that it survives a
+    /// repagination that a name-based one would not notice.
+    #[test]
+    fn item_l_is_the_same_six_boxes_on_every_revision_carried() {
+        for blanks in FORM_YEARS {
+            let year = blanks.year;
+            let sched = Document::load_mem(blanks.sk1).unwrap();
+            let map = field_map(&sched);
+            for name in [
+                k1::L_BEGIN,
+                k1::L_CONTRIBUTED,
+                k1::L_NET_INCOME,
+                k1::L_OTHER,
+                k1::L_WITHDRAWN,
+                k1::L_ENDING,
+            ] {
+                assert!(
+                    map.find(name).is_some(),
+                    "the {year} Schedule K-1 has no item L box {name}"
+                );
+            }
+        }
+    }
+
+    /// A ledger with two partners' capital in four accounts, and the entries that
+    /// make each row of item L a different number — so a row written into its
+    /// neighbour's box is visible rather than hidden behind two equal figures.
+    fn ledger_with_capital_accounts() -> (crate::store::event_store::EventStore, String, String) {
+        use crate::commands::partnership_commands as pc;
+        use crate::events::types::{Event, EventAccountType, EventEnvelope, JournalLineData};
+        use crate::store::projections::ProjectionStore;
+
+        let mut store = seeded_ledger();
+        map_seeded_accounts(store.connection());
+        pc::set_profile(&mut store, "u", &profile()).unwrap();
+
+        for (id, number, name) in [
+            ("alice-in", "4002", "Alice contributions"),
+            ("alice-out", "4005", "Alice draws"),
+            ("bob-in", "4003", "Bob contributions"),
+            ("bob-out", "4006", "Bob draws"),
+        ] {
+            let e = Event::AccountCreated {
+                account_id: id.into(),
+                account_type: EventAccountType::Equity,
+                account_number: number.into(),
+                name: name.into(),
+                parent_id: None,
+                currency: Some("USD".into()),
+                description: None,
+            };
+            let stored = store.append(EventEnvelope::new(e, "u".into())).unwrap();
+            store.apply_projection(&stored).unwrap();
+        }
+
+        let mut admit = |name: &str| {
+            let who = pc::AdmitPartner {
+                name: name.into(),
+                partner_type: PartnerType::General,
+                residency: Residency::Domestic,
+                entity_type: "Individual".into(),
+                address: Address {
+                    street: "2 Other Road".into(),
+                    suite: None,
+                    city: "Cape Town".into(),
+                    state: "WC".into(),
+                    postal_code: "8001".into(),
+                    country: None,
+                },
+                start_date: Some(day(2021, 7, 1)),
+                shares: Shares::from_percents(50.0, 50.0, 50.0),
+                tin: None,
+            };
+            pc::admit_partner(&mut store, "u", &who).unwrap().0
+        };
+        let alice = admit("Alice");
+        let bob = admit("Bob");
+
+        for (partner, account, role) in [
+            (&alice, "alice-in", "contribution"),
+            (&alice, "alice-out", "draw"),
+            (&bob, "bob-in", "contribution"),
+            (&bob, "bob-out", "draw"),
+        ] {
+            pc::link_equity_account(&mut store, "u", partner, account, role).unwrap();
+        }
+
+        let mut post = |id: &str, on: NaiveDate, pairs: &[(&str, i64)]| {
+            let lines: Vec<JournalLineData> = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (acct, amount))| JournalLineData {
+                    line_id: format!("{id}-{i}"),
+                    account_id: (*acct).into(),
+                    amount: *amount,
+                    currency: "USD".into(),
+                    exchange_rate: None,
+                    memo: None,
+                })
+                .collect();
+            let e = Event::JournalEntryPosted {
+                entry_id: id.into(),
+                date: on,
+                memo: "capital".into(),
+                lines,
+                reference: None,
+                source: None,
+            };
+            let stored = store.append(EventEnvelope::new(e, "u".into())).unwrap();
+            store.apply_projection(&stored).unwrap();
+        };
+
+        // Alice: $20,000 in before the year, $3,000 in during it, $700 out.
+        post(
+            "a-prior",
+            day(FORM_TAX_YEAR - 1, 5, 1),
+            &[("cash", 2_000_000), ("alice-in", -2_000_000)],
+        );
+        post(
+            "a-in",
+            day(FORM_TAX_YEAR, 3, 1),
+            &[("cash", 300_000), ("alice-in", -300_000)],
+        );
+        post(
+            "a-out",
+            day(FORM_TAX_YEAR, 11, 1),
+            &[("alice-out", 70_000), ("cash", -70_000)],
+        );
+
+        (store, alice, bob)
+    }
+
+    /// The end-to-end check: figures posted to a partner's equity accounts reach
+    /// their K-1's item L, in the right rows, and the column on the paper adds up
+    /// the way the form says it does.
+    #[test]
+    fn item_l_reaches_the_k1_in_the_right_rows_and_the_column_foots() {
+        let (store, _alice, _bob) = ledger_with_capital_accounts();
+        let partners: Vec<PartnerFiling> =
+            crate::commands::partnership_commands::list_partners(store.connection())
+                .into_iter()
+                .map(|partner| PartnerFiling { partner, tin: None })
+                .collect();
+        let alice_first = partners[0].partner.name == "Alice";
+        assert!(
+            alice_first,
+            "the assertions below read the first K-1 as Alice's"
+        );
+
+        let req = ReturnRequest {
+            partners,
+            ..two_partner_request()
+        };
+        let bundle = build_return_from_ledger(store.connection(), &req).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+
+        let get = |field: &str| -> i64 {
+            acroform::get_value_in(&doc, &map, &k1_namespace(1), field)
+                .unwrap_or_else(|| panic!("{field} is not on the first K-1"))
+                .replace(',', "")
+                .parse::<i64>()
+                .unwrap_or_else(|_| panic!("{field} is not a number"))
+        };
+
+        assert_eq!(get(k1::L_BEGIN), 20_000, "the prior year's contribution");
+        assert_eq!(get(k1::L_CONTRIBUTED), 3_000);
+        assert_eq!(get(k1::L_OTHER), 0);
+        assert_eq!(
+            get(k1::L_WITHDRAWN),
+            700,
+            "a magnitude: the box's parentheses are printed on the form"
+        );
+        assert_eq!(
+            get(k1::L_ENDING),
+            get(k1::L_BEGIN) + get(k1::L_CONTRIBUTED) + get(k1::L_NET_INCOME) + get(k1::L_OTHER)
+                - get(k1::L_WITHDRAWN),
+            "the six rows have to add up as printed"
+        );
+
+        // Row 3 is the partner's share of the same figure Part III box 1 comes
+        // from, so a preparer reading down one K-1 sees one partnership.
+        let ordinary: i64 = acroform::get_value_in(&doc, &map, &k1_namespace(1), "f1_34[0]")
+            .unwrap()
+            .replace(',', "")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            get(k1::L_NET_INCOME),
+            ordinary,
+            "on books whose only Schedule K figure is ordinary income, the two agree"
+        );
+    }
+
+    /// The identity-only path has no ledger, so item L is left blank and
+    /// editable — the same treatment page one's figures get, and distinguishable
+    /// from an item L computed as zero.
+    #[test]
+    fn item_l_is_blank_on_a_return_built_without_a_ledger() {
+        let bundle = build_return(&two_partner_request()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        for field in [k1::L_BEGIN, k1::L_ENDING, k1::L_WITHDRAWN] {
+            assert_eq!(
+                acroform::get_value_in(&doc, &map, &k1_namespace(1), field),
+                None,
+                "{field} must be untouched when nothing computed a capital account"
+            );
+        }
+    }
+
+    /// The caveat about what a beginning capital account leaves out has to reach
+    /// the person filing, not only the module that knows it.
+    #[test]
+    fn a_ledger_built_return_carries_the_capital_account_caveat() {
+        let (store, _alice, _bob) = ledger_with_capital_accounts();
+        let partners: Vec<PartnerFiling> =
+            crate::commands::partnership_commands::list_partners(store.connection())
+                .into_iter()
+                .map(|partner| PartnerFiling { partner, tin: None })
+                .collect();
+        let req = ReturnRequest {
+            partners,
+            ..two_partner_request()
+        };
+        let bundle = build_return_from_ledger(store.connection(), &req).unwrap();
+        assert!(
+            bundle
+                .warnings
+                .iter()
+                .any(|w| w == crate::tax::capital::BEGINNING_CAPITAL_CAVEAT),
+            "{:?}",
+            bundle.warnings
+        );
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
     }
 }

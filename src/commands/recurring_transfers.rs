@@ -185,7 +185,11 @@ pub fn earliest_activity_month(conn: &Connection, account_id: &str) -> Option<St
 
 /// Last calendar day of the given year/month (28–31).
 fn last_day_of_month(year: i32, month: u32) -> u32 {
-    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     let first_next = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap();
     first_next.pred_opt().unwrap().day()
 }
@@ -356,7 +360,13 @@ mod tests {
             .unwrap();
     }
 
-    fn post(store: &mut EventStore, date: &str, memo: &str, lines: Vec<EntryLine>, reference: Option<String>) {
+    fn post(
+        store: &mut EventStore,
+        date: &str,
+        memo: &str,
+        lines: Vec<EntryLine>,
+        reference: Option<String>,
+    ) {
         let mut cmds = EntryCommands::new(store, "test".to_string());
         cmds.post_entry(PostEntryCommand {
             date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
@@ -378,10 +388,26 @@ mod tests {
         mk_account(&mut store, "exp", "5000", "Expense", "expense");
 
         // Two months of employee-card charges (credit the liability, debit exp).
-        post(&mut store, "2026-01-10", "jan charge",
-            vec![EntryLine::debit("exp", 10_000, "USD"), EntryLine::credit("card", 10_000, "USD")], None);
-        post(&mut store, "2026-02-05", "feb charge",
-            vec![EntryLine::debit("exp", 4_000, "USD"), EntryLine::credit("card", 4_000, "USD")], None);
+        post(
+            &mut store,
+            "2026-01-10",
+            "jan charge",
+            vec![
+                EntryLine::debit("exp", 10_000, "USD"),
+                EntryLine::credit("card", 10_000, "USD"),
+            ],
+            None,
+        );
+        post(
+            &mut store,
+            "2026-02-05",
+            "feb charge",
+            vec![
+                EntryLine::debit("exp", 4_000, "USD"),
+                EntryLine::credit("card", 4_000, "USD"),
+            ],
+            None,
+        );
 
         let rule = RecurringTransferRule {
             id: "r1".into(),

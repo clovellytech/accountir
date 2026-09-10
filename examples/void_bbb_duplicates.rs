@@ -85,7 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = obtain_token(&cp_url, &user_id, &group).await?;
 
     let mut client = SyncClient::new(instance_url, token);
-    let reason = "Void duplicate single-import: credit-card payments double-posted (see recovery notes)";
+    let reason =
+        "Void duplicate single-import: credit-card payments double-posted (see recovery notes)";
     let (mut ok, mut failed) = (0usize, 0usize);
     for id in DUPLICATE_ENTRY_IDS {
         match client.void_entry(*id, reason).await {
@@ -144,7 +145,11 @@ async fn obtain_token(
         .json()
         .await?;
 
-    if resp.get("mfa_required").and_then(|m| m.as_bool()).unwrap_or(false) {
+    if resp
+        .get("mfa_required")
+        .and_then(|m| m.as_bool())
+        .unwrap_or(false)
+    {
         let challenge = resp
             .get("challenge")
             .and_then(|c| c.as_str())
@@ -178,11 +183,15 @@ async fn obtain_token(
 fn saved_refresh_token() -> Option<String> {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })?;
     let path = base.join("accountir").join("session.json");
     let bytes = std::fs::read(path).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    v.get("refresh_token").and_then(|t| t.as_str()).map(str::to_string)
+    v.get("refresh_token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
 }
 
 fn prompt(p: &str) -> std::io::Result<String> {

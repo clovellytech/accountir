@@ -218,7 +218,11 @@ fn summarise(conn: &Connection, batch: &Batch, payloads: &[String]) -> String {
     // be wrong more often than it was right, and "185 entrys posted" is the kind
     // of thing that makes a screen look untrustworthy.
     fn plural<'a>(n: usize, singular: &'a str, many: &'a str) -> &'a str {
-        if n == 1 { singular } else { many }
+        if n == 1 {
+            singular
+        } else {
+            many
+        }
     }
     match batch.event_type.as_str() {
         "journal_line_reassigned" => {
@@ -252,7 +256,11 @@ fn summarise(conn: &Connection, batch: &Batch, payloads: &[String]) -> String {
                             dests.push(d);
                         }
                     }
-                    format!("{n} {} \u{2192} {}", plural(n, "line", "lines"), dests.join(", "))
+                    format!(
+                        "{n} {} \u{2192} {}",
+                        plural(n, "line", "lines"),
+                        dests.join(", ")
+                    )
                 }
             }
         }
@@ -299,7 +307,11 @@ pub fn plan_revert(conn: &Connection, lo: i64, hi: i64) -> Result<RevertPlan, Re
     )?;
     let rows: Vec<(i64, String, String)> = stmt
         .query_map([lo, hi], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?
         .collect::<Result<_, _>>()?;
 
@@ -356,8 +368,9 @@ pub fn plan_revert(conn: &Connection, lo: i64, hi: i64) -> Result<RevertPlan, Re
                         label(&a),
                         label(&new)
                     )),
-                    None => superseded
-                        .push(format!("  event {id}: line {line_id} no longer exists")),
+                    None => {
+                        superseded.push(format!("  event {id}: line {line_id} no longer exists"))
+                    }
                 }
             }
             "journal_entry_posted" => {
@@ -377,10 +390,12 @@ pub fn plan_revert(conn: &Connection, lo: i64, hi: i64) -> Result<RevertPlan, Re
                             reason: format!("reverted events {lo}\u{2013}{hi}"),
                         });
                     }
-                    Some(_) => superseded
-                        .push(format!("  event {id}: entry {entry_id} is already voided")),
-                    None => superseded
-                        .push(format!("  event {id}: entry {entry_id} no longer exists")),
+                    Some(_) => {
+                        superseded.push(format!("  event {id}: entry {entry_id} is already voided"))
+                    }
+                    None => {
+                        superseded.push(format!("  event {id}: entry {entry_id} no longer exists"))
+                    }
                 }
             }
             "journal_entry_voided" => {
@@ -393,8 +408,9 @@ pub fn plan_revert(conn: &Connection, lo: i64, hi: i64) -> Result<RevertPlan, Re
                     )
                     .ok();
                 match voided {
-                    Some(0) => superseded
-                        .push(format!("  event {id}: entry {entry_id} is not voided")),
+                    Some(0) => {
+                        superseded.push(format!("  event {id}: entry {entry_id} is not voided"))
+                    }
                     Some(_) => {
                         description.push(format!("un-void entry {entry_id}"));
                         events.push(Event::JournalEntryUnvoided {
@@ -402,11 +418,16 @@ pub fn plan_revert(conn: &Connection, lo: i64, hi: i64) -> Result<RevertPlan, Re
                             reason: format!("reverted events {lo}\u{2013}{hi}"),
                         });
                     }
-                    None => superseded
-                        .push(format!("  event {id}: entry {entry_id} no longer exists")),
+                    None => {
+                        superseded.push(format!("  event {id}: entry {entry_id} no longer exists"))
+                    }
                 }
             }
-            other => return Err(RevertError::NotRevertible { kind: other.to_string() }),
+            other => {
+                return Err(RevertError::NotRevertible {
+                    kind: other.to_string(),
+                })
+            }
         }
     }
 
@@ -417,7 +438,10 @@ pub fn plan_revert(conn: &Connection, lo: i64, hi: i64) -> Result<RevertPlan, Re
             detail: superseded.join("\n"),
         });
     }
-    Ok(RevertPlan { events, description })
+    Ok(RevertPlan {
+        events,
+        description,
+    })
 }
 
 /// Append the inverse of every event in `lo..=hi`, atomically.
@@ -426,7 +450,12 @@ pub fn plan_revert(conn: &Connection, lo: i64, hi: i64) -> Result<RevertPlan, Re
 /// previous call: between a user reading a confirmation and pressing it, the
 /// line it was about can have moved, and a plan computed outside the lock would
 /// happily write an inverse for a state that no longer holds.
-pub fn revert(store: &mut EventStore, user_id: &str, lo: i64, hi: i64) -> Result<usize, RevertError> {
+pub fn revert(
+    store: &mut EventStore,
+    user_id: &str,
+    lo: i64,
+    hi: i64,
+) -> Result<usize, RevertError> {
     let user_id = user_id.to_string();
     loop {
         let head = store.latest_id()?.unwrap_or(0);
@@ -608,7 +637,10 @@ mod tests {
             .expect_err("the batch has been overtaken");
         let msg = err.to_string();
         assert!(msg.contains("1 of the 3"), "{msg}");
-        assert!(msg.contains("9000 Uncategorized"), "names where it is now: {msg}");
+        assert!(
+            msg.contains("9000 Uncategorized"),
+            "names where it is now: {msg}"
+        );
 
         // And nothing was written — the other two are still where the bad batch
         // put them, rather than half-reverted.
@@ -727,10 +759,7 @@ mod tests {
             .connection()
             .execute(
                 "UPDATE events SET timestamp = ?1 WHERE id = ?2",
-                rusqlite::params![
-                    (Utc::now() + Duration::seconds(30)).to_rfc3339(),
-                    last
-                ],
+                rusqlite::params![(Utc::now() + Duration::seconds(30)).to_rfc3339(), last],
             )
             .unwrap();
 

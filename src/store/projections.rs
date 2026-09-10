@@ -50,19 +50,142 @@ impl<'a> Projector<'a> {
             Event::TaxLineMappingSet {
                 account_id,
                 line_key,
+                effective_from,
             } => {
                 self.conn.execute(
-                    "INSERT INTO tax_line_mappings (account_id, line_key, updated_at, updated_at_event)
-                     VALUES (?1, ?2, datetime('now'), ?3)
-                     ON CONFLICT(account_id) DO UPDATE SET
-                       line_key = ?2, updated_at = datetime('now'), updated_at_event = ?3",
-                    params![account_id, line_key, stored_event.id],
+                    "INSERT INTO tax_line_mappings
+                       (account_id, effective_from, line_key, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4)
+                     ON CONFLICT(account_id, effective_from) DO UPDATE SET
+                       line_key = ?3, updated_at = datetime('now'), updated_at_event = ?4",
+                    params![account_id, effective_from, line_key, stored_event.id],
                 )?;
             }
-            Event::TaxLineMappingCleared { account_id } => {
+            Event::PartnerSharesChanged {
+                partner_id,
+                effective_from,
+                profit_ppm,
+                loss_ppm,
+                capital_ppm,
+            } => {
                 self.conn.execute(
-                    "DELETE FROM tax_line_mappings WHERE account_id = ?1",
+                    "INSERT INTO partner_share_periods
+                       (partner_id, effective_from, profit_ppm, loss_ppm, capital_ppm,
+                        updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6)
+                     ON CONFLICT(partner_id, effective_from) DO UPDATE SET
+                       profit_ppm = ?3, loss_ppm = ?4, capital_ppm = ?5,
+                       updated_at = datetime('now'), updated_at_event = ?6",
+                    params![
+                        partner_id,
+                        effective_from.to_string(),
+                        profit_ppm,
+                        loss_ppm,
+                        capital_ppm,
+                        stored_event.id
+                    ],
+                )?;
+                // Keep `partners` holding today's split.
+                //
+                // Almost every reader wants the current percentages and nothing
+                // else, and making them all walk the series to get it would be a
+                // lot of code paying for a case they do not have — so the row
+                // stays the snapshot, and this is what keeps it true. Guarded on
+                // being the newest period, because recording a *correction to
+                // 2023* must not move what the partners hold now.
+                self.conn.execute(
+                    "UPDATE partners
+                        SET profit_ppm = ?2, loss_ppm = ?3, capital_ppm = ?4
+                      WHERE id = ?1
+                        AND NOT EXISTS (
+                            SELECT 1 FROM partner_share_periods
+                             WHERE partner_id = ?1 AND effective_from > ?5
+                        )",
+                    params![
+                        partner_id,
+                        profit_ppm,
+                        loss_ppm,
+                        capital_ppm,
+                        effective_from.to_string()
+                    ],
+                )?;
+            }
+            Event::PartnerEquityAccountLinked {
+                partner_id,
+                account_id,
+                role,
+            } => {
+                // An account belongs to one partner, so a re-link moves it
+                // rather than leaving it claimed twice.
+                self.conn.execute(
+                    "DELETE FROM partner_equity_accounts WHERE account_id = ?1",
                     params![account_id],
+                )?;
+                self.conn.execute(
+                    "INSERT INTO partner_equity_accounts
+                       (partner_id, account_id, role, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4)",
+                    params![partner_id, account_id, role, stored_event.id],
+                )?;
+            }
+            Event::PartnerEquityAccountUnlinked {
+                partner_id,
+                account_id,
+            } => {
+                self.conn.execute(
+                    "DELETE FROM partner_equity_accounts WHERE partner_id = ?1 AND account_id = ?2",
+                    params![partner_id, account_id],
+                )?;
+            }
+            Event::AccountDeleted { account_id } => {
+                // The command refuses unless nothing points at the account, so
+                // by the time this runs there is only the row itself to remove.
+                self.conn
+                    .execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+            }
+            Event::TaxDeductionLimitSet {
+                account_id,
+                deductible_pct,
+                effective_from,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO tax_deduction_limits
+                       (account_id, effective_from, deductible_pct, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4)
+                     ON CONFLICT(account_id, effective_from) DO UPDATE SET
+                       deductible_pct = ?3, updated_at = datetime('now'), updated_at_event = ?4",
+                    params![
+                        account_id,
+                        effective_from,
+                        *deductible_pct as i64,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::TaxDeductionLimitCleared {
+                account_id,
+                effective_from,
+            } => {
+                // That year's row only. Deleting every year would reach back into
+                // returns already filed on an earlier limit — which is the whole
+                // reason these are dated.
+                self.conn.execute(
+                    "DELETE FROM tax_deduction_limits
+                      WHERE account_id = ?1 AND effective_from = ?2",
+                    params![account_id, effective_from],
+                )?;
+            }
+            Event::TaxLineMappingCleared {
+                account_id,
+                effective_from,
+            } => {
+                // That year's row only — see `TaxDeductionLimitCleared`. The
+                // account then falls back to the most recent earlier year, and
+                // to its parent's assignment if there is none.
+                self.conn.execute(
+                    "DELETE FROM tax_line_mappings
+                      WHERE account_id = ?1 AND effective_from = ?2",
+                    params![account_id, effective_from],
                 )?;
             }
             Event::ScheduleBAnswerSet {
@@ -238,7 +361,12 @@ impl<'a> Projector<'a> {
                     "INSERT OR REPLACE INTO partner_relationships
                         (partner_id, related_partner_id, relationship, updated_at_event)
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![partner_id, related_partner_id, relationship, stored_event.id],
+                    params![
+                        partner_id,
+                        related_partner_id,
+                        relationship,
+                        stored_event.id
+                    ],
                 )?;
             }
             Event::PartnerRelationshipCleared {
@@ -1629,7 +1757,8 @@ mod rebuild_survives_local_config {
         let stored = s.append(EventEnvelope::new(account, "u".into())).unwrap();
         s.apply_projection(&stored).unwrap();
 
-        crate::commands::tax_setup_commands::set_account_line(&mut s, "u", "rent", "l13").unwrap();
+        crate::commands::tax_setup_commands::set_account_line(&mut s, "u", "rent", "l13", 2025)
+            .unwrap();
         crate::commands::tax_setup_commands::set_schedule_b_answer(&mut s, "u", 2025, "b5", "no")
             .unwrap();
 
@@ -1637,7 +1766,7 @@ mod rebuild_survives_local_config {
         Projector::new(s.connection()).rebuild(&events).unwrap();
 
         assert_eq!(
-            crate::tax::lines::load_mapping(s.connection())
+            crate::tax::lines::load_mapping(s.connection(), 2025)
                 .get("rent")
                 .map(String::as_str),
             Some("l13"),

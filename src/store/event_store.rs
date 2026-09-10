@@ -228,9 +228,7 @@ impl EventStore {
         let tmp = dest.with_extension("db.tmp");
         let _ = std::fs::remove_file(&tmp);
         // A checkpoint first folds pending WAL pages into the snapshot promptly.
-        let _ = self
-            .conn
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
         self.conn.backup("main", &tmp, None)?;
         std::fs::rename(&tmp, dest).map_err(|e| EventStoreError::IoError(e.to_string()))?;
         Ok(())
@@ -341,7 +339,9 @@ impl EventStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let actual_head: i64 =
-            tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| row.get(0))?;
+            tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })?;
 
         if actual_head != expected_head_seq {
             // Drop the txn (rollback) without inserting — this is a normal
@@ -486,7 +486,9 @@ impl EventStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let actual_head: i64 =
-            tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| row.get(0))?;
+            tx.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })?;
         if actual_head != expected_head_seq {
             return Ok(CheckedOutcome::HeadMismatch {
                 expected: expected_head_seq,
@@ -687,7 +689,14 @@ impl EventStore {
                     let actor_id: Option<String> = row.get(6)?;
                     let received_at_str: Option<String> = row.get(7)?;
 
-                    Ok((payload, hash, user_id, timestamp_str, actor_id, received_at_str))
+                    Ok((
+                        payload,
+                        hash,
+                        user_id,
+                        timestamp_str,
+                        actor_id,
+                        received_at_str,
+                    ))
                 },
             )
             .optional()?;
@@ -702,7 +711,13 @@ impl EventStore {
                 let received_at = parse_received_at(received_at_str.as_deref())?;
 
                 Ok(StoredEvent::with_identity(
-                    id, event, hash, user_id, timestamp, actor_id, received_at,
+                    id,
+                    event,
+                    hash,
+                    user_id,
+                    timestamp,
+                    actor_id,
+                    received_at,
                 ))
             }
             None => Err(EventStoreError::NotFound(id)),
@@ -992,7 +1007,11 @@ mod tests {
             CheckedOutcome::Rejected(e) => assert_eq!(e, "nope"),
             _ => panic!("expected Rejected"),
         }
-        assert_eq!(store.count().unwrap(), 0, "a rejected check appends nothing");
+        assert_eq!(
+            store.count().unwrap(),
+            0,
+            "a rejected check appends nothing"
+        );
     }
 
     #[test]
@@ -1078,7 +1097,10 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 3);
-        assert!(!dst.with_extension("db.tmp").exists(), "temp file left behind");
+        assert!(
+            !dst.with_extension("db.tmp").exists(),
+            "temp file left behind"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1167,7 +1189,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert!(actor_null && recv_null, "legacy identity columns must be NULL");
+        assert!(
+            actor_null && recv_null,
+            "legacy identity columns must be NULL"
+        );
 
         let all = store.get_all().unwrap();
         assert_eq!(all[0].actor_id, None);

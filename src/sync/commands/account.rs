@@ -17,7 +17,7 @@
 //! contract otherwise: one attempt, no internal retry, `409` on a stale head.
 
 use crate::commands::account_commands::{
-    build_create_account_in_txn, build_deactivate_account_in_txn,
+    build_create_account_in_txn, build_deactivate_account_in_txn, build_delete_account_in_txn,
     build_seed_default_accounts_in_txn, build_update_account_in_txn, AccountBatchStep,
     AccountCommandError, AccountStep, CreateAccountCommand, DeactivateAccountCommand,
     UpdateAccountCommand,
@@ -39,6 +39,7 @@ pub fn router() -> Router<SyncState> {
             post(submit_deactivate_account),
         )
         .route("/sync/commands/update-account", post(submit_update_account))
+        .route("/sync/commands/delete-account", post(submit_delete_account))
         .route(
             "/sync/commands/seed-default-accounts",
             post(submit_seed_default_accounts),
@@ -124,6 +125,46 @@ async fn submit_deactivate_account(
         .append_checked(
             req.expected_head_seq,
             move |tx| match build_deactivate_account_in_txn(tx, &cmd)? {
+                AccountStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                AccountStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<AccountCommandError>)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DeleteAccountRequest {
+    pub expected_head_seq: i64,
+    pub account_id: String,
+}
+
+/// Remove an account that nothing points at, over the wire.
+///
+/// # Why the check has to happen in here
+///
+/// Deletion is refused when anything at all references the account — a journal
+/// line including a voided one, a child account, a tax line mapping, a bank
+/// account, a staged import row. On a group's books two members can be looking
+/// at the same empty account while one of them posts to it, and a check made
+/// before the write lock would pass for the member who read first. So the
+/// refusal is evaluated inside the transaction against locked state, and the
+/// loser gets a 422 naming what now points at it rather than a deleted account
+/// with entries hanging off it.
+async fn submit_delete_account(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<DeleteAccountRequest>,
+) -> Result<Json<SubmitResponse>, ApiError> {
+    if req.account_id.trim().is_empty() {
+        return Err(ApiError::bad_request("account_id is required"));
+    }
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_delete_account_in_txn(tx, &req.account_id)? {
                 AccountStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
                 AccountStep::Reject(e) => Ok(Verdict::Reject(e)),
             },

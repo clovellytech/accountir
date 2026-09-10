@@ -26,16 +26,25 @@ use crate::store::event_store::EventStore;
 
 pub use crate::commands::partnership_commands::PartnershipError as TaxSetupError;
 
-/// Point an account at a Form 1065 line.
+/// Point an account at a Form 1065 line, from a tax year onward.
 ///
 /// The key is validated in [`crate::events::validation`] rather than here, so
 /// the same check guards a command from this machine and a command that arrived
 /// over the sync transport.
+///
+/// # Why the year is not optional
+///
+/// It used to be absent, and an account was on one line for all time — so
+/// remapping in 2026 silently changed the 2023 return too, one that had already
+/// been filed on the old assignment. Making the caller name the year means the
+/// question "which years does this change?" is answered where the change is
+/// made rather than discovered afterwards.
 pub fn set_account_line(
     store: &mut EventStore,
     user_id: &str,
     account_id: &str,
     line_key: &str,
+    effective_from: i32,
 ) -> Result<StoredEvent, TaxSetupError> {
     append(
         store,
@@ -43,21 +52,73 @@ pub fn set_account_line(
         Event::TaxLineMappingSet {
             account_id: account_id.to_string(),
             line_key: line_key.to_string(),
+            effective_from,
         },
     )
 }
 
-/// Take an account off the return.
+/// Say how much of an account's balance the law lets you deduct.
+///
+/// 100 clears the limit rather than storing it: "all of it" is the absence of a
+/// rule, and a row saying so is a row somebody has to maintain.
+pub fn set_deduction_limit(
+    store: &mut EventStore,
+    user_id: &str,
+    account_id: &str,
+    deductible_pct: u8,
+    effective_from: i32,
+) -> Result<StoredEvent, TaxSetupError> {
+    if deductible_pct >= 100 {
+        return clear_deduction_limit(store, user_id, account_id, effective_from);
+    }
+    append(
+        store,
+        user_id,
+        Event::TaxDeductionLimitSet {
+            account_id: account_id.to_string(),
+            deductible_pct,
+            effective_from,
+        },
+    )
+}
+
+/// Put an account back to fully deductible from a tax year onward.
+///
+/// Removes that year's row only. An earlier year keeps whatever it had, because
+/// a return filed on it is not something a later decision may edit.
+pub fn clear_deduction_limit(
+    store: &mut EventStore,
+    user_id: &str,
+    account_id: &str,
+    effective_from: i32,
+) -> Result<StoredEvent, TaxSetupError> {
+    append(
+        store,
+        user_id,
+        Event::TaxDeductionLimitCleared {
+            account_id: account_id.to_string(),
+            effective_from,
+        },
+    )
+}
+
+/// Remove an account's own line assignment from a tax year onward.
+///
+/// That year's row only. The account then falls back to the most recent earlier
+/// year's assignment, and to its parent's if there is none — which is what makes
+/// a new tax year start with the chart already mapped instead of blank.
 pub fn clear_account_line(
     store: &mut EventStore,
     user_id: &str,
     account_id: &str,
+    effective_from: i32,
 ) -> Result<StoredEvent, TaxSetupError> {
     append(
         store,
         user_id,
         Event::TaxLineMappingCleared {
             account_id: account_id.to_string(),
+            effective_from,
         },
     )
 }
@@ -232,7 +293,15 @@ pub fn adopt_pending(store: &mut EventStore, user_id: &str) -> Result<Adopted, T
         if crate::tax::any_line_def(line_key).is_none() {
             continue;
         }
-        set_account_line(store, user_id, account_id, line_key)?;
+        // Adopted setup predates dated assignments, so it applies to every year
+        // until something later supersedes it — exactly what it did before.
+        set_account_line(
+            store,
+            user_id,
+            account_id,
+            line_key,
+            crate::events::types::ANY_YEAR,
+        )?;
         out.mappings += 1;
     }
     for (tax_year, answer_key, value) in &answers {
@@ -270,6 +339,10 @@ fn append(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The year these tests assign for. Any year works: what they check is the
+    /// command and the projection, not the resolution across years.
+    const YEAR: i32 = 2025;
     use crate::store::migrations::SchemaStore;
 
     fn store() -> EventStore {
@@ -281,12 +354,12 @@ mod tests {
     #[test]
     fn a_mapping_round_trips_through_the_log() {
         let mut s = store();
-        set_account_line(&mut s, "u1", "6100", "l21").unwrap();
-        let m = crate::tax::lines::load_mapping(s.connection());
+        set_account_line(&mut s, "u1", "6100", "l21", YEAR).unwrap();
+        let m = crate::tax::lines::load_mapping(s.connection(), YEAR);
         assert_eq!(m.get("6100").map(String::as_str), Some("l21"));
 
-        clear_account_line(&mut s, "u1", "6100").unwrap();
-        assert!(crate::tax::lines::load_mapping(s.connection()).is_empty());
+        clear_account_line(&mut s, "u1", "6100", YEAR).unwrap();
+        assert!(crate::tax::lines::load_mapping(s.connection(), YEAR).is_empty());
     }
 
     /// The point of the whole change: a second machine replaying the log has to
@@ -294,8 +367,8 @@ mod tests {
     #[test]
     fn replaying_the_log_reproduces_the_setup() {
         let mut s = store();
-        set_account_line(&mut s, "u1", "6100", "l21").unwrap();
-        set_account_line(&mut s, "u1", "1000", "sl1").unwrap();
+        set_account_line(&mut s, "u1", "6100", "l21", YEAR).unwrap();
+        set_account_line(&mut s, "u1", "1000", "sl1", YEAR).unwrap();
         set_schedule_b_answer(&mut s, "u1", 2025, "b5", "no").unwrap();
 
         // A second machine receives the events and appends them, which is what
@@ -320,7 +393,7 @@ mod tests {
             .rebuild(&stored)
             .unwrap();
 
-        let m = crate::tax::lines::load_mapping(replayed.connection());
+        let m = crate::tax::lines::load_mapping(replayed.connection(), YEAR);
         assert_eq!(m.get("6100").map(String::as_str), Some("l21"));
         assert_eq!(m.get("1000").map(String::as_str), Some("sl1"));
         assert_eq!(
@@ -334,14 +407,14 @@ mod tests {
     #[test]
     fn a_cleared_mapping_stays_cleared_through_a_rebuild() {
         let mut s = store();
-        set_account_line(&mut s, "u1", "6100", "l21").unwrap();
-        clear_account_line(&mut s, "u1", "6100").unwrap();
+        set_account_line(&mut s, "u1", "6100", "l21", YEAR).unwrap();
+        clear_account_line(&mut s, "u1", "6100", YEAR).unwrap();
 
         let events = s.get_all().unwrap();
         crate::store::projections::Projector::new(s.connection())
             .rebuild(&events)
             .unwrap();
-        assert!(crate::tax::lines::load_mapping(s.connection()).is_empty());
+        assert!(crate::tax::lines::load_mapping(s.connection(), YEAR).is_empty());
     }
 
     /// Unanswered and No are different states, and a clear must replay as the
@@ -372,8 +445,8 @@ mod tests {
     #[test]
     fn a_line_key_the_catalogue_does_not_have_is_refused() {
         let mut s = store();
-        assert!(set_account_line(&mut s, "u1", "6100", "not-a-line").is_err());
-        assert!(crate::tax::lines::load_mapping(s.connection()).is_empty());
+        assert!(set_account_line(&mut s, "u1", "6100", "not-a-line", YEAR).is_err());
+        assert!(crate::tax::lines::load_mapping(s.connection(), YEAR).is_empty());
     }
 
     #[test]
@@ -424,7 +497,7 @@ mod tests {
             .rebuild(&events)
             .unwrap();
         assert_eq!(
-            crate::tax::lines::load_mapping(s.connection())
+            crate::tax::lines::load_mapping(s.connection(), YEAR)
                 .get("6100")
                 .map(String::as_str),
             Some("l21")
@@ -472,5 +545,142 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// A remap does not reach backwards into a year already filed.
+    ///
+    /// The whole point. An account mapped to Other Deductions and used to file
+    /// 2023 stays there when 2026 moves it to Repairs, because a return that has
+    /// been signed is not something a later decision may edit.
+    #[test]
+    fn remapping_an_account_leaves_the_years_before_it_alone() {
+        let mut s = store();
+        set_account_line(&mut s, "u1", "6100", "l21", 2023).unwrap();
+        set_account_line(&mut s, "u1", "6100", "l11", 2026).unwrap();
+
+        let line = |year| {
+            crate::tax::lines::load_mapping(s.connection(), year)
+                .get("6100")
+                .cloned()
+        };
+        assert_eq!(
+            line(2023).as_deref(),
+            Some("l21"),
+            "the year it was filed on"
+        );
+        assert_eq!(
+            line(2024).as_deref(),
+            Some("l21"),
+            "and every year until the change"
+        );
+        assert_eq!(line(2025).as_deref(), Some("l21"));
+        assert_eq!(
+            line(2026).as_deref(),
+            Some("l11"),
+            "the change applies forward"
+        );
+        assert_eq!(line(2027).as_deref(), Some("l11"), "and keeps applying");
+    }
+
+    /// A year with no assignment of its own inherits the most recent earlier one.
+    ///
+    /// Without this a new tax year would begin with an unmapped chart and every
+    /// account would have to be assigned again, which is the cost that made
+    /// dating them look not worth it.
+    #[test]
+    fn a_new_year_inherits_rather_than_starting_blank() {
+        let mut s = store();
+        set_account_line(&mut s, "u1", "6100", "l21", 2023).unwrap();
+        for year in [2024, 2025, 2026, 2099] {
+            assert_eq!(
+                crate::tax::lines::load_mapping(s.connection(), year)
+                    .get("6100")
+                    .map(String::as_str),
+                Some("l21"),
+                "{year} did not inherit"
+            );
+        }
+        // And a year before the first assignment has none, rather than borrowing
+        // one from the future.
+        assert!(crate::tax::lines::load_mapping(s.connection(), 2022).is_empty());
+    }
+
+    /// An assignment made before assignments were dated applies to every year.
+    ///
+    /// Books that predate this behave exactly as they did — which is what makes
+    /// the migration a no-op until somebody dates something.
+    #[test]
+    fn an_undated_assignment_still_applies_to_every_year() {
+        let mut s = store();
+        set_account_line(&mut s, "u1", "6100", "l21", crate::events::types::ANY_YEAR).unwrap();
+        for year in [2019, 2023, 2025, 2099] {
+            assert_eq!(
+                crate::tax::lines::load_mapping(s.connection(), year)
+                    .get("6100")
+                    .map(String::as_str),
+                Some("l21"),
+                "{year}"
+            );
+        }
+        // And a dated assignment supersedes it from its own year on.
+        set_account_line(&mut s, "u1", "6100", "l11", 2025).unwrap();
+        assert_eq!(
+            crate::tax::lines::load_mapping(s.connection(), 2024)
+                .get("6100")
+                .map(String::as_str),
+            Some("l21")
+        );
+        assert_eq!(
+            crate::tax::lines::load_mapping(s.connection(), 2025)
+                .get("6100")
+                .map(String::as_str),
+            Some("l11")
+        );
+    }
+
+    /// Clearing a year removes that year's assignment and no other.
+    #[test]
+    fn clearing_a_year_falls_back_rather_than_wiping_the_history() {
+        let mut s = store();
+        set_account_line(&mut s, "u1", "6100", "l21", 2023).unwrap();
+        set_account_line(&mut s, "u1", "6100", "l11", 2026).unwrap();
+        clear_account_line(&mut s, "u1", "6100", 2026).unwrap();
+
+        let line = |year| {
+            crate::tax::lines::load_mapping(s.connection(), year)
+                .get("6100")
+                .cloned()
+        };
+        assert_eq!(
+            line(2026).as_deref(),
+            Some("l21"),
+            "back to the earlier assignment"
+        );
+        assert_eq!(
+            line(2023).as_deref(),
+            Some("l21"),
+            "which was never disturbed"
+        );
+    }
+
+    /// Deduction limits are dated the same way, and for the same reason.
+    #[test]
+    fn a_deduction_limit_applies_from_its_year_forward() {
+        let mut s = store();
+        set_deduction_limit(&mut s, "u1", "3055", 50, 2023).unwrap();
+        set_deduction_limit(&mut s, "u1", "3055", 0, 2026).unwrap();
+
+        fn pct(s: &EventStore, year: i32) -> Option<u8> {
+            crate::tax::lines::load_deduction_limits(s.connection(), year)
+                .get("3055")
+                .copied()
+        }
+        assert_eq!(pct(&s, 2023), Some(50));
+        assert_eq!(pct(&s, 2025), Some(50));
+        assert_eq!(pct(&s, 2026), Some(0), "fully disallowed from 2026");
+
+        // Clearing 2026 puts it back to the 50% that 2023 set, not to no rule.
+        clear_deduction_limit(&mut s, "u1", "3055", 2026).unwrap();
+        assert_eq!(pct(&s, 2026), Some(50));
     }
 }

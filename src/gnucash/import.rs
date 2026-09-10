@@ -404,7 +404,7 @@ fn import_inner(
         let stored = store
             .append(envelope)
             .map_err(|e| GnuCashError::EventStore(e.to_string()))?;
-                store
+        store
             .apply_projection(&stored)
             .map_err(|e| GnuCashError::EventStore(e.to_string()))?;
 
@@ -424,7 +424,7 @@ fn append_and_project(
     let stored = store
         .append(envelope)
         .map_err(|e| GnuCashError::EventStore(e.to_string()))?;
-        store
+    store
         .apply_projection(&stored)
         .map_err(|e| GnuCashError::EventStore(e.to_string()))?;
     Ok(())

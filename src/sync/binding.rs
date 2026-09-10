@@ -41,6 +41,11 @@ pub enum BindingError {
     /// books.
     #[error("this ledger is already bound to group \"{existing}\" and cannot be rebound to \"{requested}\"")]
     AlreadyBound { existing: String, requested: String },
+    /// Asked to bind a ledger as adopted, but it is not the log the group holds.
+    /// Binding anyway would produce a file that believes it is a replica of a log
+    /// it is not a prefix of.
+    #[error("this ledger is not the one the group adopted: {detail}")]
+    AdoptionMismatch { detail: String },
     #[error("stored binding is corrupt: {0}")]
     Corrupt(String),
 }
@@ -152,6 +157,77 @@ pub fn bind(
     })
 }
 
+/// Bind a ledger the group has just adopted, keeping its existing events.
+///
+/// # Why this may skip the emptiness rule
+///
+/// [`bind`] refuses a non-empty file because a local log and a server log both
+/// start at seq 1, so grafting one onto the other is meaningless. After an
+/// adoption that objection is gone: the server's log *is* this file's log,
+/// event for event. This proves that rather than assuming it — the caller passes
+/// what the server reports as its head, and the binding is written only if this
+/// file's head has the same id and the same hash.
+///
+/// Get that wrong and you have a file that believes it is a replica of a log it
+/// is not a prefix of, which is exactly the corruption `bind` exists to prevent.
+/// So the check is on the hash, not on the caller's word.
+pub fn bind_adopted(
+    conn: &Connection,
+    group_id: &str,
+    instance_url: &str,
+    control_plane_url: &str,
+    server_head: i64,
+    server_head_hash: &str,
+) -> Result<GroupBinding, BindingError> {
+    if let Some(existing) = get(conn)? {
+        return Err(BindingError::AlreadyBound {
+            existing: existing.group_id,
+            requested: group_id.to_string(),
+        });
+    }
+
+    let local_head: i64 =
+        conn.query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?;
+    if local_head != server_head {
+        return Err(BindingError::AdoptionMismatch {
+            detail: format!(
+                "this ledger ends at event {local_head} but the group reports {server_head}"
+            ),
+        });
+    }
+    let local_hash: Vec<u8> = conn
+        .query_row(
+            "SELECT hash FROM events WHERE id = ?1",
+            params![local_head],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| BindingError::AdoptionMismatch {
+            detail: format!("this ledger has no event {local_head} to check"),
+        })?;
+    let local_hex: String = local_hash.iter().map(|b| format!("{b:02x}")).collect();
+    if local_hex != server_head_hash.to_ascii_lowercase() {
+        return Err(BindingError::AdoptionMismatch {
+            detail: "the group's copy does not match this one, event for event".to_string(),
+        });
+    }
+
+    let bound_at = Utc::now();
+    conn.execute(
+        "INSERT INTO group_binding (id, group_id, instance_url, control_plane_url, bound_at, last_server_head, last_synced_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?4)",
+        params![group_id, instance_url, control_plane_url, bound_at.to_rfc3339(), server_head],
+    )?;
+    Ok(GroupBinding {
+        group_id: group_id.to_string(),
+        instance_url: instance_url.to_string(),
+        control_plane_url: control_plane_url.to_string(),
+        bound_at,
+        last_server_head: server_head,
+        last_synced_at: Some(bound_at),
+    })
+}
+
 /// Record that we have seen the server at `head`, for the UI's "synced 12s ago".
 /// Never load-bearing: losing this write costs a stale label, not correctness.
 pub fn record_sync(conn: &Connection, head: i64) -> Result<(), BindingError> {
@@ -214,6 +290,115 @@ mod tests {
     use super::*;
     use crate::events::types::{Event, EventEnvelope};
     use crate::store::migrations::SchemaStore;
+
+    /// The whole point of `bind_adopted`: after a group has taken these books
+    /// over, the file *is* the group's log, so it may follow it — and the proof
+    /// is the hash, not the caller's assertion.
+    #[test]
+    fn a_ledger_the_group_adopted_may_bind_to_it() {
+        let mut s = store();
+        s.append(company_event()).unwrap();
+        let head = s.latest_id().unwrap().unwrap();
+        let hash: String = s
+            .get_hash(head)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        // `bind` still refuses it — the file has events of its own as far as it
+        // knows, and that rule has not moved.
+        assert!(matches!(
+            bind(s.connection(), "g", "https://i", "https://cp"),
+            Err(BindingError::NotEmpty { .. })
+        ));
+
+        let b = bind_adopted(s.connection(), "g", "https://i", "https://cp", head, &hash)
+            .expect("the group holds exactly this log");
+        assert_eq!(b.group_id, "g");
+        assert_eq!(b.last_server_head, head);
+        assert_eq!(get(s.connection()).unwrap().unwrap().group_id, "g");
+    }
+
+    /// The corruption this exists to prevent: a file that believes it is a
+    /// replica of a log it is not a prefix of. Every disagreement is refused.
+    #[test]
+    fn a_ledger_that_is_not_the_adopted_one_is_refused() {
+        let mut s = store();
+        s.append(company_event()).unwrap();
+        let head = s.latest_id().unwrap().unwrap();
+        let hash: String = s
+            .get_hash(head)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        // Right length, wrong content.
+        let wrong_hash = "0".repeat(hash.len());
+        assert!(matches!(
+            bind_adopted(
+                s.connection(),
+                "g",
+                "https://i",
+                "https://cp",
+                head,
+                &wrong_hash
+            ),
+            Err(BindingError::AdoptionMismatch { .. })
+        ));
+
+        // Right content, wrong place in the log.
+        assert!(matches!(
+            bind_adopted(
+                s.connection(),
+                "g",
+                "https://i",
+                "https://cp",
+                head + 5,
+                &hash
+            ),
+            Err(BindingError::AdoptionMismatch { .. })
+        ));
+
+        // And nothing was written on the way through.
+        assert!(get(s.connection()).unwrap().is_none());
+    }
+
+    /// Adoption is an initial share. A file already following a group is not one.
+    #[test]
+    fn an_already_bound_ledger_cannot_be_adopted_by_another_group() {
+        let mut s = store();
+        s.append(company_event()).unwrap();
+        let head = s.latest_id().unwrap().unwrap();
+        let hash: String = s
+            .get_hash(head)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        bind_adopted(
+            s.connection(),
+            "first",
+            "https://i",
+            "https://cp",
+            head,
+            &hash,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            bind_adopted(
+                s.connection(),
+                "second",
+                "https://i",
+                "https://cp",
+                head,
+                &hash
+            ),
+            Err(BindingError::AlreadyBound { .. })
+        ));
+    }
 
     fn store() -> EventStore {
         let mut s = EventStore::in_memory().unwrap();

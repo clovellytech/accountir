@@ -82,10 +82,7 @@ impl PayablesView {
         let a = &self.aging;
         let line = Line::from(vec![
             Span::styled("Current: ", Style::default().fg(theme.fg_dim)),
-            Span::styled(
-                format_amount(a.current),
-                Style::default().fg(theme.success),
-            ),
+            Span::styled(format_amount(a.current), Style::default().fg(theme.success)),
             Span::raw("  "),
             Span::styled("1-30: ", Style::default().fg(theme.fg_dim)),
             Span::styled(
@@ -111,7 +108,12 @@ impl PayablesView {
                 Style::default().fg(theme.error),
             ),
             Span::raw("  "),
-            Span::styled("Total: ", Style::default().fg(theme.fg_dim).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Total: ",
+                Style::default()
+                    .fg(theme.fg_dim)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format_amount(a.total),
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
@@ -159,7 +161,8 @@ impl PayablesView {
             .iter()
             .enumerate()
             .map(|(i, bill)| {
-                let is_overdue = bill.due_date < today && bill.status != "paid" && bill.status != "void";
+                let is_overdue =
+                    bill.due_date < today && bill.status != "paid" && bill.status != "void";
                 let balance = bill.amount - bill.amount_paid;
 
                 let style = if i == self.selected {

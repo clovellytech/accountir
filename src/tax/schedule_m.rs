@@ -350,7 +350,11 @@ mod tests {
         assert_eq!(m.book_income, 70_000);
         assert_eq!(m.guaranteed_payments, 30_000);
         assert_eq!(m.analysis, lines.k_analysis());
-        assert!(m.m1_reconciles(), "difference was {}", m.book_tax_difference);
+        assert!(
+            m.m1_reconciles(),
+            "difference was {}",
+            m.book_tax_difference
+        );
         assert_eq!(m.m1_line_5(), m.analysis);
         assert_eq!(m.m1_line_8(), 0);
     }
@@ -437,7 +441,10 @@ mod tests {
 
         let (mut doc, map) = form();
         let warnings = fill(&mut doc, &map, &m, true).unwrap();
-        assert_eq!(get_value(&doc, &map, m2::L4_AMOUNT).as_deref(), Some("25,000"));
+        assert_eq!(
+            get_value(&doc, &map, m2::L4_AMOUNT).as_deref(),
+            Some("25,000")
+        );
         assert!(
             warnings.iter().any(|w| w.contains("do not explain")),
             "{warnings:?}"
@@ -456,8 +463,14 @@ mod tests {
 
         let (mut doc, map) = form();
         fill(&mut doc, &map, &m, true).unwrap();
-        assert_eq!(get_value(&doc, &map, m2::L7_AMOUNT).as_deref(), Some("30,000"));
-        assert_eq!(get_value(&doc, &map, m2::L9_END).as_deref(), Some("100,000"));
+        assert_eq!(
+            get_value(&doc, &map, m2::L7_AMOUNT).as_deref(),
+            Some("30,000")
+        );
+        assert_eq!(
+            get_value(&doc, &map, m2::L9_END).as_deref(),
+            Some("100,000")
+        );
     }
 
     /// Without a balance sheet, M-2's opening balance is not knowable and the

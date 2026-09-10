@@ -124,7 +124,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     show(&store, "before:");
     println!(
         "mode:    {}\n",
-        if apply { "APPLY (writing changes)" } else { "DRY RUN (no changes)" }
+        if apply {
+            "APPLY (writing changes)"
+        } else {
+            "DRY RUN (no changes)"
+        }
     );
 
     // --- Step 1: backfill the monthly employee→parent consolidation shifts, via

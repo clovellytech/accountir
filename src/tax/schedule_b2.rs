@@ -219,6 +219,7 @@ mod tests {
 
     fn partner(name: &str, entity_type: &str, residency: Residency) -> Partner {
         Partner {
+            history: Vec::new(),
             partner_id: name.to_lowercase(),
             name: name.to_string(),
             partner_type: PartnerType::General,
@@ -253,13 +254,35 @@ mod tests {
     /// codes and the S one drags Part II along with it.
     #[test]
     fn each_eligible_kind_gets_its_own_code() {
-        assert_eq!(type_code(&partner("A", "Individual", Residency::Domestic)), Some("I"));
-        assert_eq!(type_code(&partner("B", "Estate of Deceased Partner", Residency::Domestic)), Some("E"));
-        assert_eq!(type_code(&partner("C", "S Corporation", Residency::Domestic)), Some("S"));
-        assert_eq!(type_code(&partner("D", "C Corporation", Residency::Domestic)), Some("C"));
-        assert_eq!(type_code(&partner("E", "Corporation", Residency::Foreign)), Some("F"));
+        assert_eq!(
+            type_code(&partner("A", "Individual", Residency::Domestic)),
+            Some("I")
+        );
+        assert_eq!(
+            type_code(&partner(
+                "B",
+                "Estate of Deceased Partner",
+                Residency::Domestic
+            )),
+            Some("E")
+        );
+        assert_eq!(
+            type_code(&partner("C", "S Corporation", Residency::Domestic)),
+            Some("S")
+        );
+        assert_eq!(
+            type_code(&partner("D", "C Corporation", Residency::Domestic)),
+            Some("C")
+        );
+        assert_eq!(
+            type_code(&partner("E", "Corporation", Residency::Foreign)),
+            Some("F")
+        );
         // A foreign individual is still an individual.
-        assert_eq!(type_code(&partner("F", "Individual", Residency::Foreign)), Some("I"));
+        assert_eq!(
+            type_code(&partner("F", "Individual", Residency::Foreign)),
+            Some("I")
+        );
     }
 
     /// A partner the election does not allow gets no code — and no guess.
@@ -268,12 +291,22 @@ mod tests {
         let p = partner("Holdings LP", "Partnership", Residency::Domestic);
         assert_eq!(type_code(&p), None);
 
-        let ps = vec![Eligible { partner: &p, tin: Some("98-7654321") }];
+        let ps = vec![Eligible {
+            partner: &p,
+            tin: Some("98-7654321"),
+        }];
         let (doc, _, warnings) = build("Acme LLP", "12-3456789", &ps).unwrap();
         let doc = doc.unwrap();
         let map = field_map(&doc);
-        assert_eq!(get_value(&doc, &map, PART_I[0][2]), None, "no code may be invented");
-        assert!(warnings.iter().any(|w| w.contains("Holdings LP")), "{warnings:?}");
+        assert_eq!(
+            get_value(&doc, &map, PART_I[0][2]),
+            None,
+            "no code may be invented"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("Holdings LP")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -281,19 +314,37 @@ mod tests {
         let a = partner("Alice Reyes", "Individual", Residency::Domestic);
         let b = partner("Ben Osei", "Individual", Residency::Domestic);
         let ps = vec![
-            Eligible { partner: &a, tin: Some("111-22-3333") },
-            Eligible { partner: &b, tin: Some("444-55-6666") },
+            Eligible {
+                partner: &a,
+                tin: Some("111-22-3333"),
+            },
+            Eligible {
+                partner: &b,
+                tin: Some("444-55-6666"),
+            },
         ];
         let (doc, count, _) = build("Acme LLP", "12-3456789", &ps).unwrap();
         let doc = doc.unwrap();
         let map = field_map(&doc);
 
         assert_eq!(count, 2);
-        assert_eq!(get_value(&doc, &map, PART_I[0][0]).as_deref(), Some("Alice Reyes"));
-        assert_eq!(get_value(&doc, &map, PART_I[0][1]).as_deref(), Some("111-22-3333"));
+        assert_eq!(
+            get_value(&doc, &map, PART_I[0][0]).as_deref(),
+            Some("Alice Reyes")
+        );
+        assert_eq!(
+            get_value(&doc, &map, PART_I[0][1]).as_deref(),
+            Some("111-22-3333")
+        );
         assert_eq!(get_value(&doc, &map, PART_I[0][2]).as_deref(), Some("I"));
-        assert_eq!(get_value(&doc, &map, PART_I[1][0]).as_deref(), Some("Ben Osei"));
-        assert_eq!(get_value(&doc, &map, TOTAL_PARTNERSHIP).as_deref(), Some("2"));
+        assert_eq!(
+            get_value(&doc, &map, PART_I[1][0]).as_deref(),
+            Some("Ben Osei")
+        );
+        assert_eq!(
+            get_value(&doc, &map, TOTAL_PARTNERSHIP).as_deref(),
+            Some("2")
+        );
         assert_eq!(get_value(&doc, &map, TOTAL).as_deref(), Some("2"));
     }
 
@@ -304,14 +355,23 @@ mod tests {
         let ps: Vec<Partner> = (0..20)
             .map(|i| partner(&format!("Partner {i}"), "Individual", Residency::Domestic))
             .collect();
-        let es: Vec<Eligible> = ps.iter().map(|p| Eligible { partner: p, tin: Some("111-22-3333") }).collect();
+        let es: Vec<Eligible> = ps
+            .iter()
+            .map(|p| Eligible {
+                partner: p,
+                tin: Some("111-22-3333"),
+            })
+            .collect();
         let (doc, count, warnings) = build("Acme LLP", "12-3456789", &es).unwrap();
         let doc = doc.unwrap();
         let map = field_map(&doc);
 
         assert_eq!(count, 20);
         assert_eq!(get_value(&doc, &map, TOTAL).as_deref(), Some("20"));
-        assert!(warnings.iter().any(|w| w.contains("Part IV")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("Part IV")),
+            "{warnings:?}"
+        );
     }
 
     /// Over a hundred and the election is not available at all.
@@ -320,7 +380,13 @@ mod tests {
         let ps: Vec<Partner> = (0..101)
             .map(|i| partner(&format!("Partner {i}"), "Individual", Residency::Domestic))
             .collect();
-        let es: Vec<Eligible> = ps.iter().map(|p| Eligible { partner: p, tin: None }).collect();
+        let es: Vec<Eligible> = ps
+            .iter()
+            .map(|p| Eligible {
+                partner: p,
+                tin: None,
+            })
+            .collect();
         let (_, count, warnings) = build("Acme LLP", "12-3456789", &es).unwrap();
         assert_eq!(count, 101);
         assert!(
@@ -332,9 +398,15 @@ mod tests {
     #[test]
     fn an_s_corporation_partner_drags_part_two_along_and_says_so() {
         let p = partner("Osei S Corp", "S Corporation", Residency::Domestic);
-        let ps = vec![Eligible { partner: &p, tin: Some("98-7654321") }];
+        let ps = vec![Eligible {
+            partner: &p,
+            tin: Some("98-7654321"),
+        }];
         let (_, _, warnings) = build("Acme LLP", "12-3456789", &ps).unwrap();
-        assert!(warnings.iter().any(|w| w.contains("shareholders")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("shareholders")),
+            "{warnings:?}"
+        );
     }
 
     /// An incomplete Part I can invalidate the election, so a missing TIN is not
@@ -342,9 +414,15 @@ mod tests {
     #[test]
     fn a_missing_tin_warns_that_the_election_may_be_invalid() {
         let p = partner("Alice Reyes", "Individual", Residency::Domestic);
-        let ps = vec![Eligible { partner: &p, tin: None }];
+        let ps = vec![Eligible {
+            partner: &p,
+            tin: None,
+        }];
         let (_, _, warnings) = build("Acme LLP", "12-3456789", &ps).unwrap();
-        assert!(warnings.iter().any(|w| w.contains("invalid")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("invalid")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
@@ -370,7 +448,78 @@ mod tests {
         }
         for row in PART_I {
             for f in row {
-                assert!(map.find(f).is_some(), "f1065sb2.pdf has no Part I field {f}");
+                assert!(
+                    map.find(f).is_some(),
+                    "f1065sb2.pdf has no Part I field {f}"
+                );
+            }
+        }
+    }
+
+    /// Every cell sits in the column its heading names, and on its own row.
+    ///
+    /// A grid is where an off-by-one hides best: shift `PART_I` by one and every
+    /// partner's TIN prints in the "type of partner" column while their name
+    /// prints under the TIN heading. Every name still exists and every row still
+    /// has three of them. Part I is what makes the election valid — the IRS may
+    /// treat an incomplete one as not made — so a shifted table is not a
+    /// cosmetic problem.
+    ///
+    /// The bands come off the printed headings: (i) name at x=58, (ii) TIN at
+    /// 382, (iii) type at 511.
+    #[test]
+    fn every_cell_is_in_the_column_its_heading_names() {
+        let mut doc = Document::load_mem(F1065_SB2).unwrap();
+        strip_xfa(&mut doc);
+        let map = field_map(&doc);
+
+        let at = |name: &str| -> (f64, f64) {
+            let id = map
+                .find(name)
+                .unwrap_or_else(|| panic!("the schedule has no {name}"));
+            let d = doc.get_object(id).and_then(lopdf::Object::as_dict).unwrap();
+            let r = d.get(b"Rect").and_then(lopdf::Object::as_array).unwrap();
+            let n = |i: usize| {
+                r[i].as_float()
+                    .map(f64::from)
+                    .unwrap_or_else(|_| r[i].as_i64().unwrap() as f64)
+            };
+            (n(0), n(1))
+        };
+
+        let mut previous_row: Option<f64> = None;
+        for (r, row) in PART_I.iter().enumerate() {
+            let mut y = None;
+            for (c, (name, want_x)) in row.iter().zip([58.0, 382.0, 511.0]).enumerate() {
+                let (x, this) = at(name);
+                assert!(
+                    (x - want_x).abs() < 4.0,
+                    "row {r} column {c} ({name}) is at x={x:.0}, not the {want_x:.0} column \
+                     its heading is over"
+                );
+                match y {
+                    None => y = Some(this),
+                    Some(first) => assert!(
+                        (this - first).abs() < 3.0,
+                        "row {r} column {c} ({name}) is on a different row from its own \
+                         row's first cell"
+                    ),
+                }
+            }
+            if let (Some(previous), Some(this)) = (previous_row, y) {
+                assert!(this < previous, "row {r} is not below row {}", r - 1);
+            }
+            previous_row = y;
+        }
+    }
+
+    /// No two cells write the same box.
+    #[test]
+    fn no_two_cells_share_a_box() {
+        let mut seen = std::collections::HashSet::new();
+        for row in PART_I.iter() {
+            for f in row {
+                assert!(seen.insert(*f), "{f} is used twice");
             }
         }
     }

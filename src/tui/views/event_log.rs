@@ -205,6 +205,26 @@ impl Default for EventLogView {
 }
 
 /// Format a human-readable summary of an event
+/// What the form for a year prints beside a question, or the stable key when no
+/// revision is carried for that year.
+///
+/// The number is not a property of the question — the audit-regime election is
+/// 31 on the 2023 form and 33 on the later ones — so showing one without a year
+/// is showing whichever year happened to be baked in.
+fn number_for(tax_year: i32, key: &str) -> String {
+    match crate::tax::schedule_b::table_for(tax_year) {
+        Some(table) => {
+            let n = crate::tax::schedule_b::printed_number(table, key);
+            if n.is_empty() {
+                key.to_string()
+            } else {
+                n.to_string()
+            }
+        }
+        None => key.to_string(),
+    }
+}
+
 fn format_event_summary(event: &crate::events::types::Event) -> String {
     use crate::events::types::Event;
 
@@ -280,7 +300,11 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             } else {
                 "Illinois-only"
             };
-            let pte = if d.elects_pte_tax { ", PTE elected" } else { "" };
+            let pte = if d.elects_pte_tax {
+                ", PTE elected"
+            } else {
+                ""
+            };
             format!("IL-1065 settings: {apportion}{pte}")
         }
         Event::DepreciableAssetAdded(d) | Event::DepreciableAssetUpdated(d) => {
@@ -330,6 +354,7 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::TaxLineMappingSet {
             account_id,
             line_key,
+            ..
         } => {
             let line = crate::tax::any_line_def(line_key)
                 .map(|d| d.number)
@@ -340,9 +365,58 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 line
             )
         }
-        Event::TaxLineMappingCleared { account_id } => {
+        Event::TaxLineMappingCleared { account_id, .. } => {
             format!(
                 "Account {} taken off the return",
+                widgets::truncate(account_id, 8)
+            )
+        }
+        Event::PartnerSharesChanged {
+            partner_id,
+            effective_from,
+            profit_ppm,
+            ..
+        } => {
+            format!(
+                "Partner {} takes {}% of profits from {effective_from}",
+                widgets::truncate(partner_id, 8),
+                *profit_ppm as f64 / 10_000.0
+            )
+        }
+        Event::PartnerEquityAccountLinked {
+            partner_id,
+            account_id,
+            role,
+        } => {
+            format!(
+                "Account {} is partner {}'s {role}",
+                widgets::truncate(account_id, 8),
+                widgets::truncate(partner_id, 8)
+            )
+        }
+        Event::PartnerEquityAccountUnlinked { account_id, .. } => {
+            format!(
+                "Account {} is no longer a partner's capital",
+                widgets::truncate(account_id, 8)
+            )
+        }
+        Event::AccountDeleted { account_id } => {
+            format!("Account {} deleted", widgets::truncate(account_id, 8))
+        }
+        Event::TaxDeductionLimitSet {
+            account_id,
+            deductible_pct,
+            ..
+        } => {
+            format!(
+                "Account {} is {}% deductible",
+                widgets::truncate(account_id, 8),
+                deductible_pct
+            )
+        }
+        Event::TaxDeductionLimitCleared { account_id, .. } => {
+            format!(
+                "Account {} is fully deductible again",
                 widgets::truncate(account_id, 8)
             )
         }
@@ -351,18 +425,14 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             answer_key,
             value,
         } => {
-            let q = crate::tax::schedule_b::question(answer_key)
-                .map(|q| q.number)
-                .unwrap_or(answer_key);
+            let q = number_for(*tax_year, answer_key);
             format!("Schedule B {tax_year} question {q}: {value}")
         }
         Event::ScheduleBAnswerCleared {
             tax_year,
             answer_key,
         } => {
-            let q = crate::tax::schedule_b::question(answer_key)
-                .map(|q| q.number)
-                .unwrap_or(answer_key);
+            let q = number_for(*tax_year, answer_key);
             format!("Schedule B {tax_year} question {q} back to unanswered")
         }
         Event::UserAdded { username, role, .. } => {
@@ -579,7 +649,11 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             )
         }
         Event::EventServiceRegistered { name, root_url, .. } => {
-            format!("Registered service '{}' ({})", name, widgets::truncate(root_url, 30))
+            format!(
+                "Registered service '{}' ({})",
+                name,
+                widgets::truncate(root_url, 30)
+            )
         }
         Event::EventServiceReportingChanged {
             frequency,
@@ -658,10 +732,7 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 widgets::truncate(invoice_id, 8)
             )
         }
-        Event::InvoiceVoided {
-            invoice_id,
-            reason,
-        } => {
+        Event::InvoiceVoided { invoice_id, reason } => {
             format!(
                 "Voided invoice {} - {}",
                 widgets::truncate(invoice_id, 8),

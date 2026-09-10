@@ -36,7 +36,9 @@ pub enum EntryCommandError {
         reference: String,
         existing_entry_id: String,
     },
-    #[error("Cannot unvoid: reference {reference} has been reclaimed by entry {existing_entry_id}")]
+    #[error(
+        "Cannot unvoid: reference {reference} has been reclaimed by entry {existing_entry_id}"
+    )]
     ReferenceReclaimed {
         reference: String,
         existing_entry_id: String,
@@ -450,14 +452,14 @@ pub(crate) fn build_reassign_line_in_txn(
         .optional()?;
     match new_account_active {
         None => {
-            return Ok(ReassignLineStep::Reject(EntryCommandError::AccountNotFound(
-                cmd.new_account_id.clone(),
-            )))
+            return Ok(ReassignLineStep::Reject(
+                EntryCommandError::AccountNotFound(cmd.new_account_id.clone()),
+            ))
         }
         Some(false) => {
-            return Ok(ReassignLineStep::Reject(EntryCommandError::AccountInactive(
-                cmd.new_account_id.clone(),
-            )))
+            return Ok(ReassignLineStep::Reject(
+                EntryCommandError::AccountInactive(cmd.new_account_id.clone()),
+            ))
         }
         Some(true) => {}
     }
@@ -484,10 +486,12 @@ pub(crate) fn build_post_entry_in_txn(
     // Idempotency: a live entry with this reference already exists ⇒ duplicate.
     if let Some(ref reference) = cmd.reference {
         if let Some(existing_entry_id) = check_reference_free_in_txn(tx, reference)? {
-            return Ok(PostEntryStep::Reject(EntryCommandError::DuplicateReference {
-                reference: reference.clone(),
-                existing_entry_id,
-            }));
+            return Ok(PostEntryStep::Reject(
+                EntryCommandError::DuplicateReference {
+                    reference: reference.clone(),
+                    existing_entry_id,
+                },
+            ));
         }
     }
 
@@ -1032,10 +1036,9 @@ mod tests {
         let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
         assert_eq!(oks, 1, "exactly one import may post (r1={r1:?}, r2={r2:?})");
         assert!(
-            [&r1, &r2].iter().any(|r| matches!(
-                r,
-                Err(EntryCommandError::DuplicateReference { .. })
-            )),
+            [&r1, &r2]
+                .iter()
+                .any(|r| matches!(r, Err(EntryCommandError::DuplicateReference { .. }))),
             "the loser must be rejected as a duplicate (r1={r1:?}, r2={r2:?})"
         );
 
@@ -1122,8 +1125,15 @@ mod tests {
             source: None,
         };
         let result = EntryCommands::new(&mut store, "user".to_string()).post_entry(cmd);
-        assert!(matches!(result, Err(EntryCommandError::InvalidData(_))), "got {result:?}");
-        assert_eq!(store.count().unwrap(), before, "nothing appended on overflow");
+        assert!(
+            matches!(result, Err(EntryCommandError::InvalidData(_))),
+            "got {result:?}"
+        );
+        assert_eq!(
+            store.count().unwrap(),
+            before,
+            "nothing appended on overflow"
+        );
     }
 
     #[test]
@@ -1434,7 +1444,11 @@ mod tests {
         create_test_accounts(&mut store);
         let entry_id = post_simple_entry(&mut store);
 
-        for note in ["Rent?", "January rent", "January rent — landlord, cheque 1234"] {
+        for note in [
+            "Rent?",
+            "January rent",
+            "January rent — landlord, cheque 1234",
+        ] {
             EntryCommands::new(&mut store, "user".to_string())
                 .annotate_entry(AnnotateEntryCommand {
                     entry_id: entry_id.clone(),

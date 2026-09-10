@@ -227,7 +227,10 @@ fn text(ops: &mut Vec<Operation>, font: &str, size: f32, x: f32, y: f32, s: &str
     ops.push(Operation::new("BT", vec![]));
     ops.push(Operation::new("Tf", vec![font.into(), size.into()]));
     ops.push(Operation::new("Td", vec![x.into(), y.into()]));
-    ops.push(Operation::new("Tj", vec![Object::string_literal(encode(s))]));
+    ops.push(Operation::new(
+        "Tj",
+        vec![Object::string_literal(encode(s))],
+    ));
     ops.push(Operation::new("ET", vec![]));
 }
 
@@ -423,7 +426,16 @@ mod tests {
     /// perfectly correct either way.
     #[test]
     fn every_character_encodes_to_exactly_one_byte() {
-        for s in ["plain ascii", "Café", "a · b", "an — dash", "…", "€5", "naïve", "Ÿ"] {
+        for s in [
+            "plain ascii",
+            "Café",
+            "a · b",
+            "an — dash",
+            "…",
+            "€5",
+            "naïve",
+            "Ÿ",
+        ] {
             assert_eq!(
                 encode(s).len(),
                 s.chars().count(),

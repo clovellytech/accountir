@@ -49,10 +49,8 @@ use chrono::Datelike;
 
 use lopdf::Document;
 
-use super::acroform::{FormError, field_map, set_check, set_text, strip_xfa};
-use super::lines::{
-    Field, Sense, TaxLineDef, cents_to_dollars, format_dollars, sum_by_line,
-};
+use super::acroform::{field_map, set_check, set_text, strip_xfa, FormError};
+use super::lines::{cents_to_dollars, format_dollars, sum_by_line, Field, Sense, TaxLineDef};
 use crate::domain::{AccountingMethod, BusinessProfile, SoleProprietor};
 use crate::queries::reports::IncomeStatement;
 
@@ -61,11 +59,641 @@ const F1040SC: &[u8] = include_bytes!("../../assets/irs/f1040sc.pdf");
 /// The tax year the vendored form is the revision for.
 pub const FORM_TAX_YEAR: i32 = 2025;
 
+/// One tax year's Schedule C blank, and what is known about it.
+///
+/// The same shape as [`form1065::FormYear`] and for the same reason: the boxes
+/// move between revisions, so a prior-year return built on the current blank is
+/// wrong in a way that foots. It also carries the *printed* year at the top of
+/// page 1, so filling last year's return on this year's form produces a document
+/// that says which year it is and is filed as another.
+///
+/// [`form1065::FormYear`]: super::form1065::FormYear
+pub struct ScheduleCYear {
+    pub year: i32,
+    pub form: &'static [u8],
+    /// An IRS draft, which may not be filed. Carried so the year in progress can
+    /// be projected, and said out loud on anything produced from it.
+    pub draft: bool,
+    /// Whether this revision's boxes have been checked against the names this
+    /// module uses. A revision that has not been is refused rather than filled:
+    /// see [`ScheduleCError`]'s note on why every name still resolving is the
+    /// reason to refuse rather than a reason to proceed.
+    pub mapped: bool,
+    /// This revision's lines: which box each goes in, and what the paper calls
+    /// it. Standalone — it names no other revision.
+    pub lines: &'static [LineBox],
+}
+
+/// The Schedule C revisions carried, oldest first.
+pub const SCHEDULE_C_YEARS: &[ScheduleCYear] = &[
+    ScheduleCYear {
+        year: 2023,
+        lines: LINES_2023,
+        form: include_bytes!("../../assets/irs/2023/f1040sc.pdf"),
+        draft: false,
+        mapped: true,
+    },
+    ScheduleCYear {
+        year: 2024,
+        lines: LINES_2024,
+        form: include_bytes!("../../assets/irs/2024/f1040sc.pdf"),
+        draft: false,
+        mapped: true,
+    },
+    ScheduleCYear {
+        year: FORM_TAX_YEAR,
+        lines: LINES_2025,
+        form: F1040SC,
+        draft: false,
+        mapped: true,
+    },
+    ScheduleCYear {
+        year: 2026,
+        // Unmapped: the draft renumbers and regroups. Carried so the year is
+        // named rather than silently missing.
+        lines: LINES_2025,
+        form: include_bytes!("../../assets/irs/2026/f1040sc.pdf"),
+        draft: true,
+        // The draft renumbers and regroups: the expense boxes move down by one
+        // (`f1_30` is gone and the column starts at `f1_31`) and the subform
+        // holding them is renamed from `Lines18-27` to `Lines8-16c_ReadOrder`.
+        // Nothing may be written to it until the boxes have been matched by
+        // geometry — which is a different job from checking the names resolve.
+        mapped: false,
+    },
+];
+
+/// The blank for a year, or `None` when none is carried.
+pub fn schedule_c_year(year: i32) -> Option<&'static ScheduleCYear> {
+    SCHEDULE_C_YEARS.iter().find(|f| f.year == year)
+}
+
+/// Every revision carried, oldest first — including ones nothing may be written
+/// to yet.
+///
+/// For talking *about* the years. To offer a year to somebody, use
+/// [`buildable_years`]: this list includes revisions whose boxes have not been
+/// matched, and a year offered but refused on the press is a dead end.
+pub fn supported_years() -> Vec<i32> {
+    SCHEDULE_C_YEARS.iter().map(|f| f.year).collect()
+}
+
+/// The years a Schedule C can actually be produced for, oldest first.
+///
+/// A revision whose boxes have not been read against its own labels is refused
+/// by [`build`], so offering it is offering a button that cannot work. The 2026
+/// draft is the standing example: it renumbers the expense boxes and renames the
+/// subform holding them.
+pub fn buildable_years() -> Vec<i32> {
+    SCHEDULE_C_YEARS
+        .iter()
+        .filter(|f| f.mapped)
+        .map(|f| f.year)
+        .collect()
+}
+
 /// Which part of the form a line belongs to — what a mapping editor groups by.
 pub const INCOME: &str = "Income";
 pub const EXPENSES: &str = "Expenses";
 pub const COST_OF_GOODS: &str = "Cost of goods sold";
 pub const OTHER_EXPENSES: &str = "Other expenses";
+
+/// One line's box and printed number on one revision of the schedule.
+///
+/// # Why the number is per revision
+///
+/// The IRS swapped the printed numbers of two lines in the 2025 revision without
+/// moving their boxes: what the 2023 and 2024 forms call 27a (other expenses,
+/// from line 48) and 27b (the §179D energy deduction), the 2025 form calls 27b
+/// and 27a. The form says so itself — its line 48 reads "enter here and on line
+/// 27a" on the older revisions and "27b" on the current one.
+///
+/// A number carried once, beside the meaning, is therefore wrong for two
+/// revisions out of three, and the page showed 2025's numbering beside a 2023
+/// Schedule C.
+///
+/// The `field` is here as well, though it happens not to differ on any revision
+/// carried. Checked, not assumed: all 105 boxes were compared between the three
+/// PDFs. Keeping it in the table means a revision that *does* move one is
+/// expressible without another refactor — which is the mistake this form's
+/// sibling, the Form 4562, had to be rescued from.
+pub struct LineBox {
+    pub key: &'static str,
+    pub number: &'static str,
+    pub field: &'static str,
+}
+
+/// Schedule C's lines on the 2023 revision.
+pub const LINES_2023: &[LineBox] = &[
+    LineBox {
+        key: "sc1",
+        number: "1",
+        field: "f1_10[0]",
+    },
+    LineBox {
+        key: "sc2",
+        number: "2",
+        field: "f1_11[0]",
+    },
+    LineBox {
+        key: "sc6",
+        number: "6",
+        field: "f1_15[0]",
+    },
+    LineBox {
+        key: "sc8",
+        number: "8",
+        field: "f1_17[0]",
+    },
+    LineBox {
+        key: "sc9",
+        number: "9",
+        field: "f1_18[0]",
+    },
+    LineBox {
+        key: "sc10",
+        number: "10",
+        field: "f1_19[0]",
+    },
+    LineBox {
+        key: "sc11",
+        number: "11",
+        field: "f1_20[0]",
+    },
+    LineBox {
+        key: "sc12",
+        number: "12",
+        field: "f1_21[0]",
+    },
+    LineBox {
+        key: "sc13",
+        number: "13",
+        field: "f1_22[0]",
+    },
+    LineBox {
+        key: "sc14",
+        number: "14",
+        field: "f1_23[0]",
+    },
+    LineBox {
+        key: "sc15",
+        number: "15",
+        field: "f1_24[0]",
+    },
+    LineBox {
+        key: "sc16a",
+        number: "16a",
+        field: "f1_25[0]",
+    },
+    LineBox {
+        key: "sc16b",
+        number: "16b",
+        field: "f1_26[0]",
+    },
+    LineBox {
+        key: "sc17",
+        number: "17",
+        field: "f1_27[0]",
+    },
+    LineBox {
+        key: "sc18",
+        number: "18",
+        field: "f1_28[0]",
+    },
+    LineBox {
+        key: "sc19",
+        number: "19",
+        field: "f1_29[0]",
+    },
+    LineBox {
+        key: "sc20a",
+        number: "20a",
+        field: "f1_30[0]",
+    },
+    LineBox {
+        key: "sc20b",
+        number: "20b",
+        field: "f1_31[0]",
+    },
+    LineBox {
+        key: "sc21",
+        number: "21",
+        field: "f1_32[0]",
+    },
+    LineBox {
+        key: "sc22",
+        number: "22",
+        field: "f1_33[0]",
+    },
+    LineBox {
+        key: "sc23",
+        number: "23",
+        field: "f1_34[0]",
+    },
+    LineBox {
+        key: "sc24a",
+        number: "24a",
+        field: "f1_35[0]",
+    },
+    LineBox {
+        key: "sc24b",
+        number: "24b",
+        field: "f1_36[0]",
+    },
+    LineBox {
+        key: "sc25",
+        number: "25",
+        field: "f1_37[0]",
+    },
+    LineBox {
+        key: "sc26",
+        number: "26",
+        field: "f1_38[0]",
+    },
+    LineBox {
+        key: "sc27a",
+        number: "27b",
+        field: "f1_40[0]",
+    },
+    LineBox {
+        key: "sc35",
+        number: "35",
+        field: "f2_1[0]",
+    },
+    LineBox {
+        key: "sc36",
+        number: "36",
+        field: "f2_2[0]",
+    },
+    LineBox {
+        key: "sc37",
+        number: "37",
+        field: "f2_3[0]",
+    },
+    LineBox {
+        key: "sc38",
+        number: "38",
+        field: "f2_4[0]",
+    },
+    LineBox {
+        key: "sc39",
+        number: "39",
+        field: "f2_5[0]",
+    },
+    LineBox {
+        key: "sc41",
+        number: "41",
+        field: "f2_7[0]",
+    },
+    LineBox {
+        key: "sc48",
+        number: "48",
+        field: "f2_33[0]",
+    },
+];
+
+/// Schedule C's lines on the 2024 revision.
+pub const LINES_2024: &[LineBox] = &[
+    LineBox {
+        key: "sc1",
+        number: "1",
+        field: "f1_10[0]",
+    },
+    LineBox {
+        key: "sc2",
+        number: "2",
+        field: "f1_11[0]",
+    },
+    LineBox {
+        key: "sc6",
+        number: "6",
+        field: "f1_15[0]",
+    },
+    LineBox {
+        key: "sc8",
+        number: "8",
+        field: "f1_17[0]",
+    },
+    LineBox {
+        key: "sc9",
+        number: "9",
+        field: "f1_18[0]",
+    },
+    LineBox {
+        key: "sc10",
+        number: "10",
+        field: "f1_19[0]",
+    },
+    LineBox {
+        key: "sc11",
+        number: "11",
+        field: "f1_20[0]",
+    },
+    LineBox {
+        key: "sc12",
+        number: "12",
+        field: "f1_21[0]",
+    },
+    LineBox {
+        key: "sc13",
+        number: "13",
+        field: "f1_22[0]",
+    },
+    LineBox {
+        key: "sc14",
+        number: "14",
+        field: "f1_23[0]",
+    },
+    LineBox {
+        key: "sc15",
+        number: "15",
+        field: "f1_24[0]",
+    },
+    LineBox {
+        key: "sc16a",
+        number: "16a",
+        field: "f1_25[0]",
+    },
+    LineBox {
+        key: "sc16b",
+        number: "16b",
+        field: "f1_26[0]",
+    },
+    LineBox {
+        key: "sc17",
+        number: "17",
+        field: "f1_27[0]",
+    },
+    LineBox {
+        key: "sc18",
+        number: "18",
+        field: "f1_28[0]",
+    },
+    LineBox {
+        key: "sc19",
+        number: "19",
+        field: "f1_29[0]",
+    },
+    LineBox {
+        key: "sc20a",
+        number: "20a",
+        field: "f1_30[0]",
+    },
+    LineBox {
+        key: "sc20b",
+        number: "20b",
+        field: "f1_31[0]",
+    },
+    LineBox {
+        key: "sc21",
+        number: "21",
+        field: "f1_32[0]",
+    },
+    LineBox {
+        key: "sc22",
+        number: "22",
+        field: "f1_33[0]",
+    },
+    LineBox {
+        key: "sc23",
+        number: "23",
+        field: "f1_34[0]",
+    },
+    LineBox {
+        key: "sc24a",
+        number: "24a",
+        field: "f1_35[0]",
+    },
+    LineBox {
+        key: "sc24b",
+        number: "24b",
+        field: "f1_36[0]",
+    },
+    LineBox {
+        key: "sc25",
+        number: "25",
+        field: "f1_37[0]",
+    },
+    LineBox {
+        key: "sc26",
+        number: "26",
+        field: "f1_38[0]",
+    },
+    LineBox {
+        key: "sc27a",
+        number: "27b",
+        field: "f1_40[0]",
+    },
+    LineBox {
+        key: "sc35",
+        number: "35",
+        field: "f2_1[0]",
+    },
+    LineBox {
+        key: "sc36",
+        number: "36",
+        field: "f2_2[0]",
+    },
+    LineBox {
+        key: "sc37",
+        number: "37",
+        field: "f2_3[0]",
+    },
+    LineBox {
+        key: "sc38",
+        number: "38",
+        field: "f2_4[0]",
+    },
+    LineBox {
+        key: "sc39",
+        number: "39",
+        field: "f2_5[0]",
+    },
+    LineBox {
+        key: "sc41",
+        number: "41",
+        field: "f2_7[0]",
+    },
+    LineBox {
+        key: "sc48",
+        number: "48",
+        field: "f2_33[0]",
+    },
+];
+
+/// Schedule C's lines on the 2025 revision.
+pub const LINES_2025: &[LineBox] = &[
+    LineBox {
+        key: "sc1",
+        number: "1",
+        field: "f1_10[0]",
+    },
+    LineBox {
+        key: "sc2",
+        number: "2",
+        field: "f1_11[0]",
+    },
+    LineBox {
+        key: "sc6",
+        number: "6",
+        field: "f1_15[0]",
+    },
+    LineBox {
+        key: "sc8",
+        number: "8",
+        field: "f1_17[0]",
+    },
+    LineBox {
+        key: "sc9",
+        number: "9",
+        field: "f1_18[0]",
+    },
+    LineBox {
+        key: "sc10",
+        number: "10",
+        field: "f1_19[0]",
+    },
+    LineBox {
+        key: "sc11",
+        number: "11",
+        field: "f1_20[0]",
+    },
+    LineBox {
+        key: "sc12",
+        number: "12",
+        field: "f1_21[0]",
+    },
+    LineBox {
+        key: "sc13",
+        number: "13",
+        field: "f1_22[0]",
+    },
+    LineBox {
+        key: "sc14",
+        number: "14",
+        field: "f1_23[0]",
+    },
+    LineBox {
+        key: "sc15",
+        number: "15",
+        field: "f1_24[0]",
+    },
+    LineBox {
+        key: "sc16a",
+        number: "16a",
+        field: "f1_25[0]",
+    },
+    LineBox {
+        key: "sc16b",
+        number: "16b",
+        field: "f1_26[0]",
+    },
+    LineBox {
+        key: "sc17",
+        number: "17",
+        field: "f1_27[0]",
+    },
+    LineBox {
+        key: "sc18",
+        number: "18",
+        field: "f1_28[0]",
+    },
+    LineBox {
+        key: "sc19",
+        number: "19",
+        field: "f1_29[0]",
+    },
+    LineBox {
+        key: "sc20a",
+        number: "20a",
+        field: "f1_30[0]",
+    },
+    LineBox {
+        key: "sc20b",
+        number: "20b",
+        field: "f1_31[0]",
+    },
+    LineBox {
+        key: "sc21",
+        number: "21",
+        field: "f1_32[0]",
+    },
+    LineBox {
+        key: "sc22",
+        number: "22",
+        field: "f1_33[0]",
+    },
+    LineBox {
+        key: "sc23",
+        number: "23",
+        field: "f1_34[0]",
+    },
+    LineBox {
+        key: "sc24a",
+        number: "24a",
+        field: "f1_35[0]",
+    },
+    LineBox {
+        key: "sc24b",
+        number: "24b",
+        field: "f1_36[0]",
+    },
+    LineBox {
+        key: "sc25",
+        number: "25",
+        field: "f1_37[0]",
+    },
+    LineBox {
+        key: "sc26",
+        number: "26",
+        field: "f1_38[0]",
+    },
+    LineBox {
+        key: "sc27a",
+        number: "27a",
+        field: "f1_40[0]",
+    },
+    LineBox {
+        key: "sc35",
+        number: "35",
+        field: "f2_1[0]",
+    },
+    LineBox {
+        key: "sc36",
+        number: "36",
+        field: "f2_2[0]",
+    },
+    LineBox {
+        key: "sc37",
+        number: "37",
+        field: "f2_3[0]",
+    },
+    LineBox {
+        key: "sc38",
+        number: "38",
+        field: "f2_4[0]",
+    },
+    LineBox {
+        key: "sc39",
+        number: "39",
+        field: "f2_5[0]",
+    },
+    LineBox {
+        key: "sc41",
+        number: "41",
+        field: "f2_7[0]",
+    },
+    LineBox {
+        key: "sc48",
+        number: "48",
+        field: "f2_33[0]",
+    },
+];
+
+/// One line's box and number on the revision for a year.
+pub fn line_box(year: i32, key: &str) -> Option<&'static LineBox> {
+    schedule_c_year(year)?.lines.iter().find(|l| l.key == key)
+}
 
 /// Every line an account can be mapped to.
 ///
@@ -157,8 +785,20 @@ pub const SCHEDULE_C_LINES: &[TaxLineDef] = &[
     TaxLineDef { key: "sc26", number: "26", label: "Wages (less employment credits)", group: EXPENSES, schedule: super::lines::Schedule::Page1, field: Field::One("f1_38[0]"), sense: Sense::Natural,
         instructions: "Wages paid to employees, reduced by any employment credits claimed. Never the proprietor's own draw — a sole proprietor is not an employee of their own business.",
         attachment: None },
-    TaxLineDef { key: "sc27a", number: "27a", label: "Energy efficient commercial buildings deduction", group: EXPENSES, schedule: super::lines::Schedule::Page1, field: Field::One("f1_39[0]"), sense: Sense::Natural,
-        instructions: "The §179D deduction, computed on Form 7205.",
+    // `f1_40[0]`, not `f1_39[0]`. The two are adjacent boxes in the same column
+    // and both real, so writing to the wrong one produces a return that foots —
+    // line 28 adds both either way — with the §179D deduction printed on the
+    // "Other expenses" line and the Part V total printed on the energy line.
+    //
+    // The IRS *swapped the printed numbers* in the 2025 revision: what the 2023
+    // and 2024 forms call 27a (other expenses) and 27b (energy) the 2025 form
+    // calls 27b and 27a. The **boxes did not move** — `f1_39` is the other-
+    // expenses line and `f1_40` the energy line on every revision carried — so
+    // the fix is to name the right box, not to alias per year. `number` below is
+    // the 2025 printing; `renumbered_27` on [`ScheduleCYear`] says where that is
+    // not what the paper says.
+    TaxLineDef { key: "sc27a", number: "27a", label: "Energy efficient commercial buildings deduction", group: EXPENSES, schedule: super::lines::Schedule::Page1, field: Field::One("f1_40[0]"), sense: Sense::Natural,
+        instructions: "The §179D deduction, computed on Form 7205. Printed as line 27b on the 2023 and 2024 forms, which numbered these two the other way round.",
         attachment: Some(FORM_7205) },
 
     // --- Part III, cost of goods sold ---
@@ -329,10 +969,16 @@ pub struct Computed {
 pub fn compute(
     statement: &IncomeStatement,
     mapping: &BTreeMap<String, String>,
+    limits: &BTreeMap<String, u8>,
 ) -> Computed {
     let (cents, detail, warnings) = sum_by_line(
         statement,
         mapping,
+        limits,
+        // Schedule C has no line for a disallowed expense — a sole proprietor's
+        // basis is not tracked on the form the way a partner's is — so the
+        // limited part is simply not deducted, and `sum_by_line` says so.
+        None,
         &|key| line_def(key).map(|d| (d.key, d.sense)),
         "Schedule C",
     );
@@ -373,7 +1019,10 @@ pub enum Control {
         no_on: &'static str,
     },
     /// A single box, ticked or not.
-    Check { on: &'static str, on_state: &'static str },
+    Check {
+        on: &'static str,
+        on_state: &'static str,
+    },
 }
 
 /// One of Schedule C's questions.
@@ -464,9 +1113,9 @@ impl ScheduleC {
 /// Read a year's answers from the books.
 pub fn load(conn: &rusqlite::Connection, tax_year: i32) -> ScheduleC {
     let mut out = ScheduleC::default();
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT answer_key, value FROM schedule_c_answers WHERE tax_year = ?1",
-    ) else {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT answer_key, value FROM schedule_c_answers WHERE tax_year = ?1")
+    else {
         return out;
     };
     if let Ok(rows) = stmt.query_map([tax_year], |r| {
@@ -517,8 +1166,17 @@ mod field {
     pub const L5_GROSS_PROFIT: &str = "f1_14[0]";
     pub const L7_GROSS_INCOME: &str = "f1_16[0]";
 
-    /// Part II derived: 27b from Part V, then 28 and 29.
-    pub const L27B_OTHER: &str = "f1_40[0]";
+    /// Part II derived: the "Other expenses (from line 48)" line, then 28 and 29.
+    ///
+    /// `f1_39[0]`, the box directly under line 26's. It was `f1_40[0]` — the
+    /// energy-efficient-buildings box beneath it — which put the Part V total on
+    /// the §179D line and the §179D deduction here. Both boxes feed line 28, so
+    /// the return footed and only the two lines were transposed.
+    ///
+    /// Named for what it *is* rather than for its printed number, because the
+    /// number is not stable: the 2023 and 2024 forms print this line as 27a and
+    /// the 2025 form prints it as 27b.
+    pub const L27B_OTHER: &str = "f1_39[0]";
     pub const L28_TOTAL_EXPENSES: &str = "f1_41[0]";
     pub const L29_TENTATIVE: &str = "f1_42[0]";
     /// 30, business use of the home, and 31, the figure that leaves the form.
@@ -576,14 +1234,45 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
     let mut warnings = computed.warnings.clone();
     let lines = &computed.lines;
 
-    let mut doc = Document::load_mem(F1040SC)?;
+    // The year's own blank. Refused rather than substituted, exactly as on the
+    // 1065: a Schedule C built on another year's form carries that year in
+    // pre-printed type at the top of page 1, and the boxes behind the figures
+    // are not necessarily the ones the labels name.
+    let revision = schedule_c_year(req.year).ok_or_else(|| FormError::NoFormForYear {
+        form: "Schedule C",
+        year: req.year,
+        available: supported_years()
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    })?;
+    if !revision.mapped {
+        return Err(FormError::UnmappedRevision(revision.year));
+    }
+    let mut doc = Document::load_mem(revision.form)?;
     strip_xfa(&mut doc);
     let map = field_map(&doc);
 
-    if req.year != FORM_TAX_YEAR {
+    if revision.draft {
         warnings.push(format!(
-            "The bundled form is the {FORM_TAX_YEAR} revision and this is a {} return. The line              numbering moves between years — check every figure against the {} form before              filing.",
-            req.year, req.year
+            "The {} Schedule C is an IRS draft, which may not be filed. This is a projection of \
+             what the year is heading for, not a return — check for the final form before filing \
+             anything on it.",
+            revision.year
+        ));
+    }
+    // The IRS swapped the printed numbers of these two lines in the 2025
+    // revision without moving the boxes. The figures land correctly either way;
+    // what changes is what the line is *called*, and anybody reading this
+    // program's line list against an older form would find them the other way up.
+    if revision.year < 2025 {
+        warnings.push(format!(
+            "On the {} Schedule C the other-expenses line is numbered 27a and the energy \
+             efficient commercial buildings deduction is 27b — the 2025 form numbers them the \
+             other way round, and this program names them the 2025 way. The figures are in the \
+             right boxes; only the numbers this program prints beside them differ from the paper.",
+            revision.year
         ));
     }
 
@@ -616,15 +1305,35 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
         ),
     }
 
-    set_text(&mut doc, &map, field::BUSINESS_NAME, &req.profile.legal_name)?;
-    set_text(&mut doc, &map, field::BUSINESS_CODE, &req.profile.naics_code)?;
+    set_text(
+        &mut doc,
+        &map,
+        field::BUSINESS_NAME,
+        &req.profile.legal_name,
+    )?;
+    set_text(
+        &mut doc,
+        &map,
+        field::BUSINESS_CODE,
+        &req.profile.naics_code,
+    )?;
     // The EIN box is a nine-character comb — one digit per cell — so the hyphen
     // an EIN is written with does not fit and would be refused outright. Digits
     // only, which is what the comb is drawn for.
-    let ein_digits: String = req.profile.ein.chars().filter(|c| c.is_ascii_digit()).collect();
+    let ein_digits: String = req
+        .profile
+        .ein
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
     set_text(&mut doc, &map, field::EIN, &ein_digits)?;
     set_text(&mut doc, &map, field::STREET, &address_line(req.profile))?;
-    set_text(&mut doc, &map, field::CITY_STATE_ZIP, &city_line(req.profile))?;
+    set_text(
+        &mut doc,
+        &map,
+        field::CITY_STATE_ZIP,
+        &city_line(req.profile),
+    )?;
     if let Some(activity) = &req.profile.principal_activity {
         set_text(&mut doc, &map, field::PRINCIPAL_BUSINESS, activity)?;
     }
@@ -654,12 +1363,18 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
     }
 
     // --- the mapped lines ---
-    for def in SCHEDULE_C_LINES {
-        if !lines.is_mapped(def.key) {
-            continue;
-        }
-        if let Field::One(name) = def.field {
-            set_text(&mut doc, &map, name, &format_dollars(lines.get(def.key)))?;
+    //
+    // Through this revision's own table. The catalogue carries a box too, but it
+    // is the current revision's, and reading it for a prior year is the mistake
+    // that put the §179D deduction on the other-expenses line.
+    for line in revision.lines {
+        if lines.is_mapped(line.key) {
+            set_text(
+                &mut doc,
+                &map,
+                line.field,
+                &format_dollars(lines.get(line.key)),
+            )?;
         }
     }
 
@@ -700,21 +1415,51 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
         set_text(&mut doc, &map, name, &format_dollars(value))?;
     }
     if other_expenses != 0 {
-        set_text(&mut doc, &map, field::L27B_OTHER, &format_dollars(other_expenses))?;
-        set_text(&mut doc, &map, field::L48_TOTAL, &format_dollars(other_expenses))?;
+        set_text(
+            &mut doc,
+            &map,
+            field::L27B_OTHER,
+            &format_dollars(other_expenses),
+        )?;
+        set_text(
+            &mut doc,
+            &map,
+            field::L48_TOTAL,
+            &format_dollars(other_expenses),
+        )?;
     }
     if home_office != 0 {
-        set_text(&mut doc, &map, field::L30_HOME, &format_dollars(home_office))?;
+        set_text(
+            &mut doc,
+            &map,
+            field::L30_HOME,
+            &format_dollars(home_office),
+        )?;
     }
 
     // Part III prints only when there is a Part III. A business that sells
     // services and holds no stock should get a blank page, not a column of
     // zeroes that reads as an answered question.
     if lines.has_cost_of_goods() {
-        set_text(&mut doc, &map, field::L40_TOTAL, &format_dollars(lines.line_40()))?;
+        set_text(
+            &mut doc,
+            &map,
+            field::L40_TOTAL,
+            &format_dollars(lines.line_40()),
+        )?;
         let cogs = lines.cost_of_goods_sold();
-        set_text(&mut doc, &map, field::L42_COST_OF_GOODS, &format_dollars(cogs))?;
-        set_text(&mut doc, &map, field::L4_COST_OF_GOODS, &format_dollars(cogs))?;
+        set_text(
+            &mut doc,
+            &map,
+            field::L42_COST_OF_GOODS,
+            &format_dollars(cogs),
+        )?;
+        set_text(
+            &mut doc,
+            &map,
+            field::L4_COST_OF_GOODS,
+            &format_dollars(cogs),
+        )?;
     }
 
     // --- what the books *can* answer, and the form asks anyway ---
@@ -840,14 +1585,25 @@ mod tests {
     /// once in line 1 and again in the subtraction.
     #[test]
     fn no_derived_line_is_in_the_catalogue() {
-        for derived in ["sc3", "sc4", "sc5", "sc7", "sc28", "sc29", "sc31", "sc40", "sc42"] {
-            assert!(line_def(derived).is_none(), "{derived} is mappable and derived");
+        for derived in [
+            "sc3", "sc4", "sc5", "sc7", "sc28", "sc29", "sc31", "sc40", "sc42",
+        ] {
+            assert!(
+                line_def(derived).is_none(),
+                "{derived} is mappable and derived"
+            );
         }
     }
 
     #[test]
     fn gross_profit_subtracts_returns_and_cost_of_goods() {
-        let l = lines(&[("sc1", 100_000), ("sc2", 4_000), ("sc35", 10_000), ("sc36", 30_000), ("sc41", 12_000)]);
+        let l = lines(&[
+            ("sc1", 100_000),
+            ("sc2", 4_000),
+            ("sc35", 10_000),
+            ("sc36", 30_000),
+            ("sc41", 12_000),
+        ]);
         assert_eq!(l.line_3(), 96_000);
         assert_eq!(l.line_40(), 40_000);
         assert_eq!(l.cost_of_goods_sold(), 28_000);
@@ -877,12 +1633,21 @@ mod tests {
     #[test]
     fn the_net_figure_walks_down_the_form() {
         let l = lines(&[
-            ("sc1", 200_000), ("sc2", 5_000), ("sc6", 1_000),
-            ("sc8", 3_000), ("sc20b", 24_000), ("sc25", 6_000), ("sc26", 40_000),
+            ("sc1", 200_000),
+            ("sc2", 5_000),
+            ("sc6", 1_000),
+            ("sc8", 3_000),
+            ("sc20b", 24_000),
+            ("sc25", 6_000),
+            ("sc26", 40_000),
         ]);
         assert_eq!(l.line_3(), 195_000);
         assert_eq!(l.line_7(), 196_000);
-        assert_eq!(l.line_28(2_000), 75_000, "73,000 of Part II plus 2,000 of other");
+        assert_eq!(
+            l.line_28(2_000),
+            75_000,
+            "73,000 of Part II plus 2,000 of other"
+        );
         assert_eq!(l.line_29(2_000), 121_000);
         assert_eq!(l.line_31(2_000, 5_000), 116_000, "less the home office");
     }
@@ -943,7 +1708,11 @@ mod tests {
         }
     }
 
-    fn built(c: &Computed, p: Option<&SoleProprietor>, ssn: Option<&str>) -> (Document, Vec<String>) {
+    fn built(
+        c: &Computed,
+        p: Option<&SoleProprietor>,
+        ssn: Option<&str>,
+    ) -> (Document, Vec<String>) {
         let answers = ScheduleC::default();
         let profile = profile();
         let req = ScheduleCRequest {
@@ -967,39 +1736,333 @@ mod tests {
     /// the form under us — the check every other form module carries.
     #[test]
     fn every_field_this_module_names_exists_in_the_vendored_form() {
-        let mut doc = Document::load_mem(F1040SC).unwrap();
+        for revision in SCHEDULE_C_YEARS.iter().filter(|r| r.mapped) {
+            check_revision(revision.year, revision.form);
+        }
+    }
+
+    /// A prior-year Schedule C puts each figure in that year's box.
+    ///
+    /// The end-to-end version of the numbering check: the §179D deduction and
+    /// the Part V total are adjacent boxes that both feed line 28, so a
+    /// transposition foots and only the two lines read wrong. Building both
+    /// revisions and comparing proves the fill goes through the revision's own
+    /// table rather than the catalogue's.
+    #[test]
+    fn a_prior_year_schedule_c_fills_that_years_boxes() {
+        let c = computed(&[("sc1", 100_000), ("sc27a", 7_000)]);
+        let p = proprietor();
+        let profile = profile();
+        let answers = ScheduleC::default();
+
+        let build_for = |year: i32| {
+            let req = ScheduleCRequest {
+                year,
+                profile: &profile,
+                proprietor: Some(&p),
+                ssn: None,
+                answers: &answers,
+                home_office_dollars: Some(0),
+            };
+            let bundle = build(&req, &c).expect("a carried revision builds");
+            let doc = Document::load_mem(&bundle.pdf).unwrap();
+            let map = field_map(&doc);
+            let read = |f: &str| crate::tax::acroform::get_value(&doc, &map, f);
+            (
+                read(line_box(year, "sc27a").unwrap().field),
+                read(field::L27B_OTHER),
+                bundle.warnings,
+            )
+        };
+
+        let (energy_2023, other_2023, warnings_2023) = build_for(2023);
+        let (energy_2025, other_2025, _) = build_for(2025);
+
+        assert_eq!(energy_2023.as_deref(), Some("7,000"), "2023 §179D");
+        assert_eq!(energy_2025.as_deref(), Some("7,000"), "2025 §179D");
+        // The Part V total box is a different box, and stays empty here — the
+        // failure this guards against is the two swapping.
+        assert_ne!(
+            line_box(2023, "sc27a").unwrap().field,
+            field::L27B_OTHER,
+            "the deduction and the Part V total must not share a box"
+        );
+        assert!(other_2023.unwrap_or_default().is_empty());
+        assert!(other_2025.unwrap_or_default().is_empty());
+
+        // And the 2023 return says which two lines its paper numbers differently.
+        assert!(
+            warnings_2023.iter().any(|w| w.contains("numbered 27a")),
+            "{warnings_2023:?}"
+        );
+    }
+
+    /// The shared catalogue is the current revision, and nothing more.
+    ///
+    /// `SCHEDULE_C_LINES` carries a `number` and a `field` beside each line's
+    /// meaning. They are the **current** revision's, and any reader that has a
+    /// year in hand must go through that year's table instead — which is what
+    /// `fill` and the mapping page now do. This pins the catalogue to
+    /// `LINES_2025` so the two cannot drift, and so a new revision that moves a
+    /// box fails here rather than silently disagreeing with itself.
+    #[test]
+    fn the_shared_catalogue_is_the_current_revisions_table() {
+        assert_eq!(SCHEDULE_C_LINES.len(), LINES_2025.len());
+        for def in SCHEDULE_C_LINES {
+            let line = LINES_2025
+                .iter()
+                .find(|l| l.key == def.key)
+                .unwrap_or_else(|| panic!("{} is not in LINES_2025", def.key));
+            assert_eq!(def.number, line.number, "{} number", def.key);
+            if let Field::One(name) = def.field {
+                assert_eq!(name, line.field, "{} field", def.key);
+            }
+        }
+    }
+
+    /// Each revision numbers its lines the way its own paper does.
+    ///
+    /// The 2023 and 2024 forms print other-expenses as 27a and the §179D energy
+    /// deduction as 27b; the 2025 form prints them the other way round. Both
+    /// boxes exist on every revision and both feed line 28, so a return built
+    /// with the wrong numbering foots — and reads as though the deduction were
+    /// somewhere it is not.
+    #[test]
+    fn each_revision_numbers_its_lines_the_way_its_own_paper_does() {
+        let number = |year: i32, key: &str| line_box(year, key).map(|l| l.number);
+        assert_eq!(number(2023, "sc27a"), Some("27b"));
+        assert_eq!(number(2024, "sc27a"), Some("27b"));
+        assert_eq!(number(2025, "sc27a"), Some("27a"));
+        // And the box is the same on all three, which is why only the number moves.
+        let field = |year: i32, key: &str| line_box(year, key).map(|l| l.field);
+        assert_eq!(field(2023, "sc27a"), field(2025, "sc27a"));
+    }
+
+    /// Every money box sits beside the line whose number it is meant to carry.
+    ///
+    /// # Why a name check is not enough, demonstrated
+    ///
+    /// This module wrote the §179D deduction to `f1_39[0]` and the Part V total
+    /// to `f1_40[0]`. Both boxes exist on every revision, so the check above
+    /// passed on all of them — and both feed line 28, so the return footed. They
+    /// were simply the wrong way round: the deduction printed on the
+    /// "Other expenses" line and the Part V total on the energy line.
+    ///
+    /// What made it plausible is that the IRS *swapped the printed numbers* in
+    /// the 2025 revision — 2023 and 2024 call these lines 27a and 27b, and 2025
+    /// calls them 27b and 27a — while leaving the boxes where they were. So this
+    /// test asks the only question that settles it: is the box on the same row
+    /// of the page as the words describing it.
+    #[test]
+    fn a_money_box_sits_on_the_row_its_label_is_on() {
+        for revision in SCHEDULE_C_YEARS.iter().filter(|r| r.mapped) {
+            let mut doc = Document::load_mem(revision.form).unwrap();
+            strip_xfa(&mut doc);
+            let map = field_map(&doc);
+            let rows = printed_rows(revision.form);
+            // Without this the test would pass vacuously wherever `pdftotext` is
+            // absent — which is the one environment where nothing is checking.
+            assert!(
+                rows.len() > 20,
+                "{}: read {} rows of printed text; is pdftotext installed?",
+                revision.year,
+                rows.len()
+            );
+
+            // A handful, chosen because they are adjacent in the same column and
+            // therefore the ones a transposition hides in.
+            for (field, wanted) in [
+                (field::L27B_OTHER, "Other expenses"),
+                ("f1_40[0]", "deduction (attach Form 7205)"),
+                ("f1_38[0]", "Wages"),
+                (field::L28_TOTAL_EXPENSES, "Total expenses"),
+            ] {
+                let rect = rect_of(&doc, &map, field)
+                    .unwrap_or_else(|| panic!("{}: no box {field}", revision.year));
+                let mid = (rect.1 + rect.3) / 2.0;
+                let row = rows
+                    .iter()
+                    .filter(|(y, _)| (*y - mid).abs() < 7.0)
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    row.contains(wanted),
+                    "{}: {field} sits at y={mid:.0}, where the page says {row:?} — not {wanted:?}",
+                    revision.year
+                );
+            }
+        }
+    }
+
+    fn rect_of(
+        doc: &Document,
+        map: &crate::tax::acroform::FieldMap,
+        name: &str,
+    ) -> Option<(f64, f64, f64, f64)> {
+        let id = map.find(name)?;
+        let nums: Vec<f64> = doc
+            .get_object(id)
+            .ok()?
+            .as_dict()
+            .ok()?
+            .get(b"Rect")
+            .ok()?
+            .as_array()
+            .ok()?
+            .iter()
+            .filter_map(|o| {
+                o.as_float()
+                    .map(f64::from)
+                    .or_else(|_| o.as_i64().map(|i| i as f64))
+                    .ok()
+            })
+            .collect();
+        match nums.as_slice() {
+            [a, b, c, d] => Some((*a, *b, *c, *d)),
+            _ => None,
+        }
+    }
+
+    /// The words printed on page 1, by the y they sit at in PDF coordinates.
+    ///
+    /// Read from the page's own text rather than from a table written here: a
+    /// table would be one more thing that can disagree with the paper, which is
+    /// the failure this test exists to catch.
+    fn printed_rows(bytes: &[u8]) -> Vec<(f64, String)> {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("accountir-sc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sc.pdf");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+        let out = std::process::Command::new("pdftotext")
+            .args(["-f", "1", "-l", "1", "-bbox-layout"])
+            .arg(&path)
+            .arg("-")
+            .output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(out) = out else { return Vec::new() };
+        let text = String::from_utf8_lossy(&out.stdout);
+
+        let height: f64 = text
+            .split("height=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(792.0);
+
+        let mut rows: Vec<(f64, String)> = Vec::new();
+        for chunk in text.split("<word ").skip(1) {
+            let num = |key: &str| -> Option<f64> {
+                // The key already ends with the opening quote, so the value is
+                // what comes first after the split, not what comes second.
+                chunk
+                    .split(key)
+                    .nth(1)?
+                    .split('"')
+                    .next()?
+                    .parse::<f64>()
+                    .ok()
+            };
+            let (Some(y_min), Some(y_max)) = (num("yMin=\""), num("yMax=\"")) else {
+                continue;
+            };
+            let Some(word) = chunk.split('>').nth(1).and_then(|s| s.split('<').next()) else {
+                continue;
+            };
+            if word.trim().is_empty() {
+                continue;
+            }
+            // PDF y counts up from the bottom; pdftotext counts down from the top.
+            let y = height - (y_min + y_max) / 2.0;
+            match rows.iter_mut().find(|(at, _)| (*at - y).abs() < 3.0) {
+                Some((_, text)) => {
+                    text.push(' ');
+                    text.push_str(word.trim());
+                }
+                None => rows.push((y, word.trim().to_string())),
+            }
+        }
+        rows
+    }
+
+    /// Every box this module names, in one revision.
+    ///
+    /// Run over every carried year rather than only the current one. The 1065
+    /// learned this the expensive way: Schedule B's fields lived in their own
+    /// module and were never covered by the all-years sweep, so building a 2023
+    /// return failed on a field that had simply been renamed — after the year had
+    /// been offered in the picker as though it worked.
+    fn check_revision(year: i32, bytes: &[u8]) {
+        let mut doc = Document::load_mem(bytes).unwrap();
         strip_xfa(&mut doc);
         let map = field_map(&doc);
+        assert!(
+            !map.is_empty(),
+            "{year}: the blank has no form fields at all"
+        );
 
         for name in [
-            field::PROPRIETOR, field::SSN, field::PRINCIPAL_BUSINESS, field::BUSINESS_CODE,
-            field::BUSINESS_NAME, field::EIN, field::STREET, field::CITY_STATE_ZIP,
-            field::METHOD_OTHER, field::METHOD_CASH, field::METHOD_ACCRUAL,
-            field::METHOD_OTHER_BOX, field::L3_BALANCE, field::L4_COST_OF_GOODS,
-            field::L5_GROSS_PROFIT, field::L7_GROSS_INCOME, field::L27B_OTHER,
-            field::L28_TOTAL_EXPENSES, field::L29_TENTATIVE, field::L30_HOME, field::L31_NET,
-            field::L40_TOTAL, field::L42_COST_OF_GOODS, field::L48_TOTAL,
+            field::PROPRIETOR,
+            field::SSN,
+            field::PRINCIPAL_BUSINESS,
+            field::BUSINESS_CODE,
+            field::BUSINESS_NAME,
+            field::EIN,
+            field::STREET,
+            field::CITY_STATE_ZIP,
+            field::METHOD_OTHER,
+            field::METHOD_CASH,
+            field::METHOD_ACCRUAL,
+            field::METHOD_OTHER_BOX,
+            field::L3_BALANCE,
+            field::L4_COST_OF_GOODS,
+            field::L5_GROSS_PROFIT,
+            field::L7_GROSS_INCOME,
+            field::L27B_OTHER,
+            field::L28_TOTAL_EXPENSES,
+            field::L29_TENTATIVE,
+            field::L30_HOME,
+            field::L31_NET,
+            field::L40_TOTAL,
+            field::L42_COST_OF_GOODS,
+            field::L48_TOTAL,
         ] {
-            assert!(map.find(name).is_some(), "f1040sc.pdf has no field {name}");
+            assert!(map.find(name).is_some(), "{year}: no field {name}");
         }
         for row in field::PART_V_ROWS {
             for f in row {
-                assert!(map.find(f).is_some(), "f1040sc.pdf has no Part V field {f}");
+                assert!(map.find(f).is_some(), "{year}: no Part V field {f}");
             }
         }
         for def in SCHEDULE_C_LINES {
             if let Field::One(name) = def.field {
-                assert!(map.find(name).is_some(), "line {} names missing field {name}", def.number);
+                assert!(
+                    map.find(name).is_some(),
+                    "{year}: line {} names missing field {name}",
+                    def.number
+                );
             }
         }
         for q in QUESTIONS {
             match q.control {
                 Control::YesNo { yes, no, .. } => {
-                    assert!(map.find(yes).is_some(), "question {} yes box", q.number);
-                    assert!(map.find(no).is_some(), "question {} no box", q.number);
+                    assert!(
+                        map.find(yes).is_some(),
+                        "{year}: question {} yes box",
+                        q.number
+                    );
+                    assert!(
+                        map.find(no).is_some(),
+                        "{year}: question {} no box",
+                        q.number
+                    );
                 }
                 Control::Check { on, .. } => {
-                    assert!(map.find(on).is_some(), "question {} box", q.number);
+                    assert!(map.find(on).is_some(), "{year}: question {} box", q.number);
                 }
             }
         }
@@ -1049,8 +2112,15 @@ mod tests {
         assert_eq!(box_of(&doc, field::SSN), "123-45-6789");
         assert_eq!(box_of(&doc, field::BUSINESS_NAME), "Bunny Ears Art House");
         assert_eq!(box_of(&doc, field::BUSINESS_CODE), "611610");
-        assert_eq!(box_of(&doc, field::EIN), "123456789", "the comb takes digits only");
-        assert_eq!(box_of(&doc, field::PRINCIPAL_BUSINESS), "Fine arts instruction");
+        assert_eq!(
+            box_of(&doc, field::EIN),
+            "123456789",
+            "the comb takes digits only"
+        );
+        assert_eq!(
+            box_of(&doc, field::PRINCIPAL_BUSINESS),
+            "Fine arts instruction"
+        );
         assert_eq!(box_of(&doc, field::CITY_STATE_ZIP), "Chicago, IL 60640");
     }
 
@@ -1083,8 +2153,12 @@ mod tests {
     #[test]
     fn the_derived_boxes_carry_the_arithmetic_down_to_line_31() {
         let c = computed(&[
-            ("sc1", 200_000), ("sc2", 5_000), ("sc6", 1_000),
-            ("sc8", 3_000), ("sc20b", 24_000), ("sc26", 40_000),
+            ("sc1", 200_000),
+            ("sc2", 5_000),
+            ("sc6", 1_000),
+            ("sc8", 3_000),
+            ("sc20b", 24_000),
+            ("sc26", 40_000),
         ]);
         let answers = ScheduleC::default();
         let profile = profile();
@@ -1118,11 +2192,20 @@ mod tests {
         assert_eq!(box_of(&doc, field::L42_COST_OF_GOODS), "");
         assert_eq!(box_of(&doc, field::L4_COST_OF_GOODS), "");
 
-        let c = computed(&[("sc1", 100_000), ("sc35", 10_000), ("sc36", 30_000), ("sc41", 12_000)]);
+        let c = computed(&[
+            ("sc1", 100_000),
+            ("sc35", 10_000),
+            ("sc36", 30_000),
+            ("sc41", 12_000),
+        ]);
         let (doc, _) = built(&c, Some(&proprietor()), None);
         assert_eq!(box_of(&doc, field::L40_TOTAL), "40,000");
         assert_eq!(box_of(&doc, field::L42_COST_OF_GOODS), "28,000");
-        assert_eq!(box_of(&doc, field::L4_COST_OF_GOODS), "28,000", "line 42 carries to line 4");
+        assert_eq!(
+            box_of(&doc, field::L4_COST_OF_GOODS),
+            "28,000",
+            "line 42 carries to line 4"
+        );
     }
 
     /// Part V writes itself from the accounts mapped to line 48, and the total
@@ -1151,9 +2234,16 @@ mod tests {
 
         assert_eq!(box_of(&doc, field::PART_V_ROWS[0][0]), "Bank charges");
         assert_eq!(box_of(&doc, field::PART_V_ROWS[0][1]), "1,000");
-        assert_eq!(box_of(&doc, field::PART_V_ROWS[1][0]), "Dues and subscriptions");
+        assert_eq!(
+            box_of(&doc, field::PART_V_ROWS[1][0]),
+            "Dues and subscriptions"
+        );
         assert_eq!(box_of(&doc, field::L48_TOTAL), "1,500");
-        assert_eq!(box_of(&doc, field::L27B_OTHER), "1,500", "and on to line 27b");
+        assert_eq!(
+            box_of(&doc, field::L27B_OTHER),
+            "1,500",
+            "and on to line 27b"
+        );
     }
 
     #[test]
@@ -1172,7 +2262,9 @@ mod tests {
         );
         let (_, warnings) = built(&c, Some(&proprietor()), None);
         assert!(
-            warnings.iter().any(|w| w.contains("continuation statement")),
+            warnings
+                .iter()
+                .any(|w| w.contains("continuation statement")),
             "{warnings:?}"
         );
     }
@@ -1195,9 +2287,18 @@ mod tests {
         };
         let warnings = build(&req, &c).unwrap().warnings;
 
-        assert!(warnings.iter().any(|w| w.contains("Form 8829")), "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("Part IV")), "{warnings:?}");
-        assert!(warnings.iter().any(|w| w.contains("deductible half")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("Form 8829")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("Part IV")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("deductible half")),
+            "{warnings:?}"
+        );
     }
 
     /// The accounting method ticks one box, and line F(3) is written only for
@@ -1228,8 +2329,10 @@ mod tests {
         let answers = ScheduleC::default();
         let profile = profile();
         let p = proprietor();
+        // A carried prior year builds on its own blank, and says what the IRS
+        // renumbered between then and now.
         let req = ScheduleCRequest {
-            year: FORM_TAX_YEAR + 1,
+            year: 2023,
             profile: &profile,
             proprietor: Some(&p),
             ssn: None,
@@ -1237,7 +2340,26 @@ mod tests {
             home_office_dollars: Some(0),
         };
         let warnings = build(&req, &c).unwrap().warnings;
-        assert!(warnings.iter().any(|w| w.contains("revision")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("numbered 27a")),
+            "{warnings:?}"
+        );
+
+        // A year with no blank is refused rather than filled on another year's
+        // form, which would carry that year in pre-printed type.
+        let req = ScheduleCRequest { year: 2019, ..req };
+        match build(&req, &c) {
+            Err(FormError::NoFormForYear { year, .. }) => assert_eq!(year, 2019),
+            other => panic!("a year with no blank must be refused: {:?}", other.is_ok()),
+        }
+
+        // And a revision whose boxes have not been matched is refused too, even
+        // though every name this module uses still resolves in it.
+        let req = ScheduleCRequest { year: 2026, ..req };
+        assert!(matches!(
+            build(&req, &c),
+            Err(FormError::UnmappedRevision(2026))
+        ));
     }
 
     /// The date the business started has no box on this form, which made it look
@@ -1275,7 +2397,10 @@ mod tests {
 
         // A later year with H ticked contradicts the date.
         let w = build_for(2025, Some(YES));
-        assert!(w.iter().any(|w| w.contains("One of the two is wrong")), "{w:?}");
+        assert!(
+            w.iter().any(|w| w.contains("One of the two is wrong")),
+            "{w:?}"
+        );
 
         // A later year, H unanswered or No — the ordinary case, silent.
         for h in [None, Some(NO)] {
@@ -1296,7 +2421,10 @@ mod tests {
         // The SSN is the owner's and belongs at the top, never on line D.
         assert_eq!(box_of(&doc, field::SSN), "123-45-6789");
         assert_ne!(box_of(&doc, field::EIN), box_of(&doc, field::SSN));
-        assert!(!warnings.iter().any(|w| w.contains("Line 26")), "{warnings:?}");
+        assert!(
+            !warnings.iter().any(|w| w.contains("Line 26")),
+            "{warnings:?}"
+        );
     }
 
     /// Wages mean employees, and an employer must have an EIN — Forms 941 and
@@ -1319,7 +2447,9 @@ mod tests {
         };
         let warnings = build(&req, &c).unwrap().warnings;
         assert!(
-            warnings.iter().any(|w| w.contains("must have") && w.contains("EIN")),
+            warnings
+                .iter()
+                .any(|w| w.contains("must have") && w.contains("EIN")),
             "{warnings:?}"
         );
 
@@ -1336,4 +2466,3 @@ mod tests {
         }
     }
 }
-

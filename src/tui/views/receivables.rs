@@ -79,10 +79,7 @@ impl ReceivablesView {
         let a = &self.aging;
         let line = Line::from(vec![
             Span::styled("Current: ", Style::default().fg(theme.fg_dim)),
-            Span::styled(
-                format_amount(a.current),
-                Style::default().fg(theme.success),
-            ),
+            Span::styled(format_amount(a.current), Style::default().fg(theme.success)),
             Span::raw("  "),
             Span::styled("1-30: ", Style::default().fg(theme.fg_dim)),
             Span::styled(
@@ -108,7 +105,12 @@ impl ReceivablesView {
                 Style::default().fg(theme.error),
             ),
             Span::raw("  "),
-            Span::styled("Total: ", Style::default().fg(theme.fg_dim).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Total: ",
+                Style::default()
+                    .fg(theme.fg_dim)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format_amount(a.total),
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
@@ -156,7 +158,8 @@ impl ReceivablesView {
             .iter()
             .enumerate()
             .map(|(i, inv)| {
-                let is_overdue = inv.due_date < today && inv.status != "paid" && inv.status != "void";
+                let is_overdue =
+                    inv.due_date < today && inv.status != "paid" && inv.status != "void";
                 let balance = inv.amount - inv.amount_paid;
 
                 let style = if i == self.selected {

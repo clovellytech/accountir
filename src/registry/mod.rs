@@ -109,7 +109,10 @@ impl Registry {
     // --- businesses ---
 
     pub fn list_active(&self) -> Result<Vec<Business>> {
-        self.list_where("is_archived = 0", "last_opened_at DESC NULLS LAST, created_at DESC")
+        self.list_where(
+            "is_archived = 0",
+            "last_opened_at DESC NULLS LAST, created_at DESC",
+        )
     }
 
     pub fn list_archived(&self) -> Result<Vec<Business>> {
@@ -399,7 +402,11 @@ fn row_to_business(row: &rusqlite::Row<'_>) -> rusqlite::Result<Business> {
         db_path: PathBuf::from(db_path),
         original_path: original_path.map(PathBuf::from),
         is_archived: is_archived != 0,
-        last_opened_at: last_opened.and_then(|s| DateTime::parse_from_rfc3339(&s).ok().map(|d| d.with_timezone(&Utc))),
+        last_opened_at: last_opened.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        }),
         created_at: DateTime::parse_from_rfc3339(&created)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
@@ -416,15 +423,14 @@ fn canonicalize_existing_or_parent(path: &Path) -> Result<PathBuf> {
     let name = path
         .file_name()
         .ok_or_else(|| anyhow!("path has no filename: {}", path.display()))?;
-    let canonical_parent = std::fs::canonicalize(parent)
-        .or_else(|_| {
-            // Fall back to absolute if parent doesn't yet exist.
-            if parent.is_absolute() {
-                Ok(parent.to_path_buf())
-            } else {
-                std::env::current_dir().map(|cwd| cwd.join(parent))
-            }
-        })?;
+    let canonical_parent = std::fs::canonicalize(parent).or_else(|_| {
+        // Fall back to absolute if parent doesn't yet exist.
+        if parent.is_absolute() {
+            Ok(parent.to_path_buf())
+        } else {
+            std::env::current_dir().map(|cwd| cwd.join(parent))
+        }
+    })?;
     Ok(canonical_parent.join(name))
 }
 
@@ -441,9 +447,8 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
                 e
             )
         })?;
-        std::fs::remove_file(src).with_context(|| {
-            format!("removing source {} after copy", src.display())
-        })?;
+        std::fs::remove_file(src)
+            .with_context(|| format!("removing source {} after copy", src.display()))?;
     }
     Ok(())
 }
