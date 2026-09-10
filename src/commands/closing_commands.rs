@@ -307,6 +307,36 @@ fn accounts_with_balances(
     Ok(out)
 }
 
+/// The Schedule L line a year-result equity account belongs on: 21, partners'
+/// capital accounts.
+const YEAR_ACCOUNT_TAX_LINE: &str = "sl21";
+
+/// Whether the target account already reaches a Schedule L line for `year`.
+///
+/// An account with no mapping is dropped from Schedule L entirely — the return
+/// warns and names it, so it fails loudly rather than quietly, but a balance
+/// sheet missing the year's own result is a return nobody can file. Since the
+/// close is what puts a balance there, the close is what should say where it
+/// goes.
+///
+/// Resolution matches `tax::lines::load_mapping`: the greatest `effective_from`
+/// at or before the year.
+fn already_mapped_for_tax(tx: &Connection, account_id: &str, year: i32) -> bool {
+    tx.query_row(
+        "SELECT 1 FROM tax_line_mappings t
+          WHERE t.account_id = ?1 AND t.effective_from <= ?2
+            AND t.effective_from = (
+                SELECT MAX(u.effective_from) FROM tax_line_mappings u
+                 WHERE u.account_id = t.account_id AND u.effective_from <= ?2)",
+        rusqlite::params![account_id, year],
+        |_| Ok(true),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(false)
+}
+
 /// Do the books balance as of `as_of`? Returns `(debits, credits)`.
 ///
 /// Deliberately not [`Reports::trial_balance`], which builds itself from
@@ -630,7 +660,7 @@ pub fn close_books(
 
                 // The entry, then the lock that names it. One transaction, so the
                 // fence above saw the year open and this one closes it.
-                Ok(Verdict::Append(vec![
+                let mut events = vec![
                     EventEnvelope::new(entry_event, user_id.clone()),
                     EventEnvelope::new(
                         Event::YearEndClosed {
@@ -639,7 +669,29 @@ pub fn close_books(
                         },
                         user_id.clone(),
                     ),
-                ]))
+                ];
+
+                // Point the target at Schedule L line 21, unless it already
+                // reaches a line. The close has just given this account a
+                // balance-sheet balance; leaving it on no line means the year's
+                // own result is missing from Schedule L. Only for a partnership
+                // — line 21 is a Form 1065 line, and a sole proprietorship files
+                // no balance sheet at all, so the assignment would be noise on
+                // books that can never render it.
+                let partnership = !crate::commands::sole_proprietor_commands::business_type(tx)
+                    .is_sole_proprietorship();
+                if partnership && !already_mapped_for_tax(tx, &cmd.equity_account_id, cmd.year) {
+                    events.push(EventEnvelope::new(
+                        Event::TaxLineMappingSet {
+                            account_id: cmd.equity_account_id.clone(),
+                            line_key: YEAR_ACCOUNT_TAX_LINE.to_string(),
+                            effective_from: cmd.year,
+                        },
+                        user_id.clone(),
+                    ));
+                }
+
+                Ok(Verdict::Append(events))
             },
             |tx, stored| {
                 Projector::new(tx)
@@ -1237,9 +1289,17 @@ mod tests {
             rows.filter_map(|r| r.ok()).collect()
         };
         // `fiscal_year_opened` precedes them: the year had never been opened.
+        // The tax-line assignment rides along in the same batch — books that have
+        // never said what they file are treated as a partnership, which is what
+        // `sole_proprietor_commands::business_type` defaults to.
         assert_eq!(
             types,
-            vec!["fiscal_year_opened", "journal_entry_posted", "year_end_closed"],
+            vec![
+                "fiscal_year_opened",
+                "journal_entry_posted",
+                "year_end_closed",
+                "tax_line_mapping_set",
+            ],
         );
     }
 
@@ -1393,6 +1453,80 @@ mod tests {
             "the checkbox must not silently do nothing: {:?}",
             p.warnings
         );
+    }
+
+    fn set_business_type(store: &EventStore, kind: &str) {
+        store
+            .connection()
+            .execute(
+                "INSERT INTO business_profile
+                     (id, legal_name, street, city, state, postal_code, ein, naics_code,
+                      formation_date, business_type)
+                 VALUES ('default', 'Co', '1 St', 'Town', 'IL', '60000', '00-0000000',
+                         '451120', '2020-01-01', ?1)
+                 ON CONFLICT(id) DO UPDATE SET business_type = excluded.business_type",
+                [kind],
+            )
+            .unwrap();
+    }
+
+    fn tax_line_for(store: &EventStore, account_id: &str) -> Option<String> {
+        store
+            .connection()
+            .query_row(
+                "SELECT line_key FROM tax_line_mappings WHERE account_id = ?1",
+                [account_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    /// The close gives the year account a balance-sheet balance, so it also says
+    /// where that balance goes on Schedule L. Left unmapped, the year's own
+    /// result is simply missing from the return's balance sheet.
+    #[test]
+    fn closing_points_the_year_account_at_schedule_l_line_21() {
+        let mut b = books();
+        set_business_type(&b.store, "partnership");
+        b.ordinary_year(2023);
+
+        assert_eq!(tax_line_for(&b.store, &b.equity), None);
+        b.close(2023).unwrap();
+        assert_eq!(tax_line_for(&b.store, &b.equity).as_deref(), Some("sl21"));
+    }
+
+    /// An account that already reaches a line keeps the one it has — a
+    /// partnership closing into an existing capital account has already said
+    /// where it goes, and the close must not overrule them.
+    #[test]
+    fn an_account_that_is_already_mapped_is_left_alone() {
+        let mut b = books();
+        set_business_type(&b.store, "partnership");
+        b.ordinary_year(2023);
+        b.store
+            .connection()
+            .execute(
+                "INSERT INTO tax_line_mappings (account_id, line_key, effective_from)
+                 VALUES (?1, 'sl19a', 0)",
+                [&b.equity],
+            )
+            .unwrap();
+
+        b.close(2023).unwrap();
+        assert_eq!(tax_line_for(&b.store, &b.equity).as_deref(), Some("sl19a"));
+    }
+
+    /// Line 21 is a Form 1065 line. A sole proprietorship files no balance sheet
+    /// at all, so the assignment would be noise on books that can never show it.
+    #[test]
+    fn a_sole_proprietorship_gets_no_schedule_l_assignment() {
+        let mut b = books();
+        set_business_type(&b.store, "sole_proprietorship");
+        b.ordinary_year(2023);
+
+        b.close(2023).unwrap();
+        assert_eq!(tax_line_for(&b.store, &b.equity), None);
     }
 
     #[test]

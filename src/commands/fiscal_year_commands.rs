@@ -103,6 +103,22 @@ pub fn boundaries_for(conn: &Connection, year: i32) -> FiscalYear {
     FiscalYear::for_year(year, start_month)
 }
 
+/// The fiscal year that contains `on`, from this company's own boundaries.
+///
+/// A calendar-year company's fiscal 2026 is 2026. A company whose year starts in
+/// July is in fiscal 2025 until 30 June 2026 — so the year is named for where it
+/// *began*, not for the calendar year the date falls in, and taking
+/// `on.year()` would name the wrong year for half of every one of them.
+pub fn fiscal_year_containing(conn: &Connection, on: NaiveDate) -> FiscalYear {
+    use chrono::Datelike;
+    let candidate = boundaries_for(conn, on.year());
+    if on < candidate.start_date {
+        boundaries_for(conn, on.year() - 1)
+    } else {
+        candidate
+    }
+}
+
 /// Fiscal year command handler.
 pub struct FiscalYearCommands<'a> {
     store: &'a mut EventStore,
@@ -410,5 +426,57 @@ mod tests {
         assert_eq!(fy.retained_earnings_entry_id, None);
 
         assert!(load_year(store.connection(), 2099).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod containing_tests {
+    use super::*;
+    use crate::store::migrations::init_schema;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    fn store_with_start_month(month: u32) -> EventStore {
+        let store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO company (id, company_id, name, base_currency, fiscal_year_start_month)
+                 VALUES ('c', 'c', 'Co', 'USD', ?1)",
+                [month],
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn a_calendar_year_company_is_in_the_year_on_the_date() {
+        let store = store_with_start_month(1);
+        let fy = fiscal_year_containing(store.connection(), day(2026, 3, 4));
+        assert_eq!(fy.year, 2026);
+        assert_eq!((fy.start_date, fy.end_date), (day(2026, 1, 1), day(2026, 12, 31)));
+    }
+
+    /// The half of a July-start year that falls in the *next* calendar year is
+    /// still the year that began in July — naming it for `on.year()` would put
+    /// six months of every year in the wrong one.
+    #[test]
+    fn a_july_start_company_is_in_the_year_that_began() {
+        let store = store_with_start_month(7);
+
+        let after = fiscal_year_containing(store.connection(), day(2026, 8, 1));
+        assert_eq!(after.year, 2026);
+        assert_eq!((after.start_date, after.end_date), (day(2026, 7, 1), day(2027, 6, 30)));
+
+        let before = fiscal_year_containing(store.connection(), day(2026, 3, 4));
+        assert_eq!(before.year, 2025, "March 2026 is still fiscal 2025");
+        assert_eq!((before.start_date, before.end_date), (day(2025, 7, 1), day(2026, 6, 30)));
+
+        // The boundary days themselves.
+        assert_eq!(fiscal_year_containing(store.connection(), day(2026, 6, 30)).year, 2025);
+        assert_eq!(fiscal_year_containing(store.connection(), day(2026, 7, 1)).year, 2026);
     }
 }
