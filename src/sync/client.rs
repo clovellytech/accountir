@@ -1593,6 +1593,45 @@ impl SyncClient {
         .await
     }
 
+    /// Close a fiscal year on the group's books: sweep its revenue and expense
+    /// into `equity_account_id` and fence the year, in one server-side append.
+    ///
+    /// Carries no figures. Which accounts are swept and what they hold is
+    /// derived on the server inside the append transaction — which is what makes
+    /// this safe to retry against a moved head, and what stops two members
+    /// closing the same year from two different pictures of it. The second one
+    /// gets a `422` naming the entry that already closed it.
+    pub async fn close_books(
+        &mut self,
+        year: i32,
+        equity_account_id: &str,
+        include_draws: bool,
+    ) -> Result<i64, SyncClientError> {
+        let equity_account_id = equity_account_id.to_string();
+        self.submit_retrying("/sync/commands/close-books", |head| {
+            crate::sync::commands::fiscal::CloseBooksRequest {
+                expected_head_seq: head,
+                year,
+                equity_account_id: equity_account_id.clone(),
+                include_draws,
+            }
+        })
+        .await
+    }
+
+    /// Reopen a closed year: void its closing entry and lift the fence together.
+    pub async fn reopen_year(&mut self, year: i32, reason: &str) -> Result<i64, SyncClientError> {
+        let reason = reason.to_string();
+        self.submit_retrying("/sync/commands/reopen-year", |head| {
+            crate::sync::commands::fiscal::ReopenYearRequest {
+                expected_head_seq: head,
+                year,
+                reason: reason.clone(),
+            }
+        })
+        .await
+    }
+
     /// Record who owns a sole proprietorship on the group's books.
     ///
     /// Carries no identifying number, and there is no companion command that

@@ -49,7 +49,7 @@ use thiserror::Error;
 use crate::commands::entry_commands::{
     build_post_entry_in_txn, EntryLine, PostEntryCommand, PostEntryStep,
 };
-use crate::commands::fiscal_year_commands::{boundaries_for, load_year, FiscalYearCommands};
+use crate::commands::fiscal_year_commands::{boundaries_for, load_year};
 use crate::domain::AccountType;
 use crate::events::types::{Event, EventEnvelope, JournalEntrySource};
 use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
@@ -532,6 +532,188 @@ fn check_can_close(
     opening_balances_are_clear(conn, year, year_start)
 }
 
+/// Build every event a close appends, under the write lock.
+///
+/// Shared by [`close_books`] and the group server's `close-books` endpoint, so
+/// the invariants are enforced identically whichever door the command came
+/// through — the same reason `build_post_entry_in_txn` exists.
+///
+/// Everything is re-derived here rather than passed in: another writer may have
+/// posted into the year between the preview a user was looking at and this
+/// append, and on a group server the two are on different machines.
+pub(crate) fn build_close_books_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &CloseBooksCommand,
+) -> Result<Verdict<Vec<Event>, ClosingError>, EventStoreError> {
+    let equity: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT account_type, is_active = 1 FROM accounts WHERE id = ?1",
+            [&cmd.equity_account_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match equity {
+        None => return Ok(Verdict::Reject(ClosingError::EquityAccountMissing)),
+        Some((ty, _)) if ty != "equity" => {
+            return Ok(Verdict::Reject(ClosingError::EquityAccountWrongType(
+                cmd.equity_account_id.clone(),
+            )))
+        }
+        Some(_) => {}
+    }
+
+    // The year may never have been opened — which is the ordinary case, not the
+    // edge one: no ledger has ever had a `fiscal_years` row. Opening it rides in
+    // this same batch rather than in an append of its own, so a close is exactly
+    // one atomic unit and a failure cannot leave a year opened but not closed.
+    let existing = load_year(tx, cmd.year)?;
+    let fy = match &existing {
+        Some(fy) => fy.clone(),
+        None => boundaries_for(tx, cmd.year),
+    };
+
+    if let Some(entry_id) = closing_entry_for(tx, cmd.year) {
+        return Ok(Verdict::Reject(ClosingError::AlreadyClosed {
+            year: cmd.year,
+            entry_id,
+        }));
+    }
+
+    let revenue = match accounts_with_balances(tx, &[AccountType::Revenue], fy.end_date, None) {
+        Ok(v) => v,
+        Err(e) => return Ok(Verdict::Reject(e)),
+    };
+    let expenses = match accounts_with_balances(tx, &[AccountType::Expense], fy.end_date, None) {
+        Ok(v) => v,
+        Err(e) => return Ok(Verdict::Reject(e)),
+    };
+    let draws = if cmd.include_draws {
+        let ids = draw_account_ids(tx);
+        match accounts_with_balances(tx, &[AccountType::Equity], fy.end_date, Some(&ids)) {
+            Ok(v) => v,
+            Err(e) => return Ok(Verdict::Reject(e)),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let tb = match trial_balance_at(tx, fy.end_date) {
+        Ok(tb) => tb,
+        Err(e) => return Ok(Verdict::Reject(e)),
+    };
+    if let Err(e) = check_can_close(tx, cmd.year, fy.start_date, &revenue, &expenses, tb) {
+        return Ok(Verdict::Reject(e));
+    }
+
+    // Lines: each account back to zero, then the balancing figure to equity. The
+    // equity line is the sum of what the others removed, so the entry sums to
+    // zero by construction.
+    let currency = base_currency(tx);
+    let mut lines: Vec<EntryLine> = Vec::new();
+    let mut sweep_total: i64 = 0;
+    for account in revenue.iter().chain(expenses.iter()).chain(draws.iter()) {
+        sweep_total += account.balance_cents;
+        lines.push(account.closing_line(&currency));
+    }
+    let net_income_cents = -sweep_total;
+    if sweep_total != 0 {
+        lines.push(
+            EntryLine::signed(&cmd.equity_account_id, sweep_total, &currency)
+                .with_memo(&format!("Net result for {}", cmd.year)),
+        );
+    }
+
+    let post = PostEntryCommand {
+        date: fy.end_date,
+        memo: memo_for(cmd.year, net_income_cents, lines.len()),
+        lines,
+        reference: Some(reference_for(cmd.year)),
+        source: Some(JournalEntrySource::Closing),
+    };
+
+    let mut events = Vec::new();
+    if existing.is_none() {
+        events.push(Event::FiscalYearOpened {
+            year: cmd.year,
+            start_date: fy.start_date,
+            end_date: fy.end_date,
+        });
+    }
+
+    let entry_event = match build_post_entry_in_txn(tx, &post)? {
+        PostEntryStep::Append(event) => event,
+        PostEntryStep::Reject(e) => {
+            return Ok(Verdict::Reject(ClosingError::Entry(e.to_string())))
+        }
+    };
+    let entry_id = match &entry_event {
+        Event::JournalEntryPosted { entry_id, .. } => entry_id.clone(),
+        other => {
+            return Ok(Verdict::Reject(ClosingError::Entry(format!(
+                "building the closing entry produced a {}",
+                other.event_type()
+            ))))
+        }
+    };
+
+    events.push(entry_event);
+    events.push(Event::YearEndClosed {
+        year: cmd.year,
+        retained_earnings_entry_id: entry_id,
+    });
+
+    // Point the target at Schedule L line 21, unless it already reaches a line.
+    // The close has just given this account a balance-sheet balance; leaving it
+    // on no line means the year's own result is missing from Schedule L. Only for
+    // a partnership — line 21 is a Form 1065 line, and a sole proprietorship
+    // files no balance sheet at all.
+    let partnership =
+        !crate::commands::sole_proprietor_commands::business_type(tx).is_sole_proprietorship();
+    if partnership && !already_mapped_for_tax(tx, &cmd.equity_account_id, cmd.year) {
+        events.push(Event::TaxLineMappingSet {
+            account_id: cmd.equity_account_id.clone(),
+            line_key: YEAR_ACCOUNT_TAX_LINE.to_string(),
+            effective_from: cmd.year,
+        });
+    }
+
+    Ok(Verdict::Append(events))
+}
+
+/// Build every event a reopen appends, under the write lock. Shared with the
+/// group server's `reopen-year` endpoint.
+pub(crate) fn build_reopen_books_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    year: i32,
+    reason: &str,
+    user_id: &str,
+) -> Result<Verdict<Vec<Event>, ClosingError>, EventStoreError> {
+    let is_closed = load_year(tx, year)?.map(|fy| fy.is_closed).unwrap_or(false);
+    let entry_id = closing_entry_for(tx, year);
+    if !is_closed && entry_id.is_none() {
+        return Ok(Verdict::Reject(ClosingError::NotClosed { year }));
+    }
+
+    let mut events = Vec::new();
+    if let Some(entry_id) = entry_id {
+        // Built directly rather than through `build_void_entry_in_txn`, which
+        // refuses to void a closing entry while its year is closed — the state
+        // this very batch is undoing. Its other check, that the entry is live,
+        // `closing_entry_for` has already made: it only returns entries with
+        // `is_void = 0`, and nothing else can touch them under this write lock.
+        events.push(Event::JournalEntryVoided {
+            entry_id,
+            reason: format!("Reopening {year}: {reason}"),
+        });
+    }
+    events.push(Event::YearEndReopened {
+        year,
+        reason: reason.to_string(),
+        reopened_by_user_id: user_id.to_string(),
+    });
+    Ok(Verdict::Append(events))
+}
+
 /// Close the books for a year: post the closing entry and fence the year, in one
 /// atomic append.
 pub fn close_books(
@@ -539,159 +721,26 @@ pub fn close_books(
     user_id: &str,
     cmd: CloseBooksCommand,
 ) -> Result<Closed, ClosingError> {
-    // The year must have a `fiscal_years` row for the fence to key off. No
-    // ledger has ever had one, so this is the ordinary path, not the edge case.
-    FiscalYearCommands::new(store, user_id.to_string()).ensure_year_open(cmd.year)?;
-
-    let currency = base_currency(store.connection());
-
     let equity_account_id = cmd.equity_account_id.clone();
+    let year = cmd.year;
 
     loop {
         let head = store.latest_id()?.unwrap_or(0);
         let user_id = user_id.to_string();
         let cmd = cmd.clone();
-        let currency = currency.clone();
 
         let outcome = store.append_checked_many(
             head,
             move |tx| {
-                // Everything is re-derived under the write lock: another writer
-                // may have posted into the year between the preview the user saw
-                // and this append.
-                let equity: Option<(String, bool)> = tx
-                    .query_row(
-                        "SELECT account_type, is_active = 1 FROM accounts WHERE id = ?1",
-                        [&cmd.equity_account_id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
-                match equity {
-                    None => return Ok(Verdict::Reject(ClosingError::EquityAccountMissing)),
-                    Some((ty, _)) if ty != "equity" => {
-                        return Ok(Verdict::Reject(ClosingError::EquityAccountWrongType(
-                            cmd.equity_account_id.clone(),
-                        )))
-                    }
-                    Some(_) => {}
-                }
-
-                let fy = match load_year(tx, cmd.year)? {
-                    Some(fy) => fy,
-                    None => boundaries_for(tx, cmd.year),
-                };
-                if let Some(entry_id) = closing_entry_for(tx, cmd.year) {
-                    return Ok(Verdict::Reject(ClosingError::AlreadyClosed {
-                        year: cmd.year,
-                        entry_id,
-                    }));
-                }
-
-                let revenue =
-                    match accounts_with_balances(tx, &[AccountType::Revenue], fy.end_date, None) {
-                        Ok(v) => v,
-                        Err(e) => return Ok(Verdict::Reject(e)),
-                    };
-                let expenses =
-                    match accounts_with_balances(tx, &[AccountType::Expense], fy.end_date, None) {
-                        Ok(v) => v,
-                        Err(e) => return Ok(Verdict::Reject(e)),
-                    };
-                let draws = if cmd.include_draws {
-                    let ids = draw_account_ids(tx);
-                    match accounts_with_balances(tx, &[AccountType::Equity], fy.end_date, Some(&ids))
-                    {
-                        Ok(v) => v,
-                        Err(e) => return Ok(Verdict::Reject(e)),
-                    }
-                } else {
-                    Vec::new()
-                };
-
-                let tb = match trial_balance_at(tx, fy.end_date) {
-                    Ok(tb) => tb,
-                    Err(e) => return Ok(Verdict::Reject(e)),
-                };
-                if let Err(e) =
-                    check_can_close(tx, cmd.year, fy.start_date, &revenue, &expenses, tb)
-                {
-                    return Ok(Verdict::Reject(e));
-                }
-
-                // Lines: each account back to zero, then the balancing figure to
-                // equity. The equity line is the sum of what the others removed,
-                // so the entry sums to zero by construction.
-                let mut lines: Vec<EntryLine> = Vec::new();
-                let mut sweep_total: i64 = 0;
-                for account in revenue.iter().chain(expenses.iter()).chain(draws.iter()) {
-                    sweep_total += account.balance_cents;
-                    lines.push(account.closing_line(&currency));
-                }
-                let net_income_cents = -sweep_total;
-                if sweep_total != 0 {
-                    lines.push(
-                        EntryLine::signed(&cmd.equity_account_id, sweep_total, &currency)
-                            .with_memo(&format!("Net result for {}", cmd.year)),
-                    );
-                }
-
-                let post = PostEntryCommand {
-                    date: fy.end_date,
-                    memo: memo_for(cmd.year, net_income_cents, lines.len()),
-                    lines,
-                    reference: Some(reference_for(cmd.year)),
-                    source: Some(JournalEntrySource::Closing),
-                };
-                let entry_event = match build_post_entry_in_txn(tx, &post)? {
-                    PostEntryStep::Append(event) => event,
-                    PostEntryStep::Reject(e) => {
-                        return Ok(Verdict::Reject(ClosingError::Entry(e.to_string())))
-                    }
-                };
-                let entry_id = match &entry_event {
-                    Event::JournalEntryPosted { entry_id, .. } => entry_id.clone(),
-                    other => {
-                        return Ok(Verdict::Reject(ClosingError::Entry(format!(
-                            "building the closing entry produced a {}",
-                            other.event_type()
-                        ))))
-                    }
-                };
-
-                // The entry, then the lock that names it. One transaction, so the
-                // fence above saw the year open and this one closes it.
-                let mut events = vec![
-                    EventEnvelope::new(entry_event, user_id.clone()),
-                    EventEnvelope::new(
-                        Event::YearEndClosed {
-                            year: cmd.year,
-                            retained_earnings_entry_id: entry_id,
-                        },
-                        user_id.clone(),
+                Ok(match build_close_books_in_txn(tx, &cmd)? {
+                    Verdict::Append(events) => Verdict::Append(
+                        events
+                            .into_iter()
+                            .map(|e| EventEnvelope::new(e, user_id.clone()))
+                            .collect(),
                     ),
-                ];
-
-                // Point the target at Schedule L line 21, unless it already
-                // reaches a line. The close has just given this account a
-                // balance-sheet balance; leaving it on no line means the year's
-                // own result is missing from Schedule L. Only for a partnership
-                // — line 21 is a Form 1065 line, and a sole proprietorship files
-                // no balance sheet at all, so the assignment would be noise on
-                // books that can never render it.
-                let partnership = !crate::commands::sole_proprietor_commands::business_type(tx)
-                    .is_sole_proprietorship();
-                if partnership && !already_mapped_for_tax(tx, &cmd.equity_account_id, cmd.year) {
-                    events.push(EventEnvelope::new(
-                        Event::TaxLineMappingSet {
-                            account_id: cmd.equity_account_id.clone(),
-                            line_key: YEAR_ACCOUNT_TAX_LINE.to_string(),
-                            effective_from: cmd.year,
-                        },
-                        user_id.clone(),
-                    ));
-                }
-
-                Ok(Verdict::Append(events))
+                    Verdict::Reject(e) => Verdict::Reject(e),
+                })
             },
             |tx, stored| {
                 Projector::new(tx)
@@ -720,7 +769,7 @@ pub fn close_books(
                     .unwrap_or(0);
                 let net = net_income_from(store.connection(), &entry_id, &equity_account_id);
                 return Ok(Closed {
-                    year: cmd.year,
+                    year,
                     entry_id,
                     net_income_cents: net,
                     // The equity line is not a swept account.
@@ -792,37 +841,15 @@ pub fn reopen_books(
         let outcome = store.append_checked_many(
             head,
             move |tx| {
-                let is_closed = load_year(tx, year)?.map(|fy| fy.is_closed).unwrap_or(false);
-                let entry_id = closing_entry_for(tx, year);
-                if !is_closed && entry_id.is_none() {
-                    return Ok(Verdict::Reject(ClosingError::NotClosed { year }));
-                }
-
-                let mut events = Vec::new();
-                if let Some(entry_id) = entry_id {
-                    // Built directly rather than through `build_void_entry_in_txn`,
-                    // which refuses to void a closing entry while its year is
-                    // closed — the state this very batch is undoing. Its other
-                    // check, that the entry is live, `closing_entry_for` has
-                    // already made: it only returns entries with `is_void = 0`,
-                    // and nothing else can touch them under this write lock.
-                    events.push(EventEnvelope::new(
-                        Event::JournalEntryVoided {
-                            entry_id,
-                            reason: format!("Reopening {year}: {reason}"),
-                        },
-                        user_id.clone(),
-                    ));
-                }
-                events.push(EventEnvelope::new(
-                    Event::YearEndReopened {
-                        year,
-                        reason: reason.clone(),
-                        reopened_by_user_id: user_id.clone(),
-                    },
-                    user_id.clone(),
-                ));
-                Ok(Verdict::Append(events))
+                Ok(match build_reopen_books_in_txn(tx, year, &reason, &user_id)? {
+                    Verdict::Append(events) => Verdict::Append(
+                        events
+                            .into_iter()
+                            .map(|e| EventEnvelope::new(e, user_id.clone()))
+                            .collect(),
+                    ),
+                    Verdict::Reject(e) => Verdict::Reject(e),
+                })
             },
             |tx, stored| {
                 Projector::new(tx)
@@ -1245,9 +1272,12 @@ mod tests {
         let mut b = books();
         b.ordinary_year(2023);
         // Open the year first, so the head does not move for that reason.
-        FiscalYearCommands::new(&mut b.store, "user".to_string())
-            .ensure_year_open(2023)
-            .unwrap();
+        crate::commands::fiscal_year_commands::FiscalYearCommands::new(
+            &mut b.store,
+            "user".to_string(),
+        )
+        .ensure_year_open(2023)
+        .unwrap();
         let before = b.head();
 
         let _ = close_books(
