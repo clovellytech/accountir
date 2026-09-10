@@ -1876,7 +1876,7 @@ mod tests {
 mod closing_tests {
     use super::*;
     use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
-    use crate::commands::closing_commands::{close_books, CloseBooksCommand};
+    use crate::commands::closing_commands::{close_books, CloseBooksCommand, ClosingTarget};
     use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
     use crate::domain::AccountType;
     use crate::events::types::JournalEntrySource;
@@ -1998,7 +1998,7 @@ mod closing_tests {
             "user",
             CloseBooksCommand {
                 year: 2023,
-                equity_account_id: equity,
+                target: ClosingTarget::Account(equity),
                 include_draws: false,
             },
         )

@@ -40,6 +40,7 @@
 
 use crate::commands::closing_commands::{
     build_close_books_in_txn, build_reopen_books_in_txn, CloseBooksCommand, ClosingError,
+    ClosingTarget,
 };
 use crate::store::event_store::Verdict;
 use crate::sync::{
@@ -58,11 +59,18 @@ pub fn router() -> Router<SyncState> {
 pub struct CloseBooksRequest {
     pub expected_head_seq: i64,
     pub year: i32,
-    /// The equity account the year's result lands in. An id rather than a path:
-    /// resolving `Equity:Years:2023` may create accounts, and creating them is
-    /// its own command with its own answer. The server checks the account exists
+    /// The equity account the year's result lands in — an id rather than a path,
+    /// because resolving `Equity:Years:2023` may create accounts and creating
+    /// them is its own command with its own answer. The server checks it exists
     /// and is equity, under the write lock.
-    pub equity_account_id: String,
+    ///
+    /// **`None` means allocate to partner capital instead**: one line per
+    /// partner, into their own capital account, split on the percentages in
+    /// force across the year. Absent rather than a separate flag so the two are
+    /// mutually exclusive by construction — there is no request that names an
+    /// account *and* asks for the split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equity_account_id: Option<String>,
     #[serde(default)]
     pub include_draws: bool,
 }
@@ -92,13 +100,19 @@ async fn submit_close_books(
     if !plausible_year(req.year) {
         return Err(ApiError::bad_request("year is not a tax year"));
     }
-    if req.equity_account_id.trim().is_empty() {
-        return Err(ApiError::bad_request("equity_account_id is required"));
-    }
+    let target = match req.equity_account_id {
+        None => ClosingTarget::PartnerCapital,
+        Some(id) if id.trim().is_empty() => {
+            return Err(ApiError::bad_request(
+                "equity_account_id is empty; omit it entirely to allocate to partner capital",
+            ))
+        }
+        Some(id) => ClosingTarget::Account(id),
+    };
 
     let cmd = CloseBooksCommand {
         year: req.year,
-        equity_account_id: req.equity_account_id,
+        target,
         include_draws: req.include_draws,
     };
     let expected = req.expected_head_seq;
@@ -307,7 +321,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: head,
                 year: 2023,
-                equity_account_id: equity.clone(),
+                equity_account_id: Some(equity.clone()),
                 include_draws: false,
             },
         )
@@ -370,7 +384,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: head,
                 year: 2023,
-                equity_account_id: equity,
+                equity_account_id: Some(equity),
                 include_draws: false,
             },
         )
@@ -408,7 +422,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: head,
                 year: 2023,
-                equity_account_id: equity,
+                equity_account_id: Some(equity),
                 include_draws: false,
             },
         )
@@ -439,7 +453,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: head,
                 year: 2023,
-                equity_account_id: equity.clone(),
+                equity_account_id: Some(equity.clone()),
                 include_draws: false,
             },
         )
@@ -453,7 +467,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: head,
                 year: 2023,
-                equity_account_id: equity,
+                equity_account_id: Some(equity),
                 include_draws: false,
             },
         )
@@ -486,7 +500,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: 0,
                 year: 2023,
-                equity_account_id: equity,
+                equity_account_id: Some(equity),
                 include_draws: false,
             },
         )
@@ -517,7 +531,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: head,
                 year: 2023,
-                equity_account_id: cash,
+                equity_account_id: Some(cash),
                 include_draws: false,
             },
         )
@@ -538,7 +552,7 @@ mod tests {
                 &CloseBooksRequest {
                     expected_head_seq: head,
                     year,
-                    equity_account_id: account.to_string(),
+                    equity_account_id: Some(account.to_string()),
                     include_draws: false,
                 },
             )
@@ -572,7 +586,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: head,
                 year: 2023,
-                equity_account_id: equity.clone(),
+                equity_account_id: Some(equity.clone()),
                 include_draws: false,
             },
         )
@@ -610,7 +624,7 @@ mod tests {
             &CloseBooksRequest {
                 expected_head_seq: head,
                 year: 2023,
-                equity_account_id: equity,
+                equity_account_id: Some(equity),
                 include_draws: false,
             },
         )

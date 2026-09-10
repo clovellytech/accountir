@@ -107,6 +107,40 @@ pub enum ClosingError {
     EquityAccountMissing,
     #[error("{0} is not an equity account — a year's result has to land in equity")]
     EquityAccountWrongType(String),
+    #[error(
+        "These books are not a partnership, so there are no partner capital accounts to \
+         allocate {year} to. Close into a single equity account instead."
+    )]
+    NotAPartnership { year: i32 },
+    #[error("No partner held an interest during {year}, so there is nobody to allocate it to")]
+    NoPartnersInYear { year: i32 },
+    #[error(
+        "{partner} has no capital account linked, so there is nowhere to put their share of \
+         {year}. Link one on the Partners page — an account is tied to a partner deliberately, \
+         because matching on the name would move the link the day somebody renames it."
+    )]
+    PartnerHasNoCapitalAccount { partner: String, year: i32 },
+    #[error(
+        "{partner} has {count} accounts linked in the contribution role, so it is not clear \
+         which one their share of {year} belongs in. Leave one linked as the capital account."
+    )]
+    PartnerCapitalIsAmbiguous {
+        partner: String,
+        count: usize,
+        year: i32,
+    },
+    #[error(
+        "The partners' profit percentages do not total 100% for {year}: {}.{:02} of \
+         {}.{:02} would be allocated and the rest would belong to nobody. Fix the percentages \
+         on the Partners page — they are what the allocation runs on.",
+        allocated.abs() / 100, allocated.abs() % 100,
+        total.abs() / 100, total.abs() % 100
+    )]
+    SharesDoNotTotal {
+        year: i32,
+        allocated: i64,
+        total: i64,
+    },
 }
 
 /// One account the close will sweep.
@@ -140,6 +174,9 @@ pub struct ClosingPreview {
     pub revenue: Vec<SweptAccount>,
     pub expenses: Vec<SweptAccount>,
     pub draws: Vec<SweptAccount>,
+    /// How the result is split across the partners, when closing to partner
+    /// capital. Empty when closing into a single account.
+    pub allocation: Vec<PartnerShare>,
     /// Positive for a profit, negative for a loss.
     pub net_income_cents: i64,
     pub trial_balance_debits: i64,
@@ -168,14 +205,30 @@ impl ClosingPreview {
     }
 }
 
+/// Where a year's result goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosingTarget {
+    /// One equity account, conventionally `Equity:Years:2023`. Resolved — and
+    /// created, if the caller wants a path that does not exist yet — before the
+    /// command is called.
+    Account(String),
+    /// One line per partner, into their own capital account, split on the
+    /// percentages in force across the year.
+    ///
+    /// This is what a partnership's books do. A partnership pays no tax itself;
+    /// the year's result passes through to the partners, and each partner's
+    /// capital account is what says whose it is. Closing to a single equity
+    /// account records that the partnership earned something without recording
+    /// whose it is — which the Schedule K-1s then have to compute separately,
+    /// leaving two records of one fact and only one of them in the ledger.
+    PartnerCapital,
+}
+
 /// Command to close a fiscal year.
 #[derive(Debug, Clone)]
 pub struct CloseBooksCommand {
     pub year: i32,
-    /// Where the year's result lands. Resolved — and created, if the caller
-    /// wants a path like `Equity:Years:2023` that does not exist yet — before
-    /// this command is called.
-    pub equity_account_id: String,
+    pub target: ClosingTarget,
     /// Also sweep partner draw accounts into the year's result. Off by default:
     /// leaving draws as their own equity line is the more readable balance
     /// sheet, and for a partnership they feed Schedule K-1 item L.
@@ -360,6 +413,132 @@ fn trial_balance_at(conn: &Connection, as_of: NaiveDate) -> Result<(i64, i64), C
     Ok((debits, credits))
 }
 
+/// One partner's share of a year, and where it goes.
+#[derive(Debug, Clone)]
+pub struct PartnerShare {
+    pub partner_id: String,
+    pub partner_name: String,
+    pub account_id: String,
+    pub account_label: String,
+    /// Positive for a share of profit, negative for a share of a loss.
+    pub cents: i64,
+}
+
+/// Split a year's result across the partners, and say which account each share
+/// goes to.
+///
+/// # Why `allocate_over_year` and not `allocate_as_of`
+///
+/// A partner's percentage can change mid-year, and §706(d) then wants the year
+/// divided at the change with each part allocated on its own split.
+/// `allocate_as_of` applies one split to the whole year and warns; this is the
+/// one `tax::capital` uses for Schedule K-1 item L, and using anything else here
+/// would put a different figure in the ledger from the one on the K-1 — which is
+/// exactly the divergence item L row 3 and box 1 hit before that module was
+/// changed.
+///
+/// # Cents, not dollars
+///
+/// `allocate_on_ppm` is unit-agnostic and exact by construction — every partner
+/// gets the floor of their share and the remainders go one each to the largest
+/// fractional parts — so passing cents gives cents that sum to the cents given.
+/// The K-1 passes dollars for the same reason: whole dollars are what the form
+/// prints. A ledger entry needs the cents, and rounding to dollars here would
+/// leave the closing entry unbalanced by the difference.
+fn partner_capital_lines(
+    tx: &Connection,
+    year: i32,
+    net_income_cents: i64,
+) -> Result<Vec<PartnerShare>, ClosingError> {
+    if crate::commands::sole_proprietor_commands::business_type(tx).is_sole_proprietorship() {
+        return Err(ClosingError::NotAPartnership { year });
+    }
+
+    let partners = crate::commands::partnership_commands::partners_for_year(tx, year);
+    if partners.is_empty() {
+        return Err(ClosingError::NoPartnersInYear { year });
+    }
+
+    // One capital account each, in the contribution role. A partner may own
+    // several linked accounts — contributions kept apart from draws is ordinary
+    // bookkeeping — but a share of income has exactly one place to go, and
+    // guessing between two would put a partner's earnings somewhere nobody
+    // chose.
+    let links = crate::tax::capital::load_partner_equity_accounts(tx);
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for p in &partners {
+        let mine: Vec<&crate::tax::capital::EquityAccount> = links
+            .iter()
+            .filter(|l| {
+                l.partner_id == p.partner_id && l.role == crate::tax::capital::Role::Contribution
+            })
+            .collect();
+        match mine.len() {
+            0 => {
+                return Err(ClosingError::PartnerHasNoCapitalAccount {
+                    partner: p.name.clone(),
+                    year,
+                })
+            }
+            1 => targets.push((p.partner_id.clone(), mine[0].account_id.clone())),
+            count => {
+                return Err(ClosingError::PartnerCapitalIsAmbiguous {
+                    partner: p.name.clone(),
+                    count,
+                    year,
+                })
+            }
+        }
+    }
+
+    let refs: Vec<&crate::domain::Partner> = partners.iter().collect();
+    let shares = crate::tax::varying::allocate_over_year(
+        tx,
+        year,
+        net_income_cents,
+        &refs,
+        crate::tax::allocate::Basis::ProfitOrLoss,
+    );
+
+    // The percentages are apportioned as given — a partnership whose shares sum
+    // to 90% gets 90% allocated and the rest belongs to nobody. That is the right
+    // answer for a return, which reports what the records say; it is not a thing
+    // a journal entry can do, because the missing tenth would leave it
+    // unbalanced. So it is refused here, naming the shortfall.
+    let allocated: i64 = shares.iter().map(|s| s.dollars).sum();
+    if allocated != net_income_cents {
+        return Err(ClosingError::SharesDoNotTotal {
+            year,
+            allocated,
+            total: net_income_cents,
+        });
+    }
+
+    let mut out = Vec::new();
+    for (i, p) in partners.iter().enumerate() {
+        let cents = shares.get(i).map(|s| s.dollars).unwrap_or(0);
+        let (_, account_id) = &targets[i];
+        let label: String = tx
+            .query_row(
+                "SELECT account_number || ' ' || name FROM accounts WHERE id = ?1",
+                [account_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| account_id.clone());
+        out.push(PartnerShare {
+            partner_id: p.partner_id.clone(),
+            partner_name: p.name.clone(),
+            account_id: account_id.clone(),
+            account_label: label,
+            cents,
+        });
+    }
+    Ok(out)
+}
+
 /// The equity accounts linked to a partner in the "draw" role.
 fn draw_account_ids(conn: &Connection) -> Vec<String> {
     let mut stmt = match conn
@@ -413,6 +592,7 @@ pub fn preview(
     conn: &Connection,
     year: i32,
     include_draws: bool,
+    target: &ClosingTarget,
 ) -> Result<ClosingPreview, ClosingError> {
     let fy = load_year(conn, year)?.unwrap_or_else(|| boundaries_for(conn, year));
     let (year_start, year_end) = (fy.start_date, fy.end_date);
@@ -460,6 +640,15 @@ pub fn preview(
         warnings.push(stale);
     }
 
+    // Computed for the preview even when it would refuse, so the page can show
+    // the split it *would* post beside the reason it cannot.
+    let allocation = match target {
+        ClosingTarget::PartnerCapital => {
+            partner_capital_lines(conn, year, net_income_cents).unwrap_or_default()
+        }
+        ClosingTarget::Account(_) => Vec::new(),
+    };
+
     let closed_by = closing_entry_for(conn, year);
     let blocker = match closed_by {
         Some(ref entry_id) => Some(
@@ -478,6 +667,15 @@ pub fn preview(
             (debits, credits),
         )
         .err()
+        .or_else(|| match target {
+            // The allocation's own refusals — an unlinked partner, an ambiguous
+            // capital account, percentages that do not total — belong in the
+            // blocker too, or the page would offer a Close button that fails.
+            ClosingTarget::PartnerCapital => {
+                partner_capital_lines(conn, year, net_income_cents).err()
+            }
+            ClosingTarget::Account(_) => None,
+        })
         .map(|e| e.to_string()),
     };
 
@@ -488,6 +686,7 @@ pub fn preview(
         revenue,
         expenses,
         draws,
+        allocation,
         net_income_cents,
         trial_balance_debits: debits,
         trial_balance_credits: credits,
@@ -545,21 +744,23 @@ pub(crate) fn build_close_books_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &CloseBooksCommand,
 ) -> Result<Verdict<Vec<Event>, ClosingError>, EventStoreError> {
-    let equity: Option<(String, bool)> = tx
-        .query_row(
-            "SELECT account_type, is_active = 1 FROM accounts WHERE id = ?1",
-            [&cmd.equity_account_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    match equity {
-        None => return Ok(Verdict::Reject(ClosingError::EquityAccountMissing)),
-        Some((ty, _)) if ty != "equity" => {
-            return Ok(Verdict::Reject(ClosingError::EquityAccountWrongType(
-                cmd.equity_account_id.clone(),
-            )))
+    if let ClosingTarget::Account(account_id) = &cmd.target {
+        let equity: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT account_type, is_active = 1 FROM accounts WHERE id = ?1",
+                [account_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match equity {
+            None => return Ok(Verdict::Reject(ClosingError::EquityAccountMissing)),
+            Some((ty, _)) if ty != "equity" => {
+                return Ok(Verdict::Reject(ClosingError::EquityAccountWrongType(
+                    account_id.clone(),
+                )))
+            }
+            Some(_) => {}
         }
-        Some(_) => {}
     }
 
     // The year may never have been opened — which is the ordinary case, not the
@@ -616,16 +817,41 @@ pub(crate) fn build_close_books_in_txn(
         lines.push(account.closing_line(&currency));
     }
     let net_income_cents = -sweep_total;
-    if sweep_total != 0 {
-        lines.push(
-            EntryLine::signed(&cmd.equity_account_id, sweep_total, &currency)
-                .with_memo(&format!("Net result for {}", cmd.year)),
-        );
+    // The other side: one line to a single equity account, or one per partner.
+    match &cmd.target {
+        ClosingTarget::Account(account_id) => {
+            if sweep_total != 0 {
+                lines.push(
+                    EntryLine::signed(account_id, sweep_total, &currency)
+                        .with_memo(&format!("Net result for {}", cmd.year)),
+                );
+            }
+        }
+        ClosingTarget::PartnerCapital => {
+            let allocation = match partner_capital_lines(tx, cmd.year, net_income_cents) {
+                Ok(a) => a,
+                Err(e) => return Ok(Verdict::Reject(e)),
+            };
+            for share in &allocation {
+                if share.cents == 0 {
+                    continue;
+                }
+                // A share of income is a credit to capital, so the line carries
+                // the negation — the same orientation the single-account line
+                // has, applied per partner.
+                lines.push(
+                    EntryLine::signed(&share.account_id, -share.cents, &currency).with_memo(
+                        &format!("{}'s share of {}", share.partner_name, cmd.year),
+                    ),
+                );
+            }
+        }
     }
 
+    let swept_count = revenue.len() + expenses.len() + draws.len();
     let post = PostEntryCommand {
         date: fy.end_date,
-        memo: memo_for(cmd.year, net_income_cents, lines.len()),
+        memo: memo_for(cmd.year, net_income_cents, swept_count),
         lines,
         reference: Some(reference_for(cmd.year)),
         source: Some(JournalEntrySource::Closing),
@@ -662,19 +888,25 @@ pub(crate) fn build_close_books_in_txn(
         retained_earnings_entry_id: entry_id,
     });
 
-    // Point the target at Schedule L line 21, unless it already reaches a line.
-    // The close has just given this account a balance-sheet balance; leaving it
-    // on no line means the year's own result is missing from Schedule L. Only for
-    // a partnership — line 21 is a Form 1065 line, and a sole proprietorship
-    // files no balance sheet at all.
-    let partnership =
-        !crate::commands::sole_proprietor_commands::business_type(tx).is_sole_proprietorship();
-    if partnership && !already_mapped_for_tax(tx, &cmd.equity_account_id, cmd.year) {
-        events.push(Event::TaxLineMappingSet {
-            account_id: cmd.equity_account_id.clone(),
-            line_key: YEAR_ACCOUNT_TAX_LINE.to_string(),
-            effective_from: cmd.year,
-        });
+    // Point the year account at Schedule L line 21, unless it already reaches a
+    // line. The close has just given this account a balance-sheet balance;
+    // leaving it on no line means the year's own result is missing from Schedule
+    // L. Only for a partnership — line 21 is a Form 1065 line, and a sole
+    // proprietorship files no balance sheet at all.
+    //
+    // Not done for partner capital accounts: those are not accounts this command
+    // created, they already carried balances, and where they belong on the return
+    // is a decision their owner has already made.
+    if let ClosingTarget::Account(account_id) = &cmd.target {
+        let partnership =
+            !crate::commands::sole_proprietor_commands::business_type(tx).is_sole_proprietorship();
+        if partnership && !already_mapped_for_tax(tx, account_id, cmd.year) {
+            events.push(Event::TaxLineMappingSet {
+                account_id: account_id.clone(),
+                line_key: YEAR_ACCOUNT_TAX_LINE.to_string(),
+                effective_from: cmd.year,
+            });
+        }
     }
 
     Ok(Verdict::Append(events))
@@ -721,7 +953,6 @@ pub fn close_books(
     user_id: &str,
     cmd: CloseBooksCommand,
 ) -> Result<Closed, ClosingError> {
-    let equity_account_id = cmd.equity_account_id.clone();
     let year = cmd.year;
 
     loop {
@@ -760,20 +991,12 @@ pub fn close_books(
                     .ok_or_else(|| {
                         ClosingError::Entry("the close appended no journal entry".to_string())
                     })?;
-                let lines = events
-                    .iter()
-                    .find_map(|s| match &s.event {
-                        Event::JournalEntryPosted { lines, .. } => Some(lines.len()),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let net = net_income_from(store.connection(), &entry_id, &equity_account_id);
+                let (net, swept) = result_of(store.connection(), &entry_id);
                 return Ok(Closed {
                     year,
                     entry_id,
                     net_income_cents: net,
-                    // The equity line is not a swept account.
-                    accounts_swept: lines.saturating_sub(1),
+                    accounts_swept: swept,
                 });
             }
             CheckedOutcome::HeadMismatch { .. } => continue,
@@ -782,24 +1005,32 @@ pub fn close_books(
     }
 }
 
-/// Read the net result back off the posted entry, so what is reported is what
-/// the ledger actually holds rather than what the caller computed.
-fn net_income_from(conn: &Connection, entry_id: &str, equity_account_id: &str) -> i64 {
+/// The net result and how many accounts were swept, read back off the posted
+/// entry — so what is reported is what the ledger actually holds rather than
+/// what the caller computed.
+///
+/// Counted from the income-statement lines rather than from whatever the other
+/// side turned out to be, which is one line to an equity account or one per
+/// partner depending on the target.
+fn result_of(conn: &Connection, entry_id: &str) -> (i64, usize) {
     conn.query_row(
-        "SELECT COALESCE(SUM(amount), 0) FROM journal_lines
-          WHERE entry_id = ?1 AND account_id = ?2",
-        rusqlite::params![entry_id, equity_account_id],
-        |r| r.get::<_, i64>(0),
+        "SELECT COALESCE(SUM(jl.amount), 0), COUNT(*)
+           FROM journal_lines jl
+           JOIN accounts a ON a.id = jl.account_id
+          WHERE jl.entry_id = ?1 AND a.account_type IN ('revenue', 'expense')",
+        [entry_id],
+        // The lines are already the negation of the balances they clear, so their
+        // sum *is* the net result: a credit-balance revenue account contributes a
+        // debit line, and income comes out positive.
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as usize)),
     )
     .optional()
     .ok()
     .flatten()
-    .map(|equity_line| -equity_line)
-    .unwrap_or(0)
+    .unwrap_or((0, 0))
 }
 
-fn memo_for(year: i32, net_income_cents: i64, lines: usize) -> String {
-    let swept = lines.saturating_sub(1);
+fn memo_for(year: i32, net_income_cents: i64, swept: usize) -> String {
     let magnitude = format!(
         "{}.{:02}",
         net_income_cents.abs() / 100,
@@ -1031,7 +1262,7 @@ mod tests {
                 "user",
                 CloseBooksCommand {
                     year,
-                    equity_account_id: equity,
+                    target: ClosingTarget::Account(equity),
                     include_draws: false,
                 },
             )
@@ -1244,7 +1475,7 @@ mod tests {
             "user",
             CloseBooksCommand {
                 year: 2023,
-                equity_account_id: "no-such-account".to_string(),
+                target: ClosingTarget::Account("no-such-account".to_string()),
                 include_draws: false,
             },
         )
@@ -1257,7 +1488,7 @@ mod tests {
             "user",
             CloseBooksCommand {
                 year: 2023,
-                equity_account_id: cash,
+                target: ClosingTarget::Account(cash),
                 include_draws: false,
             },
         )
@@ -1285,7 +1516,7 @@ mod tests {
             "user",
             CloseBooksCommand {
                 year: 2023,
-                equity_account_id: "no-such-account".to_string(),
+                target: ClosingTarget::Account("no-such-account".to_string()),
                 include_draws: false,
             },
         )
@@ -1506,7 +1737,8 @@ mod tests {
         let mut b = books();
         b.ordinary_year(2023);
 
-        let p = preview(b.store.connection(), 2023, false).unwrap();
+        let target = ClosingTarget::Account(b.equity.clone());
+        let p = preview(b.store.connection(), 2023, false, &target).unwrap();
         assert_eq!(p.year_end, day(2023, 12, 31));
         assert_eq!(p.net_income_cents, 180_000);
         assert_eq!(p.revenue.len(), 2, "sales and refunds");
@@ -1519,7 +1751,7 @@ mod tests {
         assert_eq!(closed.net_income_cents, p.net_income_cents);
         assert_eq!(closed.accounts_swept, p.swept().count());
 
-        let after = preview(b.store.connection(), 2023, false).unwrap();
+        let after = preview(b.store.connection(), 2023, false, &target).unwrap();
         assert!(after.is_closed());
         assert_eq!(after.closed_by.as_deref(), Some(closed.entry_id.as_str()));
         assert!(after.blocker.is_some(), "a closed year reports why it cannot close again");
@@ -1531,7 +1763,8 @@ mod tests {
         b.ordinary_year(2022);
         b.ordinary_year(2023);
 
-        let p = preview(b.store.connection(), 2023, false).unwrap();
+        let target = ClosingTarget::Account(b.equity.clone());
+        let p = preview(b.store.connection(), 2023, false, &target).unwrap();
         let blocker = p.blocker.expect("2023 cannot be closed while 2022 is open");
         assert!(
             blocker.contains("earlier activity"),
@@ -1544,7 +1777,13 @@ mod tests {
         let mut b = books();
         b.ordinary_year(2023);
 
-        let p = preview(b.store.connection(), 2023, true).unwrap();
+        let p = preview(
+            b.store.connection(),
+            2023,
+            true,
+            &ClosingTarget::Account(b.equity.clone()),
+        )
+        .unwrap();
         assert!(p.draws.is_empty());
         assert!(
             p.warnings.iter().any(|w| w.contains("draw")),
@@ -1625,6 +1864,295 @@ mod tests {
 
         b.close(2023).unwrap();
         assert_eq!(tax_line_for(&b.store, &b.equity), None);
+    }
+
+    // --- closing to partner capital ----------------------------------------
+
+    /// The books above, made into a partnership with two partners splitting
+    /// 60/40, each with a contribution and a draw account linked.
+    fn as_a_partnership(b: &mut Books, split: (f64, f64)) -> (String, String) {
+        use crate::commands::partnership_commands::{
+            admit_partner, link_equity_account, set_profile, AdmitPartner,
+        };
+        use crate::domain::{Address, BusinessProfile, PartnerType, Residency, Shares};
+
+        let address = || Address {
+            street: "1 Example Street".into(),
+            suite: None,
+            city: "Chicago".into(),
+            state: "IL".into(),
+            postal_code: "60600".into(),
+            country: None,
+        };
+        set_profile(
+            &mut b.store,
+            "u",
+            &BusinessProfile {
+                legal_name: "Two Partners LLC".into(),
+                address: address(),
+                ein: "88-1234567".into(),
+                naics_code: "541511".into(),
+                formation_date: day(2020, 1, 1),
+                principal_activity: None,
+                principal_product: None,
+            },
+        )
+        .unwrap();
+
+        let mut admit = |name: &str, pct: f64| -> String {
+            admit_partner(
+                &mut b.store,
+                "u",
+                &AdmitPartner {
+                    name: name.into(),
+                    partner_type: PartnerType::General,
+                    residency: Residency::Domestic,
+                    entity_type: "Individual".into(),
+                    address: address(),
+                    start_date: Some(day(2020, 1, 1)),
+                    shares: Shares::from_percents(pct, pct, pct),
+                    tin: None,
+                },
+            )
+            .unwrap()
+            .0
+        };
+        let one = admit("Ada", split.0);
+        let two = admit("Bo", split.1);
+
+        // Their capital accounts, and a draw account each so the roles are not
+        // trivially unambiguous.
+        for (number, name) in [
+            ("3101", "Ada capital"),
+            ("3102", "Ada draws"),
+            ("3201", "Bo capital"),
+            ("3202", "Bo draws"),
+        ] {
+            AccountCommands::new(&mut b.store, "u".to_string())
+                .create_account(CreateAccountCommand {
+                    account_type: AccountType::Equity,
+                    account_number: number.to_string(),
+                    name: name.to_string(),
+                    parent_id: None,
+                    currency: Some("USD".to_string()),
+                    description: None,
+                })
+                .unwrap();
+        }
+        let id = |b: &Books, n: &str| -> String {
+            b.store
+                .connection()
+                .query_row("SELECT id FROM accounts WHERE account_number = ?1", [n], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        for (partner, number, role) in [
+            (&one, "3101", "contribution"),
+            (&one, "3102", "draw"),
+            (&two, "3201", "contribution"),
+            (&two, "3202", "draw"),
+        ] {
+            let account = id(b, number);
+            link_equity_account(&mut b.store, "u", partner, &account, role).unwrap();
+        }
+        (id(b, "3101"), id(b, "3201"))
+    }
+
+    fn close_to_partners(b: &mut Books, year: i32) -> Result<Closed, ClosingError> {
+        close_books(
+            &mut b.store,
+            "user",
+            CloseBooksCommand {
+                year,
+                target: ClosingTarget::PartnerCapital,
+                include_draws: false,
+            },
+        )
+    }
+
+    /// The point of the whole phase: the year's result reaches the partners'
+    /// own capital accounts, in their shares, rather than sitting in one bucket.
+    #[test]
+    fn the_year_is_split_across_the_partners_capital_accounts() {
+        let mut b = books();
+        let (ada, bo) = as_a_partnership(&mut b, (60.0, 40.0));
+        b.ordinary_year(2023);
+
+        let closed = close_to_partners(&mut b, 2023).unwrap();
+        assert_eq!(closed.net_income_cents, 180_000);
+
+        let end = day(2023, 12, 31);
+        assert_eq!(b.balance(&ada, end), -108_000, "60% of 1,800");
+        assert_eq!(b.balance(&bo, end), -72_000, "40% of 1,800");
+        assert_eq!(
+            b.balance(&ada, end) + b.balance(&bo, end),
+            -180_000,
+            "the shares have to add back to the year"
+        );
+        // And nothing was left in the year account.
+        assert_eq!(b.balance(&b.equity, end), 0);
+    }
+
+    /// Rounding is by largest remainder, so thirds of an odd number still add
+    /// back exactly — the property that stops a K-1 set totalling one cent short
+    /// of Schedule K.
+    #[test]
+    fn an_indivisible_result_still_adds_back_exactly() {
+        let mut b = books();
+        let (ada, bo) = as_a_partnership(&mut b, (50.0, 50.0));
+        // 1,000.01 of sales and nothing else: an odd number of cents.
+        let (cash, sales) = (b.cash.clone(), b.sales.clone());
+        b.post(day(2023, 5, 1), &cash, &sales, 100_001);
+
+        let closed = close_to_partners(&mut b, 2023).unwrap();
+        assert_eq!(closed.net_income_cents, 100_001);
+
+        let end = day(2023, 12, 31);
+        let (a, o) = (b.balance(&ada, end), b.balance(&bo, end));
+        assert_eq!(a + o, -100_001, "not a cent may go missing");
+        assert!((a - o).abs() == 1, "and the odd cent goes to one of them: {a} {o}");
+    }
+
+    /// A loss is a debit to capital, in each partner's share.
+    #[test]
+    fn a_loss_is_split_too() {
+        let mut b = books();
+        let (ada, bo) = as_a_partnership(&mut b, (60.0, 40.0));
+        let (cash, sales, rent) = (b.cash.clone(), b.sales.clone(), b.rent.clone());
+        b.post(day(2023, 3, 1), &cash, &sales, 100_000);
+        b.post(day(2023, 9, 1), &rent, &cash, 250_000);
+
+        let closed = close_to_partners(&mut b, 2023).unwrap();
+        assert_eq!(closed.net_income_cents, -150_000);
+
+        let end = day(2023, 12, 31);
+        assert_eq!(b.balance(&ada, end), 90_000, "a debit — capital went down");
+        assert_eq!(b.balance(&bo, end), 60_000);
+    }
+
+    /// Percentages that do not total 100% are apportioned as given by the
+    /// return, which reports what the records say. A journal entry cannot do
+    /// that — the missing part would leave it unbalanced — so it is refused.
+    #[test]
+    fn shares_that_do_not_total_are_refused_rather_than_posted_short() {
+        let mut b = books();
+        as_a_partnership(&mut b, (50.0, 40.0));
+        b.ordinary_year(2023);
+
+        let err = close_to_partners(&mut b, 2023).unwrap_err();
+        match err {
+            ClosingError::SharesDoNotTotal { year, total, .. } => {
+                assert_eq!(year, 2023);
+                assert_eq!(total, 180_000);
+            }
+            other => panic!("expected SharesDoNotTotal, got {other:?}"),
+        }
+        assert!(closing_entry_for(b.store.connection(), 2023).is_none());
+    }
+
+    #[test]
+    fn a_partner_with_no_capital_account_blocks_the_close() {
+        use crate::commands::partnership_commands::unlink_equity_account;
+
+        let mut b = books();
+        let (ada, _bo) = as_a_partnership(&mut b, (60.0, 40.0));
+        b.ordinary_year(2023);
+
+        let partner: String = b
+            .store
+            .connection()
+            .query_row(
+                "SELECT partner_id FROM partner_equity_accounts WHERE account_id = ?1",
+                [&ada],
+                |r| r.get(0),
+            )
+            .unwrap();
+        unlink_equity_account(&mut b.store, "u", &partner, &ada).unwrap();
+
+        let err = close_to_partners(&mut b, 2023).unwrap_err();
+        match err {
+            ClosingError::PartnerHasNoCapitalAccount { partner, .. } => {
+                assert_eq!(partner, "Ada");
+            }
+            other => panic!("expected PartnerHasNoCapitalAccount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_sole_proprietorship_cannot_close_to_partner_capital() {
+        let mut b = books();
+        set_business_type(&b.store, "sole_proprietorship");
+        b.ordinary_year(2023);
+
+        let err = close_to_partners(&mut b, 2023).unwrap_err();
+        assert!(
+            matches!(err, ClosingError::NotAPartnership { year: 2023 }),
+            "got {err:?}"
+        );
+    }
+
+    /// The preview shows the split it would post, and agrees with what the close
+    /// actually does.
+    #[test]
+    fn the_preview_shows_the_split() {
+        let mut b = books();
+        as_a_partnership(&mut b, (60.0, 40.0));
+        b.ordinary_year(2023);
+
+        let p = preview(
+            b.store.connection(),
+            2023,
+            false,
+            &ClosingTarget::PartnerCapital,
+        )
+        .unwrap();
+        assert!(p.blocker.is_none());
+        assert_eq!(p.allocation.len(), 2);
+        assert_eq!(
+            p.allocation.iter().map(|a| a.cents).sum::<i64>(),
+            p.net_income_cents
+        );
+        let ada = p.allocation.iter().find(|a| a.partner_name == "Ada").unwrap();
+        assert_eq!(ada.cents, 108_000);
+        assert!(ada.account_label.starts_with("3101"));
+
+        let closed = close_to_partners(&mut b, 2023).unwrap();
+        assert_eq!(closed.net_income_cents, p.net_income_cents);
+    }
+
+    /// The reason `capital.rs` had to change: the allocation lands in the
+    /// contribution account, and item L must not then report it as capital the
+    /// partner paid in *and* as their share of income.
+    #[test]
+    fn item_l_does_not_count_the_allocation_twice() {
+        use crate::commands::partnership_commands::partners_for_year;
+
+        let mut b = books();
+        as_a_partnership(&mut b, (60.0, 40.0));
+        b.ordinary_year(2023);
+        close_to_partners(&mut b, 2023).unwrap();
+
+        let partners = partners_for_year(b.store.connection(), 2023);
+        let refs: Vec<&crate::domain::Partner> = partners.iter().collect();
+        let capital =
+            crate::tax::capital::compute(b.store.connection(), 2023, &refs, 1_800).unwrap();
+
+        let ada = capital
+            .accounts
+            .iter()
+            .find(|a| a.partner_name == "Ada")
+            .unwrap();
+        assert_eq!(
+            ada.contributed, 0,
+            "the closing allocation is not a contribution"
+        );
+        assert_eq!(ada.net_income, 1_080, "it is her share of income, once");
+        assert_eq!(
+            ada.beginning + ada.contributed + ada.net_income - ada.withdrawals,
+            1_080,
+            "ending capital ties to the ledger"
+        );
     }
 
     #[test]

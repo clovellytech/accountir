@@ -1601,13 +1601,15 @@ impl SyncClient {
     /// this safe to retry against a moved head, and what stops two members
     /// closing the same year from two different pictures of it. The second one
     /// gets a `422` naming the entry that already closed it.
+    /// `equity_account_id` of `None` allocates to partner capital instead: one
+    /// line per partner, on the percentages in force across the year.
     pub async fn close_books(
         &mut self,
         year: i32,
-        equity_account_id: &str,
+        equity_account_id: Option<&str>,
         include_draws: bool,
     ) -> Result<i64, SyncClientError> {
-        let equity_account_id = equity_account_id.to_string();
+        let equity_account_id = equity_account_id.map(str::to_string);
         self.submit_retrying("/sync/commands/close-books", |head| {
             crate::sync::commands::fiscal::CloseBooksRequest {
                 expected_head_seq: head,

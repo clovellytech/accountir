@@ -847,7 +847,7 @@ mod tests {
 mod closing_tests {
     use super::*;
     use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
-    use crate::commands::closing_commands::{close_books, CloseBooksCommand};
+    use crate::commands::closing_commands::{close_books, CloseBooksCommand, ClosingTarget};
     use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
     use crate::events::types::JournalEntrySource;
     use crate::store::event_store::EventStore;
@@ -944,7 +944,7 @@ mod closing_tests {
                 "user",
                 CloseBooksCommand {
                     year,
-                    equity_account_id: equity,
+                    target: ClosingTarget::Account(equity),
                     include_draws: false,
                 },
             )
@@ -1093,7 +1093,7 @@ mod closing_tests {
             "user",
             CloseBooksCommand {
                 year: 2022,
-                equity_account_id: equity_2022,
+                target: ClosingTarget::Account(equity_2022),
                 include_draws: false,
             },
         )
@@ -1242,7 +1242,9 @@ mod deactivated_account_tests {
     /// post to — the reports seeing the account does not make it postable.
     #[test]
     fn closing_still_refuses_while_the_account_is_deactivated() {
-        use crate::commands::closing_commands::{close_books, CloseBooksCommand, ClosingError};
+        use crate::commands::closing_commands::{
+            close_books, CloseBooksCommand, ClosingError, ClosingTarget,
+        };
 
         let (mut store, _) = books_with_a_deactivated_expense();
         AccountCommands::new(&mut store, "u".to_string())
@@ -1269,7 +1271,7 @@ mod deactivated_account_tests {
             "u",
             CloseBooksCommand {
                 year: 2023,
-                equity_account_id: equity,
+                target: ClosingTarget::Account(equity),
                 include_draws: false,
             },
         )

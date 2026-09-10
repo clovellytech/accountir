@@ -444,9 +444,24 @@ pub fn compute(
             // net of what went in and what came out, and splitting it by role
             // would report a partner's lifetime contributions as their opening
             // capital and lose every draw they ever took.
-            beginning_cents += movement(conn, &link.account_id, None, Some(opening))?;
+            // The opening balance is a *position*, so it counts everything —
+            // including earlier years' closing entries, whose allocations are
+            // genuinely part of what this partner had at the start.
+            beginning_cents += movement(conn, &link.account_id, None, Some(opening), true)?;
 
-            let in_year = movement(conn, &link.account_id, Some(year_start), Some(year_end))?;
+            // The year's own contributions and draws are *activity*, and a
+            // closing entry is neither. Once a partnership closes to partner
+            // capital, this year's allocation lands in the contribution account —
+            // and counting it here would report it as capital the partner paid
+            // in, on row 2, while row 3 reports the same money as their share of
+            // income. One year's earnings, twice, on one K-1.
+            let in_year = movement(
+                conn,
+                &link.account_id,
+                Some(year_start),
+                Some(year_end),
+                false,
+            )?;
             match link.role {
                 Role::Contribution => contributed_cents += in_year,
                 Role::Draw => drawn_cents += in_year,
@@ -511,11 +526,18 @@ pub fn for_return(
 /// Voided entries are excluded, matching every other reader of this ledger — a
 /// reversed draw that still counted would show a partner having taken money the
 /// books say they gave back.
+/// What moved on an account between two dates.
+///
+/// `include_closing` decides whether year-end closing entries count. Both
+/// answers are needed and they are not interchangeable — see the two call sites
+/// in [`compute`], and `AccountQueries::period_movement` for the same
+/// distinction drawn for the income statement.
 fn movement(
     conn: &Connection,
     account_id: &str,
     from: Option<NaiveDate>,
     to: Option<NaiveDate>,
+    include_closing: bool,
 ) -> Result<i64, rusqlite::Error> {
     let mut sql = String::from(
         "SELECT COALESCE(SUM(jl.amount), 0)
@@ -523,6 +545,9 @@ fn movement(
          JOIN journal_entries je ON jl.entry_id = je.id
          WHERE jl.account_id = ?1 AND je.is_void = 0",
     );
+    if !include_closing {
+        sql.push_str(" AND (je.source IS NULL OR je.source != 'closing')");
+    }
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(account_id.to_string())];
     if let Some(from) = from {
         params.push(Box::new(from.to_string()));
