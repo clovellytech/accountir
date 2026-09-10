@@ -139,6 +139,13 @@ impl<'a> AccountQueries<'a> {
     }
 
     /// Get active accounts only
+    /// Accounts that may still be *posted to*.
+    ///
+    /// For pickers and forms — the places where somebody is choosing an account
+    /// to use. **Not for reports.** Deactivating an account does not erase what
+    /// was posted to it, so a report built from this list drops any balance a
+    /// deactivated account is still carrying, and then fails to foot. See
+    /// [`AccountQueries::get_all_accounts`].
     pub fn get_active_accounts(&self) -> Result<Vec<Account>, AccountQueryError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, account_type, account_number, name, parent_id, currency, description, is_active
@@ -187,9 +194,12 @@ impl<'a> AccountQueries<'a> {
             AccountType::Expense => "expense",
         };
 
+        // Includes deactivated accounts, like `get_all_accounts` — this is a
+        // reporting query, and a deactivated account still holds its balance.
+        // Callers offering a choice of account want `get_active_accounts`.
         let mut stmt = self.conn.prepare(
             "SELECT id, account_type, account_number, name, parent_id, currency, description, is_active
-             FROM accounts WHERE account_type = ?1 AND is_active = 1 ORDER BY account_number",
+             FROM accounts WHERE account_type = ?1 ORDER BY account_number",
         )?;
 
         let accounts = stmt
@@ -278,12 +288,22 @@ impl<'a> AccountQueries<'a> {
         )?)
     }
 
-    /// Get all account balances
+    /// Every account's balance, deactivated accounts included.
+    ///
+    /// Deliberately every account. This built itself from
+    /// [`get_active_accounts`](AccountQueries::get_active_accounts), so an
+    /// account deactivated while still carrying a balance vanished from the
+    /// trial balance and the balance sheet — taking its balance with it and
+    /// leaving both reports not footing, with nothing to say why. Deactivating
+    /// an account means "do not post to this again", not "this never happened".
+    ///
+    /// Callers already skip zero balances, so the accounts this adds are exactly
+    /// the ones whose absence was the bug.
     pub fn get_all_balances(
         &self,
         as_of_date: Option<NaiveDate>,
     ) -> Result<Vec<AccountBalance>, AccountQueryError> {
-        let accounts = self.get_active_accounts()?;
+        let accounts = self.get_all_accounts()?;
         let mut balances = Vec::new();
 
         for account in accounts {

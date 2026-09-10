@@ -260,7 +260,11 @@ impl<'a> Reports<'a> {
 
         // Get balances for the period
         let queries = AccountQueries::new(self.conn);
-        let accounts = queries.get_active_accounts()?;
+        // Every account, not just the active ones: an expense account
+        // deactivated in July still holds what was posted to it in June, and a
+        // P&L that leaves it out understates the year and does not tie to the
+        // trial balance.
+        let accounts = queries.get_all_accounts()?;
 
         for account in accounts {
             if !account.account_type.is_income_statement() {
@@ -1110,5 +1114,169 @@ mod closing_tests {
         let bs = reports.balance_sheet(day(2023, 12, 31)).unwrap();
         assert!(bs.is_balanced);
         assert_eq!(bs.equity.total, 400_000, "both years' results, once each");
+    }
+}
+
+/// Deactivated accounts that still carry a balance.
+///
+/// Deactivating an account means "do not post to this again". It does not
+/// unwrite what was posted to it, so a report that filters on the active flag
+/// silently loses that balance — and then does not foot, with nothing on the
+/// page to say which account went missing or why the totals disagree.
+#[cfg(test)]
+mod deactivated_account_tests {
+    use super::*;
+    use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
+    use crate::commands::entry_commands::{EntryCommands, EntryLine, PostEntryCommand};
+    use crate::events::types::JournalEntrySource;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// Cash, a revenue account and an expense account; 500 of sales and 300 of
+    /// rent in 2023. The expense account is then deactivated, still holding its
+    /// 300.
+    fn books_with_a_deactivated_expense() -> (EventStore, String) {
+        let store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        let mut store = store;
+
+        for (ty, number, name) in [
+            (AccountType::Asset, "1000", "Cash"),
+            (AccountType::Revenue, "4000", "Sales"),
+            (AccountType::Expense, "6100", "Rent"),
+        ] {
+            AccountCommands::new(&mut store, "u".to_string())
+                .create_account(CreateAccountCommand {
+                    account_type: ty,
+                    account_number: number.to_string(),
+                    name: name.to_string(),
+                    parent_id: None,
+                    currency: Some("USD".to_string()),
+                    description: None,
+                })
+                .unwrap();
+        }
+        let id = |store: &EventStore, n: &str| -> String {
+            store
+                .connection()
+                .query_row("SELECT id FROM accounts WHERE account_number = ?1", [n], |r| {
+                    r.get(0)
+                })
+                .unwrap()
+        };
+        let (cash, sales, rent) = (id(&store, "1000"), id(&store, "4000"), id(&store, "6100"));
+
+        for (date, debit, credit, cents) in [
+            (day(2023, 3, 1), &cash, &sales, 50_000i64),
+            (day(2023, 6, 1), &rent, &cash, 30_000),
+        ] {
+            EntryCommands::new(&mut store, "u".to_string())
+                .post_entry(PostEntryCommand {
+                    date,
+                    memo: "t".to_string(),
+                    lines: vec![
+                        EntryLine::debit(debit, cents, "USD"),
+                        EntryLine::credit(credit, cents, "USD"),
+                    ],
+                    reference: None,
+                    source: Some(JournalEntrySource::Manual),
+                })
+                .unwrap();
+        }
+
+        store
+            .connection()
+            .execute("UPDATE accounts SET is_active = 0 WHERE id = ?1", [&rent])
+            .unwrap();
+
+        (store, rent)
+    }
+
+    #[test]
+    fn the_trial_balance_still_foots() {
+        let (store, rent) = books_with_a_deactivated_expense();
+        let tb = Reports::new(store.connection())
+            .trial_balance(Some(day(2023, 12, 31)))
+            .unwrap();
+
+        assert!(
+            tb.is_balanced,
+            "debits {} credits {} — a deactivated account took its balance out of one side",
+            tb.total_debits, tb.total_credits
+        );
+        assert!(
+            tb.lines.iter().any(|l| l.account_id == rent),
+            "the deactivated account has a balance and belongs on the trial balance"
+        );
+    }
+
+    #[test]
+    fn the_income_statement_still_counts_it() {
+        let (store, _) = books_with_a_deactivated_expense();
+        let is = Reports::new(store.connection())
+            .income_statement(day(2023, 1, 1), day(2023, 12, 31))
+            .unwrap();
+
+        assert_eq!(is.revenue.total, 50_000);
+        assert_eq!(is.expenses.total, 30_000, "the deactivated rent still happened");
+        assert_eq!(is.net_income, 20_000);
+    }
+
+    #[test]
+    fn the_balance_sheet_still_balances() {
+        let (store, _) = books_with_a_deactivated_expense();
+        let bs = Reports::new(store.connection())
+            .balance_sheet(day(2023, 12, 31))
+            .unwrap();
+
+        assert!(bs.is_balanced);
+        assert_eq!(bs.total_assets, 20_000);
+        assert_eq!(bs.equity.total, 20_000);
+    }
+
+    /// The close still refuses rather than sweeping into an account nothing can
+    /// post to — the reports seeing the account does not make it postable.
+    #[test]
+    fn closing_still_refuses_while_the_account_is_deactivated() {
+        use crate::commands::closing_commands::{close_books, CloseBooksCommand, ClosingError};
+
+        let (mut store, _) = books_with_a_deactivated_expense();
+        AccountCommands::new(&mut store, "u".to_string())
+            .create_account(CreateAccountCommand {
+                account_type: AccountType::Equity,
+                account_number: "3023".to_string(),
+                name: "2023".to_string(),
+                parent_id: None,
+                currency: Some("USD".to_string()),
+                description: None,
+            })
+            .unwrap();
+        let equity: String = store
+            .connection()
+            .query_row(
+                "SELECT id FROM accounts WHERE account_number = '3023'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let err = close_books(
+            &mut store,
+            "u",
+            CloseBooksCommand {
+                year: 2023,
+                equity_account_id: equity,
+                include_draws: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ClosingError::InactiveAccountHoldsBalance { .. }),
+            "got {err:?}"
+        );
     }
 }

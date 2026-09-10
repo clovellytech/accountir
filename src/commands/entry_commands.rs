@@ -31,6 +31,13 @@ pub enum EntryCommandError {
     NotVoided,
     #[error("The books are closed for the year containing {0}")]
     YearClosed(NaiveDate),
+    #[error(
+        "This is the closing entry for {year}, and {year} is closed. Voiding it on its own would \
+         leave the year locked with nothing to show what it earned, and no way to post the \
+         correction. Reopen {year} from the Year end page instead — that voids this entry and \
+         lifts the lock together."
+    )]
+    ClosingEntryFenced { year: i32 },
     #[error("An entry with reference {reference} already exists")]
     DuplicateReference {
         reference: String,
@@ -102,6 +109,24 @@ pub(crate) fn check_entry_invariants_in_txn(
     }
 
     Ok(None)
+}
+
+/// The fiscal year this entry closes, if it is a live closing entry and that
+/// year is still closed. `None` for every ordinary entry.
+fn closing_entry_in_a_closed_year(
+    tx: &rusqlite::Transaction<'_>,
+    entry_id: &str,
+) -> Result<Option<i32>, EventStoreError> {
+    Ok(tx
+        .query_row(
+            "SELECT fy.year FROM journal_entries je
+               JOIN fiscal_years fy
+                 ON je.date BETWEEN fy.start_date AND fy.end_date
+              WHERE je.id = ?1 AND je.source = 'closing' AND fy.is_closed = 1",
+            [entry_id],
+            |r| r.get::<_, i32>(0),
+        )
+        .optional()?)
 }
 
 /// Re-check, inside an append transaction, that a journal entry exists and is not
@@ -541,6 +566,19 @@ pub(crate) fn build_void_entry_in_txn(
 ) -> Result<PostEntryStep, EventStoreError> {
     if let Some(e) = check_entry_not_voided_in_txn(tx, &cmd.entry_id)? {
         return Ok(PostEntryStep::Reject(e));
+    }
+    // Voiding a closing entry while its year is still closed reaches a state
+    // nothing can get out of by ordinary means: the balances come back, the
+    // fence stays up, and the entry that would put them away again cannot be
+    // posted. Reopening is the operation that does both, in one append.
+    //
+    // `closing_commands::reopen_books` builds its void event directly rather
+    // than through here, for exactly this reason — it is lifting the same fence
+    // in the same transaction.
+    if let Some(year) = closing_entry_in_a_closed_year(tx, &cmd.entry_id)? {
+        return Ok(PostEntryStep::Reject(
+            EntryCommandError::ClosingEntryFenced { year },
+        ));
     }
     Ok(PostEntryStep::Append(Event::JournalEntryVoided {
         entry_id: cmd.entry_id.clone(),

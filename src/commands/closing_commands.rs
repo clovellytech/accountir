@@ -47,7 +47,7 @@ use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
 use crate::commands::entry_commands::{
-    build_post_entry_in_txn, EntryLine, PostEntryCommand, PostEntryStep, VoidEntryCommand,
+    build_post_entry_in_txn, EntryLine, PostEntryCommand, PostEntryStep,
 };
 use crate::commands::fiscal_year_commands::{boundaries_for, load_year, FiscalYearCommands};
 use crate::domain::AccountType;
@@ -800,18 +800,19 @@ pub fn reopen_books(
 
                 let mut events = Vec::new();
                 if let Some(entry_id) = entry_id {
-                    let void = VoidEntryCommand {
-                        entry_id,
-                        reason: format!("Reopening {year}: {reason}"),
-                    };
-                    match crate::commands::entry_commands::build_void_entry_in_txn(tx, &void)? {
-                        PostEntryStep::Append(event) => {
-                            events.push(EventEnvelope::new(event, user_id.clone()))
-                        }
-                        PostEntryStep::Reject(e) => {
-                            return Ok(Verdict::Reject(ClosingError::Entry(e.to_string())))
-                        }
-                    }
+                    // Built directly rather than through `build_void_entry_in_txn`,
+                    // which refuses to void a closing entry while its year is
+                    // closed — the state this very batch is undoing. Its other
+                    // check, that the entry is live, `closing_entry_for` has
+                    // already made: it only returns entries with `is_void = 0`,
+                    // and nothing else can touch them under this write lock.
+                    events.push(EventEnvelope::new(
+                        Event::JournalEntryVoided {
+                            entry_id,
+                            reason: format!("Reopening {year}: {reason}"),
+                        },
+                        user_id.clone(),
+                    ));
                 }
                 events.push(EventEnvelope::new(
                     Event::YearEndReopened {
@@ -1349,6 +1350,73 @@ mod tests {
         let second = b.close(2023).unwrap();
         assert_ne!(second.entry_id, first.entry_id);
         assert_eq!(second.net_income_cents, 280_000);
+    }
+
+    /// Voiding the closing entry on its own would put the books somewhere
+    /// nothing can get them out of: the balances come back, the fence stays up,
+    /// and the entry that would put them away again cannot be posted.
+    #[test]
+    fn the_closing_entry_cannot_be_voided_while_the_year_is_closed() {
+        use crate::commands::entry_commands::VoidEntryCommand;
+
+        let mut b = books();
+        b.ordinary_year(2023);
+        let closed = b.close(2023).unwrap();
+
+        let err = EntryCommands::new(&mut b.store, "user".to_string())
+            .void_entry(VoidEntryCommand {
+                entry_id: closed.entry_id.clone(),
+                reason: "changed my mind".to_string(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, EntryCommandError::ClosingEntryFenced { year: 2023 }),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("Reopen"),
+            "the refusal has to name the way out: {err}"
+        );
+
+        // Still intact, and still closed.
+        assert_eq!(
+            closing_entry_for(b.store.connection(), 2023).as_deref(),
+            Some(closed.entry_id.as_str())
+        );
+        assert!(load_year(b.store.connection(), 2023).unwrap().unwrap().is_closed);
+
+        // Reopening does void it — that is the door.
+        reopen_books(&mut b.store, "user", 2023, "correcting an invoice").unwrap();
+        assert!(closing_entry_for(b.store.connection(), 2023).is_none());
+    }
+
+    /// Once the year is open again, its old closing entry is an ordinary voided
+    /// entry and the fence has nothing to say about a later one.
+    #[test]
+    fn an_ordinary_entry_is_still_voidable_in_a_closed_year() {
+        let mut b = books();
+        b.ordinary_year(2023);
+        // A live 2024 entry, and 2023 closed. The fence keys on the entry's own
+        // year, so a 2024 entry is unaffected by 2023 being shut.
+        let (cash, sales) = (b.cash.clone(), b.sales.clone());
+        b.post(day(2024, 2, 1), &cash, &sales, 10_000);
+        b.close(2023).unwrap();
+
+        let entry_2024: String = b
+            .store
+            .connection()
+            .query_row(
+                "SELECT id FROM journal_entries WHERE date = '2024-02-01'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        EntryCommands::new(&mut b.store, "user".to_string())
+            .void_entry(crate::commands::entry_commands::VoidEntryCommand {
+                entry_id: entry_2024,
+                reason: "duplicate".to_string(),
+            })
+            .unwrap();
     }
 
     #[test]
