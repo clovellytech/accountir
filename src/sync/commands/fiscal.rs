@@ -123,9 +123,9 @@ async fn submit_close_books(
             expected,
             move |tx| {
                 Ok(match build_close_books_in_txn(tx, &cmd)? {
-                    Verdict::Append(events) => Verdict::Append(
-                        events.into_iter().map(|e| stamp(e, &actor)).collect(),
-                    ),
+                    Verdict::Append(events) => {
+                        Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect())
+                    }
                     Verdict::Reject(e) => Verdict::Reject(e),
                 })
             },
@@ -159,9 +159,9 @@ async fn submit_reopen_year(
             move |tx| {
                 Ok(
                     match build_reopen_books_in_txn(tx, year, &reason, &actor)? {
-                        Verdict::Append(events) => Verdict::Append(
-                            events.into_iter().map(|e| stamp(e, &actor)).collect(),
-                        ),
+                        Verdict::Append(events) => {
+                            Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect())
+                        }
                         Verdict::Reject(e) => Verdict::Reject(e),
                     },
                 )
@@ -193,11 +193,8 @@ mod tests {
 
     /// A group's books with 2023 trading: 5,000 of sales against 3,000 of rent.
     /// Returns the base URL, the store handle, and the equity account's id.
-    async fn serve_with_a_year_to_close() -> (
-        String,
-        std::sync::Arc<std::sync::Mutex<EventStore>>,
-        String,
-    ) {
+    async fn serve_with_a_year_to_close(
+    ) -> (String, std::sync::Arc<std::sync::Mutex<EventStore>>, String) {
         let mut store = {
             let s = EventStore::in_memory().unwrap();
             init_schema(s.connection()).unwrap();
@@ -233,9 +230,11 @@ mod tests {
         let id = |store: &EventStore, n: &str| -> String {
             store
                 .connection()
-                .query_row("SELECT id FROM accounts WHERE account_number = ?1", [n], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT id FROM accounts WHERE account_number = ?1",
+                    [n],
+                    |r| r.get(0),
+                )
                 .unwrap()
         };
         let (cash, sales, rent, equity) = (
@@ -333,7 +332,10 @@ mod tests {
         assert!(new_head > head);
 
         assert_eq!(
-            count(&store, "SELECT is_closed FROM fiscal_years WHERE year = 2023"),
+            count(
+                &store,
+                "SELECT is_closed FROM fiscal_years WHERE year = 2023"
+            ),
             1
         );
         assert_eq!(
@@ -478,7 +480,11 @@ mod tests {
             body["error"].as_str().unwrap().contains("already closed"),
             "{body}"
         );
-        assert_eq!(head_of(&base).await, head, "a rejection must not move the log");
+        assert_eq!(
+            head_of(&base).await,
+            head,
+            "a rejection must not move the log"
+        );
         assert_eq!(
             count(
                 &store,
@@ -606,7 +612,10 @@ mod tests {
         assert_eq!(r.status(), reqwest::StatusCode::OK);
 
         assert_eq!(
-            count(&store, "SELECT is_closed FROM fiscal_years WHERE year = 2023"),
+            count(
+                &store,
+                "SELECT is_closed FROM fiscal_years WHERE year = 2023"
+            ),
             0
         );
         assert_eq!(

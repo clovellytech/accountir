@@ -541,13 +541,12 @@ fn partner_capital_lines(
 
 /// The equity accounts linked to a partner in the "draw" role.
 fn draw_account_ids(conn: &Connection) -> Vec<String> {
-    let mut stmt = match conn
-        .prepare("SELECT account_id FROM partner_equity_accounts WHERE role = 'draw'")
-    {
-        Ok(s) => s,
-        // The table is absent on a ledger predating migration 037; no draws.
-        Err(_) => return Vec::new(),
-    };
+    let mut stmt =
+        match conn.prepare("SELECT account_id FROM partner_equity_accounts WHERE role = 'draw'") {
+            Ok(s) => s,
+            // The table is absent on a ledger predating migration 037; no draws.
+            Err(_) => return Vec::new(),
+        };
     let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -634,9 +633,7 @@ pub fn preview(
             ));
         }
     }
-    if let Some(stale) =
-        crate::commands::depreciation_commands::posting_is_stale(conn, year)
-    {
+    if let Some(stale) = crate::commands::depreciation_commands::posting_is_stale(conn, year) {
         warnings.push(stale);
     }
 
@@ -840,9 +837,8 @@ pub(crate) fn build_close_books_in_txn(
                 // the negation — the same orientation the single-account line
                 // has, applied per partner.
                 lines.push(
-                    EntryLine::signed(&share.account_id, -share.cents, &currency).with_memo(
-                        &format!("{}'s share of {}", share.partner_name, cmd.year),
-                    ),
+                    EntryLine::signed(&share.account_id, -share.cents, &currency)
+                        .with_memo(&format!("{}'s share of {}", share.partner_name, cmd.year)),
                 );
             }
         }
@@ -868,9 +864,7 @@ pub(crate) fn build_close_books_in_txn(
 
     let entry_event = match build_post_entry_in_txn(tx, &post)? {
         PostEntryStep::Append(event) => event,
-        PostEntryStep::Reject(e) => {
-            return Ok(Verdict::Reject(ClosingError::Entry(e.to_string())))
-        }
+        PostEntryStep::Reject(e) => return Ok(Verdict::Reject(ClosingError::Entry(e.to_string()))),
     };
     let entry_id = match &entry_event {
         Event::JournalEntryPosted { entry_id, .. } => entry_id.clone(),
@@ -1072,15 +1066,17 @@ pub fn reopen_books(
         let outcome = store.append_checked_many(
             head,
             move |tx| {
-                Ok(match build_reopen_books_in_txn(tx, year, &reason, &user_id)? {
-                    Verdict::Append(events) => Verdict::Append(
-                        events
-                            .into_iter()
-                            .map(|e| EventEnvelope::new(e, user_id.clone()))
-                            .collect(),
-                    ),
-                    Verdict::Reject(e) => Verdict::Reject(e),
-                })
+                Ok(
+                    match build_reopen_books_in_txn(tx, year, &reason, &user_id)? {
+                        Verdict::Append(events) => Verdict::Append(
+                            events
+                                .into_iter()
+                                .map(|e| EventEnvelope::new(e, user_id.clone()))
+                                .collect(),
+                        ),
+                        Verdict::Reject(e) => Verdict::Reject(e),
+                    },
+                )
             },
             |tx, stored| {
                 Projector::new(tx)
@@ -1396,10 +1392,7 @@ mod tests {
         b.ordinary_year(2023);
         b.store
             .connection()
-            .execute(
-                "UPDATE accounts SET is_active = 0 WHERE id = ?1",
-                [&b.rent],
-            )
+            .execute("UPDATE accounts SET is_active = 0 WHERE id = ?1", [&b.rent])
             .unwrap();
 
         let err = b.close(2023).unwrap_err();
@@ -1545,9 +1538,7 @@ mod tests {
             let mut stmt = conn
                 .prepare("SELECT event_type FROM events WHERE id > ?1 ORDER BY id")
                 .unwrap();
-            let rows = stmt
-                .query_map([before], |r| r.get::<_, String>(0))
-                .unwrap();
+            let rows = stmt.query_map([before], |r| r.get::<_, String>(0)).unwrap();
             rows.filter_map(|r| r.ok()).collect()
         };
         // `fiscal_year_opened` precedes them: the year had never been opened.
@@ -1584,7 +1575,10 @@ mod tests {
                 source: Some(JournalEntrySource::Manual),
             })
             .unwrap_err();
-        assert!(matches!(err, EntryCommandError::YearClosed(_)), "got {err:?}");
+        assert!(
+            matches!(err, EntryCommandError::YearClosed(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1595,7 +1589,13 @@ mod tests {
 
         reopen_books(&mut b.store, "user", 2023, "found a missing invoice").unwrap();
 
-        assert!(load_year(b.store.connection(), 2023).unwrap().unwrap().is_closed == false);
+        assert!(
+            load_year(b.store.connection(), 2023)
+                .unwrap()
+                .unwrap()
+                .is_closed
+                == false
+        );
         assert!(closing_entry_for(b.store.connection(), 2023).is_none());
         assert_eq!(
             b.balance(&b.sales, day(2023, 12, 31)),
@@ -1644,7 +1644,12 @@ mod tests {
             closing_entry_for(b.store.connection(), 2023).as_deref(),
             Some(closed.entry_id.as_str())
         );
-        assert!(load_year(b.store.connection(), 2023).unwrap().unwrap().is_closed);
+        assert!(
+            load_year(b.store.connection(), 2023)
+                .unwrap()
+                .unwrap()
+                .is_closed
+        );
 
         // Reopening does void it — that is the door.
         reopen_books(&mut b.store, "user", 2023, "correcting an invoice").unwrap();
@@ -1754,7 +1759,10 @@ mod tests {
         let after = preview(b.store.connection(), 2023, false, &target).unwrap();
         assert!(after.is_closed());
         assert_eq!(after.closed_by.as_deref(), Some(closed.entry_id.as_str()));
-        assert!(after.blocker.is_some(), "a closed year reports why it cannot close again");
+        assert!(
+            after.blocker.is_some(),
+            "a closed year reports why it cannot close again"
+        );
     }
 
     #[test]
@@ -1942,9 +1950,11 @@ mod tests {
         let id = |b: &Books, n: &str| -> String {
             b.store
                 .connection()
-                .query_row("SELECT id FROM accounts WHERE account_number = ?1", [n], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT id FROM accounts WHERE account_number = ?1",
+                    [n],
+                    |r| r.get(0),
+                )
                 .unwrap()
         };
         for (partner, number, role) in [
@@ -2011,7 +2021,10 @@ mod tests {
         let end = day(2023, 12, 31);
         let (a, o) = (b.balance(&ada, end), b.balance(&bo, end));
         assert_eq!(a + o, -100_001, "not a cent may go missing");
-        assert!((a - o).abs() == 1, "and the odd cent goes to one of them: {a} {o}");
+        assert!(
+            (a - o).abs() == 1,
+            "and the odd cent goes to one of them: {a} {o}"
+        );
     }
 
     /// A loss is a debit to capital, in each partner's share.
@@ -2113,7 +2126,11 @@ mod tests {
             p.allocation.iter().map(|a| a.cents).sum::<i64>(),
             p.net_income_cents
         );
-        let ada = p.allocation.iter().find(|a| a.partner_name == "Ada").unwrap();
+        let ada = p
+            .allocation
+            .iter()
+            .find(|a| a.partner_name == "Ada")
+            .unwrap();
         assert_eq!(ada.cents, 108_000);
         assert!(ada.account_label.starts_with("3101"));
 

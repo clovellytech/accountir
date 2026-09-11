@@ -331,7 +331,10 @@ mod tests {
 
         store
             .connection()
-            .execute("UPDATE fiscal_years SET is_closed = 1 WHERE year = 2024", [])
+            .execute(
+                "UPDATE fiscal_years SET is_closed = 1 WHERE year = 2024",
+                [],
+            )
             .unwrap();
 
         for date in [day(2024, 1, 1), day(2024, 6, 15), day(2024, 12, 31)] {
@@ -457,7 +460,10 @@ mod containing_tests {
         let store = store_with_start_month(1);
         let fy = fiscal_year_containing(store.connection(), day(2026, 3, 4));
         assert_eq!(fy.year, 2026);
-        assert_eq!((fy.start_date, fy.end_date), (day(2026, 1, 1), day(2026, 12, 31)));
+        assert_eq!(
+            (fy.start_date, fy.end_date),
+            (day(2026, 1, 1), day(2026, 12, 31))
+        );
     }
 
     /// The half of a July-start year that falls in the *next* calendar year is
@@ -469,14 +475,26 @@ mod containing_tests {
 
         let after = fiscal_year_containing(store.connection(), day(2026, 8, 1));
         assert_eq!(after.year, 2026);
-        assert_eq!((after.start_date, after.end_date), (day(2026, 7, 1), day(2027, 6, 30)));
+        assert_eq!(
+            (after.start_date, after.end_date),
+            (day(2026, 7, 1), day(2027, 6, 30))
+        );
 
         let before = fiscal_year_containing(store.connection(), day(2026, 3, 4));
         assert_eq!(before.year, 2025, "March 2026 is still fiscal 2025");
-        assert_eq!((before.start_date, before.end_date), (day(2025, 7, 1), day(2026, 6, 30)));
+        assert_eq!(
+            (before.start_date, before.end_date),
+            (day(2025, 7, 1), day(2026, 6, 30))
+        );
 
         // The boundary days themselves.
-        assert_eq!(fiscal_year_containing(store.connection(), day(2026, 6, 30)).year, 2025);
-        assert_eq!(fiscal_year_containing(store.connection(), day(2026, 7, 1)).year, 2026);
+        assert_eq!(
+            fiscal_year_containing(store.connection(), day(2026, 6, 30)).year,
+            2025
+        );
+        assert_eq!(
+            fiscal_year_containing(store.connection(), day(2026, 7, 1)).year,
+            2026
+        );
     }
 }

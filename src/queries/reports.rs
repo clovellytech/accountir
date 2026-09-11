@@ -202,7 +202,8 @@ impl<'a> Reports<'a> {
         // of time: once a year is closed its result sits in a real equity
         // account, and counting it here as well would show it twice and take the
         // sheet out of balance.
-        let income = self.calculate_net_income(self.unclosed_from(as_of_date)?, Some(as_of_date))?;
+        let income =
+            self.calculate_net_income(self.unclosed_from(as_of_date)?, Some(as_of_date))?;
         if income != 0 {
             equity.push(BalanceSheetLine {
                 account_id: "__net_income__".to_string(),
@@ -990,7 +991,11 @@ mod closing_tests {
             .balance_sheet(day(2023, 12, 31))
             .unwrap();
 
-        assert!(bs.is_balanced, "assets {} vs L+E {}", bs.total_assets, bs.total_liabilities_and_equity);
+        assert!(
+            bs.is_balanced,
+            "assets {} vs L+E {}",
+            bs.total_assets, bs.total_liabilities_and_equity
+        );
         assert_eq!(bs.total_assets, 200_000);
         assert_eq!(bs.equity.total, 200_000);
         assert!(
@@ -1163,9 +1168,11 @@ mod deactivated_account_tests {
         let id = |store: &EventStore, n: &str| -> String {
             store
                 .connection()
-                .query_row("SELECT id FROM accounts WHERE account_number = ?1", [n], |r| {
-                    r.get(0)
-                })
+                .query_row(
+                    "SELECT id FROM accounts WHERE account_number = ?1",
+                    [n],
+                    |r| r.get(0),
+                )
                 .unwrap()
         };
         let (cash, sales, rent) = (id(&store, "1000"), id(&store, "4000"), id(&store, "6100"));
@@ -1222,7 +1229,10 @@ mod deactivated_account_tests {
             .unwrap();
 
         assert_eq!(is.revenue.total, 50_000);
-        assert_eq!(is.expenses.total, 30_000, "the deactivated rent still happened");
+        assert_eq!(
+            is.expenses.total, 30_000,
+            "the deactivated rent still happened"
+        );
         assert_eq!(is.net_income, 20_000);
     }
 

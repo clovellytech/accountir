@@ -174,10 +174,7 @@ mod tests {
     #[test]
     fn reopening_clears_the_entry_and_refuses_on_an_open_year() {
         let mut fy = FiscalYear::calendar_year(2024);
-        assert!(matches!(
-            fy.reopen(),
-            Err(FiscalYearError::AlreadyOpen)
-        ));
+        assert!(matches!(fy.reopen(), Err(FiscalYearError::AlreadyOpen)));
 
         fy.close("entry-1".to_string()).unwrap();
         fy.reopen().unwrap();
