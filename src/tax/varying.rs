@@ -250,13 +250,91 @@ fn figure_for(lines: &Form1065Lines, key: &str) -> i64 {
 ///
 /// Falls back to the year-end split when the segments carry nothing to weight
 /// by, which is the same fallback `split_across_partners` makes and names.
+///
+/// # Which line the segments are weighted by
+///
+/// `line` names the figure each part of the year is weighted by — not the figure
+/// being split, which is `total`. [`ANALYSIS`] is the usual answer: item L row 3
+/// and the closing entry are shares of the whole of Schedule K, so the year's
+/// parts are weighted by what the whole of Schedule K did in each of them.
+///
+/// A caller splitting **one line** has to pass that line's own key instead, and
+/// this parameter exists because getting it wrong is not a rounding error. Item L
+/// row 4 and the line 18c statements are shares of line 18c, and
+/// `split_across_partners` weights box 18 code C by line 18c. Weighting one of
+/// them by `k_analysis` put a statement of 140 on the same page as a box of 180
+/// on a $200 line — a partnership that earned evenly and spent its meals in one
+/// half of the year is enough to produce it, and nothing on the finished K-1
+/// shows which of the two figures is the one to believe.
 pub fn allocate_over_year(
     conn: &rusqlite::Connection,
     year: i32,
     total: i64,
     partners: &[&crate::domain::Partner],
     basis: Basis,
+    line: &str,
 ) -> Vec<crate::tax::allocate::Share> {
+    year_split(conn, year, partners, basis, line).allocate(total)
+}
+
+/// The split a year's figures travel on, worked out once.
+///
+/// [`allocate_over_year`] reads the share periods and, on a segmented year, one
+/// income statement per segment — every time it is called. A caller splitting
+/// *one* figure should keep calling it. A caller splitting a list of figures on
+/// the same basis and the same line — [`crate::tax::nondeductible`], which walks
+/// the running total of line 18c's components — would otherwise re-read the same
+/// ledger once per item to arrive at the same percentages, so it takes the
+/// percentages once and does the arithmetic itself.
+pub struct YearSplit {
+    /// The partners as passed, with their dated series filled in from the books
+    /// where the caller left it empty. Borrowed out for the fallback path, which
+    /// reads percentages off them.
+    partners: Vec<crate::domain::Partner>,
+    /// The §706(d) effective percentages, when the year was segmented and the
+    /// segments carried something to weight by. `None` means the ordinary case:
+    /// one split, the percentages in force at year end.
+    effective: Option<Vec<i64>>,
+    year_end: NaiveDate,
+    basis: Basis,
+}
+
+impl YearSplit {
+    /// Split `total` on this year's percentages, exactly.
+    ///
+    /// Repeatable and free of the ledger: the same instance splits a hundred
+    /// figures on one read of the books, and every one of them lands on the same
+    /// percentages — which is the point, because two figures on one K-1 split on
+    /// two readings of the same year is the defect this whole module exists over.
+    pub fn allocate(&self, total: i64) -> Vec<crate::tax::allocate::Share> {
+        let refs: Vec<&crate::domain::Partner> = self.partners.iter().collect();
+        match &self.effective {
+            Some(ppm) => crate::tax::allocate::allocate_on_ppm(total, ppm),
+            // The sign of each figure still decides profit or loss here, which is
+            // why the fallback cannot be reduced to a percentage vector too.
+            None => {
+                crate::tax::allocate::allocate_as_of(total, &refs, self.basis, Some(self.year_end))
+            }
+        }
+    }
+
+    /// Whether the year was divided at a change of partnership interest.
+    pub fn is_segmented(&self) -> bool {
+        self.effective.is_some()
+    }
+}
+
+/// Work out [`YearSplit`] for a year, reading the books once.
+///
+/// `line` is what the year's parts are weighted by — see [`allocate_over_year`],
+/// which is this followed by one [`YearSplit::allocate`].
+pub fn year_split(
+    conn: &rusqlite::Connection,
+    year: i32,
+    partners: &[&crate::domain::Partner],
+    basis: Basis,
+    line: &str,
+) -> YearSplit {
     let (year_start, year_end) = crate::commands::partnership_commands::calendar_year(year);
     // Only the dated series is taken from the books. Replacing the whole record
     // would silently overwrite whatever the caller passed — their percentages,
@@ -280,6 +358,7 @@ pub fn allocate_over_year(
         .collect();
 
     let spans = segments(&owned, year_start, year_end);
+    let mut effective = None;
     if spans.len() > 1 {
         let mapping = crate::tax::lines::load_effective_mapping(conn, year);
         let limits = crate::tax::lines::load_effective_limits(conn, year);
@@ -297,17 +376,23 @@ pub fn allocate_over_year(
         // Referenced against the partners *as passed*, whose `history` the caller
         // may not have filled — so the borrowed slice is rebuilt from `owned`.
         let with_history: Vec<&crate::domain::Partner> = owned.iter().collect();
-        if let Some(ppm) = effective_ppm(&with_history, &segs, ANALYSIS, basis) {
-            return crate::tax::allocate::allocate_on_ppm(total, &ppm);
-        }
+        effective = effective_ppm(&with_history, &segs, line, basis);
     }
-    let with_history: Vec<&crate::domain::Partner> = owned.iter().collect();
-    crate::tax::allocate::allocate_as_of(total, &with_history, basis, Some(year_end))
+
+    YearSplit {
+        partners: owned,
+        effective,
+        year_end,
+        basis,
+    }
 }
 
 /// The line key standing for "the whole of Schedule K", which item L row 3 and
 /// the Analysis of Net Income are both a share of.
-const ANALYSIS: &str = "k_analysis";
+///
+/// Public because it is what a caller of [`allocate_over_year`] passes when the
+/// figure being split is the year's result rather than one line of it.
+pub const ANALYSIS: &str = "k_analysis";
 
 /// Spread one year's figures across its segments in proportion to their length.
 ///

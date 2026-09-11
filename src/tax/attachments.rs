@@ -148,6 +148,14 @@ pub fn required(
         // entered the assets.
         let is_4562 = a.name == "Form 4562";
         let produced = a.generated || (is_4562 && asset_register_size > 0);
+        // The nondeductible-expenses statement is the one attachment that is not
+        // a single page supporting a single box. The entity's Schedule K figure
+        // gets one, and so does every partner's share of it, because item L row
+        // 4 and box 18 code C reach each partner as a bare figure on a row the
+        // K-1 instructions say to attach an explanation for. Said here because a
+        // filer counting pages against this list would otherwise find more of
+        // them than they were told to expect.
+        let is_nondeductible = a.name == super::lines::NONDEDUCTIBLE_STATEMENT.name;
         let because = if is_4562 && produced {
             format!(
                 "{where_} carries a figure, and the register holds {asset_register_size} asset(s) — the schedule is computed from them."
@@ -155,6 +163,14 @@ pub fn required(
         } else if is_4562 {
             format!(
                 "{where_} carries a figure, and no depreciable asset is on the register. Enter the assets to have this computed, or fill it in yourself."
+            )
+        } else if is_nondeductible {
+            format!(
+                "{where_} carries a figure. One statement itemises it for the partnership, and \
+                 each of the {partner_count} partner(s) with a share of it gets their own share \
+                 of the same list behind their Schedule K-1 — it is the explanation item L, row 4 \
+                 asks for. A partner the line allocates nothing to gets no page, so there may be \
+                 fewer of these than there are partners."
             )
         } else {
             format!("{where_} carries a figure.")
@@ -279,6 +295,37 @@ mod tests {
             .expect("listed");
         assert_eq!(f.provenance, Provenance::Generated);
         assert!(f.because.contains("3 asset(s)"), "{}", f.because);
+    }
+
+    /// A figure on line 18c obliges a statement, and the list has to say the
+    /// statement is one page per partner as well as one for the partnership —
+    /// somebody counting pages against this list would otherwise find more of
+    /// them than they were promised.
+    #[test]
+    fn line_18c_obliges_a_statement_the_list_says_is_per_partner() {
+        let mut a = ScheduleB::default();
+        a.set("b4", YES);
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k18c", 140);
+
+        let list = required(&a, &lines, 2, false, 0);
+        let s = list
+            .iter()
+            .find(|x| x.name == "Nondeductible expenses statement")
+            .unwrap_or_else(|| panic!("not listed: {:?}", names(&list)));
+        assert_eq!(s.provenance, Provenance::Generated);
+        assert!(s.because.contains("Schedule K, line 18c"), "{}", s.because);
+        assert!(s.because.contains("2 partner(s)"), "{}", s.because);
+        assert!(s.because.contains("item L"), "{}", s.because);
+    }
+
+    /// And nothing on the line obliges nothing.
+    #[test]
+    fn no_nondeductible_expenses_oblige_no_statement() {
+        let mut a = ScheduleB::default();
+        a.set("b4", YES);
+        let list = required(&a, &Form1065Lines::default(), 2, false, 0);
+        assert!(!names(&list).contains(&"Nondeductible expenses statement"));
     }
 
     #[test]

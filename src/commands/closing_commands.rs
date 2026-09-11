@@ -498,6 +498,8 @@ fn partner_capital_lines(
         net_income_cents,
         &refs,
         crate::tax::allocate::Basis::ProfitOrLoss,
+        // The whole of Schedule K, because that is what is being split.
+        crate::tax::varying::ANALYSIS,
     );
 
     // The percentages are apportioned as given — a partnership whose shares sum
@@ -2153,7 +2155,9 @@ mod tests {
         let partners = partners_for_year(b.store.connection(), 2023);
         let refs: Vec<&crate::domain::Partner> = partners.iter().collect();
         let capital =
-            crate::tax::capital::compute(b.store.connection(), 2023, &refs, 1_800).unwrap();
+            // No nondeductible expenses in this scenario, so item L row 4 is
+            // zero and the identity below is the same one it always was.
+            crate::tax::capital::compute(b.store.connection(), 2023, &refs, 1_800, 0).unwrap();
 
         let ada = capital
             .accounts

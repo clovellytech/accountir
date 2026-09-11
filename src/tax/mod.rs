@@ -16,6 +16,7 @@ pub mod form1065;
 pub mod form4562;
 pub mod il1065;
 pub mod lines;
+pub mod nondeductible;
 pub mod schedule_b;
 pub mod schedule_b1;
 pub mod schedule_b2;

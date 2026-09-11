@@ -2347,6 +2347,7 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
                     assets: Vec::new(),
                     schedule_l: None,
                     capital: Default::default(),
+                    nondeductible: Vec::new(),
                     segments: Vec::new(),
                     detail: Default::default(),
                     options: Default::default(),

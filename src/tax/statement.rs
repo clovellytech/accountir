@@ -50,6 +50,17 @@ pub struct StatementRequest<'a> {
     pub year: i32,
     pub line: &'static TaxLineDef,
     pub rows: &'a [LineDetail],
+    /// Whose share this is, when the statement supports one partner's K-1 rather
+    /// than the entity's own form.
+    ///
+    /// `None` is the ordinary case: line 21 and line 7 are entity figures and
+    /// the page supports the box on the return. `Some` names a partner, and then
+    /// the rows are that partner's share of the line rather than the line —
+    /// which is the difference between a page an examiner can tie to Schedule K
+    /// and one they can tie to a Schedule K-1. Left as part of the same request
+    /// rather than given its own drawing routine, because the only thing that
+    /// changes is who the heading says the figures belong to.
+    pub partner: Option<&'a str>,
 }
 
 /// Build the statement pages for one line as their own document.
@@ -133,15 +144,28 @@ fn page_ops(
     let mut ops = Vec::new();
     let mut y = PAGE_H - MARGIN;
 
-    let heading = format!(
-        "Form 1065 ({}) — {} statement",
-        req.year,
-        match req.line.schedule {
-            super::lines::Schedule::Page1 => format!("Page 1, line {}", req.line.number),
-            super::lines::Schedule::K => format!("Schedule K, line {}", req.line.number),
-            super::lines::Schedule::L => format!("Schedule L, line {}", req.line.number),
-        }
-    );
+    let where_ = match req.line.schedule {
+        super::lines::Schedule::Page1 => format!("Page 1, line {}", req.line.number),
+        super::lines::Schedule::K => format!("Schedule K, line {}", req.line.number),
+        super::lines::Schedule::L => format!("Schedule L, line {}", req.line.number),
+    };
+    // A partner's statement names the schedule it supports, which is their K-1
+    // and not the partnership's Schedule K. The two pages carry different
+    // figures for the same line, and a heading that did not say which is which
+    // is how they get filed against each other.
+    //
+    // `where_` is not reused for the partner's heading, because it names the
+    // schedule the line lives on: interpolating it gave "Schedule K-1, Schedule
+    // K, line 18c statement" — two schedules in one breath, and the one it
+    // supports is the first of them. The line number alone is unambiguous, since
+    // a K-1's coded boxes take their numbers from Schedule K.
+    let heading = match req.partner {
+        Some(_) => format!(
+            "Form 1065 ({}) — Schedule K-1, line {} statement",
+            req.year, req.line.number
+        ),
+        None => format!("Form 1065 ({}) — {where_} statement", req.year),
+    };
     text(&mut ops, "F2", TITLE_SIZE, MARGIN, y, &heading);
     y -= LINE_H * 1.4;
     text(&mut ops, "F2", BODY_SIZE, MARGIN, y, req.line.label);
@@ -157,7 +181,21 @@ fn page_ops(
         y,
         &format!("{}  ·  EIN {}", req.legal_name, req.ein),
     );
-    y -= LINE_H * 1.6;
+    y -= LINE_H;
+    // On every page, like the entity line above it: a statement that comes
+    // adrift from the bundle has to be able to say whose K-1 it belongs behind.
+    if let Some(partner) = req.partner {
+        text(
+            &mut ops,
+            "F2",
+            BODY_SIZE,
+            MARGIN,
+            y,
+            &format!("Partner: {partner}"),
+        );
+        y -= LINE_H;
+    }
+    y -= LINE_H * 0.6;
 
     text(&mut ops, "F2", BODY_SIZE, MARGIN, y, "Account");
     right(&mut ops, "F2", BODY_SIZE, PAGE_W - MARGIN, y, "Amount");
@@ -346,6 +384,7 @@ mod tests {
             year: 2025,
             line: line_def("l21").unwrap(),
             rows,
+            partner: None,
         }
     }
 
@@ -406,6 +445,79 @@ mod tests {
         assert!(text.contains("12-3456789"), "{text:?}");
         assert!(text.contains("2025"), "{text:?}");
         assert!(text.contains("line 21"), "{text:?}");
+    }
+
+    /// A partner's statement has to say whose it is and which schedule it
+    /// supports. Two partners' pages of the same line are otherwise identical
+    /// apart from the figures, which is not a difference anybody can file by.
+    #[test]
+    fn a_partner_statement_names_the_partner_and_their_schedule() {
+        let rows = vec![detail("3055", "Partner meals — 50% disallowed", 71_00)];
+        let doc = build(&StatementRequest {
+            partner: Some("Zachary Patterson"),
+            line: line_def("k18c").unwrap(),
+            rows: &rows,
+            ..req(&rows)
+        })
+        .unwrap()
+        .unwrap();
+        let text = page_text(&doc);
+        assert!(text.contains("Zachary Patterson"), "{text:?}");
+        assert!(text.contains("K-1"), "{text:?}");
+        assert!(text.contains("line 18c"), "{text:?}");
+    }
+
+    /// And the entity's own page does not claim to be anybody's K-1.
+    #[test]
+    fn an_entity_statement_names_no_partner() {
+        let rows = vec![detail("6100", "Advertising", 120_00)];
+        let doc = build(&req(&rows)).unwrap().unwrap();
+        let text = page_text(&doc);
+        assert!(!text.contains("Partner:"), "{text:?}");
+        assert!(!text.contains("K-1"), "{text:?}");
+    }
+
+    /// A partner with more components than fit on a page gets a second one, and
+    /// the second one still says whose it is. A loose sheet with a column of
+    /// figures and no name on it cannot be filed behind anything.
+    #[test]
+    fn a_partner_statement_repeats_its_heading_on_every_page() {
+        let rows: Vec<LineDetail> = (0..ROWS_PER_PAGE + 3)
+            .map(|i| detail(&format!("{}", 6000 + i), "Meals — 50% disallowed", 100))
+            .collect();
+        let doc = build(&StatementRequest {
+            partner: Some("Zachary Patterson"),
+            line: line_def("k18c").unwrap(),
+            rows: &rows,
+            ..req(&rows)
+        })
+        .unwrap()
+        .unwrap();
+
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        assert_eq!(pages.len(), 2, "forty-five rows do not fit on one page");
+        for (i, p) in pages.iter().enumerate() {
+            let text = doc.extract_text(&[*p]).unwrap();
+            assert!(
+                text.contains("Zachary Patterson"),
+                "page {} does not name the partner: {text:?}",
+                i + 1
+            );
+            assert!(text.contains("K-1"), "page {} : {text:?}", i + 1);
+            assert!(
+                text.contains(&format!("Page {} of 2", i + 1)),
+                "page {} is not numbered: {text:?}",
+                i + 1
+            );
+        }
+        // The total belongs on the last page only, and it is the sum of every
+        // page's rows rather than the last page's.
+        let last = doc.extract_text(&[pages[1]]).unwrap();
+        assert!(last.contains("Total"), "{last:?}");
+        assert!(
+            !doc.extract_text(&[pages[0]]).unwrap().contains("Total"),
+            "a running total on page one reads as the whole figure"
+        );
     }
 
     /// An account name with characters outside WinAnsi must not corrupt the

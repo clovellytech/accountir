@@ -720,6 +720,17 @@ pub struct ReturnRequest {
     /// is what puts two partners under 50% each onto the schedule at their combined
     /// percentage. See [`super::constructive`].
     pub relationships: Vec<crate::domain::PartnerRelationship>,
+    /// Each partner's share of Schedule K line 18c, itemised account by account.
+    ///
+    /// The statement that goes behind their own K-1, and the explanation item L
+    /// row 4 asks for. Default-empty rather than optional, like [`capital`]: a
+    /// return with no nondeductible expenses and one whose caller had no ledger
+    /// to split them with both produce no statement, and the difference is
+    /// already visible in whether line 18c carries a figure at all. Filled by
+    /// [`build_return_from_ledger`], the only entry point with books to read.
+    ///
+    /// [`capital`]: ReturnRequest::capital
+    pub nondeductible: Vec<super::nondeductible::PartnerStatement>,
     /// The depreciable asset register, for Form 4562 and for checking the
     /// ledger's depreciation against what the assets actually earn.
     ///
@@ -824,8 +835,26 @@ pub fn build_return_from_ledger(
     // contributions would otherwise close the year on a capital account short by
     // exactly those.
     if owned.capital.is_empty() {
-        owned.capital =
-            super::capital::for_return(conn, req.year, &req.partners, computed.lines.k_analysis());
+        owned.capital = super::capital::for_return(
+            conn,
+            req.year,
+            &req.partners,
+            computed.lines.k_analysis(),
+            // Item L row 4. Positive here — it is Schedule K line 18c as the form
+            // prints it — and `capital` negates it, because row 4 is a decrease.
+            computed.lines.get(super::lines::NONDEDUCTIBLE_LINE),
+        );
+    }
+    // The itemisation behind row 4 and behind box 18 code C. Read here for the
+    // reason item L is: splitting the components needs the same ledger the
+    // percentages come from, and a caller that skipped it would ship K-1s
+    // carrying a figure that reduces a partner's capital with nothing anywhere
+    // saying what it was spent on.
+    if owned.nondeductible.is_empty() {
+        if let Some(components) = computed.detail.get(super::lines::NONDEDUCTIBLE_LINE) {
+            owned.nondeductible =
+                super::nondeductible::for_return(conn, req.year, &req.partners, components);
+        }
     }
     // §706(d) interim closing: the year cut at each change of interest, with each
     // part's figures read from the books for those dates. Done here for the
@@ -1031,7 +1060,16 @@ fn build_return_inner(
             ),
         }
 
-        let m = super::schedule_m::reconcile(req.book_income_cents, lines, req.schedule_l.as_ref());
+        // Line 18c is handed over rather than left inside M-1's residual: the
+        // disallowed half of a meal is an expense the books bear and the return
+        // does not deduct, which is precisely what M-1 line 4 is for, and it is
+        // the one component of that residual this program can name.
+        let m = super::schedule_m::reconcile(
+            req.book_income_cents,
+            lines,
+            req.schedule_l.as_ref(),
+            lines.get(super::lines::NONDEDUCTIBLE_LINE),
+        );
         warnings.extend(super::schedule_m::fill(&mut doc, &map, &m, !exempt)?);
     } else {
         warnings.push(
@@ -1071,6 +1109,20 @@ fn build_return_inner(
             year_end,
         )?);
         append_document(&mut doc, sched)?;
+
+        // --- and, behind it, their nondeductible-expenses statement ---
+        //
+        // Out of order on purpose. Everything else this program composes is
+        // appended after the IRS schedules, so the bundle reads form, K-1s,
+        // official schedules, then our supporting pages. This one page names a
+        // partner and supports two boxes on the schedule immediately in front of
+        // it — box 18 code C, and item L row 4, which the K-1 instructions tell
+        // you to attach an explanation for. Filed at the back it is a loose sheet
+        // somebody has to match to a partner by reading it; filed here it is
+        // attached to the K-1 it explains, which is what "attach" means.
+        warnings.extend(nondeductible_statement(
+            &mut doc, req, filing, &filed, &shares[i],
+        )?);
     }
 
     // --- Schedule B-1 and B-2 ---
@@ -1206,6 +1258,9 @@ fn build_return_inner(
             year: req.year,
             line: def,
             rows,
+            // The entity's own page: these are Schedule K's figures, not any one
+            // partner's share of them.
+            partner: None,
         })?;
         if let Some(statement) = statement {
             append_document(&mut doc, statement)?;
@@ -1565,6 +1620,136 @@ fn fill_schedule_k(
              there rather than in page 1, line 21."
                 .to_string(),
         );
+    }
+
+    Ok(warnings)
+}
+
+/// Draw one partner's share of Schedule K line 18c behind their own K-1.
+///
+/// Nothing to draw is the ordinary case — most partnerships have no limited
+/// deduction at all — and it is not worth a word: an absent statement for an
+/// absent figure is correct, and [`super::statement::build`] already declines to
+/// draw a page for an empty list. A partner whose *box* carries a figure and
+/// whose statement is missing is a different thing entirely, and is said.
+///
+/// # The two checks, and why they are still here
+///
+/// Box 18 code C, item L row 4 and this page are all one partner's share of one
+/// line, split by one allocator on one weighting — line 18c's own history over
+/// the year. They agree by construction, and through
+/// [`build_return_from_ledger`] neither check below can fire.
+///
+/// They are kept for the path that does not go through it. A caller may build a
+/// [`ReturnRequest`] by hand — a projection, a what-if, a restored bundle — and
+/// hand in figures that were never split together. The mismatch these catch used
+/// to be reachable from the books: weighting row 4 and the statement by the whole
+/// of Schedule K instead put a statement of 140 beside a box of 180 on a $200
+/// line. A statement quietly contradicting the box above it is the kind of thing
+/// only ever found by whoever is being audited.
+fn nondeductible_statement(
+    doc: &mut Document,
+    req: &ReturnRequest,
+    filing: &PartnerFiling,
+    filed: &[&PartnerFiling],
+    shares: &PartnerShares,
+) -> Result<Vec<String>, FormError> {
+    let mut warnings = Vec::new();
+    let boxed = shares.get(super::lines::NONDEDUCTIBLE_LINE);
+    let Some(mine) = req
+        .nondeductible
+        .iter()
+        .find(|s| s.partner_id == filing.partner.partner_id)
+    else {
+        // Silence here used to be indistinguishable from "no nondeductible
+        // expenses": a partner with a figure in box 18 code C got no page
+        // explaining it and nothing saying a page was missing.
+        if boxed != 0 {
+            warnings.push(format!(
+                "{}: box 18 code C on their Schedule K-1 carries {}, and no statement of what \
+                 makes it up was produced, so their K-1 reports a figure that reduces their \
+                 capital account with nothing behind it. `build_return_from_ledger` splits the \
+                 statement from the books; a return built from figures alone has to have one \
+                 attached by hand.",
+                filing.partner.name,
+                super::lines::format_dollars(boxed),
+            ));
+        }
+        return Ok(warnings);
+    };
+    // The catalogue has carried this line since the deduction limits landed; the
+    // `else` is unreachable and is a `return` rather than an `expect` because a
+    // missing statement is not worth failing somebody's return over.
+    let Some(def) = super::lines::line_def(super::lines::NONDEDUCTIBLE_LINE) else {
+        return Ok(warnings);
+    };
+
+    // Two partners of the same name is not a hypothetical — a father and son, a
+    // trust named after its settlor — and their two statements would otherwise be
+    // one page printed twice with different figures on it, with nothing saying
+    // which K-1 either belongs behind. So the heading falls back to what item E
+    // of the K-1 in front of it carries, and to the books' own id when even that
+    // is absent. Only when it is needed: an unambiguous name reads better than a
+    // name with an identifier stapled to it, and most pages are unambiguous.
+    let shares_a_name = filed
+        .iter()
+        .filter(|f| f.partner.name == filing.partner.name)
+        .count()
+        > 1;
+    let heading_name = if shares_a_name {
+        match filing.tin.as_deref() {
+            Some(tin) => format!("{} · {}", filing.partner.name, tin),
+            None => format!("{} · {}", filing.partner.name, filing.partner.partner_id),
+        }
+    } else {
+        filing.partner.name.clone()
+    };
+
+    if let Some(page) = super::statement::build(&super::statement::StatementRequest {
+        legal_name: &req.profile.legal_name,
+        ein: &req.profile.ein,
+        year: req.year,
+        line: def,
+        rows: &mine.rows,
+        partner: Some(&heading_name),
+    })? {
+        append_document(doc, page)?;
+    }
+
+    // A negative row. Largest-remainder is not monotone, so adding a component to
+    // the running total can move the dollar it rounds up from one partner to
+    // another and leave this partner's share of that component at −1. It is a
+    // real dollar in the right place — the column and the row both still foot —
+    // and it reads on the page as an expense that came back. Named rather than
+    // smoothed away, because the alternatives are worse: see
+    // [`super::nondeductible`].
+    for row in mine.rows.iter().filter(|r| r.cents < 0) {
+        warnings.push(format!(
+            "{}: on their nondeductible expenses statement, {} {} shows {}. That is rounding, \
+             not a credit — their share of the line is apportioned a component at a time, and \
+             where the dollar left over moves from one partner to another between two components \
+             one of them comes out a dollar short on the second. The statement still totals their \
+             box 18 code C and the partners still total Schedule K line 18c. Re-label the row by \
+             hand if it would puzzle a reader.",
+            filing.partner.name,
+            row.account_number,
+            row.account_name,
+            super::lines::format_dollars(super::lines::cents_to_dollars(row.cents)),
+        ));
+    }
+
+    if mine.total() != boxed {
+        warnings.push(format!(
+            "{}: the nondeductible expenses statement behind their Schedule K-1 totals {}, but \
+             box 18 code C on that K-1 says {}. Both are their share of the same Schedule K line \
+             18c, so the two were not split together — usually because the request was built from \
+             figures rather than from the books, and the statement and the box came from different \
+             readings of the year. Settle which the partnership agreement means and correct the \
+             other before filing.",
+            filing.partner.name,
+            super::lines::format_dollars(mine.total()),
+            super::lines::format_dollars(boxed),
+        ));
     }
 
     Ok(warnings)
@@ -1946,6 +2131,7 @@ mod tests {
             assets: Vec::new(),
             schedule_l: None,
             capital: Default::default(),
+            nondeductible: Vec::new(),
             detail: Default::default(),
             options: Default::default(),
             book_income_cents: 0,
@@ -2634,6 +2820,7 @@ mod tests {
             assets: Vec::new(),
             schedule_l: None,
             capital: Default::default(),
+            nondeductible: Vec::new(),
             detail: Default::default(),
             options: Default::default(),
             book_income_cents: 0,
@@ -3548,6 +3735,317 @@ mod tests {
         );
     }
 
+    /// Each partner's share of line 18c travels behind their own K-1.
+    ///
+    /// Box 18 code C and item L row 4 both reach a partner as a bare figure, and
+    /// row 4 is a row the instructions say to attach an explanation for. This is
+    /// that explanation, and it has to name the partner it belongs to — two
+    /// identical pages with different figures are not filable.
+    #[test]
+    fn each_partner_gets_the_statement_behind_their_own_k1() {
+        use crate::tax::lines::LineDetail;
+        use crate::tax::nondeductible::PartnerStatement;
+
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k18c", 140);
+
+        let mut req = two_partner_request();
+        let without = build_return_inner(&req, &lines, Vec::new()).unwrap();
+
+        // 50/50, so $70 each and nothing for the cross-check to complain about.
+        req.nondeductible = ["alice", "bob"]
+            .iter()
+            .zip(["Alice", "Bob"])
+            .map(|(id, name)| PartnerStatement {
+                partner_id: (*id).to_string(),
+                partner_name: name.to_string(),
+                rows: vec![LineDetail {
+                    account_id: "3055".into(),
+                    account_number: "3055".into(),
+                    account_name: "Partner meals — 50% disallowed".into(),
+                    cents: 70_00,
+                }],
+            })
+            .collect();
+
+        let with = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        assert_eq!(
+            with.page_count,
+            without.page_count + 2,
+            "one statement page per partner"
+        );
+
+        let doc = Document::load_mem(&with.pdf).unwrap();
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Partner: Alice"), "{text:?}");
+        assert!(text.contains("Partner: Bob"), "{text:?}");
+        assert!(
+            !with
+                .warnings
+                .iter()
+                .any(|w| w.contains("box 18 code C on that K-1")),
+            "the shares agree with the box: {:?}",
+            with.warnings
+        );
+    }
+
+    /// **What the attachment list promises is an upper bound, not a count.**
+    ///
+    /// `attachments::required` tells a filer that each of the N partners gets
+    /// their own page. A partner whose share of line 18c rounds to nothing gets
+    /// no page — correctly, a statement of zeros is worse than none — so a
+    /// two-partner return can come back with one partner page against a list
+    /// that named two. Pinned here so the gap between the promise and the bundle
+    /// is a known one.
+    #[test]
+    fn a_partner_allocated_nothing_gets_no_page_though_the_list_named_them() {
+        use crate::tax::lines::LineDetail;
+        use crate::tax::nondeductible::PartnerStatement;
+
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k18c", 140);
+
+        let mut req = two_partner_request();
+        let without = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        req.nondeductible = vec![
+            PartnerStatement {
+                partner_id: "alice".into(),
+                partner_name: "Alice".into(),
+                rows: vec![LineDetail {
+                    account_id: "3055".into(),
+                    account_number: "3055".into(),
+                    account_name: "Partner meals — 50% disallowed".into(),
+                    cents: 140_00,
+                }],
+            },
+            // The whole line went to Alice; Bob's share was nothing.
+            PartnerStatement {
+                partner_id: "bob".into(),
+                partner_name: "Bob".into(),
+                rows: Vec::new(),
+            },
+        ];
+        let with = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        assert_eq!(
+            with.page_count,
+            without.page_count + 1,
+            "one page, not one per partner"
+        );
+
+        // And the list still says two, which is the overclaim.
+        let mut answers = crate::tax::schedule_b::ScheduleB::default();
+        answers.set("b4", crate::tax::schedule_b::YES);
+        let listed = crate::tax::attachments::required(&answers, &lines, 2, false, 0);
+        let entry = listed
+            .iter()
+            .find(|a| a.name == crate::tax::lines::NONDEDUCTIBLE_STATEMENT.name)
+            .expect("line 18c obliges a statement");
+        assert!(entry.because.contains("2 partner(s)"), "{}", entry.because);
+    }
+
+    /// The one way that page and the schedule in front of it can disagree. Both
+    /// split the same figure on the same percentages, but over a year whose
+    /// interests moved they weight the year's parts differently — so the two are
+    /// compared rather than assumed equal.
+    #[test]
+    fn a_statement_that_contradicts_box_18c_is_reported() {
+        use crate::tax::lines::LineDetail;
+        use crate::tax::nondeductible::PartnerStatement;
+
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k18c", 140);
+
+        let mut req = two_partner_request();
+        // A statement saying $90 against a box that says $70.
+        req.nondeductible = vec![PartnerStatement {
+            partner_id: "alice".into(),
+            partner_name: "Alice".into(),
+            rows: vec![LineDetail {
+                account_id: "3055".into(),
+                account_number: "3055".into(),
+                account_name: "Partner meals — 50% disallowed".into(),
+                cents: 90_00,
+            }],
+        }];
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let complaint = bundle
+            .warnings
+            .iter()
+            .find(|w| w.contains("box 18 code C on that K-1"))
+            .unwrap_or_else(|| panic!("no mismatch reported: {:?}", bundle.warnings));
+        assert!(complaint.contains("Alice"), "{complaint}");
+        assert!(complaint.contains("90"), "{complaint}");
+        assert!(complaint.contains("70"), "{complaint}");
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// A negative row on a statement is rounding, and the return says so rather
+    /// than leaving a reader to work out how an expense came back.
+    #[test]
+    fn a_negative_row_on_a_statement_is_explained_rather_than_left_to_puzzle() {
+        use crate::tax::lines::LineDetail;
+        use crate::tax::nondeductible::PartnerStatement;
+
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k18c", 2);
+
+        let row = |number: &str, name: &str, cents: i64| LineDetail {
+            account_id: number.into(),
+            account_number: number.into(),
+            account_name: name.into(),
+            cents,
+        };
+        let mut req = two_partner_request();
+        req.nondeductible = vec![
+            PartnerStatement {
+                partner_id: "alice".into(),
+                partner_name: "Alice".into(),
+                rows: vec![row("6100", "Meals", 2_00), row("6200", "Fines", -1_00)],
+            },
+            PartnerStatement {
+                partner_id: "bob".into(),
+                partner_name: "Bob".into(),
+                rows: vec![row("6200", "Fines", 1_00)],
+            },
+        ];
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let said = bundle
+            .warnings
+            .iter()
+            .find(|w| w.contains("That is rounding, not a credit"))
+            .unwrap_or_else(|| panic!("{:?}", bundle.warnings));
+        assert!(said.starts_with("Alice"), "{said}");
+        assert!(said.contains("6200"), "the row has to be named: {said}");
+        assert!(said.contains("-1"), "and its figure: {said}");
+        assert!(
+            !bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("box 18 code C on that K-1")),
+            "the totals agree, negative row and all: {:?}",
+            bundle.warnings
+        );
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// A figure in box 18 code C with no statement behind it. Silence here read
+    /// exactly like "this partnership had no nondeductible expenses", which is
+    /// the one thing it does not mean.
+    #[test]
+    fn a_box_18c_figure_with_no_statement_is_reported() {
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k18c", 140);
+
+        let req = two_partner_request();
+        assert!(req.nondeductible.is_empty(), "the case under test");
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let missing: Vec<&String> = bundle
+            .warnings
+            .iter()
+            .filter(|w| w.contains("no statement of what makes it up"))
+            .collect();
+        assert_eq!(missing.len(), 2, "one per partner: {:?}", bundle.warnings);
+        assert!(missing.iter().any(|w| w.starts_with("Alice")));
+        assert!(missing.iter().any(|w| w.contains("70")), "{missing:?}");
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// Two partners of the same name — a father and son, a trust named after its
+    /// settlor. Their statements would otherwise be one page printed twice with
+    /// different figures on it and nothing saying which K-1 either sits behind.
+    #[test]
+    fn two_partners_of_one_name_get_statements_that_can_be_told_apart() {
+        use crate::tax::lines::LineDetail;
+        use crate::tax::nondeductible::PartnerStatement;
+
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k18c", 140);
+
+        let mut req = two_partner_request();
+        req.partners[1].partner.name = req.partners[0].partner.name.clone();
+        req.partners[0].tin = Some("123-45-6789".into());
+        req.partners[1].tin = Some("987-65-4321".into());
+        req.nondeductible = req
+            .partners
+            .iter()
+            .map(|f| PartnerStatement {
+                partner_id: f.partner.partner_id.clone(),
+                partner_name: f.partner.name.clone(),
+                rows: vec![LineDetail {
+                    account_id: "3055".into(),
+                    account_number: "3055".into(),
+                    account_name: "Partner meals — 50% disallowed".into(),
+                    cents: 70_00,
+                }],
+            })
+            .collect();
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let pages: Vec<String> = doc
+            .get_pages()
+            .keys()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect();
+        assert!(
+            pages.iter().any(|p| p.contains("123-45-6789")),
+            "the first partner's page names no identifier"
+        );
+        assert!(
+            pages.iter().any(|p| p.contains("987-65-4321")),
+            "nor the second's"
+        );
+    }
+
+    /// And an ordinary partnership's pages are not cluttered with one.
+    #[test]
+    fn a_partner_whose_name_is_their_own_is_named_and_nothing_else() {
+        use crate::tax::lines::LineDetail;
+        use crate::tax::nondeductible::PartnerStatement;
+
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k18c", 140);
+        let mut req = two_partner_request();
+        req.nondeductible = req
+            .partners
+            .iter()
+            .map(|f| PartnerStatement {
+                partner_id: f.partner.partner_id.clone(),
+                partner_name: f.partner.name.clone(),
+                rows: vec![LineDetail {
+                    account_id: "3055".into(),
+                    account_number: "3055".into(),
+                    account_name: "Partner meals — 50% disallowed".into(),
+                    cents: 70_00,
+                }],
+            })
+            .collect();
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let pages: Vec<String> = doc
+            .get_pages()
+            .keys()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect();
+        let hers = pages
+            .iter()
+            .find(|p| p.contains("Partner: Alice"))
+            .unwrap_or_else(|| panic!("no statement page for Alice"));
+        assert!(
+            !hers.contains("123-45-6789"),
+            "an unambiguous name needs no identifier: {hers}"
+        );
+    }
+
     /// No Yes, no extra schedules — the common case must not gain pages.
     #[test]
     fn a_return_with_no_b_schedule_answers_gains_no_b_schedules() {
@@ -4436,17 +4934,49 @@ mod tests {
             let year = blanks.year;
             let sched = Document::load_mem(blanks.sk1).unwrap();
             let map = field_map(&sched);
-            for name in [
-                k1::L_BEGIN,
-                k1::L_CONTRIBUTED,
-                k1::L_NET_INCOME,
-                k1::L_OTHER,
-                k1::L_WITHDRAWN,
-                k1::L_ENDING,
-            ] {
+            let rows = [
+                (k1::L_BEGIN, "beginning capital account"),
+                (k1::L_CONTRIBUTED, "capital contributed"),
+                (k1::L_NET_INCOME, "current year net income"),
+                (k1::L_OTHER, "other increase (decrease)"),
+                (k1::L_WITHDRAWN, "withdrawals and distributions"),
+                (k1::L_ENDING, "ending capital account"),
+            ];
+            for (name, _) in rows {
                 assert!(
                     map.find(name).is_some(),
                     "the {year} Schedule K-1 has no item L box {name}"
+                );
+            }
+
+            // And they are still the boxes in that order. Existence alone would
+            // pass with row 4 pointing at row 3's box on a repaginated revision,
+            // and now that row 4 carries a figure that mistake is a capital
+            // account off by that partner's nondeductible expenses — on a page
+            // that would still foot, because `ending()` is computed and not read
+            // back off the form. Item L prints top to bottom, so the boxes have
+            // to descend.
+            use lopdf::Object;
+            let top = |name: &str| -> f64 {
+                let id = map.find(name).expect("checked above");
+                let d = sched.get_object(id).and_then(Object::as_dict).unwrap();
+                let r = d.get(b"Rect").and_then(Object::as_array).unwrap();
+                // The higher of the two y coordinates: a box's top edge.
+                let num = |i: usize| {
+                    r[i].as_float()
+                        .map(f64::from)
+                        .unwrap_or_else(|_| r[i].as_i64().unwrap() as f64)
+                };
+                num(1).max(num(3))
+            };
+            for pair in rows.windows(2) {
+                let (above, what_above) = pair[0];
+                let (below, what_below) = pair[1];
+                assert!(
+                    top(above) > top(below),
+                    "on the {year} Schedule K-1, {what_above} ({above}, y={:.0}) is not above                      {what_below} ({below}, y={:.0}) — one of them is pointing at the other's                      row",
+                    top(above),
+                    top(below)
                 );
             }
         }
@@ -4620,6 +5150,492 @@ mod tests {
             ordinary,
             "on books whose only Schedule K figure is ordinary income, the two agree"
         );
+    }
+
+    /// A ledger with a half-deductible meals account, revenue in both halves of
+    /// the year, and the meal itself in the second half only.
+    ///
+    /// `moves_mid_year` sets Alice from a half to nine tenths on 1 July, which
+    /// is what makes this a §706(d) year. Everything else is identical between
+    /// the two, so the only thing a difference in the output can be attributed
+    /// to is the change of interest.
+    fn meals_ledger(moves_mid_year: bool) -> crate::store::event_store::EventStore {
+        use crate::commands::partnership_commands as pc;
+        use crate::commands::share_period_commands as spc;
+        use crate::commands::tax_setup_commands as tsc;
+        use crate::events::types::{Event, EventAccountType, EventEnvelope, JournalLineData};
+        use crate::store::event_store::EventStore;
+        use crate::store::projections::ProjectionStore;
+
+        let mut store = EventStore::in_memory().unwrap();
+        crate::store::migrations::init_schema(store.connection()).unwrap();
+        for (id, ty, number, name) in [
+            ("cash", EventAccountType::Asset, "1000", "Cash"),
+            ("sales", EventAccountType::Revenue, "4000", "Sales"),
+            ("meals", EventAccountType::Expense, "3055", "Partner meals"),
+        ] {
+            let e = Event::AccountCreated {
+                account_id: id.into(),
+                account_type: ty,
+                account_number: number.into(),
+                name: name.into(),
+                parent_id: None,
+                currency: Some("USD".into()),
+                description: None,
+            };
+            let stored = store.append(EventEnvelope::new(e, "u".into())).unwrap();
+            store.apply_projection(&stored).unwrap();
+        }
+        pc::set_profile(&mut store, "u", &profile()).unwrap();
+        crate::tax::lines::set_account_line(store.connection(), "sales", "l1a", 0).unwrap();
+        crate::tax::lines::set_account_line(store.connection(), "meals", "l21", 0).unwrap();
+        tsc::set_deduction_limit(&mut store, "u", "meals", 50, FORM_TAX_YEAR).unwrap();
+
+        let mut post = |id: &str, on: NaiveDate, pairs: &[(&str, i64)]| {
+            let lines: Vec<JournalLineData> = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (acct, amount))| JournalLineData {
+                    line_id: format!("{id}-{i}"),
+                    account_id: (*acct).into(),
+                    amount: *amount,
+                    currency: "USD".into(),
+                    exchange_rate: None,
+                    memo: None,
+                })
+                .collect();
+            let e = Event::JournalEntryPosted {
+                entry_id: id.into(),
+                date: on,
+                memo: "seed".into(),
+                lines,
+                reference: None,
+                source: None,
+            };
+            let stored = store.append(EventEnvelope::new(e, "u".into())).unwrap();
+            store.apply_projection(&stored).unwrap();
+        };
+        // Half the year's revenue either side of 1 July, so the two halves carry
+        // the same weight on the whole of Schedule K...
+        post(
+            "h1",
+            day(FORM_TAX_YEAR, 3, 1),
+            &[("cash", 100_000_00), ("sales", -100_000_00)],
+        );
+        post(
+            "h2",
+            day(FORM_TAX_YEAR, 9, 1),
+            &[("cash", 100_000_00), ("sales", -100_000_00)],
+        );
+        // ...and the whole of the meal in the second half, so line 18c's own
+        // weighting is nothing like it.
+        post(
+            "meal",
+            day(FORM_TAX_YEAR, 9, 2),
+            &[("meals", 400_00), ("cash", -400_00)],
+        );
+
+        for name in ["Alice", "Bob"] {
+            let who = pc::AdmitPartner {
+                name: name.into(),
+                partner_type: PartnerType::General,
+                residency: Residency::Domestic,
+                entity_type: "Individual".into(),
+                address: Address {
+                    street: "2 Other Road".into(),
+                    suite: None,
+                    city: "Cape Town".into(),
+                    state: "WC".into(),
+                    postal_code: "8001".into(),
+                    country: None,
+                },
+                start_date: Some(day(2021, 7, 1)),
+                shares: Shares::from_percents(50.0, 50.0, 50.0),
+                tin: None,
+            };
+            pc::admit_partner(&mut store, "u", &who).unwrap();
+        }
+        if moves_mid_year {
+            for (name, pct) in [("Alice", 90.0), ("Bob", 10.0)] {
+                let id = spc::list_partners_with_history(store.connection())
+                    .into_iter()
+                    .find(|p| p.name == name)
+                    .expect("admitted above")
+                    .partner_id;
+                spc::set_partner_shares(
+                    &mut store,
+                    "u",
+                    &id,
+                    day(FORM_TAX_YEAR, 7, 1),
+                    Shares::from_percents(pct, pct, pct),
+                )
+                .unwrap();
+            }
+        }
+        store
+    }
+
+    fn meals_request(store: &crate::store::event_store::EventStore) -> ReturnRequest {
+        let partners: Vec<PartnerFiling> =
+            crate::commands::share_period_commands::list_partners_with_history(store.connection())
+                .into_iter()
+                .map(|partner| PartnerFiling { partner, tin: None })
+                .collect();
+        ReturnRequest {
+            partners,
+            ..two_partner_request()
+        }
+    }
+
+    /// **The §706(d) conflict, now closed.** Box 18 code C is weighted by what
+    /// line 18c itself carried in each part of the year. Item L row 4 and the
+    /// statement behind the K-1 once followed the whole of Schedule K instead,
+    /// and on this ledger — half the revenue either side of 1 July, the whole
+    /// meal after it, and the interests moving on the same day — that put a
+    /// statement of about 140 and an item L row 4 of −140 on the same page as a
+    /// box of 180. Not a rounding artefact: 20% of the line, unbounded.
+    ///
+    /// All three are weighted by line 18c now, so they agree by construction and
+    /// this books' worst case is the proof.
+    #[test]
+    fn a_segmented_year_splits_row_four_the_box_and_the_statement_alike() {
+        let store = meals_ledger(true);
+        let req = meals_request(&store);
+        let bundle = build_return_from_ledger(store.connection(), &req).unwrap();
+
+        assert!(
+            !bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("box 18 code C on that K-1")),
+            "nothing is left to disagree about: {:?}",
+            bundle.warnings
+        );
+
+        // Schedule K line 18c is $200: half of a $400 meal, all of it bought in
+        // the segment Alice held nine tenths of.
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        let money = |which: usize, field: &str| -> i64 {
+            acroform::get_value_in(&doc, &map, &k1_namespace(which), field)
+                .unwrap_or_else(|| panic!("{field} is not on K-1 {which}"))
+                .replace(',', "")
+                .parse()
+                .unwrap_or_else(|_| panic!("{field} on K-1 {which} is not a number"))
+        };
+        assert_eq!(money(1, "f1_88[0]"), 180, "Alice's box 18 code C");
+        assert_eq!(money(1, k1::L_OTHER), -180, "and her item L row 4");
+        assert_eq!(money(2, "f1_88[0]"), 20, "Bob's box 18 code C");
+        assert_eq!(money(2, k1::L_OTHER), -20);
+
+        // And her statement, which is the page explaining both of them. Read per
+        // page, because "180" appears all over a return and what matters is that
+        // it is on *her* page.
+        let pages: Vec<String> = doc
+            .get_pages()
+            .keys()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect();
+        let hers = pages
+            .iter()
+            .find(|p| p.contains("Partner: Alice"))
+            .unwrap_or_else(|| panic!("no statement page for Alice"));
+        assert!(
+            hers.contains("180"),
+            "her statement says something else: {hers}"
+        );
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// And on a settled year the same books produce no such complaint. Without
+    /// this the test above passes just as well against a check that always
+    /// fires, which would put a false contradiction on every return that has a
+    /// meal on it.
+    #[test]
+    fn a_settled_year_never_reports_the_statement_disagreeing_with_box_18c() {
+        let store = meals_ledger(false);
+        let req = meals_request(&store);
+        let bundle = build_return_from_ledger(store.connection(), &req).unwrap();
+
+        assert!(
+            !bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("box 18 code C on that K-1")),
+            "{:?}",
+            bundle.warnings
+        );
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// The whole chain on one set of books: a meal in the ledger, half of it
+    /// disallowed, reaching Schedule K line 18c, each partner's box, each
+    /// partner's item L row 4 as a decrease, and a statement page behind each
+    /// K-1 — all of them the same figure, split the same way.
+    #[test]
+    fn a_meal_in_the_ledger_reaches_every_place_line_18c_belongs() {
+        let store = meals_ledger(false);
+        let req = meals_request(&store);
+        let bundle = build_return_from_ledger(store.connection(), &req).unwrap();
+
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        assert_eq!(
+            acroform::get_value(&doc, &map, "f5_49[0]").as_deref(),
+            Some("200"),
+            "Schedule K line 18c"
+        );
+        // Read off the paper rather than out of the struct: what is filed is the
+        // paper, and a figure that never reached a box is the failure.
+        let money = |which: usize, field: &str| -> i64 {
+            acroform::get_value_in(&doc, &map, &k1_namespace(which), field)
+                .unwrap_or_else(|| panic!("{field} is not on K-1 {which}"))
+                .replace(',', "")
+                .parse()
+                .unwrap_or_else(|_| panic!("{field} on K-1 {which} is not a number"))
+        };
+        let mut row_four = 0i64;
+        for k1 in 1..=2 {
+            assert_eq!(
+                money(k1, k1::L_OTHER),
+                -100,
+                "item L row 4 on K-1 {k1} is a decrease of half of the line"
+            );
+            row_four += money(k1, k1::L_OTHER);
+            assert_eq!(
+                money(k1, k1::L_ENDING),
+                money(k1, k1::L_BEGIN)
+                    + money(k1, k1::L_CONTRIBUTED)
+                    + money(k1, k1::L_NET_INCOME)
+                    + money(k1, k1::L_OTHER)
+                    - money(k1, k1::L_WITHDRAWN),
+                "item L on K-1 {k1} does not foot as printed"
+            );
+            assert_eq!(
+                money(k1, "f1_88[0]"),
+                100,
+                "box 18 code C on K-1 {k1}, positive as the form prints an expense"
+            );
+            assert_eq!(
+                acroform::get_value_in(&doc, &map, &k1_namespace(k1), "f1_87[0]").as_deref(),
+                Some("C"),
+                "and it is coded C"
+            );
+        }
+        assert_eq!(-row_four, 200, "the two rows are the whole of line 18c");
+
+        // And the pages behind them.
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(text.contains("Partner: Alice"), "{text:?}");
+        assert!(text.contains("Partner: Bob"), "{text:?}");
+        assert!(
+            text.contains("50% disallowed"),
+            "the statement names the part of the account it is about: {text:?}"
+        );
+    }
+
+    /// A partner admitted halfway through the year gets a K-1, so they get a
+    /// statement; one who left before it started gets neither. Allocating over a
+    /// partner with no K-1 in the bundle is the failure this guards: the shares
+    /// would still foot and one partner's page would be missing.
+    #[test]
+    fn the_statement_set_is_exactly_the_k1_set() {
+        use crate::commands::partnership_commands as pc;
+
+        let store = meals_ledger(false);
+        let mut partners: Vec<Partner> =
+            crate::commands::share_period_commands::list_partners_with_history(store.connection());
+        // A third partner who left before the year began — a K-1 they must not
+        // get, and a statement they must not get either.
+        let gone = partner("Gone", PartnerType::General, Residency::Domestic, 0.0);
+        let mut gone = gone;
+        gone.start_date = day(2019, 1, 1);
+        gone.end_date = Some(day(FORM_TAX_YEAR - 1, 12, 31));
+        partners.push(gone);
+        let filings: Vec<PartnerFiling> = partners
+            .into_iter()
+            .map(|partner| PartnerFiling { partner, tin: None })
+            .collect();
+        let req = ReturnRequest {
+            partners: filings,
+            ..two_partner_request()
+        };
+        let bundle = build_return_from_ledger(store.connection(), &req).unwrap();
+
+        // The two sets the bundle is built from, taken the way it takes them.
+        let components = {
+            let (start, end) = pc::calendar_year(FORM_TAX_YEAR);
+            let mapping =
+                crate::tax::lines::load_effective_mapping(store.connection(), FORM_TAX_YEAR);
+            let limits =
+                crate::tax::lines::load_effective_limits(store.connection(), FORM_TAX_YEAR);
+            let statement = crate::queries::reports::Reports::new(store.connection())
+                .income_statement(start, end)
+                .unwrap();
+            crate::tax::lines::compute(&statement, &mapping, &limits)
+                .detail
+                .remove(crate::tax::lines::NONDEDUCTIBLE_LINE)
+                .expect("the meal is on 18c")
+        };
+        let statements = crate::tax::nondeductible::for_return(
+            store.connection(),
+            FORM_TAX_YEAR,
+            &req.partners,
+            &components,
+        );
+        let ids: Vec<&str> = statements.iter().map(|s| s.partner_id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            2,
+            "the departed partner must not be allocated anything: {ids:?}"
+        );
+        assert!(!ids.iter().any(|id| id.contains("gone")), "{ids:?}");
+        assert_eq!(
+            statements.iter().map(|s| s.total()).sum::<i64>(),
+            200,
+            "and the two who remain still carry the whole line: {statements:?}"
+        );
+
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!text.contains("Partner: Gone"), "{text:?}");
+    }
+
+    /// A partner admitted halfway through the year gets a K-1, so they get a
+    /// statement page too — and the three statements still come to the whole of
+    /// line 18c. Allocating over a set the K-1s are not drawn over is the
+    /// failure: the figures would foot and one partner's explanation would be
+    /// missing from the bundle.
+    #[test]
+    fn a_partner_admitted_mid_year_gets_a_statement_like_everybody_else() {
+        use crate::commands::partnership_commands as pc;
+        use crate::commands::share_period_commands as spc;
+
+        let mut store = meals_ledger(false);
+        let who = pc::AdmitPartner {
+            name: "Carol".into(),
+            partner_type: PartnerType::General,
+            residency: Residency::Domestic,
+            entity_type: "Individual".into(),
+            address: Address {
+                street: "2 Other Road".into(),
+                suite: None,
+                city: "Cape Town".into(),
+                state: "WC".into(),
+                postal_code: "8001".into(),
+                country: None,
+            },
+            start_date: Some(day(FORM_TAX_YEAR, 7, 1)),
+            shares: Shares::from_percents(20.0, 20.0, 20.0),
+            tin: None,
+        };
+        pc::admit_partner(&mut store, "u", &who).unwrap();
+        for name in ["Alice", "Bob"] {
+            let id = spc::list_partners_with_history(store.connection())
+                .into_iter()
+                .find(|p| p.name == name)
+                .unwrap()
+                .partner_id;
+            spc::set_partner_shares(
+                &mut store,
+                "u",
+                &id,
+                day(FORM_TAX_YEAR, 7, 1),
+                Shares::from_percents(40.0, 40.0, 40.0),
+            )
+            .unwrap();
+        }
+
+        let req = meals_request(&store);
+        assert_eq!(req.partners.len(), 3, "all three file");
+        let bundle = build_return_from_ledger(store.connection(), &req).unwrap();
+
+        let components = {
+            let (start, end) = pc::calendar_year(FORM_TAX_YEAR);
+            let mapping =
+                crate::tax::lines::load_effective_mapping(store.connection(), FORM_TAX_YEAR);
+            let limits =
+                crate::tax::lines::load_effective_limits(store.connection(), FORM_TAX_YEAR);
+            let statement = crate::queries::reports::Reports::new(store.connection())
+                .income_statement(start, end)
+                .unwrap();
+            crate::tax::lines::compute(&statement, &mapping, &limits)
+                .detail
+                .remove(crate::tax::lines::NONDEDUCTIBLE_LINE)
+                .expect("the meal is on 18c")
+        };
+        let statements = crate::tax::nondeductible::for_return(
+            store.connection(),
+            FORM_TAX_YEAR,
+            &req.partners,
+            &components,
+        );
+        assert_eq!(statements.len(), 3, "{statements:?}");
+        assert_eq!(
+            statements.iter().map(|s| s.total()).sum::<i64>(),
+            200,
+            "the three shares are still the whole line: {statements:?}"
+        );
+
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for name in ["Alice", "Bob", "Carol"] {
+            assert!(
+                text.contains(&format!("Partner: {name}")),
+                "{name} has no statement page"
+            );
+        }
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// Nothing on line 18c is nothing everywhere: no statement page, no row 4,
+    /// and — the one that is easy to get wrong — no warning saying a statement
+    /// nobody produced disagrees with a box carrying nothing.
+    #[test]
+    fn no_nondeductible_expenses_produce_no_statement_and_no_complaint() {
+        let store = seeded_ledger();
+        map_seeded_accounts(store.connection());
+        let bundle = build_return_from_ledger(store.connection(), &two_partner_request()).unwrap();
+
+        assert!(
+            !bundle
+                .warnings
+                .iter()
+                .any(|w| w.contains("box 18 code C on that K-1")),
+            "{:?}",
+            bundle.warnings
+        );
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        for k1 in 1..=2 {
+            assert_eq!(
+                acroform::get_value_in(&doc, &map, &k1_namespace(k1), k1::L_OTHER).as_deref(),
+                Some("0"),
+                "row 4 stays at nothing on K-1 {k1}"
+            );
+        }
+        let pages: Vec<u32> = doc.get_pages().keys().copied().collect();
+        let text: String = pages
+            .iter()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!text.contains("Partner:"), "{text:?}");
     }
 
     /// The identity-only path has no ledger, so item L is left blank and

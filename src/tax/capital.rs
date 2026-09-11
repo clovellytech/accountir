@@ -14,8 +14,9 @@
 //! Four of those rows are ledger movements on the accounts a partner's capital
 //! actually lives in, one is their slice of the year's result, and one — "other
 //! increase (decrease)" — is a row the form itself asks you to attach an
-//! explanation for. See [`CapitalAccount::other`] for why this program leaves it
-//! at zero rather than plugging the identity with it.
+//! explanation for. It carries exactly one thing here: the partner's share of
+//! the year's nondeductible expenses. See [`CapitalAccount::other`] for why that
+//! belongs there and why a residual still does not.
 //!
 //! # Which accounts are whose
 //!
@@ -92,11 +93,12 @@ pub const DRAW: &str = "draw";
 /// Said on every return that computes an item L. See the module docs.
 pub const BEGINNING_CAPITAL_CAVEAT: &str =
     "Item L's beginning capital account is the balance of each partner's linked equity accounts \
-     on the last day of the prior year — their contributions less their draws. It does not \
-     include their share of prior years' income unless the books post that share into those \
-     accounts at each year end. Check every beginning figure against last year's K-1 before \
-     filing; where they differ, the difference is undistributed income that has to be added by \
-     hand.";
+     on the last day of the prior year — their contributions less their draws. It carries neither \
+     their share of prior years' income, unless the books post that share into those accounts at \
+     each year end, nor row 4: a prior year's nondeductible expenses reduced that year's ending \
+     capital and are not in this year's opening balance. Check every beginning figure against \
+     last year's K-1 before filing. Where they differ, the difference is last year's \
+     undistributed income less last year's row 4, and both parts have to be put in by hand.";
 
 /// Which side of a partner's capital an account records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,15 +189,47 @@ pub struct CapitalAccount {
     pub contributed: i64,
     /// Row 3. Their allocated share of the Analysis of Net Income figure.
     pub net_income: i64,
-    /// Row 4. Always zero.
+    /// Row 4, "other increase (decrease)": this partner's share of the year's
+    /// nondeductible expenses, as a **negative** figure.
     ///
-    /// The form wants an explanation attached to whatever goes here, which is
-    /// the IRS saying this row is for facts that are not ordinary contributions,
-    /// draws or income — a transfer of interest, a revaluation, a correction of
-    /// a prior year. None of those is distinguishable in a general ledger from
-    /// any other entry on the same account. Left at zero and kept as a named
-    /// field so a caller can see it was not merely forgotten; a residual plugged
-    /// in here would make item L foot while asserting something nobody wrote.
+    /// # Why anything at all is written here
+    ///
+    /// The form wants an explanation attached to whatever goes on this row,
+    /// which is the IRS saying it is for facts that are not ordinary
+    /// contributions, draws or income. That is a reason to refuse a *residual* —
+    /// a plug has no explanation to attach, and writing one here would make item
+    /// L foot while asserting something nobody wrote — and it was read for years
+    /// as a reason to leave the row at zero altogether. It is not.
+    ///
+    /// A partner's share of the disallowed half of meals (§274(n)) is not a
+    /// residual. It is a known figure with a known cause: money the partnership
+    /// spent, that the return does not deduct, that reduces tax-basis capital
+    /// anyway — Schedule K line 18c, split on the same percentages as row 3.
+    /// Leaving it out overstates every partner's ending capital by their share
+    /// of it, and overstating capital understates the gain on a later
+    /// disposition. The explanation the form asks for is the per-partner
+    /// statement in [`crate::tax::nondeductible`], which itemises this figure
+    /// account by account and travels with the K-1 it belongs to.
+    ///
+    /// It does not compound. `beginning` is re-read from the ledger every year
+    /// and carries no row from last year's item L, so an omission here is one
+    /// year's error in one year's ending figure — and, for the same reason, a
+    /// correction here does not reach next year's opening balance either. That
+    /// gap is what [`BEGINNING_CAPITAL_CAVEAT`] is about, and it now has two
+    /// halves rather than one.
+    ///
+    /// # Why it is negative
+    ///
+    /// Schedule K line 18c is an expense and prints positive, on both Schedule K
+    /// and box 18 code C of the K-1. Row 4 is signed — "increase (decrease)" —
+    /// and nondeductible expenses are a decrease, so the figure is negated on
+    /// the way in. [`CapitalAccount::ending`] adds this row, so a positive here
+    /// would raise every capital account by twice what it should lower it by,
+    /// and item L would still foot.
+    ///
+    /// A residual is still not welcome here. This row carries what can be named
+    /// and nothing else; anything item L does not explain stays unexplained and
+    /// visible, which is the whole point of the caveat on the beginning balance.
     pub other: i64,
     /// Row 5. Movements on their `draw` accounts during the year, as a positive
     /// figure — the box's parentheses are printed on the form.
@@ -216,6 +250,13 @@ impl CapitalAccount {
     /// `None` when the year allocated them income, or when the loss leaves them
     /// still positive. Otherwise the amount by which the loss ran past zero,
     /// which is the whole loss when they were already negative before it.
+    ///
+    /// It reads [`CapitalAccount::ending`], so row 4 is in it. That is correct —
+    /// §704(b) asks what the capital account can carry, and a nondeductible
+    /// expense has already left it — but it is worth saying out loud, because it
+    /// moved a warning a preparer acts on: a partner whose loss was supported
+    /// before row 4 existed can now be reported as running past zero by their
+    /// share of line 18c. The figure changed; the rule did not.
     pub fn unsupported_loss(&self) -> Option<i64> {
         if self.net_income >= 0 || self.ending() >= 0 {
             return None;
@@ -390,11 +431,19 @@ impl Capital {
 /// dollars to make the K-1s foot, so a partnership whose splits sum to 90% closes
 /// the year with a tenth of it in nobody's capital account — which is the state
 /// of their records, and is warned about where the shares are checked.
+///
+/// `nondeductible` is Schedule K line 18c in whole dollars — **positive**, the
+/// way the form prints an expense — and becomes row 4, negated. It is passed in
+/// rather than read from the ledger for the same reason `net_income` is: it is a
+/// figure the return has already computed, limits and all, and a second
+/// derivation of it here would eventually disagree with the box it is meant to
+/// explain. See [`CapitalAccount::other`].
 pub fn compute(
     conn: &Connection,
     year: i32,
     partners: &[&Partner],
     net_income: i64,
+    nondeductible: i64,
 ) -> Result<Capital, rusqlite::Error> {
     let (year_start, year_end) = crate::commands::partnership_commands::calendar_year(year);
     // "Beginning of tax year" is the position before the year's first entry, the
@@ -429,8 +478,50 @@ pub fn compute(
     // 155,560 — two figures for the same partner's share of the same year, on
     // the same page, differing by the part of the year they held a different
     // percentage.
-    let shares =
-        super::varying::allocate_over_year(conn, year, net_income, partners, Basis::ProfitOrLoss);
+    let shares = super::varying::allocate_over_year(
+        conn,
+        year,
+        net_income,
+        partners,
+        Basis::ProfitOrLoss,
+        // Row 3 is a share of the whole of Schedule K, so the year's parts are
+        // weighted by what the whole of Schedule K did in each of them.
+        super::varying::ANALYSIS,
+    );
+
+    // Row 4, on the same allocator as row 3 and for the same reason: a single
+    // split applied to a year that contained a change of interest is a §706(d)
+    // problem, and row 4 disagreeing with row 3 about which part of the year a
+    // partner held what would be the same self-contradicting page in miniature.
+    //
+    // Weighted by line 18c and **not** by the whole of Schedule K, which is the
+    // one place row 4 must part company with row 3. Row 3 is a share of the
+    // year's result; row 4 is a share of one line, and box 18 code C on the same
+    // K-1 is a share of that line too. Weighting row 4 by `k_analysis` put −140
+    // in row 4 beside a box of 180 on a $200 line, on a partnership that earned
+    // evenly and bought its meals in one half of the year. See
+    // `varying::allocate_over_year`.
+    //
+    // `nondeductible` arrives positive, so this travels on the *profit*
+    // percentages — which is right: the expense was incurred out of the same
+    // year's operations that the profit split divides. It is the negation below,
+    // not the allocation, that turns it into a decrease.
+    //
+    // Skipped entirely when there is nothing to split, which is most
+    // partnerships: the allocator reads the share periods and, on a segmented
+    // year, one income statement per segment, all to divide zero.
+    let nondeductible_shares = if nondeductible == 0 {
+        Vec::new()
+    } else {
+        super::varying::allocate_over_year(
+            conn,
+            year,
+            nondeductible,
+            partners,
+            Basis::ProfitOrLoss,
+            super::lines::NONDEDUCTIBLE_LINE,
+        )
+    };
 
     let mut accounts = Vec::with_capacity(partners.len());
     for (i, p) in partners.iter().enumerate() {
@@ -474,7 +565,10 @@ pub fn compute(
             beginning: cents_to_dollars(-beginning_cents),
             contributed: cents_to_dollars(-contributed_cents),
             net_income: shares.get(i).map(|s| s.dollars).unwrap_or(0),
-            other: 0,
+            // Negated. The share is their part of a positive expense figure;
+            // row 4 is signed and this is a decrease. See `CapitalAccount::other`
+            // — this is the line that looks like a sign error and is not.
+            other: -nondeductible_shares.get(i).map(|s| s.dollars).unwrap_or(0),
             withdrawals: cents_to_dollars(drawn_cents),
             linked_accounts: mine.map(Vec::len).unwrap_or(0),
         });
@@ -504,6 +598,7 @@ pub fn for_return(
     year: i32,
     partners: &[crate::tax::form1065::PartnerFiling],
     net_income: i64,
+    nondeductible: i64,
 ) -> Capital {
     let (year_start, year_end) = crate::commands::partnership_commands::calendar_year(year);
     let filed: Vec<&Partner> = partners
@@ -512,7 +607,7 @@ pub fn for_return(
         .filter(|p| p.was_partner_during(year_start, year_end))
         .collect();
 
-    match compute(conn, year, &filed, net_income) {
+    match compute(conn, year, &filed, net_income, nondeductible) {
         Ok(capital) => capital,
         Err(e) => Capital {
             failed: Some(e.to_string()),
@@ -718,9 +813,14 @@ mod tests {
     }
 
     fn run(store: &EventStore, net_income: i64) -> Capital {
+        run_with(store, net_income, 0)
+    }
+
+    /// The same, with a Schedule K line 18c figure to push into row 4.
+    fn run_with(store: &EventStore, net_income: i64, nondeductible: i64) -> Capital {
         let ps = partners(store.connection());
         let refs: Vec<&Partner> = ps.iter().collect();
-        compute(store.connection(), YEAR, &refs, net_income).unwrap()
+        compute(store.connection(), YEAR, &refs, net_income, nondeductible).unwrap()
     }
 
     /// Item L row 3 follows §706(d) too, or it contradicts box 1 on the same page.
@@ -850,6 +950,317 @@ mod tests {
         assert_eq!(zak.net_income, 3_000, "half of 6,000");
         assert_eq!(zak.other, 0);
         assert_eq!(zak.ending(), 8_000 + 4_000 + 3_000 - 1_500);
+    }
+
+    /// Row 4 carries the partner's share of the nondeductible expenses, and
+    /// carries it as a decrease. The figure arrives positive — Schedule K line
+    /// 18c prints positive — so the one thing that can go wrong here is the sign,
+    /// and it goes wrong invisibly: item L still foots either way.
+    #[test]
+    fn nondeductible_expenses_come_off_the_capital_account_on_row_four() {
+        let mut store = books();
+        link_all(&mut store);
+
+        // $140 of nondeductible expenses, two partners at 50/50.
+        let capital = run_with(&store, 10_000, 140);
+        let zak = capital.for_partner("zak").unwrap();
+        let jinny = capital.for_partner("jinny").unwrap();
+
+        assert_eq!(zak.other, -70, "a decrease, not an increase");
+        assert_eq!(jinny.other, -70);
+        assert_eq!(
+            -(zak.other + jinny.other),
+            140,
+            "and the shares are the whole of line 18c"
+        );
+        assert_eq!(
+            zak.ending(),
+            zak.beginning + zak.contributed + zak.net_income + zak.other - zak.withdrawals,
+            "item L foots with row 4 in it"
+        );
+        assert_eq!(zak.ending(), 5_000 - 70);
+    }
+
+    /// The real books' percentages, where the split does not divide evenly: the
+    /// dollar left over goes to one partner and the two still add to the box.
+    #[test]
+    fn the_rounding_of_row_four_adds_back_to_schedule_k() {
+        let store = books();
+        let mut ps = partners(store.connection());
+        ps[0].shares = Shares::from_percents(49.0, 49.0, 49.0);
+        ps[1].shares = Shares::from_percents(51.0, 51.0, 51.0);
+        let refs: Vec<&Partner> = ps.iter().collect();
+
+        let capital = compute(store.connection(), YEAR, &refs, 0, 140).unwrap();
+        let rows: Vec<i64> = capital.accounts.iter().map(|a| a.other).collect();
+        assert_eq!(-rows.iter().sum::<i64>(), 140, "{rows:?}");
+        assert!(rows.iter().all(|r| *r < 0), "{rows:?}");
+    }
+
+    /// A partnership with no limited deduction gets the row it always had. The
+    /// figure is passed in, so this is the check that nothing is being derived
+    /// behind the caller's back.
+    #[test]
+    fn row_four_is_zero_when_there_are_no_nondeductible_expenses() {
+        let mut store = books();
+        link_all(&mut store);
+        assert_eq!(run(&store, 10_000).for_partner("zak").unwrap().other, 0);
+    }
+
+    /// **The sign-and-basis mistake, in the shape the real books have it.**
+    ///
+    /// Jinny takes 51% of the profit and none of the loss; Zachary takes 49% and
+    /// all of it. Line 18c arrives positive, so row 4 has to be split 51/49 and
+    /// then negated. Split on the *loss* shares instead it would go 0/100 — one
+    /// partner's capital account taking the whole of it — and item L would still
+    /// foot for both of them, which is why this needs asserting rather than
+    /// eyeballing.
+    #[test]
+    fn row_four_uses_the_profit_shares_even_where_the_loss_shares_differ_sharply() {
+        let mut store = books();
+        link_all(&mut store);
+        let mut ps = partners(store.connection());
+        // ps is sorted by id: jinny, zak.
+        ps[0].shares = Shares::from_percents(51.0, 0.0, 51.0);
+        ps[1].shares = Shares::from_percents(49.0, 100.0, 49.0);
+        let refs: Vec<&Partner> = ps.iter().collect();
+
+        let capital = compute(store.connection(), YEAR, &refs, 0, 140).unwrap();
+        let jinny = capital.for_partner("jinny").unwrap();
+        let zak = capital.for_partner("zak").unwrap();
+
+        assert_eq!(
+            jinny.other, -71,
+            "51% of 140, negated — not nothing: {:?}",
+            capital.accounts
+        );
+        assert_eq!(
+            zak.other, -69,
+            "49% of 140, negated — not the whole of it: {:?}",
+            capital.accounts
+        );
+        assert_eq!(-(jinny.other + zak.other), 140);
+    }
+
+    /// And the other direction, so a reversed convention cannot pass both tests.
+    /// A negative line 18c is a decrease that has turned into an increase, and
+    /// the allocator puts a negative figure on the loss shares — which here is
+    /// the whole of it on one partner.
+    #[test]
+    fn a_negative_line_18c_becomes_an_increase_on_the_loss_shares() {
+        let mut store = books();
+        link_all(&mut store);
+        let mut ps = partners(store.connection());
+        ps[0].shares = Shares::from_percents(51.0, 0.0, 51.0);
+        ps[1].shares = Shares::from_percents(49.0, 100.0, 49.0);
+        let refs: Vec<&Partner> = ps.iter().collect();
+
+        let capital = compute(store.connection(), YEAR, &refs, 0, -140).unwrap();
+        assert_eq!(capital.for_partner("jinny").unwrap().other, 0);
+        assert_eq!(
+            capital.for_partner("zak").unwrap().other,
+            140,
+            "negated twice is an increase"
+        );
+    }
+
+    /// Item L is an identity and row 4 is inside it. Checked over a grid rather
+    /// than one example, with every other row carrying a figure too — a row 4
+    /// that was added to `ending()` but not to the identity, or added twice,
+    /// shows up here and nowhere else.
+    #[test]
+    fn item_l_foots_with_a_non_zero_row_four_over_a_grid() {
+        let mut store = books();
+        link_all(&mut store);
+        // Something on every other row: contributions and draws before and
+        // during the year.
+        post(
+            &mut store,
+            "p1",
+            day(2024, 3, 1),
+            &[("cash", 1_000_000), ("zak-in", -1_000_000)],
+        );
+        post(
+            &mut store,
+            "p2",
+            day(2024, 3, 2),
+            &[("cash", 800_000), ("jinny-in", -800_000)],
+        );
+        post(
+            &mut store,
+            "c1",
+            day(YEAR, 4, 1),
+            &[("cash", 400_000), ("zak-in", -400_000)],
+        );
+        post(
+            &mut store,
+            "d1",
+            day(YEAR, 8, 1),
+            &[("zak-out", 150_000), ("cash", -150_000)],
+        );
+        post(
+            &mut store,
+            "d2",
+            day(YEAR, 8, 2),
+            &[("jinny-out", 333_00), ("cash", -333_00)],
+        );
+
+        for net_income in [-10_001i64, -1, 0, 1, 10_001] {
+            for nondeductible in [1i64, 3, 139, 140, 219, 7_777] {
+                let capital = run_with(&store, net_income, nondeductible);
+                let case = format!("net {net_income}, 18c {nondeductible}");
+                let mut others = 0i64;
+                for a in &capital.accounts {
+                    assert_eq!(
+                        a.ending(),
+                        a.beginning + a.contributed + a.net_income + a.other - a.withdrawals,
+                        "item L does not foot for {}: {case}",
+                        a.partner_id
+                    );
+                    assert!(a.other <= 0, "a positive 18c is a decrease: {case} {a:?}");
+                    others += a.other;
+                }
+                assert_eq!(
+                    -others, nondeductible,
+                    "the shares of row 4 are the whole of line 18c: {case}"
+                );
+                assert!(
+                    capital.accounts.iter().any(|a| a.other != 0),
+                    "nothing landed on row 4 at all: {case}"
+                );
+            }
+        }
+    }
+
+    /// Row 4 is split over the year on **line 18c's own** history, and row 3 on
+    /// the whole of Schedule K. On a year whose percentages moved, those are two
+    /// different weightings and the two rows are then meant to differ.
+    ///
+    /// This is the fix for a real defect, not a nicety. Row 4 used to be weighted
+    /// by `k_analysis` because it seemed obvious that the two capital rows should
+    /// be divided the same way. But box 18 code C sits on the same K-1 and is a
+    /// share of line 18c, weighted by line 18c — so item L row 4 came out at −140
+    /// beside a box 18c of 180 on a $200 line, and nothing on the finished form
+    /// said which to believe. Row 4 belongs with the box it explains.
+    ///
+    /// Here: income earned evenly across the year, meals bought entirely in the
+    /// first half. Zak goes from half to nine tenths on 1 July, so he takes 70%
+    /// of the income and 50% of the meals.
+    #[test]
+    fn row_four_follows_line_18c_over_the_year_and_row_three_follows_schedule_k() {
+        let mut store = books();
+        link_all(&mut store);
+        for (id, ty, number, name) in [
+            ("revenue", EventAccountType::Revenue, "5000", "Sales"),
+            ("meals", EventAccountType::Expense, "3055", "Partner meals"),
+        ] {
+            let e = Event::AccountCreated {
+                account_id: id.into(),
+                account_type: ty,
+                account_number: number.into(),
+                name: name.into(),
+                parent_id: None,
+                currency: Some("USD".into()),
+                description: None,
+            };
+            let stored = store.append(EventEnvelope::new(e, "u".into())).unwrap();
+            store.apply_projection(&stored).unwrap();
+        }
+        crate::commands::tax_setup_commands::set_account_line(
+            &mut store, "u", "revenue", "l1a", YEAR,
+        )
+        .unwrap();
+        crate::commands::tax_setup_commands::set_account_line(
+            &mut store, "u", "meals", "l21", YEAR,
+        )
+        .unwrap();
+        // Half deductible, so the other half reaches line 18c — which is the only
+        // way the segments have an 18c figure to be weighted by at all.
+        crate::commands::tax_setup_commands::set_deduction_limit(
+            &mut store, "u", "meals", 50, YEAR,
+        )
+        .unwrap();
+
+        post(
+            &mut store,
+            "h1",
+            day(YEAR, 3, 1),
+            &[("cash", 100_000_00), ("revenue", -100_000_00)],
+        );
+        post(
+            &mut store,
+            "h2",
+            day(YEAR, 9, 1),
+            &[("cash", 100_000_00), ("revenue", -100_000_00)],
+        );
+        // Every meal in the first half of the year, while the split was 50/50.
+        post(
+            &mut store,
+            "m1",
+            day(YEAR, 4, 1),
+            &[("meals", 2_000_00), ("cash", -2_000_00)],
+        );
+        for (who, pct) in [("zak", 90.0), ("jinny", 10.0)] {
+            crate::commands::share_period_commands::set_partner_shares(
+                &mut store,
+                "u",
+                who,
+                day(YEAR, 7, 1),
+                Shares::from_percents(pct, pct, pct),
+            )
+            .unwrap();
+        }
+
+        let capital = run_with(&store, 200_000, 1_000);
+        let zak = capital.for_partner("zak").unwrap();
+        let jinny = capital.for_partner("jinny").unwrap();
+        // A little over 70% rather than exactly it: row 3 is weighted by the
+        // whole of Schedule K, and the first half bore the deductible half of the
+        // meals as well as its share of the income, so the halves weigh 99,000
+        // against 100,000 rather than evenly.
+        assert_eq!(
+            zak.net_income, 140_201,
+            "row 3 follows the whole of Schedule K: {:?}",
+            capital.accounts
+        );
+        assert_eq!(
+            zak.other, -500,
+            "row 4 follows line 18c, and every meal was bought while he held \
+             half: {:?}",
+            capital.accounts
+        );
+        assert_eq!(jinny.other, -500);
+        assert_ne!(
+            zak.net_income * 1_000 / 200_000,
+            -zak.other * 1_000 / 1_000,
+            "the two rows are meant to differ here — that is the whole point"
+        );
+        assert_eq!(-(zak.other + jinny.other), 1_000, "and they are the whole");
+    }
+
+    /// A segmented year with nothing on line 18c in any part of it. There is no
+    /// basis for preferring one partner's percentage to another's, so the split
+    /// falls back to the year-end one — the same fallback every other line makes.
+    #[test]
+    fn row_four_falls_back_to_the_year_end_split_when_no_segment_carries_18c() {
+        let mut store = books();
+        link_all(&mut store);
+        for (who, pct) in [("zak", 90.0), ("jinny", 10.0)] {
+            crate::commands::share_period_commands::set_partner_shares(
+                &mut store,
+                "u",
+                who,
+                day(YEAR, 7, 1),
+                Shares::from_percents(pct, pct, pct),
+            )
+            .unwrap();
+        }
+
+        // The figure is passed in, so line 18c can carry one on the return while
+        // the ledger this reads has no limited account to have produced it.
+        let capital = run_with(&store, 0, 1_000);
+        assert_eq!(capital.for_partner("zak").unwrap().other, -900);
+        assert_eq!(capital.for_partner("jinny").unwrap().other, -100);
     }
 
     /// The sign error this module's whole orientation exists to prevent: equity
@@ -1157,10 +1568,10 @@ mod tests {
         ps[1].shares = Shares::from_percents(10.0, 90.0, 50.0);
         let refs: Vec<&Partner> = ps.iter().collect();
 
-        let profit = compute(store.connection(), YEAR, &refs, 1_000).unwrap();
+        let profit = compute(store.connection(), YEAR, &refs, 1_000, 0).unwrap();
         assert_eq!(profit.accounts[0].net_income, 900, "Zak's profit share");
 
-        let loss = compute(store.connection(), YEAR, &refs, -1_000).unwrap();
+        let loss = compute(store.connection(), YEAR, &refs, -1_000, 0).unwrap();
         assert_eq!(loss.accounts[0].net_income, -100, "Zak's loss share");
         assert_eq!(loss.accounts[1].net_income, -900);
     }
@@ -1260,7 +1671,7 @@ mod tests {
                 crate::tax::form1065::PartnerFiling { partner, tin: None }
             })
             .collect();
-        let capital = for_return(store.connection(), YEAR, &filings, 10_000);
+        let capital = for_return(store.connection(), YEAR, &filings, 10_000, 0);
 
         assert_eq!(capital.accounts.len(), 1, "only the partner still in");
         assert_eq!(
@@ -1286,7 +1697,7 @@ mod tests {
             .into_iter()
             .map(|partner| crate::tax::form1065::PartnerFiling { partner, tin: None })
             .collect();
-        let capital = for_return(store.connection(), YEAR, &filings, 10_000);
+        let capital = for_return(store.connection(), YEAR, &filings, 10_000, 0);
 
         assert!(capital.is_empty());
         let warnings = capital.warnings();

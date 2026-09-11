@@ -205,6 +205,18 @@ const OTHER_INCOME_STATEMENT: Attachment = Attachment {
     url: "https://www.irs.gov/instructions/i1065",
     generated: true,
 };
+/// Line 18c's, which is produced twice over: once for the partnership's own
+/// Schedule K box, and once per partner for the share on their K-1.
+///
+/// The per-partner half is the one the form actually demands. Box 18 code C and
+/// item L row 4 both reach a partner as a single unexplained figure, and item L
+/// row 4 is a row the K-1 instructions tell you to attach an explanation for.
+/// See [`crate::tax::nondeductible`].
+pub const NONDEDUCTIBLE_STATEMENT: Attachment = Attachment {
+    name: "Nondeductible expenses statement",
+    url: "https://www.irs.gov/instructions/i1065",
+    generated: true,
+};
 
 /// The Instructions for Form 1065 themselves — the document every `instructions`
 /// string on this table is condensed from, and where a preparer goes when the
@@ -377,8 +389,8 @@ pub const MAPPABLE_LINES: &[TaxLineDef] = &[
         instructions: "Income excluded from gross income other than tax-exempt interest — life insurance proceeds, certain forgiven loans. Increases each partner's basis.",
         attachment: None },
     TaxLineDef { key: "k18c", number: "18c", label: "Nondeductible expenses", group: "Other information", schedule: Schedule::K, field: Field::One("f5_49[0]"), sense: Sense::Natural,
-        instructions: "Expenses paid that are not deductible and not capitalised — the disallowed half of meals, fines and penalties, political contributions. Reduces each partner's basis, which is why it is reported rather than ignored.",
-        attachment: None },
+        instructions: "Expenses paid that are not deductible and not capitalised — the disallowed half of meals, fines and penalties, political contributions. Reduces each partner's basis and their tax-basis capital account, which is why it is reported rather than ignored. A statement itemising what makes up this line is attached, and each partner's K-1 carries their own share of the same list.",
+        attachment: Some(NONDEDUCTIBLE_STATEMENT) },
     TaxLineDef { key: "k19a", number: "19a", label: "Distributions of cash and marketable securities", group: "Other information", schedule: Schedule::K, field: Field::One("f5_50[0]"), sense: Sense::Natural,
         instructions: "Cash and marketable securities distributed to partners during the year. A distribution is not a deduction — it reduces the partner's capital account and basis.",
         attachment: None },
