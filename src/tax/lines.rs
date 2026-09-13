@@ -1088,6 +1088,113 @@ pub fn load_effective_limits(conn: &Connection, year: i32) -> BTreeMap<String, u
         .collect()
 }
 
+/// Which parent accounts print as one row on the attached statements, for a year.
+///
+/// Stored as a dated yes or no — see migration 040 — so only the yeses in force
+/// for the year come back.
+pub fn load_statement_groups(conn: &Connection, year: i32) -> BTreeSet<String> {
+    load_dated(conn, "tax_statement_groups", "grouped", year)
+        .into_iter()
+        .filter(|(_, grouped)| grouped == "1")
+        .map(|(account, _)| account)
+        .collect()
+}
+
+/// Every account's number and name, by id.
+///
+/// For labelling a grouped statement row: the parent a group is named for often
+/// carries no balance of its own, so it is not among the rows being grouped.
+/// Read from the table rather than the active accounts, for the reason
+/// [`load_parents`] is.
+pub fn load_account_labels(conn: &Connection) -> BTreeMap<String, (String, String)> {
+    let mut out = BTreeMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, account_number, name FROM accounts") {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, String>(1)?, r.get::<_, String>(2)?),
+            ))
+        }) {
+            for (id, label) in rows.flatten() {
+                out.insert(id, label);
+            }
+        }
+    }
+    out
+}
+
+/// What a grouped statement row adds to its parent's name, so a reader tallying
+/// the column knows the row is a subtotal. The reports' wording, deliberately.
+pub const WITH_CHILDREN: &str = " (with children)";
+
+/// Collapse a statement's rows under the parents set to group their children.
+///
+/// Each row goes to its outermost grouped ancestor — itself included — and rows
+/// that share one are summed; a row with no grouped ancestor stays as it is.
+/// Outermost, because grouping "Office" is a statement about everything under
+/// it, a grouped child of it included. Groups keep the position of their first
+/// row, so the statement keeps the order the books gave it.
+///
+/// The total cannot move: grouping relocates figures between rows, and a
+/// statement that no longer footed to its line would be worse than a long one.
+pub fn group_statement_rows(
+    rows: &[LineDetail],
+    grouped: &BTreeSet<String>,
+    parent_of: &BTreeMap<String, Option<String>>,
+    labels: &BTreeMap<String, (String, String)>,
+) -> Vec<LineDetail> {
+    if grouped.is_empty() {
+        return rows.to_vec();
+    }
+    let mut out: Vec<LineDetail> = Vec::with_capacity(rows.len());
+    // Where each group's row is in `out`, and whether anything under the parent
+    // has been folded into it.
+    let mut groups: BTreeMap<String, (usize, bool)> = BTreeMap::new();
+
+    for row in rows {
+        let mut outermost = None;
+        let mut cursor = Some(row.account_id.clone());
+        for _ in 0..MAX_TREE_DEPTH {
+            let Some(id) = cursor else { break };
+            if grouped.contains(&id) {
+                outermost = Some(id.clone());
+            }
+            cursor = parent_of.get(&id).cloned().flatten();
+        }
+        let Some(parent) = outermost else {
+            out.push(row.clone());
+            continue;
+        };
+        let is_child = parent != row.account_id;
+        match groups.get_mut(&parent) {
+            Some((i, has_children)) => {
+                out[*i].cents += row.cents;
+                *has_children |= is_child;
+            }
+            None => {
+                let (account_number, account_name) = labels
+                    .get(&parent)
+                    .cloned()
+                    .unwrap_or_else(|| (row.account_number.clone(), row.account_name.clone()));
+                groups.insert(parent.clone(), (out.len(), is_child));
+                out.push(LineDetail {
+                    account_id: parent,
+                    account_number,
+                    account_name,
+                    cents: row.cents,
+                });
+            }
+        }
+    }
+
+    for (i, has_children) in groups.into_values() {
+        if has_children {
+            out[i].account_name.push_str(WITH_CHILDREN);
+        }
+    }
+    out
+}
+
 /// Split a balance into the part that is deducted and the part that is not.
 ///
 /// Rounding is done once, on the deductible part, and the remainder is whatever
@@ -2021,5 +2128,120 @@ mod closing_tests {
             after, before,
             "closing the books must leave the filed figures exactly as they were"
         );
+    }
+}
+
+#[cfg(test)]
+mod statement_group_tests {
+    use super::*;
+
+    fn stmt_row(id: &str, cents: i64) -> LineDetail {
+        LineDetail {
+            account_id: id.into(),
+            account_number: format!("n{id}"),
+            account_name: format!("row {id}"),
+            cents,
+        }
+    }
+
+    /// Office (P) holds Supplies (C1) and Postage (C2); Paper (G) sits under
+    /// Supplies. Travel (U) is unrelated.
+    fn tree() -> (
+        BTreeMap<String, Option<String>>,
+        BTreeMap<String, (String, String)>,
+    ) {
+        let parents = [
+            ("P", None),
+            ("C1", Some("P")),
+            ("C2", Some("P")),
+            ("G", Some("C1")),
+            ("U", None),
+        ]
+        .into_iter()
+        .map(|(id, p)| (id.to_string(), p.map(str::to_string)))
+        .collect();
+        let labels = [("P", "6000", "Office"), ("C1", "6010", "Supplies")]
+            .into_iter()
+            .map(|(id, n, name)| (id.to_string(), (n.to_string(), name.to_string())))
+            .collect();
+        (parents, labels)
+    }
+
+    fn rows() -> Vec<LineDetail> {
+        vec![
+            stmt_row("C1", 100),
+            stmt_row("G", 5),
+            stmt_row("U", 7),
+            stmt_row("C2", 20),
+        ]
+    }
+
+    fn set(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn total(rows: &[LineDetail]) -> i64 {
+        rows.iter().map(|r| r.cents).sum()
+    }
+
+    #[test]
+    fn nothing_grouped_leaves_the_rows_alone() {
+        let (parents, labels) = tree();
+        assert_eq!(
+            group_statement_rows(&rows(), &set(&[]), &parents, &labels),
+            rows()
+        );
+    }
+
+    #[test]
+    fn a_grouped_parent_takes_its_whole_subtree_under_its_own_name() {
+        let (parents, labels) = tree();
+        let out = group_statement_rows(&rows(), &set(&["P"]), &parents, &labels);
+        let shown: Vec<(&str, &str, i64)> = out
+            .iter()
+            .map(|r| (r.account_number.as_str(), r.account_name.as_str(), r.cents))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![("6000", "Office (with children)", 125), ("nU", "row U", 7)]
+        );
+        assert_eq!(total(&out), total(&rows()), "grouping moved the total");
+    }
+
+    #[test]
+    fn a_grouped_child_groups_only_beneath_itself() {
+        let (parents, labels) = tree();
+        let out = group_statement_rows(&rows(), &set(&["C1"]), &parents, &labels);
+        let shown: Vec<(&str, i64)> = out
+            .iter()
+            .map(|r| (r.account_name.as_str(), r.cents))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("Supplies (with children)", 105),
+                ("row U", 7),
+                ("row C2", 20)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_outermost_grouped_ancestor_wins() {
+        let (parents, labels) = tree();
+        assert_eq!(
+            group_statement_rows(&rows(), &set(&["P", "C1"]), &parents, &labels),
+            group_statement_rows(&rows(), &set(&["P"]), &parents, &labels)
+        );
+    }
+
+    /// A parent that posted to itself and has nothing beneath it on this line is
+    /// not a subtotal, and is not labelled as one.
+    #[test]
+    fn a_parent_with_only_its_own_balance_is_not_called_a_subtotal() {
+        let (parents, labels) = tree();
+        let out = group_statement_rows(&[stmt_row("P", 40)], &set(&["P"]), &parents, &labels);
+        assert_eq!(out[0].account_name, "Office");
+        assert_eq!(out[0].cents, 40);
     }
 }

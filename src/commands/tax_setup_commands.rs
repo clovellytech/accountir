@@ -102,6 +102,30 @@ pub fn clear_deduction_limit(
     )
 }
 
+/// Print a parent account's children as one row on the statements attached to
+/// the return, or go back to a row each, from a tax year onward.
+///
+/// A yes-or-no for the year rather than a set and a clear, so "not from 2025"
+/// is recorded as such and a statement attached to an earlier return is left as
+/// it was filed.
+pub fn set_statement_grouping(
+    store: &mut EventStore,
+    user_id: &str,
+    account_id: &str,
+    grouped: bool,
+    effective_from: i32,
+) -> Result<StoredEvent, TaxSetupError> {
+    append(
+        store,
+        user_id,
+        Event::TaxStatementGroupingSet {
+            account_id: account_id.to_string(),
+            grouped,
+            effective_from,
+        },
+    )
+}
+
 /// Remove an account's own line assignment from a tax year onward.
 ///
 /// That year's row only. The account then falls back to the most recent earlier
@@ -349,6 +373,24 @@ mod tests {
         let mut s = EventStore::in_memory().expect("in-memory store");
         SchemaStore::init_schema(&mut s).unwrap();
         s
+    }
+
+    /// Grouping applies from its year forward, and stopping it later leaves the
+    /// earlier years grouped.
+    #[test]
+    fn statement_grouping_is_dated_and_can_be_stopped_later() {
+        let mut s = store();
+        set_statement_grouping(&mut s, "u1", "6000", true, 2023).unwrap();
+        set_statement_grouping(&mut s, "u1", "6000", false, 2025).unwrap();
+
+        let on = |y| crate::tax::lines::load_statement_groups(s.connection(), y).contains("6000");
+        assert!(!on(2022), "before it was set");
+        assert!(on(2023));
+        assert!(on(2024), "a year with no row of its own inherits 2023's");
+        assert!(
+            !on(2025),
+            "the no from 2025 is a row, not a fall back to 2023"
+        );
     }
 
     #[test]

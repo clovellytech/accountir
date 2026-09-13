@@ -470,6 +470,10 @@ fn deletion_blockers(
             "a deduction limit",
         ),
         (
+            "SELECT COUNT(*) FROM tax_statement_groups WHERE account_id = ?1",
+            "a statement grouping",
+        ),
+        (
             "SELECT COUNT(*) FROM ingest_account_mappings WHERE account_id = ?1",
             "an import mapping",
         ),

@@ -144,6 +144,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             39,
             include_str!("../../migrations/039_drop_fiscal_periods.sql"),
         ),
+        (
+            40,
+            include_str!("../../migrations/040_statement_groups.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -713,6 +717,18 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             account_id TEXT NOT NULL,
             effective_from INTEGER NOT NULL DEFAULT 0,
             deductible_pct INTEGER NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (account_id, effective_from)
+        );
+
+        -- Which parent accounts print as one row on the attached statements
+        -- (migration 040). Dated like `tax_deduction_limits`, and a stored no
+        -- is a row rather than an absence — see the migration.
+        CREATE TABLE IF NOT EXISTS tax_statement_groups (
+            account_id TEXT NOT NULL,
+            effective_from INTEGER NOT NULL,
+            grouped INTEGER NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at_event INTEGER REFERENCES events(id),
             PRIMARY KEY (account_id, effective_from)

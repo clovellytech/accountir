@@ -420,6 +420,21 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 widgets::truncate(account_id, 8)
             )
         }
+        Event::TaxStatementGroupingSet {
+            account_id,
+            grouped,
+            ..
+        } => {
+            format!(
+                "Account {} {} its children on attached statements",
+                widgets::truncate(account_id, 8),
+                if *grouped {
+                    "groups"
+                } else {
+                    "no longer groups"
+                }
+            )
+        }
         Event::ScheduleBAnswerSet {
             tax_year,
             answer_key,

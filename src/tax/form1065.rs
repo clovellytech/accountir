@@ -917,7 +917,23 @@ pub fn build_return_from_ledger(
     }
 
     // The statements are built from this, and only this path knows it.
-    owned.detail = computed.detail;
+    //
+    // Grouped here, after the partners' nondeductible split above has read the
+    // detail account by account: grouping is how finely a statement itemises a
+    // line, and must not change what any partner is allocated.
+    owned.detail = {
+        let groups = super::lines::load_statement_groups(conn, owned.year);
+        let parents = super::lines::load_parents(conn);
+        let labels = super::lines::load_account_labels(conn);
+        computed
+            .detail
+            .into_iter()
+            .map(|(line, rows)| {
+                let rows = super::lines::group_statement_rows(&rows, &groups, &parents, &labels);
+                (line, rows)
+            })
+            .collect()
+    };
     // Schedule M-1 line 1. Read here rather than demanded from the caller, for
     // the same reason Schedule L is: this is the only entry point with a ledger,
     // and a caller that forgot would ship an M-1 opening at zero.

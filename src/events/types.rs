@@ -409,6 +409,25 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "is_any_year")]
         effective_from: i32,
     },
+    /// A parent account's children print as one row on the statements attached
+    /// to the return — or, with `grouped` false, go back to a row each.
+    ///
+    /// Its own event for the reason [`Event::TaxDeductionLimitSet`] is: which
+    /// line an account reports on is a fact about the return, and how finely the
+    /// statement behind that line itemises it is a choice about presentation
+    /// that changes independently. An event rather than a local setting because
+    /// the statement is part of a return about the partnership, and a colleague
+    /// generating it has to get the same pages.
+    ///
+    /// A yes-or-no for a year rather than a set-and-clear pair. Grouping stopped
+    /// from 2025 is a row of its own; deleting 2025's row instead would fall back
+    /// to an earlier year's yes.
+    TaxStatementGroupingSet {
+        account_id: String,
+        grouped: bool,
+        /// The first tax year this applies to.
+        effective_from: i32,
+    },
     /// An account is taken off the return.
     TaxLineMappingCleared {
         account_id: String,
@@ -837,6 +856,7 @@ impl Event {
             Event::AccountDeleted { .. } => "account_deleted",
             Event::TaxDeductionLimitSet { .. } => "tax_deduction_limit_set",
             Event::TaxDeductionLimitCleared { .. } => "tax_deduction_limit_cleared",
+            Event::TaxStatementGroupingSet { .. } => "tax_statement_grouping_set",
             Event::ScheduleBAnswerSet { .. } => "schedule_b_answer_set",
             Event::ScheduleBAnswerCleared { .. } => "schedule_b_answer_cleared",
             Event::PartnerWithdrawn { .. } => "partner_withdrawn",
@@ -908,6 +928,7 @@ impl Event {
             Event::AccountDeleted { account_id } => Some(account_id),
             Event::TaxDeductionLimitSet { account_id, .. } => Some(account_id),
             Event::TaxDeductionLimitCleared { account_id, .. } => Some(account_id),
+            Event::TaxStatementGroupingSet { account_id, .. } => Some(account_id),
             // Keyed by (year, question), so no single id names the thing changed.
             Event::ScheduleBAnswerSet { .. } => None,
             Event::ScheduleBAnswerCleared { .. } => None,

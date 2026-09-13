@@ -333,6 +333,9 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::TaxDeductionLimitCleared { account_id, .. } => {
             validate_non_empty(account_id, "account_id")?;
         }
+        Event::TaxStatementGroupingSet { account_id, .. } => {
+            validate_non_empty(account_id, "account_id")?;
+        }
         Event::AccountDeleted { account_id } => {
             validate_non_empty(account_id, "account_id")?;
         }

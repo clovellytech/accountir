@@ -34,6 +34,10 @@ pub fn router() -> Router<SyncState> {
             post(submit_set_deduction_limit),
         )
         .route(
+            "/sync/commands/set-statement-grouping",
+            post(submit_set_statement_grouping),
+        )
+        .route(
             "/sync/commands/set-schedule-b-answer",
             post(submit_set_answer),
         )
@@ -176,6 +180,38 @@ async fn submit_set_deduction_limit(
         }
     };
     append(st, req.expected_head_seq, actor, event)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SetStatementGroupingRequest {
+    pub expected_head_seq: i64,
+    /// The first tax year this applies to.
+    pub effective_from: i32,
+    pub account_id: String,
+    /// Whether the account's children print as one row with it from that year.
+    pub grouped: bool,
+}
+
+/// Print a parent account's children as one row on the attached statements, or
+/// go back to a row each.
+async fn submit_set_statement_grouping(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetStatementGroupingRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    if req.account_id.trim().is_empty() {
+        return Err(ApiError::bad_request("account_id is required"));
+    }
+    append(
+        st,
+        req.expected_head_seq,
+        actor,
+        Event::TaxStatementGroupingSet {
+            account_id: req.account_id,
+            grouped: req.grouped,
+            effective_from: req.effective_from,
+        },
+    )
 }
 
 async fn submit_set_answer(

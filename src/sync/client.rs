@@ -1356,6 +1356,26 @@ impl SyncClient {
         .await
     }
 
+    /// Print a parent account's children as one row on the statements attached
+    /// to the return from `effective_from`, or go back to a row each.
+    pub async fn set_statement_grouping(
+        &mut self,
+        account_id: impl Into<String>,
+        grouped: bool,
+        effective_from: i32,
+    ) -> Result<i64, SyncClientError> {
+        let account_id = account_id.into();
+        self.submit_retrying("/sync/commands/set-statement-grouping", |head| {
+            crate::sync::commands::tax_setup::SetStatementGroupingRequest {
+                expected_head_seq: head,
+                effective_from,
+                account_id: account_id.clone(),
+                grouped,
+            }
+        })
+        .await
+    }
+
     /// Receive a bill: the bill's journal entry and `BillReceived`, appended
     /// atomically by the server.
     #[allow(clippy::too_many_arguments)]

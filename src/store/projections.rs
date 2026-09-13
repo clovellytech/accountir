@@ -174,6 +174,22 @@ impl<'a> Projector<'a> {
                     params![account_id, effective_from],
                 )?;
             }
+            Event::TaxStatementGroupingSet {
+                account_id,
+                grouped,
+                effective_from,
+            } => {
+                // Stored as a yes or a no, never deleted: a no from 2025 has to
+                // be a row, or 2025 would fall back to an earlier year's yes.
+                self.conn.execute(
+                    "INSERT INTO tax_statement_groups
+                       (account_id, effective_from, grouped, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4)
+                     ON CONFLICT(account_id, effective_from) DO UPDATE SET
+                       grouped = ?3, updated_at = datetime('now'), updated_at_event = ?4",
+                    params![account_id, effective_from, *grouped as i64, stored_event.id],
+                )?;
+            }
             Event::TaxLineMappingCleared {
                 account_id,
                 effective_from,
@@ -1184,6 +1200,7 @@ impl<'a> Projector<'a> {
              -- and its colleagues do not, which is the divergence that made these
              -- events necessary in the first place.
              DELETE FROM tax_line_mappings;
+             DELETE FROM tax_statement_groups;
              DELETE FROM schedule_b_answers;
              -- Projections too, and missing from this list until now: a rebuild
              -- that left them behind was a merge rather than a replay, so a
