@@ -24,6 +24,12 @@
 //! widgets share, so typing a TIN for one partner fills it in for all three.
 //! [`namespace_fields`] gives each copy its own namespace before it is
 //! appended.
+//!
+//! It is not only repeated copies. Every IRS blank names its root field
+//! `topmostSubform[0]`, so two *different* forms collide wherever their inner
+//! names happen to agree — Form 4562's Part I and II boxes are `f1_15` to
+//! `f1_25`, and so are boxes on Form 1065 page 1. [`append_document`] refuses a
+//! merge that would join any two fields.
 
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use std::collections::BTreeMap;
@@ -49,6 +55,12 @@ pub enum FormError {
     },
     #[error("{0}")]
     Malformed(String),
+    #[error(
+        "Appending a form would join {count} of its fields to fields already in the return, \
+         starting with {first} — a viewer shows one value in both places. The form needs its \
+         own namespace before it is appended."
+    )]
+    FieldCollision { first: String, count: usize },
     #[error(
         "The {0} Form 1065 re-paginates the form — a new Schedule A takes page 1, so the income \
          page becomes page 2 and Schedule K page 6 — and its boxes have not been matched to this \
@@ -507,8 +519,23 @@ pub fn namespace_fields(doc: &mut Document, namespace: &str) {
 ///
 /// The caller is expected to have run [`namespace_fields`] on `other` first;
 /// nothing here can tell two identical field names apart once they are in the
-/// same document.
+/// same document. So a merge that would join a field to one already present is
+/// refused with [`FormError::FieldCollision`] rather than trusted: a missed
+/// namespace does not fail anywhere else, it prints one form's figures on another.
 pub fn append_document(base: &mut Document, mut other: Document) -> Result<(), FormError> {
+    let existing = field_map(base);
+    let incoming = field_map(&other);
+    let clashes: Vec<&String> = incoming
+        .names()
+        .filter(|n| existing.0.contains_key(*n))
+        .collect();
+    if let Some(first) = clashes.first() {
+        return Err(FormError::FieldCollision {
+            first: (*first).clone(),
+            count: clashes.len(),
+        });
+    }
+
     // Move `other`'s object ids clear of `base`'s so nothing collides.
     other.renumber_objects_with(base.max_id + 1);
     base.max_id = other.max_id;

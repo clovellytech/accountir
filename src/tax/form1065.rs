@@ -166,6 +166,21 @@ pub fn k1_namespace(n: usize) -> String {
     format!("K1_{n}")
 }
 
+/// Where Form 4562's fields live in the bundle.
+///
+/// Its own namespace because every IRS blank's root is `topmostSubform[0]`, and
+/// the 4562's Part I and II boxes (`f1_15` to `f1_25`) and Part V check boxes
+/// have the same names as boxes on Form 1065 pages 1 and 2. Appended under the
+/// shared root, a viewer treats each pair as one field: the 1065's figures print
+/// in Parts I and II, and the 4562's check boxes answer Schedule B's questions.
+pub const F4562_NAMESPACE: &str = "F4562";
+
+/// Where Schedule B-1's fields live in the bundle. See [`F4562_NAMESPACE`].
+pub const SCHEDULE_B1_NAMESPACE: &str = "SchB1";
+
+/// Where Schedule B-2's fields live in the bundle. See [`F4562_NAMESPACE`].
+pub const SCHEDULE_B2_NAMESPACE: &str = "SchB2";
+
 // --- Form 1065, page 1 ------------------------------------------------------
 // Descriptions are from docs/form-1065-fields.md.
 /// Page one's boxes on one revision of the form.
@@ -1164,7 +1179,8 @@ fn build_return_inner(
             super::schedule_b1::build(&req.profile.legal_name, &req.profile.ein, &owners)?;
         warnings.extend(b1_warnings);
         match sched {
-            Some(sched) => {
+            Some(mut sched) => {
+                namespace_fields(&mut sched, SCHEDULE_B1_NAMESPACE);
                 append_document(&mut doc, sched)?;
                 warnings.push(super::schedule_b1::CONSTRUCTIVE_OWNERSHIP_CAVEAT.to_string());
             }
@@ -1209,7 +1225,8 @@ fn build_return_inner(
     let (form_4562, f4562_warnings) =
         super::form4562::build(&req.profile, &year_schedule, &activity, req.year)?;
     warnings.extend(f4562_warnings);
-    if let Some(filled) = form_4562 {
+    if let Some(mut filled) = form_4562 {
+        namespace_fields(&mut filled.document, F4562_NAMESPACE);
         append_document(&mut doc, filled.document)?;
     }
 
@@ -1224,7 +1241,8 @@ fn build_return_inner(
         let (sched, count, b2_warnings) =
             super::schedule_b2::build(&req.profile.legal_name, &req.profile.ein, &eligible)?;
         warnings.extend(b2_warnings);
-        if let Some(sched) = sched {
+        if let Some(mut sched) = sched {
+            namespace_fields(&mut sched, SCHEDULE_B2_NAMESPACE);
             append_document(&mut doc, sched)?;
         }
 
@@ -2632,6 +2650,76 @@ mod tests {
             map.names().any(|n| n.ends_with("R6[0]")),
             "the attached 4562 is not the 2023 revision"
         );
+    }
+
+    /// Form 4562 keeps its own boxes once it is in the bundle.
+    ///
+    /// Every IRS blank's root field is `topmostSubform[0]`, and the 4562's page 1
+    /// boxes `f1_15` to `f1_25` — Part I lines 7 to 13, Part II and line 17 — are
+    /// named exactly like boxes on 1065 page 1, as its Part V check boxes are
+    /// like Schedule B's. Appended under the shared root, a viewer showed the
+    /// 1065's figures in Parts I and II of a 2023 return.
+    #[test]
+    fn form_4562_does_not_share_boxes_with_the_1065() {
+        use crate::domain::{BonusElection, DepreciableAsset, PropertyClass, System};
+
+        let mut req = two_partner_request();
+        req.year = 2023;
+        req.assets = vec![DepreciableAsset {
+            asset_id: "fitout".into(),
+            description: "Leasehold improvements".into(),
+            asset_account_id: "1500".into(),
+            expense_account_id: "6500".into(),
+            accumulated_account_id: "1590".into(),
+            section_179_account_id: None,
+            acquired_on: day(2023, 10, 19),
+            placed_in_service: day(2023, 10, 19),
+            cost_cents: 12_481_600,
+            class: PropertyClass::Nonresidential,
+            system: System::Gds,
+            section_179_cents: 0,
+            bonus: BonusElection::Decline,
+            disposed_on: None,
+            notes: None,
+        }];
+
+        let bundle = build_return(&req).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        let names: Vec<&String> = map.names().collect();
+        for leaf in ["Page1[0].f1_15[0]", "Page1[0].f1_22[0]", "Page2[0].c2_1[0]"] {
+            let theirs = format!("{F4562_NAMESPACE}.{leaf}");
+            let ours = format!("topmostSubform[0].{leaf}");
+            assert!(names.contains(&&theirs), "the 4562 has no {theirs}");
+            assert!(names.contains(&&ours), "the 1065 has no {ours}");
+        }
+        // Nothing is ever filled into Part II for property bonus cannot reach.
+        assert_eq!(
+            crate::tax::acroform::get_value(
+                &doc,
+                &map,
+                &format!("{F4562_NAMESPACE}.Page1[0].f1_22[0]")
+            ),
+            None
+        );
+    }
+
+    /// A form whose fields would join the return's is refused, not merged.
+    #[test]
+    fn appending_a_form_that_shares_field_names_is_refused() {
+        let mut base =
+            Document::load_mem(include_bytes!("../../assets/irs/2023/f1065.pdf")).unwrap();
+        strip_xfa(&mut base);
+        let mut other =
+            Document::load_mem(include_bytes!("../../assets/irs/2023/f4562.pdf")).unwrap();
+        strip_xfa(&mut other);
+
+        match append_document(&mut base, other) {
+            Err(crate::tax::acroform::FormError::FieldCollision { count, .. }) => {
+                assert!(count > 0)
+            }
+            other => panic!("expected a field collision, got {other:?}"),
+        }
     }
 
     /// A merged form must carry the fonts its fields ask for.
