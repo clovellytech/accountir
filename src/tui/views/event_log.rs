@@ -342,6 +342,20 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::DepreciationOverrideCleared { asset_id, tax_year } => {
             format!("Asset {asset_id}: {tax_year} depreciation back to the computed figure")
         }
+        Event::DepreciationBasisAdjusted {
+            asset_id,
+            effective_year,
+            amount_cents,
+            note,
+            ..
+        } => format!(
+            "Asset {asset_id}: basis {} by ${:.2} from {effective_year} — {note}",
+            if *amount_cents < 0 { "reduced" } else { "increased" },
+            amount_cents.abs() as f64 / 100.0
+        ),
+        Event::DepreciationBasisAdjustmentRemoved { asset_id, .. } => {
+            format!("Asset {asset_id}: a basis adjustment removed")
+        }
         Event::BusinessTypeSet { business_type } => {
             let t = crate::domain::BusinessType::parse(business_type)
                 .map(|t| t.label())

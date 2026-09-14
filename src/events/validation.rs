@@ -270,6 +270,32 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::DepreciationOverrideCleared { asset_id, .. } => {
             validate_non_empty(asset_id, "asset_id")?;
         }
+        Event::DepreciationBasisAdjusted {
+            adjustment_id,
+            asset_id,
+            effective_year,
+            amount_cents,
+            note,
+        } => {
+            validate_non_empty(adjustment_id, "adjustment_id")?;
+            validate_non_empty(asset_id, "asset_id")?;
+            // What moved the basis is the point: it is what the Form 4562
+            // statement prints beside the adjusted figure.
+            validate_non_empty(note, "note")?;
+            if *amount_cents == 0 {
+                return Err(ValidationError::InvalidValue(
+                    "amount_cents: an adjustment of nothing changes no basis".to_string(),
+                ));
+            }
+            if !(1900..=2200).contains(effective_year) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "effective_year: {effective_year} is not a tax year"
+                )));
+            }
+        }
+        Event::DepreciationBasisAdjustmentRemoved { adjustment_id, .. } => {
+            validate_non_empty(adjustment_id, "adjustment_id")?;
+        }
         // --- sole proprietorships (migration 031) ---
         Event::BusinessTypeSet { business_type } => {
             // Checked against the catalogue rather than for emptiness: an

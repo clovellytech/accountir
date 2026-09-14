@@ -1193,6 +1193,122 @@ fn money(cents: i64) -> String {
     format_dollars(cents_to_dollars(cents))
 }
 
+/// The statement behind any asset whose basis changed after it was bought.
+///
+/// Form 4562 has a basis column only for property placed in service this year,
+/// and nowhere at all to say that an older asset's basis moved — a grant that
+/// reimbursed a fit-out, a rebate. Its depreciation still reaches line 17 on the
+/// adjusted figure, so this page shows how it got there: cost, each adjustment
+/// and why, the adjusted basis, and the depreciation on it. A year fixed by hand
+/// is named with its reason too, since it is the other way a figure on the form
+/// departs from the tables. `None` when no asset carries an adjustment in effect.
+pub fn basis_statement(
+    schedule: &YearSchedule<'_>,
+    legal_name: &str,
+    ein: &str,
+) -> Result<Option<Document>, FormError> {
+    use super::statement::{build_table, Column, TableLine, TableStatement};
+
+    let year = schedule.tax_year;
+    let rows: Vec<_> = schedule
+        .rows
+        .iter()
+        .filter(|r| {
+            r.asset
+                .basis_adjustments
+                .iter()
+                .any(|a| a.effective_year <= year)
+        })
+        .collect();
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let dollars = |cents: i64| {
+        let whole = super::lines::format_dollars(super::lines::cents_to_dollars(cents.abs()));
+        if cents < 0 {
+            format!("({whole})")
+        } else {
+            whole
+        }
+    };
+    let column = |title: &str, x: f32, right: bool| Column {
+        title: title.to_string(),
+        x,
+        right,
+    };
+    let columns = vec![
+        column("Asset", 54.0, false),
+        column("In service", 206.0, false),
+        column("Cost", 322.0, true),
+        column("Adjustments", 396.0, true),
+        column("Adjusted basis", 474.0, true),
+        column("Method", 484.0, false),
+        column("Prior years", 612.0, true),
+        column(&year.to_string(), 676.0, true),
+        column("Accumulated", 738.0, true),
+    ];
+
+    let mut lines = Vec::new();
+    for r in rows {
+        let a = r.asset;
+        let this_year = r.total_cents();
+        lines.push(TableLine::Cells(vec![
+            a.description.chars().take(30).collect(),
+            a.placed_in_service.to_string(),
+            dollars(a.cost_cents),
+            dollars(r.adjusted_cost_cents - a.cost_cents),
+            dollars(r.adjusted_cost_cents),
+            format!(
+                "{} {} {}",
+                method_label(a.class.method(a.system)),
+                convention_label(r.convention),
+                recovery_label(a.class.recovery_years(a.system))
+            ),
+            dollars(r.accumulated_cents - this_year),
+            dollars(this_year),
+            dollars(r.accumulated_cents),
+        ]));
+        for adjustment in a.basis_adjustments.iter().filter(|b| b.effective_year <= year) {
+            lines.push(TableLine::Note(format!(
+                "Basis {} by {} from {}: {}",
+                if adjustment.amount_cents < 0 {
+                    "reduced"
+                } else {
+                    "increased"
+                },
+                dollars(adjustment.amount_cents.abs()),
+                adjustment.effective_year,
+                adjustment.note
+            )));
+        }
+        if let Some(fixed) = a.overrides.get(&year) {
+            lines.push(TableLine::Note(format!(
+                "{year} depreciation fixed at {}: {}",
+                dollars(fixed.amount_cents),
+                fixed.note
+            )));
+        }
+    }
+
+    build_table(&TableStatement {
+        legal_name,
+        ein,
+        heading: format!("Form 4562 ({year}) — basis adjustments statement"),
+        subheading: "Depreciable property whose basis changed after it was placed in service"
+            .to_string(),
+        columns,
+        lines,
+        footnotes: vec![
+            "From the year an adjustment takes effect, depreciation is figured on the adjusted \
+             basis less the depreciation already allowed, over the rest of the recovery period. \
+             An adjustment in the year the property was placed in service is part of its basis \
+             from the start."
+                .to_string(),
+        ],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1247,6 +1363,7 @@ mod tests {
             disposed_on: None,
             notes: None,
             overrides: Default::default(),
+            basis_adjustments: Vec::new(),
         }
     }
 

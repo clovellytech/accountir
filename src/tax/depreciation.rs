@@ -128,7 +128,7 @@ pub fn mid_quarter_applies(assets: &[DepreciableAsset], pis_year: i32) -> bool {
         {
             continue;
         }
-        let basis = (a.cost_cents - a.section_179_cents).max(0);
+        let basis = (a.opening_basis_cents() - a.section_179_cents).max(0);
         total += basis;
         if a.quarter_placed() == 4 {
             fourth_quarter += basis;
@@ -265,6 +265,9 @@ pub struct AssetYear<'a> {
     /// Cost less §179 less bonus: what MACRS actually runs on.
     pub macrs_basis_cents: i64,
     pub macrs_cents: i64,
+    /// Cost plus the basis adjustments in effect by the end of this year — what
+    /// Schedule L line 9a carries for the asset.
+    pub adjusted_cost_cents: i64,
     /// Everything written off against this asset from the start through the end
     /// of this year, §179 and bonus included. Schedule L line 9b reads this.
     pub accumulated_cents: i64,
@@ -284,7 +287,7 @@ impl AssetYear<'_> {
 
     /// Cost less everything written off — the asset's remaining tax basis.
     pub fn remaining_basis_cents(&self) -> i64 {
-        self.asset.cost_cents - self.accumulated_cents
+        self.adjusted_cost_cents - self.accumulated_cents
     }
 }
 
@@ -337,7 +340,7 @@ impl YearSchedule<'_> {
         self.rows
             .iter()
             .filter(|r| !r.disposed)
-            .map(|r| r.asset.cost_cents)
+            .map(|r| r.adjusted_cost_cents)
             .sum()
     }
 
@@ -378,12 +381,8 @@ fn accumulated_through(asset: &DepreciableAsset, through_year: i32, mid_quarter:
         first_year_fraction(convention, asset.placed_in_service),
         life,
     );
-    let schedule = schedule_cents(
-        macrs_basis,
-        life,
-        asset.class.method(asset.system),
-        &fractions,
-    );
+    let method = asset.class.method(asset.system);
+    let schedule = schedule_cents(macrs_basis, life, method, &fractions);
 
     let mut total = section_179;
     for year in 1..=last {
@@ -404,6 +403,21 @@ fn accumulated_through(asset: &DepreciableAsset, through_year: i32, mid_quarter:
         let Some(&amount) = schedule.get(index) else {
             break;
         };
+        // Once the basis has moved after the first year, the tables no longer
+        // describe the asset: what is left of the adjusted basis is spread over
+        // what is left of the recovery period — the same rule `compute_year`
+        // applies, so the two cannot disagree.
+        let amount = if asset.basis_adjusted_after_placement_by(tax_year) {
+            remaining_life_cents(
+                asset.adjusted_cost_through(tax_year) - total,
+                life,
+                method,
+                &fractions,
+                index,
+            )
+        } else {
+            amount
+        };
         let first_year_bonus = if year == 1 { bonus } else { 0 };
         // A disposal year is a part year, on the same convention that opened the
         // asset; after it there is nothing left to take.
@@ -417,12 +431,54 @@ fn accumulated_through(asset: &DepreciableAsset, through_year: i32, mid_quarter:
         // Never past the basis — the same cap `compute_year` applies, so the two
         // cannot disagree about a year after one fixed above the table.
         total +=
-            first_year_bonus + amount.min((asset.cost_cents - total - first_year_bonus).max(0));
+            first_year_bonus
+                + amount.min((asset.adjusted_cost_through(tax_year) - total - first_year_bonus).max(0));
         if last_year {
             break;
         }
     }
-    total.min(asset.cost_cents)
+    // Capped at the most the basis ever was: a reduction below what had already
+    // been allowed leaves that depreciation standing rather than undoing it.
+    total.min(
+        asset
+            .opening_basis_cents()
+            .max(asset.adjusted_cost_through(through_year)),
+    )
+}
+
+/// One year's depreciation on what is left of an adjusted basis, over what is
+/// left of the recovery period.
+///
+/// After a basis changes in a later year the published tables stop describing
+/// the asset, so the year is figured directly: straight line on the remaining
+/// basis over the remaining period, or the declining-balance rate on it where
+/// that is larger. The final year takes whatever is left, so the adjusted basis is
+/// recovered exactly.
+fn remaining_life_cents(
+    remaining_cents: i64,
+    life: f64,
+    method: Method,
+    fractions: &[f64],
+    index: usize,
+) -> i64 {
+    if remaining_cents <= 0 {
+        return 0;
+    }
+    let Some(&fraction) = fractions.get(index) else {
+        return 0;
+    };
+    let consumed: f64 = fractions[..index].iter().sum();
+    let remaining_life = life - consumed;
+    if remaining_life <= fraction + 1e-9 {
+        return remaining_cents;
+    }
+    let remaining = remaining_cents as f64;
+    let straight = remaining / remaining_life * fraction;
+    let amount = match method {
+        Method::StraightLine => straight,
+        Method::DecliningBalance { factor } => (remaining * factor / life * fraction).max(straight),
+    };
+    (amount.round() as i64).clamp(0, remaining_cents)
 }
 
 /// §179, bonus and the basis MACRS is left with — in the statutory order.
@@ -431,8 +487,9 @@ fn accumulated_through(asset: &DepreciableAsset, through_year: i32, mid_quarter:
 /// on the rest. Each step is clamped so an over-large §179 election cannot drive
 /// the basis negative.
 fn first_year_splits(asset: &DepreciableAsset) -> (i64, i64, i64) {
-    let section_179 = asset.section_179_cents.clamp(0, asset.cost_cents);
-    let after_179 = asset.cost_cents - section_179;
+    let basis = asset.opening_basis_cents().max(0);
+    let section_179 = asset.section_179_cents.clamp(0, basis);
+    let after_179 = basis - section_179;
     let bonus = (after_179 as f64 * bonus_rate(asset)).round() as i64;
     let bonus = bonus.clamp(0, after_179);
     (section_179, bonus, after_179 - bonus)
@@ -482,6 +539,7 @@ pub fn compute_year<'a>(assets: &'a [DepreciableAsset], tax_year: i32) -> YearSc
                 bonus_rate: 0.0,
                 macrs_basis_cents: 0,
                 macrs_cents: 0,
+                adjusted_cost_cents: asset.adjusted_cost_through(tax_year),
                 accumulated_cents: 0,
                 disposed: true,
             });
@@ -500,17 +558,39 @@ pub fn compute_year<'a>(assets: &'a [DepreciableAsset], tax_year: i32) -> YearSc
             first_year_fraction(convention, asset.placed_in_service),
             life,
         );
-        let schedule = schedule_cents(
-            macrs_basis,
-            life,
-            asset.class.method(asset.system),
-            &fractions,
-        );
+        let method = asset.class.method(asset.system);
+        let schedule = schedule_cents(macrs_basis, life, method, &fractions);
 
         let mut macrs = schedule
             .get((recovery_year - 1) as usize)
             .copied()
             .unwrap_or(0);
+
+        let adjusted_cost = asset.adjusted_cost_through(tax_year);
+        let already = accumulated_through(asset, tax_year - 1, mid_quarter);
+        // A basis changed after the year it was placed in service: the tables no
+        // longer apply, and what is left of the adjusted basis is spread over what
+        // is left of the recovery period.
+        if asset.basis_adjusted_after_placement_by(tax_year) {
+            macrs = remaining_life_cents(
+                adjusted_cost - already,
+                life,
+                method,
+                &fractions,
+                (recovery_year - 1) as usize,
+            );
+            if adjusted_cost < already {
+                warnings.push(format!(
+                    "{}: its basis is {} after adjustments by the end of {tax_year}, below the {} \
+                     of depreciation already allowed. Nothing more is deductible on it, and the \
+                     excess already taken is not reversed here — check how the adjustment should \
+                     be treated.",
+                    asset.description,
+                    dollars(adjusted_cost),
+                    dollars(already)
+                ));
+            }
+        }
 
         let disposed = asset.disposed_during(tax_year);
         if disposed {
@@ -531,15 +611,14 @@ pub fn compute_year<'a>(assets: &'a [DepreciableAsset], tax_year: i32) -> YearSc
         // Never past the basis. The table recovers exactly the basis over the
         // life, so this only bites after a year fixed above the table — and then
         // it is what stops the asset deducting more than it cost.
-        let already = accumulated_through(asset, tax_year - 1, mid_quarter);
-        macrs = macrs.min((asset.cost_cents - already - section_179 - bonus).max(0));
+        macrs = macrs.min((adjusted_cost - already - section_179 - bonus).max(0));
 
         // A year fixed by hand replaces bonus and MACRS with the figure fixed, and
         // says so wherever the schedule's warnings are read — the return included.
         let (bonus, macrs) = match asset.overrides.get(&tax_year) {
             Some(fixed) => {
                 warnings.push(format!(
-                    "{}: {tax_year} depreciation is fixed by hand at ${:.2}; the register computes                      ${:.2}. Reason given: {}",
+                    "{}: {tax_year} depreciation is fixed by hand at ${:.2}; the register computes ${:.2}. Reason given: {}",
                     asset.description,
                     fixed.amount_cents as f64 / 100.0,
                     (bonus + macrs) as f64 / 100.0,
@@ -560,6 +639,7 @@ pub fn compute_year<'a>(assets: &'a [DepreciableAsset], tax_year: i32) -> YearSc
             bonus_rate: bonus_rate_used,
             macrs_basis_cents: macrs_basis,
             macrs_cents: macrs,
+            adjusted_cost_cents: adjusted_cost,
             accumulated_cents: accumulated_through(asset, tax_year, mid_quarter),
             disposed,
         });
@@ -601,7 +681,7 @@ pub fn gross_cost_at(assets: &[DepreciableAsset], through_year: i32) -> i64 {
         .iter()
         .filter(|a| a.placed_in_service.year() <= through_year)
         .filter(|a| !a.disposed_on.is_some_and(|d| d.year() <= through_year))
-        .map(|a| a.cost_cents)
+        .map(|a| a.adjusted_cost_through(through_year))
         .sum()
 }
 
@@ -845,6 +925,7 @@ mod tests {
             disposed_on: None,
             notes: None,
             overrides: Default::default(),
+            basis_adjustments: Vec::new(),
         }
     }
 
@@ -1488,5 +1569,49 @@ mod tests {
             life, 12_481_600,
             "the whole life recovers the cost, not more"
         );
+    }
+
+    /// A basis reduced after the asset was placed in service is recovered over
+    /// what is left of the recovery period, Schedule L carries the adjusted cost,
+    /// and the adjusted basis still comes back exactly.
+    #[test]
+    fn a_later_basis_reduction_spreads_the_rest_over_the_remaining_life() {
+        let mut fitout = asset(PropertyClass::Nonresidential, date(2023, 10, 19), 12_481_600);
+        fitout.basis_adjustments.push(crate::domain::BasisAdjustment {
+            adjustment_id: "grant".into(),
+            effective_year: 2024,
+            amount_cents: -11_444_200,
+            note: "Grant reimbursed the build-out".into(),
+        });
+        let assets = vec![fitout];
+
+        let first = compute_year(&assets, 2023).line_16a_cents();
+        let second = compute_year(&assets, 2024);
+        let expected = ((1_037_400 - first) as f64 / (39.0 - 2.5 / 12.0)).round() as i64;
+        assert_eq!(second.line_16a_cents(), expected);
+        assert_eq!(second.gross_cost_cents(), 1_037_400);
+        assert_eq!(gross_cost_at(&assets, 2023), 12_481_600, "before the grant");
+        assert_eq!(accumulated_at(&assets, 2070), 1_037_400);
+    }
+
+    /// An adjustment in the year placed in service is part of the opening basis,
+    /// so the tables apply to the smaller figure exactly as to a smaller cost.
+    #[test]
+    fn an_adjustment_in_the_first_year_is_just_a_smaller_cost() {
+        let mut adjusted = asset(PropertyClass::FiveYear, date(2025, 6, 1), 1_000_000);
+        adjusted.basis_adjustments.push(crate::domain::BasisAdjustment {
+            adjustment_id: "rebate".into(),
+            effective_year: 2025,
+            amount_cents: -400_000,
+            note: "Manufacturer rebate".into(),
+        });
+        let smaller = asset(PropertyClass::FiveYear, date(2025, 6, 1), 600_000);
+        for year in 2025..=2031 {
+            assert_eq!(
+                compute_year(std::slice::from_ref(&adjusted), year).line_16a_cents(),
+                compute_year(std::slice::from_ref(&smaller), year).line_16a_cents(),
+                "{year}"
+            );
+        }
     }
 }

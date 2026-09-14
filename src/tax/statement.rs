@@ -73,6 +73,23 @@ pub fn build(req: &StatementRequest) -> Result<Option<Document>, FormError> {
         return Ok(None);
     }
 
+    let chunks: Vec<&[LineDetail]> = req.rows.chunks(ROWS_PER_PAGE).collect();
+    let page_count = chunks.len();
+    let total_cents: i64 = req.rows.iter().map(|r| r.cents).sum();
+    let pages = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let last = i + 1 == page_count;
+            page_ops(req, chunk, i + 1, page_count, last.then_some(total_cents))
+        })
+        .collect();
+    assemble(pages, PAGE_W, PAGE_H).map(Some)
+}
+
+/// Pages of drawn text as one document: the fonts, the page tree and the
+/// catalogue, shared by every kind of statement.
+fn assemble(pages: Vec<Vec<Operation>>, width: f32, height: f32) -> Result<Document, FormError> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
 
@@ -94,14 +111,8 @@ pub fn build(req: &StatementRequest) -> Result<Option<Document>, FormError> {
         "Font" => dictionary! { "F1" => font_id, "F2" => bold_id },
     });
 
-    let chunks: Vec<&[LineDetail]> = req.rows.chunks(ROWS_PER_PAGE).collect();
-    let page_count = chunks.len();
-    let total_cents: i64 = req.rows.iter().map(|r| r.cents).sum();
-
-    let mut page_ids: Vec<Object> = Vec::with_capacity(page_count);
-    for (i, chunk) in chunks.iter().enumerate() {
-        let last = i + 1 == page_count;
-        let ops = page_ops(req, chunk, i + 1, page_count, last.then_some(total_cents));
+    let mut page_ids: Vec<Object> = Vec::with_capacity(pages.len());
+    for ops in pages {
         let content_id = doc.add_object(Stream::new(
             dictionary! {},
             Content { operations: ops }.encode()?,
@@ -110,7 +121,7 @@ pub fn build(req: &StatementRequest) -> Result<Option<Document>, FormError> {
             "Type" => "Page",
             "Parent" => pages_id,
             "Contents" => content_id,
-            "MediaBox" => vec![0.into(), 0.into(), PAGE_W.into(), PAGE_H.into()],
+            "MediaBox" => vec![0.into(), 0.into(), width.into(), height.into()],
             "Resources" => resources_id,
         });
         page_ids.push(page_id.into());
@@ -130,8 +141,154 @@ pub fn build(req: &StatementRequest) -> Result<Option<Document>, FormError> {
         "Pages" => pages_id,
     });
     doc.trailer.set("Root", catalog_id);
+    Ok(doc)
+}
 
-    Ok(Some(doc))
+/// Landscape letter, for statements with more columns than a portrait page holds.
+const LANDSCAPE_W: f32 = 792.0;
+const LANDSCAPE_H: f32 = 612.0;
+const TABLE_SIZE: f32 = 8.5;
+const TABLE_LINE_H: f32 = 12.0;
+
+/// One column of a table statement. `x` is where the column starts, or where it
+/// ends when `right` is set — figures line up on their last digit.
+pub struct Column {
+    pub title: String,
+    pub x: f32,
+    pub right: bool,
+}
+
+/// One printed line of a table statement: a cell per column, or a note that
+/// runs across the page beneath the row above it.
+pub enum TableLine {
+    Cells(Vec<String>),
+    Note(String),
+}
+
+/// A statement that is a table rather than a list of accounts — the Form 4562
+/// basis adjustments statement, whose rows each need eight figures.
+pub struct TableStatement<'a> {
+    pub legal_name: &'a str,
+    pub ein: &'a str,
+    pub heading: String,
+    pub subheading: String,
+    pub columns: Vec<Column>,
+    pub lines: Vec<TableLine>,
+    /// Printed once, after the last row.
+    pub footnotes: Vec<String>,
+}
+
+/// Build a table statement as its own landscape document, or `None` when it has
+/// no rows.
+pub fn build_table(req: &TableStatement) -> Result<Option<Document>, FormError> {
+    if req.lines.is_empty() {
+        return Ok(None);
+    }
+    let reserved = 110.0 + req.footnotes.len() as f32 * TABLE_LINE_H * 3.0;
+    let per_page = (((LANDSCAPE_H - 2.0 * MARGIN - reserved) / TABLE_LINE_H) as usize).max(10);
+    let chunks: Vec<&[TableLine]> = req.lines.chunks(per_page).collect();
+    let page_count = chunks.len();
+    let pages = chunks
+        .iter()
+        .enumerate()
+        .map(|(i, chunk)| table_page_ops(req, chunk, i + 1, page_count))
+        .collect();
+    assemble(pages, LANDSCAPE_W, LANDSCAPE_H).map(Some)
+}
+
+fn table_page_ops(
+    req: &TableStatement,
+    lines: &[TableLine],
+    page_no: usize,
+    page_count: usize,
+) -> Vec<Operation> {
+    let mut ops = Vec::new();
+    let mut y = LANDSCAPE_H - MARGIN;
+    text(&mut ops, "F2", TITLE_SIZE, MARGIN, y, &req.heading);
+    y -= LINE_H * 1.4;
+    text(&mut ops, "F2", BODY_SIZE, MARGIN, y, &req.subheading);
+    y -= LINE_H;
+    text(
+        &mut ops,
+        "F1",
+        BODY_SIZE,
+        MARGIN,
+        y,
+        &format!("{}  ·  EIN {}", req.legal_name, req.ein),
+    );
+    y -= LINE_H * 1.6;
+
+    for c in &req.columns {
+        if c.right {
+            right(&mut ops, "F2", TABLE_SIZE, c.x, y, &c.title);
+        } else {
+            text(&mut ops, "F2", TABLE_SIZE, c.x, y, &c.title);
+        }
+    }
+    y -= 4.0;
+    rule(&mut ops, MARGIN, y, LANDSCAPE_W - MARGIN);
+    y -= TABLE_LINE_H;
+
+    for line in lines {
+        match line {
+            TableLine::Cells(cells) => {
+                for (c, s) in req.columns.iter().zip(cells) {
+                    if c.right {
+                        right(&mut ops, "F1", TABLE_SIZE, c.x, y, s);
+                    } else {
+                        text(&mut ops, "F1", TABLE_SIZE, c.x, y, s);
+                    }
+                }
+            }
+            TableLine::Note(s) => {
+                text(&mut ops, "F1", TABLE_SIZE - 0.5, MARGIN + 12.0, y, &truncate(s, 150));
+            }
+        }
+        y -= TABLE_LINE_H;
+    }
+
+    if page_no == page_count && !req.footnotes.is_empty() {
+        y -= 4.0;
+        rule(&mut ops, MARGIN, y, LANDSCAPE_W - MARGIN);
+        y -= TABLE_LINE_H;
+        for footnote in &req.footnotes {
+            for part in wrap(footnote, 140) {
+                text(&mut ops, "F1", TABLE_SIZE, MARGIN, y, &part);
+                y -= TABLE_LINE_H;
+            }
+        }
+    }
+
+    if page_count > 1 {
+        right(
+            &mut ops,
+            "F1",
+            8.0,
+            LANDSCAPE_W - MARGIN,
+            MARGIN * 0.6,
+            &format!("Page {page_no} of {page_count}"),
+        );
+    }
+    ops
+}
+
+/// Break text into lines of at most `width` characters, at spaces.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in s.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
 }
 
 fn page_ops(

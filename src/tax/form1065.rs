@@ -1313,6 +1313,15 @@ fn build_return_inner(
         namespace_fields(&mut filled.document, F4562_NAMESPACE);
         append_document(&mut doc, filled.document)?;
     }
+    // Behind the form: any asset whose basis moved after purchase — a grant that
+    // reimbursed it, say — which none of the form's own lines has room to explain.
+    if let Some(statement) = super::form4562::basis_statement(
+        &year_schedule,
+        &req.profile.legal_name,
+        &req.profile.ein,
+    )? {
+        append_document(&mut doc, statement)?;
+    }
 
     if super::schedule_b2::is_required(&req.schedule_b) {
         let eligible: Vec<super::schedule_b2::Eligible> = filed
@@ -3129,6 +3138,7 @@ mod tests {
             disposed_on: None,
             notes: None,
             overrides: Default::default(),
+            basis_adjustments: Vec::new(),
         }];
 
         let bundle = build_return(&req).unwrap();
@@ -3218,6 +3228,7 @@ mod tests {
             disposed_on: None,
             notes: None,
             overrides: Default::default(),
+            basis_adjustments: Vec::new(),
         }];
 
         let bundle = build_return(&req).unwrap();
@@ -4036,6 +4047,7 @@ mod tests {
                 disposed_on: None,
                 notes: None,
                 overrides: Default::default(),
+                basis_adjustments: Vec::new(),
             }
         }
 
@@ -4238,6 +4250,7 @@ mod tests {
             disposed_on: None,
             notes: None,
             overrides: Default::default(),
+            basis_adjustments: Vec::new(),
         }];
 
         let mut lines = crate::tax::lines::Form1065Lines::default();

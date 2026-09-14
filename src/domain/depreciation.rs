@@ -497,6 +497,23 @@ pub struct DepreciationOverride {
     pub note: String,
 }
 
+/// A change to an asset's basis after it was bought, with the reason.
+///
+/// For a grant or rebate that reimburses what an asset cost, a casualty loss, or
+/// anything else that moves the basis the register depreciates. Negative reduces
+/// the basis. From `effective_year` on, depreciation runs on the adjusted basis
+/// less what has already been allowed, over what is left of the recovery period;
+/// an adjustment in the year the asset was placed in service is simply part of
+/// its opening basis. The note is required, because an adjusted basis nobody can
+/// explain is a deduction nobody can defend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasisAdjustment {
+    pub adjustment_id: String,
+    pub effective_year: i32,
+    pub amount_cents: i64,
+    pub note: String,
+}
+
 /// One depreciable asset, as the register holds it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DepreciableAsset {
@@ -544,9 +561,40 @@ pub struct DepreciableAsset {
     /// asset's own events: it arrives with its own, and a correction to the asset
     /// leaves it alone.
     pub overrides: std::collections::BTreeMap<i32, DepreciationOverride>,
+    /// Changes to the basis after purchase, oldest first. Like the overrides,
+    /// they arrive with events of their own.
+    pub basis_adjustments: Vec<BasisAdjustment>,
 }
 
 impl DepreciableAsset {
+    /// Cost plus every basis adjustment in effect by the end of `tax_year`.
+    pub fn adjusted_cost_through(&self, tax_year: i32) -> i64 {
+        self.cost_cents
+            + self
+                .basis_adjustments
+                .iter()
+                .filter(|a| a.effective_year <= tax_year)
+                .map(|a| a.amount_cents)
+                .sum::<i64>()
+    }
+
+    /// The basis the recovery period starts from: cost plus any adjustment made
+    /// in the year the asset was placed in service. §179, bonus and the tables
+    /// all run on this.
+    pub fn opening_basis_cents(&self) -> i64 {
+        self.adjusted_cost_through(self.placed_in_service.year())
+    }
+
+    /// Whether an adjustment made after the placed-in-service year has taken
+    /// effect by `tax_year` — from which point the tables no longer apply and
+    /// the adjusted basis is spread over what is left of the recovery period.
+    pub fn basis_adjusted_after_placement_by(&self, tax_year: i32) -> bool {
+        let placed = self.placed_in_service.year();
+        self.basis_adjustments
+            .iter()
+            .any(|a| a.effective_year > placed && a.effective_year <= tax_year)
+    }
+
     /// The convention this asset takes, given whether the mid-quarter test
     /// caught the year it was placed in service.
     ///
@@ -636,6 +684,7 @@ mod tests {
             disposed_on: None,
             notes: None,
             overrides: Default::default(),
+            basis_adjustments: Vec::new(),
         }
     }
 

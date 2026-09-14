@@ -156,6 +156,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             42,
             include_str!("../../migrations/042_partner_fixed_allocations.sql"),
         ),
+        (
+            43,
+            include_str!("../../migrations/043_depreciation_basis_adjustments.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -681,6 +685,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at_event INTEGER REFERENCES events(id),
             PRIMARY KEY (asset_id, tax_year)
+        );
+
+        -- Changes to an asset's basis after purchase (migration 043).
+        CREATE TABLE IF NOT EXISTS depreciation_basis_adjustments (
+            adjustment_id TEXT PRIMARY KEY,
+            asset_id TEXT NOT NULL,
+            effective_year INTEGER NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            note TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id)
         );
 
         -- Which Form 1065 line each account is reported on (migration 024).

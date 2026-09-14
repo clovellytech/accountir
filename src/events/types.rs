@@ -590,6 +590,21 @@ pub enum Event {
         asset_id: String,
         tax_year: i32,
     },
+    /// A change to an asset's basis after purchase — a grant that reimbursed it,
+    /// say — in effect from a tax year, with the reason. Negative reduces the
+    /// basis. See `domain::BasisAdjustment`.
+    DepreciationBasisAdjusted {
+        adjustment_id: String,
+        asset_id: String,
+        effective_year: i32,
+        amount_cents: i64,
+        note: String,
+    },
+    /// A basis adjustment entered in error comes back out.
+    DepreciationBasisAdjustmentRemoved {
+        adjustment_id: String,
+        asset_id: String,
+    },
 
     UserAdded {
         user_id: String,
@@ -905,6 +920,10 @@ impl Event {
             Event::DepreciableAssetRemoved { .. } => "depreciable_asset_removed",
             Event::DepreciationOverrideSet { .. } => "depreciation_override_set",
             Event::DepreciationOverrideCleared { .. } => "depreciation_override_cleared",
+            Event::DepreciationBasisAdjusted { .. } => "depreciation_basis_adjusted",
+            Event::DepreciationBasisAdjustmentRemoved { .. } => {
+                "depreciation_basis_adjustment_removed"
+            }
             Event::BusinessTypeSet { .. } => "business_type_set",
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
             Event::ScheduleCAnswerSet { .. } => "schedule_c_answer_set",
@@ -982,6 +1001,8 @@ impl Event {
             Event::DepreciableAssetRemoved { asset_id } => Some(asset_id),
             Event::DepreciationOverrideSet { asset_id, .. } => Some(asset_id),
             Event::DepreciationOverrideCleared { asset_id, .. } => Some(asset_id),
+            Event::DepreciationBasisAdjusted { asset_id, .. } => Some(asset_id),
+            Event::DepreciationBasisAdjustmentRemoved { asset_id, .. } => Some(asset_id),
             // One business per book, so no id names the thing changed — the same
             // answer `BusinessProfileSet` gives.
             Event::BusinessTypeSet { .. } => None,

@@ -570,6 +570,10 @@ impl<'a> Projector<'a> {
                     "DELETE FROM depreciation_overrides WHERE asset_id = ?1",
                     params![asset_id],
                 )?;
+                self.conn.execute(
+                    "DELETE FROM depreciation_basis_adjustments WHERE asset_id = ?1",
+                    params![asset_id],
+                )?;
             }
             Event::DepreciationOverrideSet {
                 asset_id,
@@ -593,6 +597,41 @@ impl<'a> Projector<'a> {
                 self.conn.execute(
                     "DELETE FROM depreciation_overrides WHERE asset_id = ?1 AND tax_year = ?2",
                     params![asset_id, tax_year],
+                )?;
+            }
+            Event::DepreciationBasisAdjusted {
+                adjustment_id,
+                asset_id,
+                effective_year,
+                amount_cents,
+                note,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO depreciation_basis_adjustments
+                        (adjustment_id, asset_id, effective_year, amount_cents, note, updated_at,
+                         updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6)
+                     ON CONFLICT(adjustment_id) DO UPDATE SET
+                        asset_id = excluded.asset_id,
+                        effective_year = excluded.effective_year,
+                        amount_cents = excluded.amount_cents,
+                        note = excluded.note,
+                        updated_at = excluded.updated_at,
+                        updated_at_event = excluded.updated_at_event",
+                    params![
+                        adjustment_id,
+                        asset_id,
+                        effective_year,
+                        amount_cents,
+                        note,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::DepreciationBasisAdjustmentRemoved { adjustment_id, .. } => {
+                self.conn.execute(
+                    "DELETE FROM depreciation_basis_adjustments WHERE adjustment_id = ?1",
+                    params![adjustment_id],
                 )?;
             }
             Event::UserAdded {
@@ -1272,6 +1311,7 @@ impl<'a> Projector<'a> {
              -- depreciation on somebody's return after a replay.
              DELETE FROM depreciable_assets;
              DELETE FROM depreciation_overrides;
+             DELETE FROM depreciation_basis_adjustments;
              -- Projections too (migration 031). `sole_proprietor_tin` is
              -- deliberately NOT cleared, exactly as `partner_tins` is not: it is
              -- local configuration, not derived from the log, and a replay must

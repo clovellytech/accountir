@@ -52,7 +52,9 @@ use uuid::Uuid;
 use crate::commands::entry_commands::{
     EntryCommands, EntryLine, PostEntryCommand, VoidEntryCommand,
 };
-use crate::domain::{BonusElection, DepreciableAsset, DepreciationOverride, PropertyClass, System};
+use crate::domain::{
+    BasisAdjustment, BonusElection, DepreciableAsset, DepreciationOverride, PropertyClass, System,
+};
 use crate::events::types::{DepreciableAssetData, Event, JournalEntrySource, StoredEvent};
 use crate::store::event_store::EventStore;
 use crate::tax::depreciation::{compute_year, YearSchedule};
@@ -190,6 +192,7 @@ pub fn list_assets(conn: &Connection) -> Vec<DepreciableAsset> {
             disposed_on: disposed.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()),
             notes,
             overrides: Default::default(),
+            basis_adjustments: Vec::new(),
         });
     }
 
@@ -211,6 +214,34 @@ pub fn list_assets(conn: &Connection) -> Vec<DepreciableAsset> {
                 if let Some(a) = out.iter_mut().find(|a| a.asset_id == asset_id) {
                     a.overrides
                         .insert(year, DepreciationOverride { amount_cents, note });
+                }
+            }
+        }
+    }
+
+    // Basis adjustments, oldest first, onto their assets — removal deletes them
+    // with the asset, as it does the overrides.
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT adjustment_id, asset_id, effective_year, amount_cents, note
+           FROM depreciation_basis_adjustments ORDER BY effective_year, rowid",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i32>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        }) {
+            for (adjustment_id, asset_id, effective_year, amount_cents, note) in rows.flatten() {
+                if let Some(a) = out.iter_mut().find(|a| a.asset_id == asset_id) {
+                    a.basis_adjustments.push(BasisAdjustment {
+                        adjustment_id,
+                        effective_year,
+                        amount_cents,
+                        note,
+                    });
                 }
             }
         }
@@ -443,6 +474,113 @@ pub fn clear_override(
         Event::DepreciationOverrideCleared {
             asset_id: asset_id.to_string(),
             tax_year,
+        },
+    )
+}
+
+/// Change an asset's basis after purchase, in effect from a tax year, with the
+/// reason. Returns the adjustment's id.
+///
+/// Negative reduces the basis — a grant that reimbursed the cost, a rebate. From
+/// `effective_year` on the register depreciates the adjusted basis over what is
+/// left of the recovery period, and Form 4562 carries a statement saying so. A
+/// year already posted reads as stale until it is posted again.
+pub fn add_basis_adjustment(
+    store: &mut EventStore,
+    user_id: &str,
+    asset_id: &str,
+    effective_year: i32,
+    amount_cents: i64,
+    note: &str,
+) -> Result<(String, StoredEvent), DepreciationError> {
+    use chrono::Datelike;
+    let Some(asset) = get_asset(store.connection(), asset_id) else {
+        return Err(DepreciationError::NoSuchAsset(asset_id.to_string()));
+    };
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(DepreciationError::Invalid(
+            "a basis adjustment needs a note saying what changed the basis — a grant, a rebate, \
+             a casualty"
+                .to_string(),
+        ));
+    }
+    if amount_cents == 0 {
+        return Err(DepreciationError::Invalid(
+            "an adjustment of $0.00 changes nothing".to_string(),
+        ));
+    }
+    let placed = asset.placed_in_service.year();
+    if effective_year < placed {
+        return Err(DepreciationError::Invalid(format!(
+            "{} was placed in service in {placed}, so its basis cannot change in {effective_year}",
+            asset.description
+        )));
+    }
+    if let Some(gone) = asset.disposed_on.filter(|d| d.year() < effective_year) {
+        return Err(DepreciationError::Invalid(format!(
+            "{} was disposed of on {gone}, before {effective_year}",
+            asset.description
+        )));
+    }
+    // Never below zero at any point, with this adjustment and those already made.
+    let mut trial = asset.clone();
+    trial.basis_adjustments.push(BasisAdjustment {
+        adjustment_id: String::new(),
+        effective_year,
+        amount_cents,
+        note: note.to_string(),
+    });
+    let lowest = trial
+        .basis_adjustments
+        .iter()
+        .map(|a| trial.adjusted_cost_through(a.effective_year))
+        .min()
+        .unwrap_or(trial.cost_cents);
+    if lowest < 0 {
+        return Err(DepreciationError::Invalid(format!(
+            "that would take the basis of {} below zero, to ${:.2}",
+            asset.description,
+            lowest as f64 / 100.0
+        )));
+    }
+
+    let adjustment_id = Uuid::new_v4().to_string();
+    let stored = append(
+        store,
+        user_id,
+        Event::DepreciationBasisAdjusted {
+            adjustment_id: adjustment_id.clone(),
+            asset_id: asset_id.to_string(),
+            effective_year,
+            amount_cents,
+            note: note.to_string(),
+        },
+    )?;
+    Ok((adjustment_id, stored))
+}
+
+/// Take a basis adjustment entered in error back out.
+pub fn remove_basis_adjustment(
+    store: &mut EventStore,
+    user_id: &str,
+    adjustment_id: &str,
+) -> Result<StoredEvent, DepreciationError> {
+    let Some(asset) = list_assets(store.connection()).into_iter().find(|a| {
+        a.basis_adjustments
+            .iter()
+            .any(|b| b.adjustment_id == adjustment_id)
+    }) else {
+        return Err(DepreciationError::Invalid(format!(
+            "no basis adjustment with id {adjustment_id}"
+        )));
+    };
+    append(
+        store,
+        user_id,
+        Event::DepreciationBasisAdjustmentRemoved {
+            adjustment_id: adjustment_id.to_string(),
+            asset_id: asset.asset_id,
         },
     )
 }
@@ -752,6 +890,7 @@ mod tests {
             disposed_on: None,
             notes: None,
             overrides: Default::default(),
+            basis_adjustments: Vec::new(),
         }
     }
 
@@ -1115,5 +1254,43 @@ mod tests {
             remove_asset(&mut s, "u", &id),
             Err(DepreciationError::NoSuchAsset(_))
         ));
+    }
+
+    /// A basis reduced after purchase reprices the years after it, needs a
+    /// reason, cannot go below zero or before the asset existed, and comes back
+    /// out cleanly.
+    #[test]
+    fn a_basis_adjustment_reprices_later_years_and_can_be_removed() {
+        let mut s = store();
+        let (id, _) = add_asset(&mut s, "u", &kiln()).expect("added");
+        let before = compute_year(&list_assets(s.connection()), 2027).line_16a_cents();
+
+        assert!(
+            add_basis_adjustment(&mut s, "u", &id, 2026, -500_000, " ").is_err(),
+            "a note is required"
+        );
+        assert!(
+            add_basis_adjustment(&mut s, "u", &id, 2024, -500_000, "grant").is_err(),
+            "not in service in 2024"
+        );
+        assert!(
+            add_basis_adjustment(&mut s, "u", &id, 2026, -2_000_000, "grant").is_err(),
+            "below zero"
+        );
+        let (adjustment, _) =
+            add_basis_adjustment(&mut s, "u", &id, 2026, -500_000, "City grant reimbursed half")
+                .expect("adjusted");
+        let assets = list_assets(s.connection());
+        assert_eq!(assets[0].basis_adjustments.len(), 1);
+        assert_eq!(assets[0].adjusted_cost_through(2026), 500_000);
+        let after = compute_year(&assets, 2027).line_16a_cents();
+        assert!(after < before, "{after} is not below {before}");
+
+        remove_basis_adjustment(&mut s, "u", &adjustment).expect("removed");
+        assert!(list_assets(s.connection())[0].basis_adjustments.is_empty());
+        assert_eq!(
+            compute_year(&list_assets(s.connection()), 2027).line_16a_cents(),
+            before
+        );
     }
 }
