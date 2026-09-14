@@ -7,6 +7,7 @@
 | `f1065sb1.pdf` | Schedule B-1, Information on Partners Owning 50% or More | Rev. August 2019 | `0d06ff4c9300381c4fe33688321a9be121738679e2792f9f48d3e8700443db3b` |
 | `f1065sb2.pdf` | Schedule B-2, Election Out of the Centralized Partnership Audit Regime | December 2018 | `fe42f9ef2e0901ceaf52c91b262a2a831316fdc807df4e49934705e43fe14eb6` |
 | `f4562.pdf` | Form 4562, Depreciation and Amortization | 2025 (rev. 2025-10-09) | `c05f9d1f5e26b1b21e18b0a13adbbcd3d568bb9f3ca53bd7bba7c795c7799b4a` |
+| `f1125a.pdf` | Form 1125-A, Cost of Goods Sold | Rev. November 2024 — tax years 2024 onward | `447270f7a058c5b8e3f3e31853bf2bf97470ccc0f5f07359fbcd5ec6a23be5c2` |
 
 ## Prior and draft years
 
@@ -23,6 +24,7 @@ carried beside them, one directory per tax year:
 | `2026/f1065sk1.pdf` | Schedule K-1 (Form 1065) — **DRAFT** | 2026 draft | `c3e8bc815c3b38cfcd2f583f2b8ee7865d651ff22d012b21ae5f6404a03c5b0a` |
 | `2023/f1040sc.pdf` | Schedule C (Form 1040) | 2023 | `d475d0c135c0ebc599eadd1a228cbb124a60b0b6ca69a32ae0d355f5708755ff` |
 | `2023/f4562.pdf` | Form 4562 | 2023 | `3df7de3f92fa4cae0c08ad051d0e5da24da4cba48753fb490defc84789428d41` |
+| `2023/f1125a.pdf` | Form 1125-A | Rev. November 2018 — tax years through 2023 (`irs-prior/f1125a--2018.pdf`) | `115aa4ff161e36381bfcbff249b5a16df952d934c1491f0548767dc2beb5f314` |
 | `2024/f1040sc.pdf` | Schedule C (Form 1040) | 2024 | `f56bfd48f3604fc015b7ea22a70c6c36535a723ba84a2b9a961bc9838d070ce6` |
 | `2024/f4562.pdf` | Form 4562 | 2024 | `5a7b8d23cf88e21a57ad7fe3d22294941a8f1161b7a5600ffcd05fa0f6b351a5` |
 | `2026/f1040sc.pdf` | Schedule C (Form 1040) — **DRAFT** | 2026 draft | `287b4510dd847c11f6cbbcc98fee05ac5ff187cc18e1413f8759a4a7cd802224` |
@@ -50,6 +52,7 @@ revision this program was written against:
 | Form 4562 | **own table** | **own table** | **own table** | not carried — nothing can reach it |
 | Schedule B-1 | rev. 2019 — one revision for every year | | | |
 | Schedule B-2 | rev. 2018 — one revision for every year | | | |
+| Form 1125-A | rev. 2018 | rev. 2024 | rev. 2024 | rev. 2024 |
 
 A refused Form 4562 is not a refused return: page 1 line 16 comes from the ledger,
 not from the form, so the figures are unaffected and the return says the schedule
@@ -132,7 +135,15 @@ alone — check `https://www.irs.gov/pub/irs-pdf/f1065sb1.pdf` against the hash
 above rather than assuming a new year means a new file.
 
 They are `include_bytes!`d into the binary by `src/tax/form1065.rs`,
-`src/tax/schedule_b1.rs`, `src/tax/schedule_b2.rs` and `src/tax/form4562.rs`. Carried
+`src/tax/schedule_b1.rs`, `src/tax/schedule_b2.rs`, `src/tax/form4562.rs` and
+`src/tax/form1125a.rs`.
+
+Form 1125-A is reissued by revision date, like the B schedules, and each
+revision serves every tax year until the next. The 2024 revision is not a light
+edit of the 2018 one: it drops the cents box beside every amount and adds three
+valuation methods and a LIFO reserve line to question 9, renumbering every check
+box after 9a. `form1125a::REVISIONS` carries a box table per revision, and
+`the_line_boxes_run_down_the_page_in_line_order` holds each to its own PDF. Carried
 rather than fetched because a return you can only produce with a working
 connection to irs.gov is one you cannot produce on the afternoon it is due.
 

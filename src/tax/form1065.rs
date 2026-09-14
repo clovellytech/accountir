@@ -175,6 +175,9 @@ pub fn k1_namespace(n: usize) -> String {
 /// in Parts I and II, and the 4562's check boxes answer Schedule B's questions.
 pub const F4562_NAMESPACE: &str = "F4562";
 
+/// Where Form 1125-A's fields live in the bundle. See [`F4562_NAMESPACE`].
+pub const F1125A_NAMESPACE: &str = "F1125A";
+
 /// Where Schedule B-1's fields live in the bundle. See [`F4562_NAMESPACE`].
 pub const SCHEDULE_B1_NAMESPACE: &str = "SchB1";
 
@@ -1212,6 +1215,23 @@ fn build_return_inner(
                     .to_string(),
             ),
         }
+    }
+
+    // --- Form 1125-A ---
+    //
+    // Built from page 1 line 2 and Schedule L's inventory rather than read from the
+    // ledger again, so the form and the two figures it supports cannot disagree.
+    let (form_1125a, f1125a_warnings) = super::form1125a::build(
+        &req.profile.legal_name,
+        &req.profile.ein,
+        req.year,
+        lines,
+        req.schedule_l.as_ref(),
+    )?;
+    warnings.extend(f1125a_warnings);
+    if let Some(mut sched) = form_1125a {
+        namespace_fields(&mut sched, F1125A_NAMESPACE);
+        append_document(&mut doc, sched)?;
     }
 
     // --- Form 4562 ---
@@ -2666,6 +2686,43 @@ mod tests {
             map.names().any(|n| n.ends_with("R6[0]")),
             "the attached 4562 is not the 2023 revision"
         );
+    }
+
+    /// Cost of goods sold brings Form 1125-A, footing to page 1 line 2 and to
+    /// Schedule L's inventory, in its own namespace.
+    #[test]
+    fn cost_of_goods_sold_attaches_a_form_1125a_that_foots_to_line_2() {
+        let mut req = two_partner_request();
+        req.year = 2023;
+        let mut sl = crate::tax::schedule_l::ScheduleL::default();
+        sl.set_for_test("sl3", 759, 1_200);
+        req.schedule_l = Some(sl);
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l2", 300);
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        let v = |leaf: &str| crate::tax::acroform::get_value_in(&doc, &map, F1125A_NAMESPACE, leaf);
+        assert_eq!(v("f1_3[0]").as_deref(), Some("759"), "line 1");
+        assert_eq!(v("f1_5[0]").as_deref(), Some("741"), "line 2");
+        assert_eq!(v("f1_15[0]").as_deref(), Some("1,200"), "line 7");
+        assert_eq!(v("f1_17[0]").as_deref(), Some("300"), "line 8");
+        assert!(bundle
+            .warnings
+            .iter()
+            .any(|w| w.contains("question 9 is unanswered")));
+    }
+
+    /// No cost of goods sold and no inventory, no Form 1125-A.
+    #[test]
+    fn a_return_with_no_inventory_attaches_no_form_1125a() {
+        let bundle =
+            build_return_inner(&two_partner_request(), &Default::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        assert!(!field_map(&doc)
+            .names()
+            .any(|n| n.starts_with(&format!("{F1125A_NAMESPACE}."))));
     }
 
     /// Form 4562 keeps its own boxes once it is in the bundle.

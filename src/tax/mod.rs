@@ -13,6 +13,7 @@ pub mod capital;
 pub mod constructive;
 pub mod depreciation;
 pub mod form1065;
+pub mod form1125a;
 pub mod form4562;
 pub mod il1065;
 pub mod lines;

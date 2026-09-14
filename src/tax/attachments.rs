@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[test]
-    fn line_21_brings_a_statement_we_produce_and_line_2_brings_a_form_we_do_not() {
+    fn line_21_brings_a_statement_and_line_2_brings_form_1125a_both_produced_here() {
         let mut a = ScheduleB::default();
         a.set("b4", YES);
         let mut lines = Form1065Lines::default();
@@ -407,7 +407,7 @@ mod tests {
             .unwrap();
         assert_eq!(stmt.provenance, Provenance::Generated);
         let f1125a = list.iter().find(|x| x.name == "Form 1125-A").unwrap();
-        assert_eq!(f1125a.provenance, Provenance::YourJob);
+        assert_eq!(f1125a.provenance, Provenance::Generated);
     }
 
     /// What we produce comes first, so the list that has a deadline attached is

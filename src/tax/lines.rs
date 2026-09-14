@@ -155,7 +155,7 @@ pub struct TaxLineDef {
 pub struct Attachment {
     pub name: &'static str,
     pub url: &'static str,
-    /// True when this program can produce it — today, only the line 21 statement.
+    /// True when this program produces it and appends it to the return.
     pub generated: bool,
 }
 
@@ -167,7 +167,7 @@ pub struct Attachment {
 const FORM_1125A: Attachment = Attachment {
     name: "Form 1125-A",
     url: "https://www.irs.gov/forms-pubs/about-form-1125-a",
-    generated: false,
+    generated: true,
 };
 const FORM_4797: Attachment = Attachment {
     name: "Form 4797",
