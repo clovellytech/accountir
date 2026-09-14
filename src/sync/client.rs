@@ -1621,21 +1621,35 @@ impl SyncClient {
     /// this safe to retry against a moved head, and what stops two members
     /// closing the same year from two different pictures of it. The second one
     /// gets a `422` naming the entry that already closed it.
-    /// `equity_account_id` of `None` allocates to partner capital instead: one
-    /// line per partner, on the percentages in force across the year.
+    /// `allocate_to_partners` moves the result on from that account to each
+    /// partner's capital account, in a second entry in the same append.
     pub async fn close_books(
         &mut self,
         year: i32,
-        equity_account_id: Option<&str>,
+        equity_account_id: &str,
+        allocate_to_partners: bool,
         include_draws: bool,
     ) -> Result<i64, SyncClientError> {
-        let equity_account_id = equity_account_id.map(str::to_string);
+        let equity_account_id = equity_account_id.to_string();
         self.submit_retrying("/sync/commands/close-books", |head| {
             crate::sync::commands::fiscal::CloseBooksRequest {
                 expected_head_seq: head,
                 year,
-                equity_account_id: equity_account_id.clone(),
+                equity_account_id: Some(equity_account_id.clone()),
+                allocate_to_partners,
                 include_draws,
+            }
+        })
+        .await
+    }
+
+    /// Allocate a closed year's result from its year account to the partners'
+    /// capital accounts, in an entry dated the day the year closed.
+    pub async fn allocate_year(&mut self, year: i32) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/allocate-year", |head| {
+            crate::sync::commands::fiscal::AllocateYearRequest {
+                expected_head_seq: head,
+                year,
             }
         })
         .await

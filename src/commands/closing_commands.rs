@@ -47,7 +47,8 @@ use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 
 use crate::commands::entry_commands::{
-    build_post_entry_in_txn, EntryLine, PostEntryCommand, PostEntryStep,
+    build_post_entry_in_closed_year_in_txn, build_post_entry_in_txn, EntryLine, PostEntryCommand,
+    PostEntryStep,
 };
 use crate::commands::fiscal_year_commands::{boundaries_for, load_year};
 use crate::domain::AccountType;
@@ -101,6 +102,15 @@ pub enum ClosingError {
     },
     #[error("{year} is already closed by entry {entry_id}")]
     AlreadyClosed { year: i32, entry_id: String },
+    #[error("{year}'s result is already allocated to the partners by entry {entry_id}")]
+    AlreadyAllocated { year: i32, entry_id: String },
+    #[error(
+        "{year}'s closing entry has no single year account to allocate from — it was closed \
+         straight into partner capital, or into more than one equity account"
+    )]
+    NoYearAccount { year: i32 },
+    #[error("{year} closed at exactly zero, so there is nothing to allocate")]
+    NothingToAllocate { year: i32 },
     #[error("{year} is not closed")]
     NotClosed { year: i32 },
     #[error("The account to close into does not exist")]
@@ -184,6 +194,11 @@ pub struct ClosingPreview {
     pub trial_balance_ok: bool,
     /// The live closing entry, if this year is already closed.
     pub closed_by: Option<String>,
+    /// The live allocation entry, if the year's result has been moved on to the
+    /// partners' capital accounts.
+    pub allocated_by: Option<String>,
+    /// Why a closed year's result cannot be allocated now, if it cannot.
+    pub allocation_blocker: Option<String>,
     /// Things worth saying that are not refusals.
     pub warnings: Vec<String>,
     /// The refusal this close would hit, rendered as a sentence. `None` if it
@@ -194,6 +209,10 @@ pub struct ClosingPreview {
 impl ClosingPreview {
     pub fn is_closed(&self) -> bool {
         self.closed_by.is_some()
+    }
+
+    pub fn is_allocated(&self) -> bool {
+        self.allocated_by.is_some()
     }
 
     /// Every account the entry will touch, revenue then expense then draws.
@@ -212,7 +231,8 @@ pub enum ClosingTarget {
     /// created, if the caller wants a path that does not exist yet — before the
     /// command is called.
     Account(String),
-    /// One line per partner, into their own capital account, split on the
+    /// The year's result into this account, and then — in a second entry, in the
+    /// same append — from it to each partner's own capital account, split on the
     /// percentages in force across the year.
     ///
     /// This is what a partnership's books do. A partnership pays no tax itself;
@@ -221,7 +241,15 @@ pub enum ClosingTarget {
     /// account records that the partnership earned something without recording
     /// whose it is — which the Schedule K-1s then have to compute separately,
     /// leaving two records of one fact and only one of them in the ledger.
-    PartnerCapital,
+    ///
+    /// # Why two entries
+    ///
+    /// One entry that swept income straight into partner capital answered two
+    /// questions at once: what the year came to, and whose it is. `close-2023`
+    /// now answers the first, putting the result in the year account, and
+    /// `close-2023-allocation` answers the second, moving it on. The figure is in
+    /// the ledger before it is divided, and the division reads on its own.
+    PartnerCapital(String),
 }
 
 /// Command to close a fiscal year.
@@ -639,16 +667,30 @@ pub fn preview(
         warnings.push(stale);
     }
 
-    // Computed for the preview even when it would refuse, so the page can show
-    // the split it *would* post beside the reason it cannot.
-    let allocation = match target {
-        ClosingTarget::PartnerCapital => {
-            partner_capital_lines(conn, year, net_income_cents).unwrap_or_default()
-        }
-        ClosingTarget::Account(_) => Vec::new(),
-    };
-
     let closed_by = closing_entry_for(conn, year);
+    let allocated_by = allocation_entry_for(conn, year);
+
+    // Computed for the preview even when it would refuse, so the page can show
+    // the split it *would* post beside the reason it cannot. For a closed year it
+    // is the split an allocation would post now, if none has been.
+    let (allocation, allocation_blocker) = if closed_by.is_some() {
+        if allocated_by.is_some() {
+            (Vec::new(), None)
+        } else {
+            match allocation_plan(conn, year) {
+                Ok(plan) => (plan.shares, None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            }
+        }
+    } else {
+        match target {
+            ClosingTarget::PartnerCapital(_) => (
+                partner_capital_lines(conn, year, net_income_cents).unwrap_or_default(),
+                None,
+            ),
+            ClosingTarget::Account(_) => (Vec::new(), None),
+        }
+    };
     let blocker = match closed_by {
         Some(ref entry_id) => Some(
             ClosingError::AlreadyClosed {
@@ -670,7 +712,7 @@ pub fn preview(
             // The allocation's own refusals — an unlinked partner, an ambiguous
             // capital account, percentages that do not total — belong in the
             // blocker too, or the page would offer a Close button that fails.
-            ClosingTarget::PartnerCapital => {
+            ClosingTarget::PartnerCapital(_) => {
                 partner_capital_lines(conn, year, net_income_cents).err()
             }
             ClosingTarget::Account(_) => None,
@@ -691,6 +733,8 @@ pub fn preview(
         trial_balance_credits: credits,
         trial_balance_ok: debits == credits,
         closed_by,
+        allocated_by,
+        allocation_blocker,
         warnings,
         blocker,
     })
@@ -743,7 +787,12 @@ pub(crate) fn build_close_books_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &CloseBooksCommand,
 ) -> Result<Verdict<Vec<Event>, ClosingError>, EventStoreError> {
-    if let ClosingTarget::Account(account_id) = &cmd.target {
+    let year_account = match &cmd.target {
+        ClosingTarget::Account(id) | ClosingTarget::PartnerCapital(id) => id.clone(),
+    };
+    // Both targets pass the result through the year account, so both check it.
+    {
+        let account_id = &year_account;
         let equity: Option<(String, bool)> = tx
             .query_row(
                 "SELECT account_type, is_active = 1 FROM accounts WHERE id = ?1",
@@ -816,35 +865,25 @@ pub(crate) fn build_close_books_in_txn(
         lines.push(account.closing_line(&currency));
     }
     let net_income_cents = -sweep_total;
-    // The other side: one line to a single equity account, or one per partner.
-    match &cmd.target {
-        ClosingTarget::Account(account_id) => {
-            if sweep_total != 0 {
-                lines.push(
-                    EntryLine::signed(account_id, sweep_total, &currency)
-                        .with_memo(&format!("Net result for {}", cmd.year)),
-                );
-            }
-        }
-        ClosingTarget::PartnerCapital => {
-            let allocation = match partner_capital_lines(tx, cmd.year, net_income_cents) {
-                Ok(a) => a,
-                Err(e) => return Ok(Verdict::Reject(e)),
-            };
-            for share in &allocation {
-                if share.cents == 0 {
-                    continue;
-                }
-                // A share of income is a credit to capital, so the line carries
-                // the negation — the same orientation the single-account line
-                // has, applied per partner.
-                lines.push(
-                    EntryLine::signed(&share.account_id, -share.cents, &currency)
-                        .with_memo(&format!("{}'s share of {}", share.partner_name, cmd.year)),
-                );
-            }
-        }
+    // The other side: one line to the year account. Moving it on to the partners
+    // is a second entry, built below.
+    if sweep_total != 0 {
+        lines.push(
+            EntryLine::signed(&year_account, sweep_total, &currency)
+                .with_memo(&format!("Net result for {}", cmd.year)),
+        );
     }
+    // Worked out before anything is built, so a partner with no capital account
+    // refuses the close rather than leaving a year closed and unallocated.
+    let allocation = match &cmd.target {
+        ClosingTarget::PartnerCapital(_) => {
+            match partner_capital_lines(tx, cmd.year, net_income_cents) {
+                Ok(a) => Some(a),
+                Err(e) => return Ok(Verdict::Reject(e)),
+            }
+        }
+        ClosingTarget::Account(_) => None,
+    };
 
     let swept_count = revenue.len() + expenses.len() + draws.len();
     let post = PostEntryCommand {
@@ -879,6 +918,29 @@ pub(crate) fn build_close_books_in_txn(
     };
 
     events.push(entry_event);
+
+    // The allocation, dated the same day. Built here, before the lock event, for
+    // the reason the closing entry is: the fence is checked against the state
+    // before this batch, so it sees the year still open and admits both.
+    if let Some(allocation) = &allocation {
+        if net_income_cents != 0 {
+            let post = allocation_post(
+                cmd.year,
+                fy.end_date,
+                &year_account,
+                net_income_cents,
+                allocation,
+                &currency,
+            );
+            match build_post_entry_in_txn(tx, &post)? {
+                PostEntryStep::Append(event) => events.push(event),
+                PostEntryStep::Reject(e) => {
+                    return Ok(Verdict::Reject(ClosingError::Entry(e.to_string())))
+                }
+            }
+        }
+    }
+
     events.push(Event::YearEndClosed {
         year: cmd.year,
         retained_earnings_entry_id: entry_id,
@@ -893,7 +955,8 @@ pub(crate) fn build_close_books_in_txn(
     // Not done for partner capital accounts: those are not accounts this command
     // created, they already carried balances, and where they belong on the return
     // is a decision their owner has already made.
-    if let ClosingTarget::Account(account_id) = &cmd.target {
+    {
+        let account_id = &year_account;
         let partnership =
             !crate::commands::sole_proprietor_commands::business_type(tx).is_sole_proprietorship();
         if partnership && !already_mapped_for_tax(tx, account_id, cmd.year) {
@@ -923,6 +986,15 @@ pub(crate) fn build_reopen_books_in_txn(
     }
 
     let mut events = Vec::new();
+    // The allocation first. It moved the result the closing entry put in the year
+    // account, and voiding the close alone would leave the partners holding shares
+    // of a year that no longer has a result.
+    if let Some(allocation_id) = allocation_entry_for(tx, year) {
+        events.push(Event::JournalEntryVoided {
+            entry_id: allocation_id,
+            reason: format!("Reopening {year}: {reason}"),
+        });
+    }
     if let Some(entry_id) = entry_id {
         // Built directly rather than through `build_void_entry_in_txn`, which
         // refuses to void a closing entry while its year is closed — the state
@@ -1089,6 +1161,233 @@ pub fn reopen_books(
 
         match outcome {
             CheckedOutcome::Appended(_) => return Ok(()),
+            CheckedOutcome::HeadMismatch { .. } => continue,
+            CheckedOutcome::Rejected(e) => return Err(e),
+        }
+    }
+}
+
+/// The idempotency key a year's allocation entry carries. Voiding it — which
+/// reopening does — frees it, exactly as for the closing entry.
+pub fn allocation_reference_for(year: i32) -> String {
+    format!("close-{year}-allocation")
+}
+
+/// The live allocation entry for a year, if its result has been allocated.
+pub fn allocation_entry_for(conn: &Connection, year: i32) -> Option<String> {
+    conn.query_row(
+        "SELECT id FROM journal_entries WHERE reference = ?1 AND is_void = 0",
+        [allocation_reference_for(year)],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+/// The entry that moves a year's result from the year account to the partners.
+///
+/// The year account line is the negation of the close's own line to it, so the
+/// account ends the year at zero; each partner's line is the negation of their
+/// share, a share of income being a credit to capital. The shares add back to
+/// the result exactly, so the entry balances by construction.
+fn allocation_post(
+    year: i32,
+    date: NaiveDate,
+    year_account: &str,
+    net_income_cents: i64,
+    shares: &[PartnerShare],
+    currency: &str,
+) -> PostEntryCommand {
+    let mut lines = vec![EntryLine::signed(year_account, net_income_cents, currency)
+        .with_memo(&format!("{year} allocated to the partners"))];
+    for share in shares.iter().filter(|s| s.cents != 0) {
+        lines.push(
+            EntryLine::signed(&share.account_id, -share.cents, currency)
+                .with_memo(&format!("{}'s share of {year}", share.partner_name)),
+        );
+    }
+    let magnitude = format!(
+        "{}.{:02}",
+        net_income_cents.abs() / 100,
+        net_income_cents.abs() % 100
+    );
+    PostEntryCommand {
+        date,
+        memo: format!(
+            "Allocation of {year}'s net {} {magnitude} to the partners",
+            if net_income_cents < 0 {
+                "loss"
+            } else {
+                "income"
+            }
+        ),
+        lines,
+        reference: Some(allocation_reference_for(year)),
+        source: Some(JournalEntrySource::Closing),
+    }
+}
+
+/// What allocating a closed year would post.
+struct AllocationPlan {
+    year_account: String,
+    date: NaiveDate,
+    shares: Vec<PartnerShare>,
+    net_income_cents: i64,
+}
+
+/// Work out the allocation for a year that is already closed.
+///
+/// The year account is read off the closing entry itself — its one equity line
+/// that is neither a partner's draw nor a partner's capital account — rather
+/// than taken from the caller, so the allocation always empties the account the
+/// close actually filled. The amount is the closed result, read the same way.
+fn allocation_plan(conn: &Connection, year: i32) -> Result<AllocationPlan, ClosingError> {
+    let Some(entry_id) = closing_entry_for(conn, year) else {
+        return Err(ClosingError::NotClosed { year });
+    };
+    if let Some(entry_id) = allocation_entry_for(conn, year) {
+        return Err(ClosingError::AlreadyAllocated { year, entry_id });
+    }
+
+    let date = conn
+        .query_row(
+            "SELECT date FROM journal_entries WHERE id = ?1",
+            [&entry_id],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|d| NaiveDate::parse_from_str(d.get(..10).unwrap_or(&d), "%Y-%m-%d").ok())
+        .ok_or(ClosingError::NotClosed { year })?;
+
+    let excluded: Vec<String> = draw_account_ids(conn)
+        .into_iter()
+        .chain(
+            crate::tax::capital::load_partner_equity_accounts(conn)
+                .into_iter()
+                .map(|l| l.account_id),
+        )
+        .collect();
+    let equity_lines: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT jl.account_id FROM journal_lines jl
+               JOIN accounts a ON a.id = jl.account_id
+              WHERE jl.entry_id = ?1 AND a.account_type = 'equity'",
+        )
+        .ok()
+        .map(|mut stmt| {
+            stmt.query_map([&entry_id], |r| r.get::<_, String>(0))
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let candidates: Vec<String> = equity_lines
+        .into_iter()
+        .filter(|a| !excluded.contains(a))
+        .collect();
+    let [year_account] = candidates.as_slice() else {
+        return Err(ClosingError::NoYearAccount { year });
+    };
+
+    let (net_income_cents, _) = result_of(conn, &entry_id);
+    if net_income_cents == 0 {
+        return Err(ClosingError::NothingToAllocate { year });
+    }
+    let shares = partner_capital_lines(conn, year, net_income_cents)?;
+    Ok(AllocationPlan {
+        year_account: year_account.clone(),
+        date,
+        shares,
+        net_income_cents,
+    })
+}
+
+/// Build the allocation of a closed year, under the write lock. Shared with the
+/// group server's `allocate-year` endpoint.
+pub(crate) fn build_allocate_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    year: i32,
+) -> Result<Verdict<Vec<Event>, ClosingError>, EventStoreError> {
+    let plan = match allocation_plan(tx, year) {
+        Ok(plan) => plan,
+        Err(e) => return Ok(Verdict::Reject(e)),
+    };
+    let currency = base_currency(tx);
+    let post = allocation_post(
+        year,
+        plan.date,
+        &plan.year_account,
+        plan.net_income_cents,
+        &plan.shares,
+        &currency,
+    );
+    // The year is closed, so the ordinary post refuses anything dated inside it.
+    // This is the one entry the fence lets through: equity to equity, out of the
+    // account the close filled, dated the day it closed.
+    Ok(match build_post_entry_in_closed_year_in_txn(tx, &post)? {
+        PostEntryStep::Append(event) => Verdict::Append(vec![event]),
+        PostEntryStep::Reject(e) => Verdict::Reject(ClosingError::Entry(e.to_string())),
+    })
+}
+
+/// What an allocation did.
+#[derive(Debug, Clone)]
+pub struct Allocated {
+    pub year: i32,
+    pub entry_id: String,
+    pub net_income_cents: i64,
+}
+
+/// Allocate a closed year's result to the partners' capital accounts, in its own
+/// entry dated the day the year closed.
+///
+/// For a year closed into its account without the allocation — closed before the
+/// partners' capital accounts were linked, say. A close to partner capital
+/// already posts it, in the same append as the close.
+pub fn allocate_to_partners(
+    store: &mut EventStore,
+    user_id: &str,
+    year: i32,
+) -> Result<Allocated, ClosingError> {
+    loop {
+        let head = store.latest_id()?.unwrap_or(0);
+        let user_id = user_id.to_string();
+
+        let outcome = store.append_checked_many(
+            head,
+            move |tx| {
+                Ok(match build_allocate_in_txn(tx, year)? {
+                    Verdict::Append(events) => Verdict::Append(
+                        events
+                            .into_iter()
+                            .map(|e| EventEnvelope::new(e, user_id.clone()))
+                            .collect(),
+                    ),
+                    Verdict::Reject(e) => Verdict::Reject(e),
+                })
+            },
+            |tx, stored| {
+                Projector::new(tx)
+                    .apply(stored)
+                    .map_err(|e| EventStoreError::Projection(e.to_string()))
+            },
+        )?;
+
+        match outcome {
+            CheckedOutcome::Appended(_) => {
+                let conn = store.connection();
+                let entry_id = allocation_entry_for(conn, year).ok_or_else(|| {
+                    ClosingError::Entry("the allocation appended no entry".to_string())
+                })?;
+                let net_income_cents = closing_entry_for(conn, year)
+                    .map(|e| result_of(conn, &e).0)
+                    .unwrap_or(0);
+                return Ok(Allocated {
+                    year,
+                    entry_id,
+                    net_income_cents,
+                });
+            }
             CheckedOutcome::HeadMismatch { .. } => continue,
             CheckedOutcome::Rejected(e) => return Err(e),
         }
@@ -1972,12 +2271,13 @@ mod tests {
     }
 
     fn close_to_partners(b: &mut Books, year: i32) -> Result<Closed, ClosingError> {
+        let year_account = b.equity.clone();
         close_books(
             &mut b.store,
             "user",
             CloseBooksCommand {
                 year,
-                target: ClosingTarget::PartnerCapital,
+                target: ClosingTarget::PartnerCapital(year_account),
                 include_draws: false,
             },
         )
@@ -2119,7 +2419,7 @@ mod tests {
             b.store.connection(),
             2023,
             false,
-            &ClosingTarget::PartnerCapital,
+            &ClosingTarget::PartnerCapital(b.equity.clone()),
         )
         .unwrap();
         assert!(p.blocker.is_none());
@@ -2174,6 +2474,139 @@ mod tests {
             1_080,
             "ending capital ties to the ledger"
         );
+    }
+
+    /// Two entries: the close puts the year's result in the year account, and the
+    /// allocation moves it on to the partners — leaving nothing behind.
+    #[test]
+    fn closing_to_partners_posts_the_result_then_its_allocation() {
+        let mut b = books();
+        let (ada, bo) = as_a_partnership(&mut b, (60.0, 40.0));
+        b.ordinary_year(2023);
+        close_to_partners(&mut b, 2023).unwrap();
+
+        let conn = b.store.connection();
+        let close = closing_entry_for(conn, 2023).expect("closed");
+        let allocation = allocation_entry_for(conn, 2023).expect("allocated");
+        let lines = |entry: &str| -> Vec<(String, i64)> {
+            let mut stmt = conn
+                .prepare("SELECT account_id, amount FROM journal_lines WHERE entry_id = ?1")
+                .unwrap();
+            let rows: Vec<(String, i64)> = stmt
+                .query_map([entry], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            rows
+        };
+
+        let close_lines = lines(&close);
+        assert!(
+            close_lines
+                .iter()
+                .any(|(a, amt)| *a == b.equity && *amt == -180_000),
+            "the result lands in the year account: {close_lines:?}"
+        );
+        assert!(
+            !close_lines.iter().any(|(a, _)| *a == ada || *a == bo),
+            "and not straight in partner capital"
+        );
+
+        let mut moved = lines(&allocation);
+        moved.sort();
+        let mut expected = vec![
+            (b.equity.clone(), 180_000),
+            (ada.clone(), -108_000),
+            (bo.clone(), -72_000),
+        ];
+        expected.sort();
+        assert_eq!(moved, expected);
+        assert_eq!(b.balance(&b.equity, day(2023, 12, 31)), 0);
+    }
+
+    /// A year closed into its account can be allocated afterwards, through the
+    /// fence, exactly once — and the fence still refuses everything else.
+    #[test]
+    fn a_closed_year_can_be_allocated_afterwards_and_only_once() {
+        let mut b = books();
+        let (ada, bo) = as_a_partnership(&mut b, (60.0, 40.0));
+        b.ordinary_year(2023);
+        b.close(2023).unwrap();
+        assert!(allocation_entry_for(b.store.connection(), 2023).is_none());
+
+        let p = preview(
+            b.store.connection(),
+            2023,
+            false,
+            &ClosingTarget::Account(b.equity.clone()),
+        )
+        .unwrap();
+        assert!(p.is_closed() && !p.is_allocated());
+        assert!(p.allocation_blocker.is_none(), "{:?}", p.allocation_blocker);
+        assert_eq!(p.allocation.iter().map(|s| s.cents).sum::<i64>(), 180_000);
+
+        let done = allocate_to_partners(&mut b.store, "user", 2023).unwrap();
+        assert_eq!(done.net_income_cents, 180_000);
+        let end = day(2023, 12, 31);
+        assert_eq!(b.balance(&ada, end), -108_000);
+        assert_eq!(b.balance(&bo, end), -72_000);
+        assert_eq!(b.balance(&b.equity, end), 0);
+
+        assert!(
+            matches!(
+                allocate_to_partners(&mut b.store, "user", 2023),
+                Err(ClosingError::AlreadyAllocated { year: 2023, .. })
+            ),
+            "only once"
+        );
+
+        let (cash, sales) = (b.cash.clone(), b.sales.clone());
+        let late =
+            EntryCommands::new(&mut b.store, "user".to_string()).post_entry(PostEntryCommand {
+                date: day(2023, 11, 1),
+                memo: "late".to_string(),
+                lines: vec![
+                    EntryLine::debit(&cash, 100, "USD"),
+                    EntryLine::credit(&sales, 100, "USD"),
+                ],
+                reference: None,
+                source: Some(JournalEntrySource::Manual),
+            });
+        assert!(
+            late.is_err(),
+            "an ordinary entry is still refused in the closed year"
+        );
+    }
+
+    #[test]
+    fn an_open_year_cannot_be_allocated() {
+        let mut b = books();
+        as_a_partnership(&mut b, (60.0, 40.0));
+        b.ordinary_year(2023);
+        assert!(matches!(
+            allocate_to_partners(&mut b.store, "user", 2023),
+            Err(ClosingError::NotClosed { year: 2023 })
+        ));
+    }
+
+    /// Reopening takes the allocation with the close, so a reopened year never
+    /// keeps a stale split — and it closes and allocates again cleanly.
+    #[test]
+    fn reopening_voids_the_allocation_with_the_close() {
+        let mut b = books();
+        let (ada, _bo) = as_a_partnership(&mut b, (60.0, 40.0));
+        b.ordinary_year(2023);
+        close_to_partners(&mut b, 2023).unwrap();
+
+        reopen_books(&mut b.store, "user", 2023, "found a missing invoice").unwrap();
+        let end = day(2023, 12, 31);
+        assert!(allocation_entry_for(b.store.connection(), 2023).is_none());
+        assert_eq!(b.balance(&ada, end), 0);
+        assert_eq!(b.balance(&b.equity, end), 0);
+
+        close_to_partners(&mut b, 2023).unwrap();
+        assert_eq!(b.balance(&ada, end), -108_000);
+        assert_eq!(b.balance(&b.equity, end), 0);
     }
 
     #[test]

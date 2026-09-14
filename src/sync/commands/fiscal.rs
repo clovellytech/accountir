@@ -39,8 +39,8 @@
 //! year with nothing to show what it earned would only ever be used by mistake.
 
 use crate::commands::closing_commands::{
-    build_close_books_in_txn, build_reopen_books_in_txn, CloseBooksCommand, ClosingError,
-    ClosingTarget,
+    build_allocate_in_txn, build_close_books_in_txn, build_reopen_books_in_txn, CloseBooksCommand,
+    ClosingError, ClosingTarget,
 };
 use crate::store::event_store::Verdict;
 use crate::sync::{
@@ -53,6 +53,7 @@ pub fn router() -> Router<SyncState> {
     Router::new()
         .route("/sync/commands/close-books", post(submit_close_books))
         .route("/sync/commands/reopen-year", post(submit_reopen_year))
+        .route("/sync/commands/allocate-year", post(submit_allocate_year))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -64,15 +65,25 @@ pub struct CloseBooksRequest {
     /// them is its own command with its own answer. The server checks it exists
     /// and is equity, under the write lock.
     ///
-    /// **`None` means allocate to partner capital instead**: one line per
-    /// partner, into their own capital account, split on the percentages in
-    /// force across the year. Absent rather than a separate flag so the two are
-    /// mutually exclusive by construction — there is no request that names an
-    /// account *and* asks for the split.
+    /// Required. It used to be optional, with `None` meaning "sweep straight into
+    /// partner capital"; the result now always passes through this account, and
+    /// `allocate_to_partners` says whether a second entry moves it on. Still an
+    /// `Option` on the wire so an older client's request is refused with a
+    /// sentence rather than failing to parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub equity_account_id: Option<String>,
+    /// Move the year's result from that account to each partner's capital
+    /// account, in a second entry in the same append.
+    #[serde(default)]
+    pub allocate_to_partners: bool,
     #[serde(default)]
     pub include_draws: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AllocateYearRequest {
+    pub expected_head_seq: i64,
+    pub year: i32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -100,15 +111,20 @@ async fn submit_close_books(
     if !plausible_year(req.year) {
         return Err(ApiError::bad_request("year is not a tax year"));
     }
-    let target = match req.equity_account_id {
-        None => ClosingTarget::PartnerCapital,
-        Some(id) if id.trim().is_empty() => {
-            return Err(ApiError::bad_request(
-                "equity_account_id is empty; omit it entirely to allocate to partner capital",
-            ))
-        }
-        Some(id) => ClosingTarget::Account(id),
-    };
+    let target =
+        match req.equity_account_id {
+            Some(id) if !id.trim().is_empty() => {
+                if req.allocate_to_partners {
+                    ClosingTarget::PartnerCapital(id)
+                } else {
+                    ClosingTarget::Account(id)
+                }
+            }
+            _ => return Err(ApiError::bad_request(
+                "equity_account_id is required: the year's result passes through that account, \
+                 and allocate_to_partners moves it on to partner capital",
+            )),
+        };
 
     let cmd = CloseBooksCommand {
         year: req.year,
@@ -165,6 +181,36 @@ async fn submit_reopen_year(
                         Verdict::Reject(e) => Verdict::Reject(e),
                     },
                 )
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response_many(outcome, expected, ApiError::domain::<ClosingError>)
+}
+
+/// Allocate a closed year's result to the partners, on the group's books.
+async fn submit_allocate_year(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<AllocateYearRequest>,
+) -> Result<Json<SubmitResponse>, ApiError> {
+    if !plausible_year(req.year) {
+        return Err(ApiError::bad_request("year is not a tax year"));
+    }
+    let expected = req.expected_head_seq;
+    let year = req.year;
+
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            expected,
+            move |tx| {
+                Ok(match build_allocate_in_txn(tx, year)? {
+                    Verdict::Append(events) => {
+                        Verdict::Append(events.into_iter().map(|e| stamp(e, &actor)).collect())
+                    }
+                    Verdict::Reject(e) => Verdict::Reject(e),
+                })
             },
             project,
         )
@@ -322,6 +368,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(equity.clone()),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;
@@ -388,6 +435,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(equity),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;
@@ -426,6 +474,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(equity),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;
@@ -457,6 +506,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(equity.clone()),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;
@@ -471,6 +521,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(equity),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;
@@ -508,6 +559,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(equity),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;
@@ -539,6 +591,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(cash),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;
@@ -560,6 +613,7 @@ mod tests {
                     year,
                     equity_account_id: Some(account.to_string()),
                     include_draws: false,
+                    allocate_to_partners: false,
                 },
             )
             .await;
@@ -594,6 +648,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(equity.clone()),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;
@@ -635,6 +690,7 @@ mod tests {
                 year: 2023,
                 equity_account_id: Some(equity),
                 include_draws: false,
+                allocate_to_partners: false,
             },
         )
         .await;

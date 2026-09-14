@@ -69,6 +69,15 @@ pub(crate) fn check_entry_invariants_in_txn(
     account_ids: &[&str],
     date: NaiveDate,
 ) -> Result<Option<EntryCommandError>, EventStoreError> {
+    check_entry_invariants(tx, account_ids, date, true)
+}
+
+fn check_entry_invariants(
+    tx: &rusqlite::Transaction<'_>,
+    account_ids: &[&str],
+    date: NaiveDate,
+    fenced: bool,
+) -> Result<Option<EntryCommandError>, EventStoreError> {
     for account_id in account_ids {
         let active: Option<bool> = tx
             .query_row(
@@ -90,6 +99,10 @@ pub(crate) fn check_entry_invariants_in_txn(
                 )))
             }
         }
+    }
+
+    if !fenced {
+        return Ok(None);
     }
 
     // The closed-year fence. A date in no fiscal year at all is unfenced —
@@ -511,6 +524,28 @@ pub(crate) fn build_post_entry_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &PostEntryCommand,
 ) -> Result<PostEntryStep, EventStoreError> {
+    build_post_entry(tx, cmd, true)
+}
+
+/// [`build_post_entry_in_txn`] without the closed-year fence — every other check
+/// (a free reference, active accounts) still applies.
+///
+/// For `closing_commands` alone, which allocates a closed year's result from the
+/// year account to the partners' capital accounts: equity to equity, dated the
+/// day the year closed, out of the account the close itself filled. That entry
+/// belongs inside the year, and the fence exists to keep everything else out.
+pub(crate) fn build_post_entry_in_closed_year_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &PostEntryCommand,
+) -> Result<PostEntryStep, EventStoreError> {
+    build_post_entry(tx, cmd, false)
+}
+
+fn build_post_entry(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &PostEntryCommand,
+    fenced: bool,
+) -> Result<PostEntryStep, EventStoreError> {
     // Idempotency: a live entry with this reference already exists ⇒ duplicate.
     if let Some(ref reference) = cmd.reference {
         if let Some(existing_entry_id) = check_reference_free_in_txn(tx, reference)? {
@@ -525,7 +560,7 @@ pub(crate) fn build_post_entry_in_txn(
 
     // State-dependent fences (accounts active, period open), under the write lock.
     let account_ids: Vec<&str> = cmd.lines.iter().map(|l| l.account_id.as_str()).collect();
-    if let Some(e) = check_entry_invariants_in_txn(tx, &account_ids, cmd.date)? {
+    if let Some(e) = check_entry_invariants(tx, &account_ids, cmd.date, fenced)? {
         return Ok(PostEntryStep::Reject(e));
     }
 
