@@ -401,10 +401,46 @@ pub fn set_check(
     on_state: &str,
 ) -> Result<(), FormError> {
     let id = map.resolve(name)?;
-    let state = Object::Name(on_state.trim_start_matches('/').as_bytes().to_vec());
-    let dict = doc.get_object_mut(id)?.as_dict_mut()?;
-    dict.set("V", state.clone());
-    dict.set("AS", state);
+    let on = on_state.trim_start_matches('/').as_bytes().to_vec();
+    let state = Object::Name(on.clone());
+
+    // A radio group keeps its value on the field and draws each choice on a
+    // widget of its own. Setting the appearance state on the field alone leaves
+    // every widget drawn off — the value is right and the page shows nothing
+    // ticked — so each widget is switched on or off by whether it has an
+    // appearance of this name.
+    let kids: Vec<ObjectId> = doc
+        .get_dictionary(id)?
+        .get(b"Kids")
+        .ok()
+        .and_then(|k| k.as_array().ok())
+        .map(|a| a.iter().filter_map(|o| o.as_reference().ok()).collect())
+        .unwrap_or_default();
+    {
+        let dict = doc.get_object_mut(id)?.as_dict_mut()?;
+        dict.set("V", state.clone());
+        if kids.is_empty() {
+            dict.set("AS", state);
+            return Ok(());
+        }
+        dict.remove(b"AS");
+    }
+    for kid in kids {
+        let has_on = doc
+            .get_dictionary(kid)
+            .ok()
+            .and_then(|d| d.get(b"AP").ok())
+            .and_then(|ap| doc.dereference(ap).ok())
+            .and_then(|(_, o)| o.as_dict().ok().cloned())
+            .and_then(|ap| ap.get(b"N").ok().cloned())
+            .and_then(|n| doc.dereference(&n).ok().and_then(|(_, o)| o.as_dict().ok().cloned()))
+            .is_some_and(|normal| normal.has(&on));
+        let widget = doc.get_object_mut(kid)?.as_dict_mut()?;
+        widget.set(
+            "AS",
+            Object::Name(if has_on { on.clone() } else { b"Off".to_vec() }),
+        );
+    }
     Ok(())
 }
 
