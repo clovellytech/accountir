@@ -157,6 +157,7 @@ mod f {
 
     // Step 4 — additions.
     pub const L14_FROM_L13: &str = "Amounts - L13";
+    pub const L16_ILLINOIS_TAXES: &str = "Illinois taxes deducted";
     pub const L17_SPECIAL_DEPRECIATION: &str = "Illinois Special Depreciation";
     pub const L20_GUARANTEED: &str = "Guaranteed payments";
     pub const L23_INCOME: &str = "Income/loss";
@@ -197,6 +198,14 @@ mod f {
     pub const L61_PTE_TAX: &str = "Pass-through entity tax";
     pub const L62_TOTAL_TAX: &str = "Total net replacement tax";
     pub const L64_TOTAL: &str = "Total taxes, surcharge";
+
+    // Step 10 — payments, and what is still owed.
+    pub const L66_TOTAL_PAYMENTS: &str = "Ttl payments";
+    pub const L71_TAX_DUE: &str = "Amount tax due - owe";
+
+    // Step 1, box Q: Form IL-4562 is attached.
+    pub const IL4562_ATTACHED: &str = "Form IL-452 chk box";
+    pub const IL4562_ON: &str = "Form IL-4562";
 
     // Schedule B header (Section B, page 5).
     pub const SCHB_NAME: &str =
@@ -244,6 +253,8 @@ const M_COL_D_SUBJECT: &str = ", Column D - Check if your partner or shareholder
                                Illinois replacment tax or is an ESOP";
 const M_COL_D_ON: &str = "Yes";
 const M_COL_E_SHARE: &str = ", Column E - Member's distributable amount of base income or loss";
+const M_COL_F_EXCLUDED: &str =
+    ", Column F -  Excluded from pass-through withholding payments.  See instructions";
 
 // ---------------------------------------------------------------------------
 // The figures IL-1065 computes, so a test can check the arithmetic without
@@ -266,6 +277,8 @@ pub struct Figures {
     pub line10: i64,
     pub line12: i64,
     pub line13: i64,
+    /// Illinois income and replacement tax the federal return deducted.
+    pub line16: i64,
     /// Illinois special depreciation addition — Form IL-4562, Step 2, line 4.
     pub line17: i64,
     pub line20: i64,
@@ -289,7 +302,7 @@ pub struct Figures {
 
 /// Compute the return's figures from the federal Schedule K totals and settings.
 pub fn figures(federal: &Form1065Lines, settings: &Il1065Settings) -> Figures {
-    figures_with(federal, settings, &SpecialDepreciation::default())
+    figures_with(federal, settings, &SpecialDepreciation::default(), 0)
 }
 
 /// [`figures`], with the Illinois special depreciation adjustments from the asset
@@ -298,6 +311,7 @@ pub fn figures_with(
     federal: &Form1065Lines,
     settings: &Il1065Settings,
     special: &SpecialDepreciation,
+    illinois_taxes: i64,
 ) -> Figures {
     // Step 2 — straight off federal Schedule K. Portfolio income is interest,
     // dividends, royalties and net capital gains; §1231 is its own line 5.
@@ -323,9 +337,12 @@ pub fn figures_with(
     // depreciation comes from the asset register; the other Illinois-specific
     // additions are left blank.
     let line14 = line13;
+    // Line 16: Illinois income and replacement tax the federal return deducted —
+    // see `illinois_taxes_deducted`.
+    let line16 = illinois_taxes;
     let line17 = special.addition_dollars();
     let line20 = federal.k_line_4c();
-    let line23 = line14 + line17 + line20;
+    let line23 = line14 + line16 + line17 + line20;
 
     // Step 5 — subtractions. Only special depreciation is known here.
     let line30 = special.subtraction_dollars();
@@ -347,6 +364,7 @@ pub fn figures_with(
             line10,
             line12,
             line13,
+            line16,
             line17,
             line20,
             line23,
@@ -405,6 +423,7 @@ pub fn figures_with(
         line10,
         line12,
         line13,
+        line16,
         line17,
         line20,
         line23,
@@ -462,24 +481,14 @@ pub struct SpecialRow {
 }
 
 impl SpecialDepreciation {
-    /// Line 17 — Form IL-4562, Step 2, line 4.
+    /// Line 17 — Form IL-4562, Step 2, line 4, figured as the form figures it.
     pub fn addition_dollars(&self) -> i64 {
-        super::lines::cents_to_dollars(
-            self.rows
-                .iter()
-                .map(|r| r.addition_cents + r.last_year_addition_cents)
-                .sum(),
-        )
+        super::il4562::Lines::from_special(self).l4
     }
 
-    /// Line 30 — Form IL-4562, Step 3, line 19.
+    /// Line 30 — Form IL-4562, Step 3, line 19, figured as the form figures it.
     pub fn subtraction_dollars(&self) -> i64 {
-        super::lines::cents_to_dollars(
-            self.rows
-                .iter()
-                .map(|r| r.subtraction_cents + r.last_year_subtraction_cents)
-                .sum(),
-        )
+        super::il4562::Lines::from_special(self).l19
     }
 }
 
@@ -603,9 +612,12 @@ fn special_statement(
     let mut lines: Vec<TableLine> = special
         .rows
         .iter()
-        .map(|r| {
-            TableLine::Cells(vec![
-                r.description.chars().take(26).collect(),
+        .flat_map(|r| {
+            // The whole description: as much as the column holds, and the rest on
+            // the line beneath rather than cut off.
+            let (head, rest) = fit_words(&r.description, PROPERTY_WIDTH);
+            let cells = TableLine::Cells(vec![
+                head,
                 r.placed_in_service.to_string(),
                 format!("{:.0}%", r.bonus_rate * 100.0),
                 dollars(r.addition_cents),
@@ -616,7 +628,8 @@ fn special_statement(
                 dollars(r.subtraction_cents),
                 dollars(r.last_year_addition_cents),
                 dollars(r.last_year_subtraction_cents),
-            ])
+            ]);
+            std::iter::once(cells).chain(rest.map(TableLine::Note))
         })
         .collect();
     let sum = |f: fn(&SpecialRow) -> i64| special.rows.iter().map(f).sum::<i64>();
@@ -643,14 +656,14 @@ fn special_statement(
         ),
         columns: vec![
             column("Property", 54.0, false),
-            column("In service", 196.0, false),
-            column("Bonus", 290.0, true),
-            column("Bonus added back", 378.0, true),
-            column("Regular depr.", 450.0, true),
-            column("Factor", 462.0, false),
-            column("Subtraction", 580.0, true),
-            column("Last yr: add", 660.0, true),
-            column("Last yr: subtract", 738.0, true),
+            column("In service", 250.0, false),
+            column("Bonus", 330.0, true),
+            column("Bonus added back", 410.0, true),
+            column("Regular depr.", 480.0, true),
+            column("Factor", 492.0, false),
+            column("Subtraction", 600.0, true),
+            column("Last yr: add", 672.0, true),
+            column("Last yr: subtract", 744.0, true),
         ],
         lines,
         footnotes: vec![
@@ -669,6 +682,113 @@ fn special_statement(
 /// tax on a loss is zero, and the caller clamps before dividing.
 fn round_rate(amount: i64, num: i64, den: i64) -> i64 {
     (amount * num + den / 2) / den
+}
+
+/// Characters of a property description the special depreciation statement's
+/// first column holds.
+const PROPERTY_WIDTH: usize = 40;
+
+/// Split text at the last space that keeps the first part within `width`
+/// characters, returning the remainder when there is one.
+fn fit_words(s: &str, width: usize) -> (String, Option<String>) {
+    if s.chars().count() <= width {
+        return (s.to_string(), None);
+    }
+    let mut head = String::new();
+    let mut rest = Vec::new();
+    for word in s.split_whitespace() {
+        if rest.is_empty() && head.chars().count() + 1 + word.chars().count() <= width {
+            if !head.is_empty() {
+                head.push(' ');
+            }
+            head.push_str(word);
+        } else {
+            rest.push(word);
+        }
+    }
+    if head.is_empty() {
+        // One word longer than the column: it prints whole.
+        return (s.to_string(), None);
+    }
+    (head, Some(rest.join(" ")).filter(|r| !r.is_empty()))
+}
+
+/// One partner's share of the return, in whole dollars: what their Schedule K-1-P
+/// carries and what Illinois Schedule B column E adds up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemberShares {
+    /// Line 1 — ordinary income, divided as the federal K-1s divide it: by the
+    /// year's fixed or preferred shares where the agreement sets them, otherwise
+    /// on the profit percentages.
+    pub ordinary: i64,
+    /// Line 20 — guaranteed payments.
+    pub guaranteed: i64,
+    /// Line 16 — Illinois income and replacement tax added back.
+    pub illinois_taxes: i64,
+    /// Line 17 — special depreciation addition.
+    pub special_addition: i64,
+    /// Line 30 — special depreciation subtraction.
+    pub special_subtraction: i64,
+    /// Schedule B column E: ordinary income plus a profit-percentage share of
+    /// everything else between line 1 and line 35. The column adds back to line 35.
+    pub base_income: i64,
+    /// Schedule K-1-P line 8: the year-end profit percentage, which the Step 5
+    /// amounts follow.
+    pub share_ppm: i64,
+}
+
+/// Every partner's [`MemberShares`], in the order given.
+///
+/// The Step 5 amounts are each line of the return times the partner's
+/// percentage, as the K-1-P instructions direct; under a preferred or fixed
+/// division of ordinary income that is the split every dollar past the fixed
+/// amounts follows.
+pub fn member_shares(
+    figs: &Figures,
+    partners: &[PartnerFiling],
+    year: i32,
+    fixed: &[crate::domain::FixedAllocation],
+) -> Vec<MemberShares> {
+    use super::allocate::{allocate_as_of, split_fixed, Basis};
+    let members: Vec<&crate::domain::Partner> = partners.iter().map(|f| &f.partner).collect();
+    let (_, year_end) = crate::commands::partnership_commands::calendar_year(year);
+    let by_profit = |total: i64| -> Vec<i64> {
+        let mut out = vec![0; members.len()];
+        if total != 0 {
+            for s in allocate_as_of(total, &members, Basis::ProfitOrLoss, Some(year_end)) {
+                out[s.partner] = s.dollars;
+            }
+        }
+        out
+    };
+    let ordinary = match split_fixed(figs.line1, &members, year, fixed, false) {
+        Some(shares) => {
+            let mut out = vec![0; members.len()];
+            for s in shares {
+                out[s.partner] = s.dollars;
+            }
+            out
+        }
+        None => by_profit(figs.line1),
+    };
+    let guaranteed = by_profit(figs.line20);
+    let taxes = by_profit(figs.line16);
+    let addition = by_profit(figs.line17);
+    let subtraction = by_profit(figs.line30);
+    let rest = by_profit(figs.line35 - figs.line1);
+    members
+        .iter()
+        .enumerate()
+        .map(|(i, p)| MemberShares {
+            ordinary: ordinary[i],
+            guaranteed: guaranteed[i],
+            illinois_taxes: taxes[i],
+            special_addition: addition[i],
+            special_subtraction: subtraction[i],
+            base_income: ordinary[i] + rest[i],
+            share_ppm: p.shares_on(year_end).profit_ppm,
+        })
+        .collect()
 }
 
 /// A partner's share of a whole-dollar figure, in ppm, rounded to the dollar.
@@ -711,6 +831,7 @@ pub fn build(
         year,
         &SpecialDepreciation::default(),
         &[],
+        0,
     )
 }
 
@@ -724,6 +845,7 @@ pub fn build_with_special(
     year: i32,
     special: &SpecialDepreciation,
     fixed: &[crate::domain::FixedAllocation],
+    illinois_taxes: i64,
 ) -> Result<Bundle, FormError> {
     // The year's own blank, or none. Refused rather than substituted, for the
     // reason the federal forms are: Illinois renumbers between revisions, and
@@ -739,13 +861,16 @@ pub fn build_with_special(
     })?;
 
     let mut warnings = Vec::new();
-    let figs = figures_with(federal, settings, special);
+    let figs = figures_with(federal, settings, special, illinois_taxes);
 
     let mut doc = Document::load_mem(revision.form)?;
     strip_xfa(&mut doc);
     let map = field_map(&doc);
 
     fill_identity(&mut doc, &map, profile, settings)?;
+    if !special.rows.is_empty() {
+        set_check(&mut doc, &map, f::IL4562_ATTACHED, f::IL4562_ON)?;
+    }
     fill_income(&mut doc, &map, &figs, &mut warnings)?;
     fill_tax(&mut doc, &map, &figs, settings, &mut warnings)?;
     fill_schedule_b(
@@ -767,14 +892,62 @@ pub fn build_with_special(
              Form IL-4562 figures them from the asset register — the federal bonus depreciation \
              added back in the year taken, recovered through a share of each later year's \
              regular depreciation, and settled in the property's last year. The figures are on \
-             the statement behind the return; complete Form IL-4562 from it and check the \
-             IL-4562 box on page 1.",
+             the statement behind Form IL-4562, and box Q on page 1 is checked.",
             format_dollars(figs.line17),
             format_dollars(figs.line30)
         ));
+        match super::il4562::build(profile, year, special)? {
+            Some(mut form) => {
+                super::acroform::namespace_fields(&mut form, "IL4562");
+                super::acroform::append_document(&mut doc, form)?;
+            }
+            None => warnings.push(format!(
+                "Form IL-4562 is not filled for {year}: this program carries the {} blank only. \
+                 Complete it by hand from the statement behind the return.",
+                super::il4562::FORM_YEAR
+            )),
+        }
         if let Some(page) = special_statement(profile, year, special)? {
             super::acroform::append_document(&mut doc, page)?;
         }
+    }
+
+    // Schedule K-1-P for each partner, behind everything that is filed.
+    if year == super::il_k1p::FORM_YEAR {
+        let shares = member_shares(&figs, partners, year, fixed);
+        for (i, (filing, share)) in partners.iter().zip(&shares).enumerate() {
+            let (mut k1p, k1p_warnings) = super::il_k1p::build(
+                profile,
+                year,
+                filing,
+                share,
+                settings.apportions_outside_illinois,
+            )?;
+            super::acroform::namespace_fields(&mut k1p, &format!("K1P_{}", i + 1));
+            super::acroform::append_document(&mut doc, k1p)?;
+            warnings.extend(k1p_warnings);
+        }
+        if !partners.is_empty() {
+            warnings.push(format!(
+                "Schedule K-1-P for each of the {} partners follows the return. Give each partner \
+                 theirs with Schedule K-1-P(2) by the IL-1065's due date; they are not mailed with \
+                 the return. Line 8 is the year-end profit percentage, which Step 5 follows; where \
+                 ordinary income on line 20 is divided in fixed or preferred amounts instead, the \
+                 instructions ask for that allocation to be explained on a sheet attached to the \
+                 schedule.{}",
+                partners.len(),
+                if settings.apportions_outside_illinois {
+                    " Line 4 and Column B are blank: the apportionment factor is not in the books."
+                } else {
+                    ""
+                }
+            ));
+        }
+    } else if !partners.is_empty() {
+        warnings.push(format!(
+            "Schedule K-1-P is not produced for {year}: this program carries the {} blank only.",
+            super::il_k1p::FORM_YEAR
+        ));
     }
 
     let mut pdf = Vec::new();
@@ -834,11 +1007,95 @@ pub fn build_from_ledger(
     let assets = crate::commands::depreciation_commands::list_assets(conn);
     let special = special_depreciation(&assets, year);
     let fixed = pc::list_fixed_allocations(conn);
+    let (illinois_taxes, addback_warnings) =
+        illinois_taxes_deducted(conn, year, &statement, &mapping, &limits);
     let mut bundle = build_with_special(
-        &profile, &filings, &federal, settings, year, &special, &fixed,
+        &profile,
+        &filings,
+        &federal,
+        settings,
+        year,
+        &special,
+        &fixed,
+        illinois_taxes,
     )?;
+    bundle.warnings.extend(addback_warnings);
     bundle.warnings.extend(problems);
     Ok(bundle)
+}
+
+/// IL-1065 line 16: the Illinois income and replacement tax the federal return
+/// deducted.
+///
+/// Read from the accounts marked as Illinois tax for the year
+/// ([`super::lines::load_illinois_tax_addbacks`]) and every account beneath them,
+/// and only as much as reached a federal deduction: an account on no line, or
+/// limited to a share of its balance, adds back what the return actually took.
+fn illinois_taxes_deducted(
+    conn: &rusqlite::Connection,
+    year: i32,
+    statement: &crate::queries::reports::IncomeStatement,
+    mapping: &std::collections::BTreeMap<String, String>,
+    limits: &std::collections::BTreeMap<String, u8>,
+) -> (i64, Vec<String>) {
+    let marked = super::lines::load_illinois_tax_addbacks(conn, year);
+    if marked.is_empty() {
+        return (0, Vec::new());
+    }
+    let parents = super::lines::load_parents(conn);
+    let is_marked = |id: &str| {
+        let mut cursor = Some(id.to_string());
+        while let Some(current) = cursor {
+            if marked.contains(&current) {
+                return true;
+            }
+            cursor = parents.get(&current).cloned().flatten();
+        }
+        false
+    };
+
+    let (mut cents, mut deducted, mut not_deducted) = (0i64, Vec::new(), Vec::new());
+    for line in &statement.expenses.lines {
+        if line.balance == 0 || !is_marked(&line.account_id) {
+            continue;
+        }
+        let label = format!("{} {}", line.account_number, line.account_name);
+        let reaches_a_deduction = mapping
+            .get(&line.account_id)
+            .filter(|k| k.as_str() != super::lines::OFF_RETURN)
+            .and_then(|k| super::lines::line_def(k))
+            .is_some_and(|d| d.schedule != super::lines::Schedule::L);
+        if reaches_a_deduction {
+            let pct = i64::from(limits.get(&line.account_id).copied().unwrap_or(100));
+            cents += line.balance * pct / 100;
+            deducted.push(label);
+        } else {
+            not_deducted.push(label);
+        }
+    }
+
+    let dollars = super::lines::cents_to_dollars(cents);
+    let mut warnings = Vec::new();
+    if dollars != 0 {
+        warnings.push(format!(
+            "IL-1065 line 16 adds back {} of Illinois income and replacement tax the federal \
+             return deducted for {year}, from {}. The tax on this return is deductible when it \
+             is paid, and added back on the return for that year.",
+            format_dollars(dollars),
+            deducted.join(", ")
+        ));
+    }
+    if !not_deducted.is_empty() {
+        warnings.push(format!(
+            "{} {} marked as Illinois tax to add back, but reach{} no deduction on the federal \
+             return, so nothing of {} is added back on IL-1065 line 16.",
+            not_deducted.join(", "),
+            if not_deducted.len() == 1 { "is" } else { "are" },
+            if not_deducted.len() == 1 { "es" } else { "" },
+            if not_deducted.len() == 1 { "its" } else { "theirs" }
+        ));
+    }
+    (dollars, warnings)
 }
 
 fn fill_identity(
@@ -896,6 +1153,7 @@ fn fill_income(
         (f::L12_ADD_8_11, figs.line12),
         (f::L13_UNMODIFIED_BASE, figs.line13),
         (f::L14_FROM_L13, figs.line13),
+        (f::L16_ILLINOIS_TAXES, figs.line16),
         (f::L17_SPECIAL_DEPRECIATION, figs.line17),
         (f::L20_GUARANTEED, figs.line20),
         (f::L23_INCOME, figs.line23),
@@ -965,6 +1223,19 @@ fn fill_tax(
     let line62 = figs.line62.expect("il-only figures are complete");
     write_money(doc, map, f::L62_TOTAL_TAX, line62, warnings)?;
     write_money(doc, map, f::L64_TOTAL, line62, warnings)?; // line 63 penalty = 0
+    // Step 10. The books hold no payment toward this return — an extension
+    // payment is made after the year the ledger covers — so line 66 is zero and
+    // line 71 is the whole of line 64.
+    if line62 > 0 {
+        write_money(doc, map, f::L66_TOTAL_PAYMENTS, 0, warnings)?;
+        write_money(doc, map, f::L71_TAX_DUE, line62, warnings)?;
+        warnings.push(format!(
+            "IL-1065 line 71 is the whole {} of line 64, with line 66 at zero. Payments made \
+             before filing (line 65b, such as an extension payment) and credits from an earlier \
+             overpayment (65a) are not in the books; enter any and re-figure lines 66 to 71.",
+            format_dollars(line62)
+        ));
+    }
     Ok(())
 }
 
@@ -984,15 +1255,7 @@ fn fill_schedule_b(
     // by the year's fixed or preferred shares where the agreement sets them — the
     // federal K-1s' own split — and otherwise on the profit percentages. Either
     // way the column adds back to line 35, as the instructions require.
-    let members: Vec<&crate::domain::Partner> = partners.iter().map(|f| &f.partner).collect();
-    let fixed_shares = super::allocate::split_fixed(figs.line35, &members, year, fixed, false);
-    let share_for = |i: usize, p: &crate::domain::Partner| match &fixed_shares {
-        Some(shares) => shares
-            .iter()
-            .find(|s| s.partner == i)
-            .map_or(0, |s| s.dollars),
-        None => share_of(figs.line35, p.shares.profit_ppm),
-    };
+    let shares = member_shares(figs, partners, year, fixed);
     let mut subject_total = 0i64;
     for (name, f2, f7) in [
         (f::SCHB_NAME, f::SCHB_FEIN_2, f::SCHB_FEIN_7),
@@ -1051,10 +1314,20 @@ fn fill_schedule_b(
         }
 
         // Column E — the member's share of base income (line 35).
-        let share = share_for(i, p);
+        let share = shares[i].base_income;
         write_money(doc, map, &member(n, M_COL_E_SHARE), share, warnings)?;
         if subject {
             subject_total += share;
+        }
+
+        // Column F — why no pass-through withholding is owed: "R" for an Illinois
+        // resident. Read from an individual's Illinois address, which is the usual
+        // case and not proof of residency; the caveat says so.
+        if illinois_member_type(p) == Some("I")
+            && matches!(p.residency, crate::domain::Residency::Domestic)
+            && p.address.state.trim().eq_ignore_ascii_case("IL")
+        {
+            set_text(doc, map, &member(n, M_COL_F_EXCLUDED), "R")?;
         }
 
         if filing.tin.is_none() {
@@ -1107,7 +1380,7 @@ fn caveats(
 
     out.push(
         "IL-1065 fills only the lines the books can compute. The Illinois additions (state and \
-         municipal interest, Illinois taxes deducted, related-party expenses) and subtractions \
+         municipal interest, related-party expenses; line 16 comes from the accounts marked as Illinois tax) and subtractions \
          (U.S. Treasury interest, and the rest of Step 5 other than special depreciation) are left \
          blank — enter any that apply and re-add the Step 4, 5 and 7 totals."
             .to_string(),
@@ -1134,7 +1407,8 @@ fn caveats(
 
     out.push(
         "Illinois Schedule B, Section B: column D (subject to replacement tax) is checked for \
-         entity partners and clear for individuals; verify each. Columns F–L (pass-through \
+         entity partners and clear for individuals, and column F is R for individuals with an \
+         Illinois address; verify each partner's residency. Columns G–L (pass-through \
          withholding and credits) and Section A lines 1, 2 and 4 to 7 are left blank."
             .to_string(),
     );
@@ -1148,7 +1422,7 @@ fn caveats(
 
 /// The Illinois Schedule B partner-type code for a partner's federal entity
 /// type, when the entity type says plainly which it is.
-fn illinois_member_type(p: &crate::domain::Partner) -> Option<&'static str> {
+pub(crate) fn illinois_member_type(p: &crate::domain::Partner) -> Option<&'static str> {
     let t = p.entity_type.trim().to_ascii_lowercase();
     if t.contains("exempt") || t.contains("llc") || t.contains("disregarded") {
         None
@@ -1172,7 +1446,7 @@ fn illinois_member_type(p: &crate::domain::Partner) -> Option<&'static str> {
 /// Split an EIN `NN-NNNNNNN` into its two-digit and seven-digit halves, the way
 /// the form's two boxes want it. A value without the hyphen is split by position
 /// rather than refused — the return is more use with the number in it.
-fn split_fein(ein: &str) -> (String, String) {
+pub(crate) fn split_fein(ein: &str) -> (String, String) {
     match ein.split_once('-') {
         Some((a, b)) => (a.to_string(), b.to_string()),
         None => {
@@ -1267,6 +1541,9 @@ mod tests {
             f::L61_PTE_TAX,
             f::L62_TOTAL_TAX,
             f::L64_TOTAL,
+            f::L66_TOTAL_PAYMENTS,
+            f::L16_ILLINOIS_TAXES,
+            f::L71_TAX_DUE,
             f::SCHB_NAME,
             f::SCHB_FEIN_2,
             f::SCHB_FEIN_7,
@@ -1287,6 +1564,7 @@ mod tests {
             v.push(member(n, M_COL_B_TYPE));
             v.push(member(n, M_COL_C_TIN));
             v.push(member(n, M_COL_E_SHARE));
+            v.push(member(n, M_COL_F_EXCLUDED));
         }
         v
     }
@@ -1297,6 +1575,7 @@ mod tests {
             (f::PTE_BOX.to_string(), f::PTE_BOX_ON.to_string()),
             (f::INSIDE_OUTSIDE.to_string(), f::INSIDE_ON.to_string()),
             (f::INSIDE_OUTSIDE.to_string(), f::OUTSIDE_ON.to_string()),
+            (f::IL4562_ATTACHED.to_string(), f::IL4562_ON.to_string()),
         ];
         for n in 1..=SCHEDULE_B_ROWS {
             v.push((member(n, M_COL_D_SUBJECT), M_COL_D_ON.to_string()));
@@ -1499,6 +1778,36 @@ mod tests {
             get_value(&doc, &map, f::L52_EXEMPTION).as_deref(),
             Some("1,000")
         );
+        assert_eq!(get_value(&doc, &map, f::L66_TOTAL_PAYMENTS).as_deref(), Some("0"));
+        assert_eq!(get_value(&doc, &map, f::L71_TAX_DUE).as_deref(), Some("1,485"));
+        // Box A shows ticked: the widget for "inside Illinois" is drawn on, not
+        // just the field's value set.
+        let parent = map.find(f::INSIDE_OUTSIDE).unwrap();
+        let states: Vec<Vec<u8>> = doc
+            .get_dictionary(parent)
+            .unwrap()
+            .get(b"Kids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| {
+                doc.get_dictionary(k.as_reference().unwrap())
+                    .unwrap()
+                    .get(b"AS")
+                    .unwrap()
+                    .as_name()
+                    .unwrap()
+                    .to_vec()
+            })
+            .collect();
+        assert!(states.contains(&b"Inside Illinois".to_vec()), "{states:?}");
+        assert!(states.contains(&b"Off".to_vec()), "{states:?}");
+        // An Illinois individual is excluded from withholding as a resident.
+        assert_eq!(
+            get_value(&doc, &map, &member(1, M_COL_F_EXCLUDED)).as_deref(),
+            Some("R")
+        );
         assert_eq!(
             get_value(&doc, &map, f::L54_REPLACEMENT).as_deref(),
             Some("1,485")
@@ -1551,6 +1860,7 @@ mod tests {
         // totals column E over the entity alone.
         assert_eq!(get_value(&doc, &map, &member(1, M_COL_B_TYPE)).as_deref(), Some("I"));
         assert_eq!(get_value(&doc, &map, &member(2, M_COL_B_TYPE)).as_deref(), Some("P"));
+        assert_eq!(get_value(&doc, &map, &member(2, M_COL_F_EXCLUDED)), None, "an entity is not R");
         assert_eq!(
             get_value(&doc, &map, f::SCHA_L3_SUBJECT_SHARE).as_deref(),
             Some("50,000")
@@ -1589,6 +1899,7 @@ mod tests {
             FORM_TAX_YEAR,
             &SpecialDepreciation::default(),
             &fixed,
+            0,
         )
         .unwrap();
         let doc = Document::load_mem(&bundle.pdf).unwrap();
@@ -1882,12 +2193,11 @@ mod tests {
         let schedule = crate::tax::depreciation::compute_year(&assets, 2024);
         let row = &schedule.rows[0];
         assert_eq!(special.addition_dollars(), 6_000, "60% bonus added back");
-        assert_eq!(
-            special.subtraction_dollars(),
-            crate::tax::lines::cents_to_dollars((row.macrs_cents as f64 * 1.5).round() as i64)
-        );
+        // The form multiplies the rate's whole-dollar regular depreciation by 1.5.
+        let regular = crate::tax::lines::cents_to_dollars(row.macrs_cents);
+        assert_eq!(special.subtraction_dollars(), (regular * 3 + 1) / 2);
 
-        let figs = figures_with(&federal_ordinary(50_000), &Il1065Settings::default(), &special);
+        let figs = figures_with(&federal_ordinary(50_000), &Il1065Settings::default(), &special, 0);
         assert_eq!(figs.line17, 6_000);
         assert_eq!(figs.line23, 50_000 + 6_000);
         assert_eq!(figs.line35, 56_000 - figs.line30);
@@ -1914,5 +2224,28 @@ mod tests {
         // add-backs brings the Illinois basis back to the federal one.
         let bonus = crate::tax::depreciation::compute_year(&assets, 2024).rows[0].bonus_cents;
         assert!(added >= bonus);
+    }
+
+    #[test]
+    fn a_long_description_splits_at_a_word_and_keeps_the_rest() {
+        assert_eq!(fit_words("Computer", 40), ("Computer".to_string(), None));
+        let (head, rest) = fit_words("Leasehold improvements - 2025 April build-out of the studio", 40);
+        assert_eq!(head, "Leasehold improvements - 2025 April");
+        assert_eq!(rest.as_deref(), Some("build-out of the studio"));
+    }
+
+    /// Illinois tax the federal return deducted is added back on line 16 and
+    /// carried into base income.
+    #[test]
+    fn illinois_taxes_deducted_are_added_back_on_line_16() {
+        let figs = figures_with(
+            &federal_ordinary(100_000),
+            &Il1065Settings::default(),
+            &SpecialDepreciation::default(),
+            639,
+        );
+        assert_eq!(figs.line16, 639);
+        assert_eq!(figs.line23, 100_639);
+        assert_eq!(figs.line35, 100_639);
     }
 }

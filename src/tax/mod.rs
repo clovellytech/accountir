@@ -16,6 +16,8 @@ pub mod form1065;
 pub mod form1125a;
 pub mod form4562;
 pub mod il1065;
+pub mod il4562;
+pub mod il_k1p;
 pub mod liabilities;
 pub mod lines;
 pub mod nondeductible;
