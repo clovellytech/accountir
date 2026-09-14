@@ -208,6 +208,9 @@ mod f {
     pub const SCHA_NAME: &str = "PSI name";
     pub const SCHA_FEIN_2: &str = "PSI FEIN-2";
     pub const SCHA_FEIN_7: &str = "PSI FEIN-7";
+    /// Section A, line 3: column E totalled over the members whose column D is
+    /// checked. The form's own field name, misleading as it is.
+    pub const SCHA_L3_SUBJECT_SHARE: &str = "PSI nonresidents shareholder amounts";
 }
 
 /// The Schedule B, Section B field for member `n` (1-based) with a shared suffix.
@@ -234,9 +237,6 @@ const M_ADDR2: &str =
 const M_CITY: &str = " - Identify your partners or shareholders. Enter the city";
 const M_STATE: &str = " - Identify your partners or shareholders. Enter the state";
 const M_ZIP: &str = " - Identify your partners or shareholders. Enter the zip code";
-// Column B is left blank (a one-character Illinois code); kept here so the tests
-// still assert the box exists, hence the allow for non-test builds.
-#[allow(dead_code)]
 const M_COL_B_TYPE: &str = ", Column B - Partner or Shareholder type. See instructions";
 const M_COL_C_TIN: &str = ", Column C - Social Security number or Federal Employer Identification \
                            Number of the partner or shareholder";
@@ -710,6 +710,7 @@ pub fn build(
         settings,
         year,
         &SpecialDepreciation::default(),
+        &[],
     )
 }
 
@@ -722,6 +723,7 @@ pub fn build_with_special(
     settings: &Il1065Settings,
     year: i32,
     special: &SpecialDepreciation,
+    fixed: &[crate::domain::FixedAllocation],
 ) -> Result<Bundle, FormError> {
     // The year's own blank, or none. Refused rather than substituted, for the
     // reason the federal forms are: Illinois renumbers between revisions, and
@@ -746,7 +748,16 @@ pub fn build_with_special(
     fill_identity(&mut doc, &map, profile, settings)?;
     fill_income(&mut doc, &map, &figs, &mut warnings)?;
     fill_tax(&mut doc, &map, &figs, settings, &mut warnings)?;
-    fill_schedule_b(&mut doc, &map, profile, partners, &figs, &mut warnings)?;
+    fill_schedule_b(
+        &mut doc,
+        &map,
+        profile,
+        partners,
+        &figs,
+        year,
+        fixed,
+        &mut warnings,
+    )?;
 
     warnings.extend(caveats(profile, settings, partners.len()));
 
@@ -822,7 +833,10 @@ pub fn build_from_ledger(
 
     let assets = crate::commands::depreciation_commands::list_assets(conn);
     let special = special_depreciation(&assets, year);
-    let mut bundle = build_with_special(&profile, &filings, &federal, settings, year, &special)?;
+    let fixed = pc::list_fixed_allocations(conn);
+    let mut bundle = build_with_special(
+        &profile, &filings, &federal, settings, year, &special, &fixed,
+    )?;
     bundle.warnings.extend(problems);
     Ok(bundle)
 }
@@ -960,9 +974,26 @@ fn fill_schedule_b(
     profile: &BusinessProfile,
     partners: &[PartnerFiling],
     figs: &Figures,
+    year: i32,
+    fixed: &[crate::domain::FixedAllocation],
     warnings: &mut Vec<String>,
 ) -> Result<(), FormError> {
     let (fein2, fein7) = split_fein(&profile.ein);
+
+    // Column E divides base income the way the partnership divides its income:
+    // by the year's fixed or preferred shares where the agreement sets them — the
+    // federal K-1s' own split — and otherwise on the profit percentages. Either
+    // way the column adds back to line 35, as the instructions require.
+    let members: Vec<&crate::domain::Partner> = partners.iter().map(|f| &f.partner).collect();
+    let fixed_shares = super::allocate::split_fixed(figs.line35, &members, year, fixed, false);
+    let share_for = |i: usize, p: &crate::domain::Partner| match &fixed_shares {
+        Some(shares) => shares
+            .iter()
+            .find(|s| s.partner == i)
+            .map_or(0, |s| s.dollars),
+        None => share_of(figs.line35, p.shares.profit_ppm),
+    };
+    let mut subject_total = 0i64;
     for (name, f2, f7) in [
         (f::SCHB_NAME, f::SCHB_FEIN_2, f::SCHB_FEIN_7),
         (f::SCHA_NAME, f::SCHA_FEIN_2, f::SCHA_FEIN_7),
@@ -987,10 +1018,19 @@ fn fill_schedule_b(
         set_text(doc, map, &member(n, M_CITY), &a.city)?;
         set_text(doc, map, &member(n, M_STATE), &a.state)?;
         set_text(doc, map, &member(n, M_ZIP), &a.postal_code)?;
-        // Column B is a one-character Illinois partner-type code (see the form's
-        // instructions), not the federal free-text entity type — so it is left
-        // blank rather than filled with a code we might get wrong. Named in the
-        // caveat below.
+        // Column B — the one-character Illinois partner type, read from the
+        // federal entity type. One that does not say plainly which code it is
+        // (an LLC, which may be disregarded; an exempt organization, which is
+        // trust or corporation) is left blank and named.
+        match illinois_member_type(p) {
+            Some(code) => set_text(doc, map, &member(n, M_COL_B_TYPE), code)?,
+            None => warnings.push(format!(
+                "Illinois Schedule B: {}'s entity type {:?} does not say which Illinois partner \
+                 type it is, so column B is blank. Enter I, P, M, T, C, S, A or N from the \
+                 instructions.",
+                p.name, p.entity_type
+            )),
+        }
         // Column C holds nine digits with no punctuation (the box is that wide),
         // so an SSN's or EIN's hyphens are stripped.
         let tin_digits: String = filing
@@ -1005,13 +1045,17 @@ fn fill_schedule_b(
         // Column D — the member is itself subject to Illinois replacement tax when
         // it is an entity (another partnership, a corporation, a trust), not an
         // individual or estate. A best-effort default; the caveat says to check it.
-        if !super::schedule_b1::is_individual_or_estate(p) {
+        let subject = !super::schedule_b1::is_individual_or_estate(p);
+        if subject {
             set_check(doc, map, &member(n, M_COL_D_SUBJECT), M_COL_D_ON)?;
         }
 
         // Column E — the member's share of base income (line 35).
-        let share = share_of(figs.line35, p.shares.profit_ppm);
+        let share = share_for(i, p);
         write_money(doc, map, &member(n, M_COL_E_SHARE), share, warnings)?;
+        if subject {
+            subject_total += share;
+        }
 
         if filing.tin.is_none() {
             warnings.push(format!(
@@ -1020,6 +1064,18 @@ fn fill_schedule_b(
                 p.name
             ));
         }
+    }
+
+    // Section A, line 3: column E over the members subject to replacement tax.
+    write_money(doc, map, f::SCHA_L3_SUBJECT_SHARE, subject_total, warnings)?;
+    if subject_total != 0 {
+        warnings.push(format!(
+            "Illinois Schedule B, Section A line 3 is {}: the base income distributable to \
+             partners subject to replacement tax. Form IL-1065 subtracts it on line 27 (or, as a \
+             loss, adds it back on line 21), which this program does not do — enter it there and \
+             re-add Steps 4, 5 and 7.",
+            format_dollars(subject_total)
+        ));
     }
 
     if partners.len() > SCHEDULE_B_ROWS {
@@ -1077,10 +1133,9 @@ fn caveats(
     }
 
     out.push(
-        "Illinois Schedule B, Section B: column B (the one-character partner-type code) is left \
-         blank — enter it from the instructions. Column D (subject to replacement tax) is checked \
-         for entity partners and clear for individuals; verify each. Columns F–L (pass-through \
-         withholding and credits) and Section A totals are left blank."
+        "Illinois Schedule B, Section B: column D (subject to replacement tax) is checked for \
+         entity partners and clear for individuals; verify each. Columns F–L (pass-through \
+         withholding and credits) and Section A lines 1, 2 and 4 to 7 are left blank."
             .to_string(),
     );
 
@@ -1089,6 +1144,29 @@ fn caveats(
     }
 
     out
+}
+
+/// The Illinois Schedule B partner-type code for a partner's federal entity
+/// type, when the entity type says plainly which it is.
+fn illinois_member_type(p: &crate::domain::Partner) -> Option<&'static str> {
+    let t = p.entity_type.trim().to_ascii_lowercase();
+    if t.contains("exempt") || t.contains("llc") || t.contains("disregarded") {
+        None
+    } else if t.is_empty() || t.contains("individual") || t.contains("person") {
+        Some("I")
+    } else if t.contains("estate") {
+        Some("M")
+    } else if t.contains("trust") {
+        Some("T")
+    } else if t.contains("s corp") || t.contains("s-corp") {
+        Some("S")
+    } else if t.contains("corp") {
+        Some("C")
+    } else if t.contains("partnership") {
+        Some("P")
+    } else {
+        None
+    }
 }
 
 /// Split an EIN `NN-NNNNNNN` into its two-digit and seven-digit halves, the way
@@ -1469,6 +1547,62 @@ mod tests {
             get_value(&doc, &map, &member(2, M_COL_D_SUBJECT)).as_deref(),
             Some("/Yes")
         );
+        // Column B carries each one's Illinois type code, and Section A line 3
+        // totals column E over the entity alone.
+        assert_eq!(get_value(&doc, &map, &member(1, M_COL_B_TYPE)).as_deref(), Some("I"));
+        assert_eq!(get_value(&doc, &map, &member(2, M_COL_B_TYPE)).as_deref(), Some("P"));
+        assert_eq!(
+            get_value(&doc, &map, f::SCHA_L3_SUBJECT_SHARE).as_deref(),
+            Some("50,000")
+        );
+        assert!(bundle.warnings.iter().any(|w| w.contains("Section A line 3 is 50,000")));
+    }
+
+    /// Column E follows a preferred share where the year has one — the split the
+    /// federal K-1s use — not the bare profit percentages, and still adds back to
+    /// base income.
+    #[test]
+    fn column_e_follows_a_preferred_share() {
+        let fed = federal_ordinary(132_464);
+        let partners = vec![
+            PartnerFiling {
+                partner: partner("Active", "Individual", 51.0),
+                tin: None,
+            },
+            PartnerFiling {
+                partner: partner("Investor", "Individual", 49.0),
+                tin: None,
+            },
+        ];
+        let fixed = vec![crate::domain::FixedAllocation {
+            tax_year: FORM_TAX_YEAR,
+            partner_id: "active".into(),
+            amount_cents: Some(9_000_000),
+            preferred: true,
+            note: "First $90,000".into(),
+        }];
+        let bundle = build_with_special(
+            &profile(),
+            &partners,
+            &fed,
+            &Il1065Settings::default(),
+            FORM_TAX_YEAR,
+            &SpecialDepreciation::default(),
+            &fixed,
+        )
+        .unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        // 90,000 first, then 42,464 split 51/49.
+        assert_eq!(
+            get_value(&doc, &map, &member(1, M_COL_E_SHARE)).as_deref(),
+            Some("111,657")
+        );
+        assert_eq!(
+            get_value(&doc, &map, &member(2, M_COL_E_SHARE)).as_deref(),
+            Some("20,807")
+        );
+        assert_eq!(get_value(&doc, &map, f::SCHA_L3_SUBJECT_SHARE).as_deref(), Some("0"));
     }
 
     #[test]
