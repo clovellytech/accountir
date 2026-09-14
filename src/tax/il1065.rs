@@ -38,7 +38,7 @@
 //! federal return leaves an unmapped line. A filled IL-1065 that silently treated
 //! them as zero would be worse than one that says which boxes still need a person.
 
-use crate::domain::{BusinessProfile, Il1065Settings};
+use crate::domain::{BonusElection, BusinessProfile, DepreciableAsset, Il1065Settings};
 
 use super::acroform::{field_map, set_check, set_text, strip_xfa, FieldMap, FormError};
 use super::form1065::{Bundle, PartnerFiling};
@@ -151,10 +151,12 @@ mod f {
 
     // Step 4 — additions.
     pub const L14_FROM_L13: &str = "Amounts - L13";
+    pub const L17_SPECIAL_DEPRECIATION: &str = "Illinois Special Depreciation";
     pub const L20_GUARANTEED: &str = "Guaranteed payments";
     pub const L23_INCOME: &str = "Income/loss";
 
     // Step 5 — subtractions.
+    pub const L30_SPECIAL_DEPRECIATION: &str = "IL Special Depreciation";
     pub const L34_TOTAL_SUBTRACT: &str = "Ttl subtract";
     pub const L35_BASE_INCOME: &str = "Bse income/loss";
 
@@ -258,8 +260,12 @@ pub struct Figures {
     pub line10: i64,
     pub line12: i64,
     pub line13: i64,
+    /// Illinois special depreciation addition — Form IL-4562, Step 2, line 4.
+    pub line17: i64,
     pub line20: i64,
     pub line23: i64,
+    /// Illinois special depreciation subtraction — Form IL-4562, Step 3, line 19.
+    pub line30: i64,
     pub line35: i64,
     /// Base income the tax is figured on. Equals line 35 for an Illinois-only
     /// partnership; `None` when apportioning, because it depends on sales figures
@@ -274,6 +280,16 @@ pub struct Figures {
 
 /// Compute the return's figures from the federal Schedule K totals and settings.
 pub fn figures(federal: &Form1065Lines, settings: &Il1065Settings) -> Figures {
+    figures_with(federal, settings, &SpecialDepreciation::default())
+}
+
+/// [`figures`], with the Illinois special depreciation adjustments from the asset
+/// register carried onto lines 17 and 30.
+pub fn figures_with(
+    federal: &Form1065Lines,
+    settings: &Il1065Settings,
+    special: &SpecialDepreciation,
+) -> Figures {
     // Step 2 — straight off federal Schedule K. Portfolio income is interest,
     // dividends, royalties and net capital gains; §1231 is its own line 5.
     let line1 = federal.k_line_1();
@@ -294,14 +310,17 @@ pub fn figures(federal: &Form1065Lines, settings: &Il1065Settings) -> Figures {
     let line12 = line8 + line9 + line10;
     let line13 = line7 - line12;
 
-    // Step 4 — additions. Only the guaranteed payments are a federal figure; the
-    // Illinois-specific additions are left blank.
+    // Step 4 — additions. Guaranteed payments are a federal figure and special
+    // depreciation comes from the asset register; the other Illinois-specific
+    // additions are left blank.
     let line14 = line13;
+    let line17 = special.addition_dollars();
     let line20 = federal.k_line_4c();
-    let line23 = line14 + line20;
+    let line23 = line14 + line17 + line20;
 
-    // Step 5 — subtractions all Illinois-specific, so none are known here.
-    let line34 = 0;
+    // Step 5 — subtractions. Only special depreciation is known here.
+    let line30 = special.subtraction_dollars();
+    let line34 = line30;
     let line35 = line23 - line34;
 
     // Steps 6–9 depend on apportionment. Only the Illinois-only path can be
@@ -319,8 +338,10 @@ pub fn figures(federal: &Form1065Lines, settings: &Il1065Settings) -> Figures {
             line10,
             line12,
             line13,
+            line17,
             line20,
             line23,
+            line30,
             line35,
             line47: None,
             line53: None,
@@ -359,8 +380,10 @@ pub fn figures(federal: &Form1065Lines, settings: &Il1065Settings) -> Figures {
         line10,
         line12,
         line13,
+        line17,
         line20,
         line23,
+        line30,
         line35,
         line47: Some(line47),
         line53: Some(line53),
@@ -369,6 +392,251 @@ pub fn figures(federal: &Form1065Lines, settings: &Il1065Settings) -> Figures {
         line61: Some(line61),
         line62: Some(line62),
     }
+}
+
+/// Illinois special depreciation for a year: Form IL-4562's addition and
+/// subtraction, one row per property that took federal bonus depreciation.
+///
+/// # What Illinois does with bonus depreciation
+///
+/// Illinois does not follow federal bonus depreciation. In the year it is taken
+/// the bonus is added back (Step 2, line 1). It is then recovered over the
+/// property's life: each year, including the first, a share of the federal
+/// regular depreciation on that property is subtracted — the depreciation the
+/// added-back amount would itself have earned. Form IL-4562 prints the share as a
+/// factor of the regular depreciation for each bonus rate: 42.9% for 30% bonus,
+/// 66.7% for 40%, 100% for 50%, 150% for 60%, 400% for 80%; for 100% bonus it is
+/// the depreciation that would have been taken without bonus (line 16). In the
+/// last year of regular depreciation the property settles up: the original
+/// addition is subtracted (line 18) and every subtraction already taken on it is
+/// added back (line 3), so over its life the subtractions equal the addition.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpecialDepreciation {
+    pub rows: Vec<SpecialRow>,
+}
+
+/// One property's Illinois special depreciation adjustments for the year, in cents.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpecialRow {
+    pub description: String,
+    pub placed_in_service: chrono::NaiveDate,
+    pub bonus_rate: f64,
+    /// Step 2, line 1: the federal bonus taken this year.
+    pub addition_cents: i64,
+    /// This year's federal regular depreciation on the property.
+    pub regular_cents: i64,
+    /// Step 3's factor for the bonus rate; `None` for 100% bonus (line 16).
+    pub factor: Option<f64>,
+    /// Step 3's subtraction for the year before any last-year settlement.
+    pub subtraction_cents: i64,
+    /// Step 2, line 3 — last year only: the subtractions already taken.
+    pub last_year_addition_cents: i64,
+    /// Step 3, line 18 — last year only: the original addition.
+    pub last_year_subtraction_cents: i64,
+}
+
+impl SpecialDepreciation {
+    /// Line 17 — Form IL-4562, Step 2, line 4.
+    pub fn addition_dollars(&self) -> i64 {
+        super::lines::cents_to_dollars(
+            self.rows
+                .iter()
+                .map(|r| r.addition_cents + r.last_year_addition_cents)
+                .sum(),
+        )
+    }
+
+    /// Line 30 — Form IL-4562, Step 3, line 19.
+    pub fn subtraction_dollars(&self) -> i64 {
+        super::lines::cents_to_dollars(
+            self.rows
+                .iter()
+                .map(|r| r.subtraction_cents + r.last_year_subtraction_cents)
+                .sum(),
+        )
+    }
+}
+
+/// Form IL-4562's Step 3 factor for a bonus rate, or `None` for 100% bonus.
+///
+/// A rate the form does not print is given the ratio its printed factors round:
+/// the bonus over what is left after it.
+fn illinois_factor(rate: f64) -> Option<f64> {
+    match (rate * 100.0).round() as i64 {
+        30 => Some(0.429),
+        40 => Some(0.667),
+        50 => Some(1.0),
+        60 => Some(1.5),
+        80 => Some(4.0),
+        100 => None,
+        _ => Some(rate / (1.0 - rate)),
+    }
+}
+
+/// Figure Illinois special depreciation for `year` from the asset register.
+pub fn special_depreciation(assets: &[DepreciableAsset], year: i32) -> SpecialDepreciation {
+    use super::depreciation::compute_year;
+    use chrono::Datelike;
+
+    let row_of = |schedule: &super::depreciation::YearSchedule<'_>, id: &str| {
+        schedule
+            .rows
+            .iter()
+            .find(|r| r.asset.asset_id == id)
+            .map(|r| (r.bonus_cents, r.bonus_rate, r.macrs_cents))
+    };
+
+    let mut rows = Vec::new();
+    for asset in assets {
+        let placed = asset.placed_in_service.year();
+        if placed > year || !asset.held_during(year) {
+            continue;
+        }
+        let Some((bonus, rate, _)) = row_of(&compute_year(assets, placed), &asset.asset_id) else {
+            continue;
+        };
+        if bonus <= 0 {
+            continue;
+        }
+        let factor = illinois_factor(rate);
+
+        // The Step 3 amount for one year: the factor times that year's federal
+        // regular depreciation, or for 100% bonus the depreciation the property
+        // would have earned without it.
+        let step_three = |y: i32| -> i64 {
+            match factor {
+                Some(f) => row_of(&compute_year(assets, y), &asset.asset_id)
+                    .map(|(_, _, macrs)| (macrs as f64 * f).round() as i64)
+                    .unwrap_or(0),
+                None => {
+                    let alternative: Vec<DepreciableAsset> = assets
+                        .iter()
+                        .map(|a| {
+                            let mut a = a.clone();
+                            if a.asset_id == asset.asset_id {
+                                a.bonus = BonusElection::Decline;
+                            }
+                            a
+                        })
+                        .collect();
+                    row_of(&compute_year(&alternative, y), &asset.asset_id)
+                        .map(|(_, _, macrs)| macrs)
+                        .unwrap_or(0)
+                }
+            }
+        };
+
+        let regular = row_of(&compute_year(assets, year), &asset.asset_id)
+            .map(|(_, _, macrs)| macrs)
+            .unwrap_or(0);
+        let subtraction = step_three(year);
+        let addition = if year == placed { bonus } else { 0 };
+        let last_year = asset.disposed_during(year) || (subtraction != 0 && step_three(year + 1) == 0);
+        let (last_add, last_sub) = if last_year {
+            let taken: i64 = (placed..year).map(step_three).sum();
+            (taken + subtraction, bonus)
+        } else {
+            (0, 0)
+        };
+        if addition == 0 && subtraction == 0 && last_add == 0 && last_sub == 0 {
+            continue;
+        }
+        rows.push(SpecialRow {
+            description: asset.description.clone(),
+            placed_in_service: asset.placed_in_service,
+            bonus_rate: rate,
+            addition_cents: addition,
+            regular_cents: regular,
+            factor,
+            subtraction_cents: subtraction,
+            last_year_addition_cents: last_add,
+            last_year_subtraction_cents: last_sub,
+        });
+    }
+    SpecialDepreciation { rows }
+}
+
+/// The Form IL-4562 figures, property by property, behind the return.
+fn special_statement(
+    profile: &BusinessProfile,
+    year: i32,
+    special: &SpecialDepreciation,
+) -> Result<Option<Document>, FormError> {
+    use super::lines::cents_to_dollars;
+    use super::statement::{build_table, Column, TableLine, TableStatement};
+
+    if special.rows.is_empty() {
+        return Ok(None);
+    }
+    let dollars = |c: i64| format_dollars(cents_to_dollars(c));
+    let column = |title: &str, x: f32, right: bool| Column {
+        title: title.to_string(),
+        x,
+        right,
+    };
+    let mut lines: Vec<TableLine> = special
+        .rows
+        .iter()
+        .map(|r| {
+            TableLine::Cells(vec![
+                r.description.chars().take(26).collect(),
+                r.placed_in_service.to_string(),
+                format!("{:.0}%", r.bonus_rate * 100.0),
+                dollars(r.addition_cents),
+                dollars(r.regular_cents),
+                r.factor
+                    .map(|f| format!("x {f}"))
+                    .unwrap_or_else(|| "line 16".to_string()),
+                dollars(r.subtraction_cents),
+                dollars(r.last_year_addition_cents),
+                dollars(r.last_year_subtraction_cents),
+            ])
+        })
+        .collect();
+    let sum = |f: fn(&SpecialRow) -> i64| special.rows.iter().map(f).sum::<i64>();
+    lines.push(TableLine::Cells(vec![
+        "Total".to_string(),
+        String::new(),
+        String::new(),
+        dollars(sum(|r| r.addition_cents)),
+        String::new(),
+        String::new(),
+        dollars(sum(|r| r.subtraction_cents)),
+        dollars(sum(|r| r.last_year_addition_cents)),
+        dollars(sum(|r| r.last_year_subtraction_cents)),
+    ]));
+
+    build_table(&TableStatement {
+        legal_name: &profile.legal_name,
+        ein: &profile.ein,
+        heading: format!("Form IL-1065 ({year}) — Illinois special depreciation (Form IL-4562)"),
+        subheading: format!(
+            "Line 17 addition {}   ·   Line 30 subtraction {}",
+            format_dollars(special.addition_dollars()),
+            format_dollars(special.subtraction_dollars())
+        ),
+        columns: vec![
+            column("Property", 54.0, false),
+            column("In service", 196.0, false),
+            column("Bonus", 290.0, true),
+            column("Bonus added back", 378.0, true),
+            column("Regular depr.", 450.0, true),
+            column("Factor", 462.0, false),
+            column("Subtraction", 580.0, true),
+            column("Last yr: add", 660.0, true),
+            column("Last yr: subtract", 738.0, true),
+        ],
+        lines,
+        footnotes: vec![
+            "Step 2, line 1 is the federal bonus (Form 4562, line 14) in the year it was taken. \
+             Step 3 subtracts the factor Form IL-4562 prints for the bonus rate times the year's \
+             federal regular depreciation on the property, or for 100% bonus the depreciation \
+             that would have been taken without it. In the last year of regular depreciation \
+             line 18 subtracts the original addition and line 3 adds back the subtractions \
+             already taken."
+                .to_string(),
+        ],
+    })
 }
 
 /// `amount × num / den`, rounded half up. Only called on non-negative amounts —
@@ -409,6 +677,26 @@ pub fn build(
     settings: &Il1065Settings,
     year: i32,
 ) -> Result<Bundle, FormError> {
+    build_with_special(
+        profile,
+        partners,
+        federal,
+        settings,
+        year,
+        &SpecialDepreciation::default(),
+    )
+}
+
+/// [`build`], with Illinois special depreciation from the asset register on lines
+/// 17 and 30 and the Form IL-4562 figures behind the return.
+pub fn build_with_special(
+    profile: &BusinessProfile,
+    partners: &[PartnerFiling],
+    federal: &Form1065Lines,
+    settings: &Il1065Settings,
+    year: i32,
+    special: &SpecialDepreciation,
+) -> Result<Bundle, FormError> {
     // The year's own blank, or none. Refused rather than substituted, for the
     // reason the federal forms are: Illinois renumbers between revisions, and
     // this one says on its first page which years it is for.
@@ -423,7 +711,7 @@ pub fn build(
     })?;
 
     let mut warnings = Vec::new();
-    let figs = figures(federal, settings);
+    let figs = figures_with(federal, settings, special);
 
     let mut doc = Document::load_mem(revision.form)?;
     strip_xfa(&mut doc);
@@ -435,6 +723,22 @@ pub fn build(
     fill_schedule_b(&mut doc, &map, profile, partners, &figs, &mut warnings)?;
 
     warnings.extend(caveats(profile, settings, partners.len()));
+
+    if !special.rows.is_empty() {
+        warnings.push(format!(
+            "Illinois special depreciation: line 17 adds back {} and line 30 subtracts {}, as \
+             Form IL-4562 figures them from the asset register — the federal bonus depreciation \
+             added back in the year taken, recovered through a share of each later year's \
+             regular depreciation, and settled in the property's last year. The figures are on \
+             the statement behind the return; complete Form IL-4562 from it and check the \
+             IL-4562 box on page 1.",
+            format_dollars(figs.line17),
+            format_dollars(figs.line30)
+        ));
+        if let Some(page) = special_statement(profile, year, special)? {
+            super::acroform::append_document(&mut doc, page)?;
+        }
+    }
 
     let mut pdf = Vec::new();
     doc.save_to(&mut pdf)?;
@@ -490,7 +794,9 @@ pub fn build_from_ledger(
         })
         .collect();
 
-    let mut bundle = build(&profile, &filings, &federal, settings, year)?;
+    let assets = crate::commands::depreciation_commands::list_assets(conn);
+    let special = special_depreciation(&assets, year);
+    let mut bundle = build_with_special(&profile, &filings, &federal, settings, year, &special)?;
     bundle.warnings.extend(problems);
     Ok(bundle)
 }
@@ -550,9 +856,11 @@ fn fill_income(
         (f::L12_ADD_8_11, figs.line12),
         (f::L13_UNMODIFIED_BASE, figs.line13),
         (f::L14_FROM_L13, figs.line13),
+        (f::L17_SPECIAL_DEPRECIATION, figs.line17),
         (f::L20_GUARANTEED, figs.line20),
         (f::L23_INCOME, figs.line23),
-        (f::L34_TOTAL_SUBTRACT, 0),
+        (f::L30_SPECIAL_DEPRECIATION, figs.line30),
+        (f::L34_TOTAL_SUBTRACT, figs.line30),
         (f::L35_BASE_INCOME, figs.line35),
     ] {
         write_money(doc, map, field, amount, warnings)?;
@@ -711,8 +1019,8 @@ fn caveats(
 
     out.push(
         "IL-1065 fills only the lines the books can compute. The Illinois additions (state and \
-         municipal interest, Illinois taxes deducted, special depreciation, related-party \
-         expenses) and subtractions (U.S. Treasury interest, and the rest of Step 5) are left \
+         municipal interest, Illinois taxes deducted, related-party expenses) and subtractions \
+         (U.S. Treasury interest, and the rest of Step 5 other than special depreciation) are left \
          blank — enter any that apply and re-add the Step 4, 5 and 7 totals."
             .to_string(),
     );
@@ -824,8 +1132,10 @@ mod tests {
             f::L12_ADD_8_11,
             f::L13_UNMODIFIED_BASE,
             f::L14_FROM_L13,
+            f::L17_SPECIAL_DEPRECIATION,
             f::L20_GUARANTEED,
             f::L23_INCOME,
+            f::L30_SPECIAL_DEPRECIATION,
             f::L34_TOTAL_SUBTRACT,
             f::L35_BASE_INCOME,
             f::L36_NONBUSINESS,
@@ -1343,5 +1653,74 @@ mod tests {
             text.contains(&format!("ending on or after December 31, {year}")),
             "the blank does not say it is for tax years ending in {year}"
         );
+    }
+
+    fn furniture(placed: NaiveDate, cost: i64, class: crate::domain::PropertyClass) -> DepreciableAsset {
+        DepreciableAsset {
+            asset_id: format!("{class:?}"),
+            description: "Tables".into(),
+            asset_account_id: "1500".into(),
+            expense_account_id: "6500".into(),
+            accumulated_account_id: "1590".into(),
+            section_179_account_id: None,
+            acquired_on: placed,
+            placed_in_service: placed,
+            cost_cents: cost,
+            class,
+            system: crate::domain::System::Gds,
+            section_179_cents: 0,
+            bonus: BonusElection::Take,
+            disposed_on: None,
+            notes: None,
+            overrides: Default::default(),
+            basis_adjustments: Vec::new(),
+        }
+    }
+
+    /// The bonus taken is added back in its year, a share of each year's regular
+    /// depreciation comes off, and base income carries both.
+    #[test]
+    fn special_depreciation_adds_back_bonus_and_subtracts_the_illinois_share() {
+        let assets = vec![furniture(
+            NaiveDate::from_ymd_opt(2024, 7, 1).unwrap(),
+            1_000_000,
+            crate::domain::PropertyClass::SevenYear,
+        )];
+        let special = special_depreciation(&assets, 2024);
+        let schedule = crate::tax::depreciation::compute_year(&assets, 2024);
+        let row = &schedule.rows[0];
+        assert_eq!(special.addition_dollars(), 6_000, "60% bonus added back");
+        assert_eq!(
+            special.subtraction_dollars(),
+            crate::tax::lines::cents_to_dollars((row.macrs_cents as f64 * 1.5).round() as i64)
+        );
+
+        let figs = figures_with(&federal_ordinary(50_000), &Il1065Settings::default(), &special);
+        assert_eq!(figs.line17, 6_000);
+        assert_eq!(figs.line23, 50_000 + 6_000);
+        assert_eq!(figs.line35, 56_000 - figs.line30);
+    }
+
+    /// Over the property's life the subtractions come back to exactly the
+    /// addition, because the last year settles whatever is left.
+    #[test]
+    fn over_its_life_the_subtractions_equal_the_addition() {
+        let assets = vec![furniture(
+            NaiveDate::from_ymd_opt(2024, 7, 1).unwrap(),
+            1_000_000,
+            crate::domain::PropertyClass::ThreeYear,
+        )];
+        let (mut added, mut subtracted) = (0i64, 0i64);
+        for year in 2024..=2030 {
+            for r in special_depreciation(&assets, year).rows {
+                added += r.addition_cents + r.last_year_addition_cents;
+                subtracted += r.subtraction_cents + r.last_year_subtraction_cents;
+            }
+        }
+        assert_eq!(subtracted - added, 0, "net over life");
+        // The addition itself is the 60% bonus; the net subtraction beyond the
+        // add-backs brings the Illinois basis back to the federal one.
+        let bonus = crate::tax::depreciation::compute_year(&assets, 2024).rows[0].bonus_cents;
+        assert!(added >= bonus);
     }
 }
