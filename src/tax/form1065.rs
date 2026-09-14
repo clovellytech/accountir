@@ -228,6 +228,9 @@ pub struct Page1 {
     /// The two-digit year after "20" in the ending date.
     pub tax_year_end_yy: &'static str,
     pub k1_count: &'static str,
+    /// Item F, total assets at the end of the year — Schedule L line 14's closing
+    /// figure. Question 4 excuses it along with Schedules L, M-1 and M-2.
+    pub total_assets: &'static str,
     pub preparer_name: &'static str,
     pub lines: Page1Lines,
 }
@@ -282,6 +285,7 @@ pub const PAGE1_2023: Page1 = Page1 {
     tax_year_end: "f1_02[0]",
     tax_year_end_yy: "f1_03[0]",
     k1_count: "f1_14[0]",
+    total_assets: "f1_12[0]",
     preparer_name: "f1_49[0]",
     lines: Page1Lines {
         l1a_gross_receipts: "f1_15[0]",
@@ -335,6 +339,7 @@ pub const PAGE1_2024: Page1 = Page1 {
     tax_year_end: "f1_2[0]",
     tax_year_end_yy: "f1_3[0]",
     k1_count: "f1_14[0]",
+    total_assets: "f1_12[0]",
     preparer_name: "f1_49[1]",
     lines: Page1Lines {
         l1a_gross_receipts: "f1_15[0]",
@@ -386,6 +391,7 @@ pub const PAGE1_2025: Page1 = Page1 {
     tax_year_end: "f1_02[0]",
     tax_year_end_yy: "f1_03[0]",
     k1_count: "f1_18[0]",
+    total_assets: "f1_16[0]",
     preparer_name: "f1_57[0]",
     lines: Page1Lines {
         l1a_gross_receipts: "f1_19[0]",
@@ -1158,7 +1164,15 @@ fn build_return_inner(
     if do_optional {
         match req.schedule_l.as_ref() {
             Some(sched_l) => {
-                warnings.extend(super::schedule_l::fill(&mut doc, &map, sched_l, !exempt)?)
+                warnings.extend(super::schedule_l::fill(&mut doc, &map, sched_l, !exempt)?);
+                if !sched_l.is_empty() {
+                    set_text(
+                        &mut doc,
+                        &map,
+                        page1.total_assets,
+                        &format_dollars(sched_l.total_assets().end),
+                    )?;
+                }
             }
             // Nobody computed one. Previously this arm was silent, so a Schedule
             // L that never ran and a Schedule L with nothing mapped produced the
@@ -6597,5 +6611,29 @@ mod tests {
         };
         assert_eq!(box_19(1), (Some("A".into()), Some("7,000".into())));
         assert_eq!(box_19(2), (Some("A".into()), Some("1,000".into())));
+    }
+
+    /// Item F is Schedule L line 14's closing figure, in the revision's own box.
+    #[test]
+    fn item_f_carries_total_assets_from_schedule_l() {
+        use crate::tax::lines::Form1065Lines;
+
+        let mut req = two_partner_request();
+        let mut sl = crate::tax::schedule_l::ScheduleL::default();
+        sl.set_for_test("sl1", 4_000, 6_500);
+        req.schedule_l = Some(sl);
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l1a", 10_000);
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        // Read inside the 1065's own namespace: the K-1s attached behind it carry
+        // leaves of the same name.
+        assert_eq!(
+            acroform::get_value_in(&doc, &map, "topmostSubform[0]", PAGE1_2025.total_assets)
+                .as_deref(),
+            Some("6,500")
+        );
     }
 }
