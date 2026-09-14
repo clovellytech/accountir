@@ -1042,6 +1042,13 @@ fn group_current_year(
 
     for row in schedule.placed_this_year() {
         let asset = row.asset;
+        // Property the §179 deduction or bonus depreciation took in full leaves no
+        // basis for a Section B or C row to depreciate. Its deduction is on line 12
+        // or 14; a row of zeros beside it says nothing and reads as an asset left
+        // undepreciated.
+        if row.macrs_basis_cents == 0 && row.macrs_cents == 0 {
+            continue;
+        }
         let table = match asset.system {
             System::Gds => &mut b,
             System::Ads => &mut c,
@@ -1655,6 +1662,33 @@ mod tests {
         assert_eq!(
             value(&f, BOXES_2025.section_b.seven_year.basis.unwrap()).as_deref(),
             Some("10,000")
+        );
+    }
+
+    /// Property bonus depreciation took in full leaves no Section B row: its
+    /// deduction is on line 14, and a row of zeros would say nothing.
+    #[test]
+    fn fully_expensed_property_leaves_no_section_b_row() {
+        let mut fitout = asset(
+            "Fit-out",
+            PropertyClass::QualifiedImprovement,
+            date(2025, 6, 1),
+            2_000_000,
+        );
+        fitout.bonus = BonusElection::Take;
+        let kiln = asset("Kiln", PropertyClass::SevenYear, date(2025, 3, 1), 1_000_000);
+        let assets = [fitout, kiln];
+        let s = compute_year(&assets, 2025);
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let f = form.expect("a form");
+
+        let fifteen = &BOXES_2025.section_b.fifteen_year;
+        assert_eq!(value(&f, fifteen.basis.unwrap()), None, "no 19e row");
+        assert_eq!(value(&f, fifteen.recovery.unwrap()), None, "not even its period");
+        assert_eq!(
+            value(&f, BOXES_2025.section_b.seven_year.basis.unwrap()).as_deref(),
+            Some("10,000"),
+            "a row with basis is still written"
         );
     }
 
