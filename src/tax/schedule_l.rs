@@ -227,20 +227,77 @@ pub fn fold(
         }
     }
 
+    let mut lines: BTreeMap<&'static str, Period> = cents
+        .iter()
+        .map(|(k, (b, e))| {
+            (
+                *k,
+                Period {
+                    begin: cents_to_dollars(*b),
+                    end: cents_to_dollars(*e),
+                },
+            )
+        })
+        .collect();
+    absorb_rounding(&cents, &mut lines);
+
     ScheduleL {
-        lines: cents
-            .into_iter()
-            .map(|(k, (b, e))| {
-                (
-                    k,
-                    Period {
-                        begin: cents_to_dollars(b),
-                        end: cents_to_dollars(e),
-                    },
-                )
-            })
-            .collect(),
+        lines,
         unmapped: unmapped.into_values().collect(),
+    }
+}
+
+/// Make each column foot after every line is rounded to the dollar, when the
+/// books themselves balance.
+///
+/// Rounding line by line can leave the two sides a dollar or two apart even
+/// though every cent is accounted for, and the form would then print a balance
+/// sheet that does not balance for no reason in the books. When the cent totals
+/// agree, the difference goes on the largest asset line, which a dollar moves
+/// least. When they do not, nothing is touched: that imbalance is real, and
+/// [`fill`] says so.
+fn absorb_rounding(
+    cents: &BTreeMap<&'static str, (i64, i64)>,
+    lines: &mut BTreeMap<&'static str, Period>,
+) {
+    for is_end in [false, true] {
+        let (mut assets_cents, mut other_cents) = (0i64, 0i64);
+        let (mut assets_dollars, mut other_dollars) = (0i64, 0i64);
+        let mut largest: Option<(&'static str, i64)> = None;
+        for (key, (b, e)) in cents {
+            let Some(def) = lookup(key) else { continue };
+            let natural = matches!(def.sense, Sense::Natural);
+            let sign = if natural { 1 } else { -1 };
+            let c = if is_end { *e } else { *b };
+            let p = lines[key];
+            let d = if is_end { p.end } else { p.begin };
+            match def.group {
+                "Assets" => {
+                    assets_cents += sign * c;
+                    assets_dollars += sign * d;
+                    if natural && largest.is_none_or(|(_, v)| d.abs() > v.abs()) {
+                        largest = Some((key, d));
+                    }
+                }
+                "Liabilities and capital" => {
+                    other_cents += sign * c;
+                    other_dollars += sign * d;
+                }
+                _ => {}
+            }
+        }
+        let difference = other_dollars - assets_dollars;
+        if assets_cents != other_cents || difference == 0 {
+            continue;
+        }
+        if let Some((key, _)) = largest {
+            let p = lines.get_mut(key).expect("the largest line is in the map");
+            if is_end {
+                p.end += difference;
+            } else {
+                p.begin += difference;
+            }
+        }
     }
 }
 
@@ -346,7 +403,7 @@ pub fn fill(
     if !begins || !ends {
         warnings.push(format!(
             "Schedule L does not balance ({}). Total assets {} / {} against liabilities and capital \
-             {} / {}. The books say so — this is not a rounding artefact of the return.",
+             {} / {}. The books say so — rounding to the dollar has already been absorbed, so this is not an artefact of the return.",
             match (begins, ends) {
                 (false, false) => "at both dates",
                 (false, true) => "at the start of the year",
@@ -801,5 +858,31 @@ mod tests {
             s.get("sl1").end + s.get("sl4").end + s.get("sl6").end,
             "the total must equal the figures the reader can see"
         );
+    }
+
+    /// Lines that each round up can leave a balanced ledger a dollar out on the
+    /// form; the difference lands on the largest asset line so the page foots.
+    #[test]
+    fn a_rounding_dollar_is_absorbed_when_the_books_balance() {
+        let sheet_on = |day| {
+            sheet(
+                day,
+                vec![
+                    line("cash", "1000", "Checking", AccountType::Asset, 100_60),
+                    line("inv", "1200", "Inventory", AccountType::Asset, 100_60),
+                ],
+                vec![],
+                vec![line("cap", "3000", "Capital", AccountType::Equity, -201_20)],
+            )
+        };
+        let s = fold(
+            &sheet_on(d(2024, 12, 31)),
+            &sheet_on(d(2025, 12, 31)),
+            &mapping(&[("cash", "sl1"), ("inv", "sl3"), ("cap", "sl21")]),
+        );
+        assert_eq!(s.get("sl21"), Period { begin: 201, end: 201 });
+        assert_eq!(s.get("sl1"), Period { begin: 100, end: 100 }, "cash takes the dollar");
+        assert_eq!(s.get("sl3"), Period { begin: 101, end: 101 });
+        assert_eq!(s.balances(), (true, true));
     }
 }
