@@ -676,6 +676,19 @@ impl Form1065Lines {
             .any(|d| self.is_mapped(d.key))
     }
 
+    /// The same lines with one figure put in place of whatever it was.
+    ///
+    /// For a line whose figure is a fact the ledger's mapping cannot express —
+    /// Schedule K line 19a, which is each partner's draws rather than an account
+    /// balance. A key the form does not have is ignored rather than inserted.
+    pub fn with_line(&self, key: &str, dollars: i64) -> Self {
+        let mut out = self.clone();
+        if let Some(def) = line_def(key) {
+            out.mapped.insert(def.key, dollars);
+        }
+        out
+    }
+
     /// Set a line directly. Tests only — the real path is [`compute`], which is
     /// the only thing that knows the rounding order the totals depend on.
     #[cfg(test)]

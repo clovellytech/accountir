@@ -1052,6 +1052,44 @@ fn build_return_inner(
         ));
     }
 
+    // --- distributions: Schedule K line 19a, box 19 code A, M-2 line 6a ---
+    //
+    // A distribution is money one partner took, not a figure to share out, so it
+    // comes from each partner's draw accounts — item L row 5 — rather than from a
+    // mapped account divided on the percentages. A mapped line 19a still stands
+    // for books with no draw account linked.
+    let draws: Vec<i64> = filed
+        .iter()
+        .map(|f| {
+            req.capital
+                .for_partner(&f.partner.partner_id)
+                .map_or(0, |a| a.withdrawals)
+        })
+        .collect();
+    let from_draws = draws.iter().any(|d| *d != 0);
+    // The split below runs on the ledger's own lines: the draws are placed on
+    // each K-1 afterwards, and handing their total to the allocator first only
+    // has it divide, and warn about dividing, a figure that is then replaced.
+    let ledger_lines = lines;
+    let with_draws;
+    let lines = if from_draws {
+        let drawn: i64 = draws.iter().sum();
+        if lines.is_mapped("k19a") && lines.get("k19a") != drawn {
+            warnings.push(format!(
+                "Schedule K line 19a: the accounts mapped to it come to {}, and the partners' \
+                 linked draw accounts to {}. The draw accounts are used, because they say which \
+                 partner took what. Take the mapping off line 19a, or link the account it points \
+                 at as a draw.",
+                format_dollars(lines.get("k19a")),
+                format_dollars(drawn)
+            ));
+        }
+        with_draws = lines.with_line("k19a", drawn);
+        &with_draws
+    } else {
+        lines
+    };
+
     // --- page one ---
     // The year's own blank, not this year's. A prior-year return on the current
     // revision is a form whose boxes have moved under the figures written into
@@ -1163,8 +1201,24 @@ fn build_return_inner(
     // Split Schedule K before any K-1 is built, so every partner's share comes
     // out of one apportionment and the shares add back to the totals above.
     let (mut shares, split_warnings) =
-        split_across_partners(lines, &filed, req.year, &req.segments, &req.fixed_allocations);
+        split_across_partners(
+            ledger_lines,
+            &filed,
+            req.year,
+            &req.segments,
+            &req.fixed_allocations,
+        );
     warnings.extend(split_warnings);
+    // Each partner's box 19 is what they drew, not a percentage of the total.
+    if from_draws {
+        for (share, drawn) in shares.iter_mut().zip(&draws) {
+            if *drawn == 0 {
+                share.by_line.remove("k19a");
+            } else {
+                share.by_line.insert("k19a", *drawn);
+            }
+        }
+    }
 
     // --- self-employment: Schedule K lines 14a and 14c, and box 14 ---
     //
@@ -6494,5 +6548,54 @@ mod tests {
         assert_eq!(split(10_000, 0), (8_000, 2_000), "6,000 first, then 50/50");
         assert_eq!(split(4_000, 0), (4_000, 0), "less than the preference");
         assert_eq!(split(10_000, 12_000), (-1_000, -1_000), "a loss ignores it");
+    }
+
+    /// Distributions come from each partner's draw accounts: Schedule K line 19a
+    /// is their total, and each K-1's box 19 code A is that partner's own draws
+    /// rather than a percentage of the total.
+    #[test]
+    fn distributions_follow_each_partners_draws() {
+        use crate::tax::capital::{Capital, CapitalAccount};
+        use crate::tax::lines::Form1065Lines;
+
+        let mut req = two_partner_request();
+        req.capital = Capital {
+            accounts: vec![
+                CapitalAccount {
+                    partner_id: "alice".into(),
+                    partner_name: "Alice".into(),
+                    withdrawals: 7_000,
+                    linked_accounts: 1,
+                    ..Default::default()
+                },
+                CapitalAccount {
+                    partner_id: "bob".into(),
+                    partner_name: "Bob".into(),
+                    withdrawals: 1_000,
+                    linked_accounts: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l1a", 10_000);
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        assert_eq!(
+            acroform::get_value(&doc, &map, "f5_50[0]").as_deref(),
+            Some("8,000"),
+            "Schedule K line 19a"
+        );
+        let box_19 = |n: usize| {
+            (
+                acroform::get_value_in(&doc, &map, &k1_namespace(n), "Line19[0]"),
+                acroform::get_value_in(&doc, &map, &k1_namespace(n), "f1_89[0]"),
+            )
+        };
+        assert_eq!(box_19(1), (Some("A".into()), Some("7,000".into())));
+        assert_eq!(box_19(2), (Some("A".into()), Some("1,000".into())));
     }
 }
