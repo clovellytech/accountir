@@ -559,6 +559,15 @@ mod k1 {
         ("k21", "f1_66[0]"),
     ];
 
+    /// Box 14's printed rows, code box then amount box.
+    ///
+    /// Two rows for three codes, so they are filled in code order with whichever
+    /// amounts a partner has — not one row per code. The usual partner has net
+    /// earnings (A) and gross nonfarm income (C), and a table that reserved the
+    /// second row for farming (B) left C with nowhere to go.
+    pub const BOX_14_ROWS: [(&str, &str); 2] =
+        [("Line14[0]", "f1_60[0]"), ("f1_61[0]", "f1_62[0]")];
+
     /// Lines the K-1 reports as a code plus an amount.
     ///
     /// `code` is the letter the IRS assigns, or `None` where the letter depends
@@ -595,20 +604,6 @@ mod k1 {
             code: None,
             code_field: "f1_58[0]",
             amount_field: "f1_59[0]",
-        },
-        CodedBox {
-            line_key: "k14a",
-            number: "14a",
-            code: Some("A"),
-            code_field: "Line14[0]",
-            amount_field: "f1_60[0]",
-        },
-        CodedBox {
-            line_key: "k14b",
-            number: "14b",
-            code: Some("B"),
-            code_field: "f1_61[0]",
-            amount_field: "f1_62[0]",
         },
         CodedBox {
             line_key: "k18a",
@@ -1121,8 +1116,25 @@ fn build_return_inner(
 
     // Split Schedule K before any K-1 is built, so every partner's share comes
     // out of one apportionment and the shares add back to the totals above.
-    let (shares, split_warnings) = split_across_partners(lines, &filed, req.year, &req.segments);
+    let (mut shares, split_warnings) =
+        split_across_partners(lines, &filed, req.year, &req.segments);
     warnings.extend(split_warnings);
+
+    // --- self-employment: Schedule K lines 14a and 14c, and box 14 ---
+    //
+    // After the split, because the worksheet allocates "the same way page 1, line
+    // 23, is allocated", and the partners' shares of line 1 are that allocation.
+    let ((line_14a, line_14c), se_warnings) = self_employment(lines, &filed, &mut shares, req.year);
+    warnings.extend(se_warnings);
+    for (key, amount) in [("k14a", line_14a), ("k14c", line_14c)] {
+        if amount == 0 {
+            continue;
+        }
+        if let Some(super::lines::Field::One(field)) = super::lines::line_def(key).map(|d| &d.field)
+        {
+            write_money(&mut doc, &map, field, amount, &mut warnings)?;
+        }
+    }
 
     // --- one K-1 per partner ---
     for (i, filing) in filed.iter().enumerate() {
@@ -1626,6 +1638,12 @@ fn fill_schedule_k(
         let super::lines::Field::One(field) = def.field else {
             continue;
         };
+        // Computed from the self-employment worksheet once the partners' shares
+        // are known — see `self_employment`. A mapped figure would be a second
+        // answer to the same question.
+        if matches!(def.key, "k14a" | "k14c") {
+            continue;
+        }
         if !lines.is_mapped(def.key) {
             continue;
         }
@@ -1989,6 +2007,127 @@ fn allocate_with(total: i64, ppm: &[i64]) -> Vec<super::allocate::Share> {
     super::allocate::allocate_on_ppm(total, ppm)
 }
 
+/// Schedule K lines 14a and 14c, and each partner's box 14 codes A and C.
+///
+/// The IRS worksheet, not a mapping. Net earnings from self-employment are
+/// ordinary business income plus other net rental income, less any Form 4797
+/// gain inside it (a 4797 loss is added back); the part of that allocated to
+/// individual general partners; plus guaranteed payments — all of them for an
+/// individual general partner, only those for services for an individual limited
+/// partner. Estates, trusts, corporations, exempt organisations and IRAs get
+/// nothing, and neither does anybody whose entity type does not say Individual.
+///
+/// Gross nonfarm income is gross profit plus other income, and goes to the same
+/// general partners. Both are split "the same way page 1, line 23, is allocated"
+/// — on the loss percentages when line 23 is a loss, the profit ones otherwise.
+/// That is also how a general partner on 99.32% of a (7,167) loss arrives at
+/// (7,118) and 8,104.
+///
+/// Rental real estate on Schedule K line 2 is left out: it counts only for a
+/// dealer, or where services go to the occupants, and the books cannot see either.
+fn self_employment(
+    lines: &Form1065Lines,
+    filed: &[&PartnerFiling],
+    shares: &mut [PartnerShares],
+    year: i32,
+) -> ((i64, i64), Vec<String>) {
+    let mut warnings = Vec::new();
+    let partners: Vec<&Partner> = filed.iter().map(|f| &f.partner).collect();
+    let (year_start, year_end) = crate::commands::partnership_commands::calendar_year(year);
+
+    let line_23 = lines.k_line_1();
+    // Worksheet line 3a: line 1a, plus 1c, plus a 4797 loss added back, less a
+    // 4797 gain — which page 1 line 6 carries with its sign.
+    let earnings_base = line_23 + lines.k_line_3c() - lines.get("l6");
+    let gross_nonfarm = lines.line_3() + lines.get("l7");
+
+    // The weighting line 23 was split on. Over a year whose percentages changed,
+    // line 23 was split in parts, so each partner's own share of it is the only
+    // weighting that agrees with it.
+    let owned: Vec<Partner> = partners.iter().map(|p| (*p).clone()).collect();
+    let changed = super::varying::segments(&owned, year_start, year_end).len() > 1;
+    let ppm: Vec<i64> = if changed && line_23 != 0 {
+        shares
+            .iter()
+            .map(|s| (s.get("k1") as i128 * 1_000_000 / line_23 as i128) as i64)
+            .collect()
+    } else {
+        partners
+            .iter()
+            .map(|p| {
+                let s = p.shares_on(year_end);
+                if line_23 < 0 {
+                    s.loss_ppm
+                } else {
+                    s.profit_ppm
+                }
+            })
+            .collect()
+    };
+    let spread = |total: i64| -> Vec<i64> {
+        let mut out = vec![0; ppm.len()];
+        if total != 0 {
+            for share in super::allocate::allocate_on_ppm(total, &ppm) {
+                out[share.partner] = share.dollars;
+            }
+        }
+        out
+    };
+    let base = spread(earnings_base);
+    let gross = spread(gross_nonfarm);
+
+    let (mut total_a, mut total_c) = (0, 0);
+    let mut not_individual = Vec::new();
+    for (i, p) in partners.iter().enumerate() {
+        let s = &mut shares[i];
+        let individual = p.entity_type.trim().eq_ignore_ascii_case("individual");
+        let (a, c) = match p.partner_type {
+            PartnerType::General => (base[i] + s.get("k4a") + s.get("k4b"), gross[i]),
+            PartnerType::Limited => (s.get("k4a"), 0),
+        };
+        let (a, c) = if individual {
+            (a, c)
+        } else {
+            if a != 0 || c != 0 {
+                not_individual.push(format!("{} (entity type {:?})", p.name, p.entity_type));
+            }
+            (0, 0)
+        };
+        for (key, amount) in [("k14a", a), ("k14c", c)] {
+            s.by_line.remove(key);
+            if amount != 0 {
+                s.by_line.insert(key, amount);
+            }
+        }
+        total_a += a;
+        total_c += c;
+    }
+
+    if !not_individual.is_empty() {
+        warnings.push(format!(
+            "No self-employment figures for {}: box 14 is for individuals, and the entity type \
+             does not say Individual. If they are one, correct the entity type and regenerate.",
+            not_individual.join(", ")
+        ));
+    }
+    if lines.get("k2") != 0 {
+        warnings.push(
+            "Schedule K line 2 (rental real estate) is left out of line 14a. It counts toward \
+             self-employment only for a real estate dealer, or where services are provided to the \
+             occupants — add it by hand if either applies."
+                .to_string(),
+        );
+    }
+    if lines.is_mapped("k14a") || lines.is_mapped("k14c") {
+        warnings.push(
+            "Accounts mapped to Schedule K line 14a or 14c are ignored: both are computed from the \
+             self-employment worksheet, from lines 1, 3c and 4 and each partner's type."
+                .to_string(),
+        );
+    }
+    ((total_a, total_c), warnings)
+}
+
 fn fill_k1(
     doc: &mut Document,
     map: &FieldMap,
@@ -2106,6 +2245,25 @@ fn fill_k1(
         ));
     }
 
+    // Box 14: self-employment, codes A to C in order, into the two printed rows.
+    let box_14: Vec<(&str, i64)> = [("A", "k14a"), ("B", "k14b"), ("C", "k14c")]
+        .into_iter()
+        .map(|(code, key)| (code, shares.get(key)))
+        .filter(|(_, amount)| *amount != 0)
+        .collect();
+    for ((code, amount), (code_field, amount_field)) in box_14.iter().zip(k1::BOX_14_ROWS) {
+        write_money(doc, map, amount_field, *amount, &mut warnings)?;
+        set_text(doc, map, code_field, code)?;
+    }
+    if let Some((code, amount)) = box_14.get(k1::BOX_14_ROWS.len()) {
+        warnings.push(format!(
+            "{}: box 14 has two printed rows and this partner carries codes A, B and C. Code {code} \
+             ({}) did not fit and belongs on an attached statement.",
+            p.name,
+            format_dollars(*amount)
+        ));
+    }
+
     Ok(warnings)
 }
 
@@ -2190,6 +2348,104 @@ mod tests {
             options: Default::default(),
             book_income_cents: 0,
         }
+    }
+
+    /// Box 14 follows the self-employment worksheet and reproduces the filed 2023
+    /// figures to the dollar: a general partner on 99.32% of a (7,167) loss has net
+    /// earnings of (7,118) and gross nonfarm income of 8,104 on $8,159, and the
+    /// limited partner beside them has neither.
+    #[test]
+    fn self_employment_follows_the_worksheet_to_the_filed_figures() {
+        let mut req = two_partner_request();
+        req.partners[0].partner.shares = Shares {
+            profit_ppm: 500_000,
+            loss_ppm: 993_200,
+            capital_ppm: 500_000,
+        };
+        req.partners[1].partner.shares = Shares {
+            profit_ppm: 500_000,
+            loss_ppm: 6_800,
+            capital_ppm: 500_000,
+        };
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l1a", 8_159);
+        lines.set_for_test("l21", 15_326);
+        assert_eq!(lines.k_line_1(), -7_167);
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        let sched_k = |key: &str| {
+            let Some(super::super::lines::Field::One(f)) =
+                super::super::lines::line_def(key).map(|d| &d.field)
+            else {
+                panic!("{key} has one box");
+            };
+            acroform::get_value(&doc, &map, f)
+        };
+        assert_eq!(sched_k("k14a").as_deref(), Some("-7,118"));
+        assert_eq!(sched_k("k14c").as_deref(), Some("8,104"));
+
+        let k1_box =
+            |n: usize, leaf: &str| acroform::get_value_in(&doc, &map, &k1_namespace(n), leaf);
+        assert_eq!(k1_box(1, "Line14[0]").as_deref(), Some("A"));
+        assert_eq!(k1_box(1, "f1_60[0]").as_deref(), Some("-7,118"));
+        assert_eq!(
+            k1_box(1, "f1_61[0]").as_deref(),
+            Some("C"),
+            "code C takes the second row"
+        );
+        assert_eq!(k1_box(1, "f1_62[0]").as_deref(), Some("8,104"));
+        assert_eq!(
+            k1_box(2, "f1_60[0]"),
+            None,
+            "a limited partner's share of the result is not self-employment"
+        );
+    }
+
+    /// Guaranteed payments reach box 14 by partner type: all of them for a general
+    /// partner, services only for a limited one, and nothing for a partner that is
+    /// not an individual.
+    #[test]
+    fn guaranteed_payments_reach_box_14_by_partner_type() {
+        let mut req = two_partner_request();
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("k4a", 1_000);
+        lines.set_for_test("k4b", 500);
+
+        let read = |req: &ReturnRequest| {
+            let bundle = build_return_inner(req, &lines, Vec::new()).unwrap();
+            let doc = Document::load_mem(&bundle.pdf).unwrap();
+            let map = field_map(&doc);
+            let a = |n: usize| acroform::get_value_in(&doc, &map, &k1_namespace(n), "f1_60[0]");
+            (
+                a(1),
+                a(2),
+                acroform::get_value(&doc, &map, "f5_29[0]"),
+                bundle.warnings,
+            )
+        };
+
+        let (alice, bob, total, _) = read(&req);
+        assert_eq!(
+            alice.as_deref(),
+            Some("750"),
+            "general: services and capital"
+        );
+        assert_eq!(bob.as_deref(), Some("500"), "limited: services only");
+        assert_eq!(total.as_deref(), Some("1,250"));
+
+        req.partners[1].partner.entity_type = "C Corporation".into();
+        let (alice, bob, total, warnings) = read(&req);
+        assert_eq!(alice.as_deref(), Some("750"));
+        assert_eq!(bob, None);
+        assert_eq!(total.as_deref(), Some("750"));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("No self-employment figures for Bob")),
+            "{warnings:?}"
+        );
     }
 
     /// The constants above name boxes by number, and nothing about `f1_14[0]`
@@ -2370,6 +2626,12 @@ mod tests {
             assert!(
                 smap.find(field).is_some(),
                 "the {year} Schedule K-1 has no field {field} for Schedule K line {line_key}"
+            );
+        }
+        for (code_field, amount_field) in k1::BOX_14_ROWS {
+            assert!(
+                smap.find(code_field).is_some() && smap.find(amount_field).is_some(),
+                "the {year} Schedule K-1 has no box 14 row {code_field}/{amount_field}"
             );
         }
         for b in k1::CODED_BOXES {
