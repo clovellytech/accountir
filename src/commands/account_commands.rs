@@ -474,6 +474,10 @@ fn deletion_blockers(
             "a statement grouping",
         ),
         (
+            "SELECT COUNT(*) FROM il_tax_addbacks WHERE account_id = ?1",
+            "an Illinois tax add-back",
+        ),
+        (
             "SELECT COUNT(*) FROM ingest_account_mappings WHERE account_id = ?1",
             "an import mapping",
         ),

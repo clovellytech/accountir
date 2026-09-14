@@ -168,6 +168,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             45,
             include_str!("../../migrations/045_liability_classifications.sql"),
         ),
+        (
+            46,
+            include_str!("../../migrations/046_illinois_tax_addbacks.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -795,6 +799,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             account_id TEXT NOT NULL,
             effective_from INTEGER NOT NULL,
             grouped INTEGER NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (account_id, effective_from)
+        );
+
+        -- Accounts holding Illinois income or replacement tax, added back on
+        -- IL-1065 line 16 (migration 046). Dated, with a stored no.
+        CREATE TABLE IF NOT EXISTS il_tax_addbacks (
+            account_id TEXT NOT NULL,
+            effective_from INTEGER NOT NULL,
+            added_back INTEGER NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at_event INTEGER REFERENCES events(id),
             PRIMARY KEY (account_id, effective_from)

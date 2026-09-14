@@ -126,6 +126,30 @@ pub fn set_statement_grouping(
     )
 }
 
+/// Mark an account as holding Illinois income or replacement tax from a tax year
+/// on — or stop — so IL-1065 line 16 adds back what the federal return deducted
+/// from it and the accounts beneath it.
+///
+/// A yes-or-no for the year, like [`set_statement_grouping`], so a return filed
+/// for an earlier year is left as it was.
+pub fn set_illinois_tax_addback(
+    store: &mut EventStore,
+    user_id: &str,
+    account_id: &str,
+    added_back: bool,
+    effective_from: i32,
+) -> Result<StoredEvent, TaxSetupError> {
+    append(
+        store,
+        user_id,
+        Event::IllinoisTaxAddbackSet {
+            account_id: account_id.to_string(),
+            added_back,
+            effective_from,
+        },
+    )
+}
+
 /// Remove an account's own line assignment from a tax year onward.
 ///
 /// That year's row only. The account then falls back to the most recent earlier
@@ -384,6 +408,22 @@ mod tests {
         set_statement_grouping(&mut s, "u1", "6000", false, 2025).unwrap();
 
         let on = |y| crate::tax::lines::load_statement_groups(s.connection(), y).contains("6000");
+        assert!(!on(2022), "before it was set");
+        assert!(on(2023));
+        assert!(on(2024), "a year with no row of its own inherits 2023's");
+        assert!(
+            !on(2025),
+            "the no from 2025 is a row, not a fall back to 2023"
+        );
+    }
+
+    #[test]
+    fn an_illinois_tax_addback_is_dated_and_can_be_stopped_later() {
+        let mut s = store();
+        set_illinois_tax_addback(&mut s, "u1", "6000", true, 2023).unwrap();
+        set_illinois_tax_addback(&mut s, "u1", "6000", false, 2025).unwrap();
+
+        let on = |y| crate::tax::lines::load_illinois_tax_addbacks(s.connection(), y).contains("6000");
         assert!(!on(2022), "before it was set");
         assert!(on(2023));
         assert!(on(2024), "a year with no row of its own inherits 2023's");

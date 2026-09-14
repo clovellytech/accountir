@@ -1113,6 +1113,17 @@ pub fn load_statement_groups(conn: &Connection, year: i32) -> BTreeSet<String> {
         .collect()
 }
 
+/// The accounts marked as Illinois income or replacement tax for a year — the
+/// ones IL-1065 line 16 adds back. Dated yeses and nos, like statement groups;
+/// the tree is walked by the reader, since a mark covers what is filed beneath.
+pub fn load_illinois_tax_addbacks(conn: &Connection, year: i32) -> BTreeSet<String> {
+    load_dated(conn, "il_tax_addbacks", "added_back", year)
+        .into_iter()
+        .filter(|(_, on)| on == "1")
+        .map(|(account, _)| account)
+        .collect()
+}
+
 /// Every account's number and name, by id.
 ///
 /// For labelling a grouped statement row: the parent a group is named for often

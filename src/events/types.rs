@@ -465,6 +465,16 @@ pub enum Event {
         /// The first tax year this applies to.
         effective_from: i32,
     },
+    /// An account holds Illinois income or replacement tax — or no longer does —
+    /// from a tax year on, so IL-1065 line 16 adds back what the federal return
+    /// deducted from it. A dated yes-or-no, like
+    /// [`Event::TaxStatementGroupingSet`].
+    IllinoisTaxAddbackSet {
+        account_id: String,
+        added_back: bool,
+        /// The first tax year this applies to.
+        effective_from: i32,
+    },
     /// An account is taken off the return.
     TaxLineMappingCleared {
         account_id: String,
@@ -931,6 +941,7 @@ impl Event {
             Event::TaxDeductionLimitSet { .. } => "tax_deduction_limit_set",
             Event::TaxDeductionLimitCleared { .. } => "tax_deduction_limit_cleared",
             Event::TaxStatementGroupingSet { .. } => "tax_statement_grouping_set",
+            Event::IllinoisTaxAddbackSet { .. } => "illinois_tax_addback_set",
             Event::ScheduleBAnswerSet { .. } => "schedule_b_answer_set",
             Event::ScheduleBAnswerCleared { .. } => "schedule_b_answer_cleared",
             Event::PartnerWithdrawn { .. } => "partner_withdrawn",
@@ -1013,6 +1024,7 @@ impl Event {
             Event::TaxDeductionLimitSet { account_id, .. } => Some(account_id),
             Event::TaxDeductionLimitCleared { account_id, .. } => Some(account_id),
             Event::TaxStatementGroupingSet { account_id, .. } => Some(account_id),
+            Event::IllinoisTaxAddbackSet { account_id, .. } => Some(account_id),
             // Keyed by (year, question), so no single id names the thing changed.
             Event::ScheduleBAnswerSet { .. } => None,
             Event::ScheduleBAnswerCleared { .. } => None,

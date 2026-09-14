@@ -1376,6 +1376,26 @@ impl SyncClient {
         .await
     }
 
+    /// Mark an account as Illinois income or replacement tax from `effective_from`,
+    /// so IL-1065 line 16 adds back what it deducts — or stop.
+    pub async fn set_illinois_tax_addback(
+        &mut self,
+        account_id: impl Into<String>,
+        added_back: bool,
+        effective_from: i32,
+    ) -> Result<i64, SyncClientError> {
+        let account_id = account_id.into();
+        self.submit_retrying("/sync/commands/set-illinois-tax-addback", |head| {
+            crate::sync::commands::tax_setup::SetIllinoisTaxAddbackRequest {
+                expected_head_seq: head,
+                effective_from,
+                account_id: account_id.clone(),
+                added_back,
+            }
+        })
+        .await
+    }
+
     /// Receive a bill: the bill's journal entry and `BillReceived`, appended
     /// atomically by the server.
     #[allow(clippy::too_many_arguments)]

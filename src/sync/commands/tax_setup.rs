@@ -38,6 +38,10 @@ pub fn router() -> Router<SyncState> {
             post(submit_set_statement_grouping),
         )
         .route(
+            "/sync/commands/set-illinois-tax-addback",
+            post(submit_set_illinois_tax_addback),
+        )
+        .route(
             "/sync/commands/set-schedule-b-answer",
             post(submit_set_answer),
         )
@@ -209,6 +213,37 @@ async fn submit_set_statement_grouping(
         Event::TaxStatementGroupingSet {
             account_id: req.account_id,
             grouped: req.grouped,
+            effective_from: req.effective_from,
+        },
+    )
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SetIllinoisTaxAddbackRequest {
+    pub expected_head_seq: i64,
+    /// The first tax year this applies to.
+    pub effective_from: i32,
+    pub account_id: String,
+    /// Whether IL-1065 line 16 adds back what this account deducts from that year.
+    pub added_back: bool,
+}
+
+/// Mark an account as Illinois income or replacement tax, or stop.
+async fn submit_set_illinois_tax_addback(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetIllinoisTaxAddbackRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    if req.account_id.trim().is_empty() {
+        return Err(ApiError::bad_request("account_id is required"));
+    }
+    append(
+        st,
+        req.expected_head_seq,
+        actor,
+        Event::IllinoisTaxAddbackSet {
+            account_id: req.account_id,
+            added_back: req.added_back,
             effective_from: req.effective_from,
         },
     )

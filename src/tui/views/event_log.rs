@@ -510,6 +510,15 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 }
             )
         }
+        Event::IllinoisTaxAddbackSet {
+            account_id,
+            added_back,
+            effective_from,
+        } => format!(
+            "Account {} {} Illinois tax added back on IL-1065 line 16 from {effective_from}",
+            widgets::truncate(account_id, 8),
+            if *added_back { "is" } else { "is no longer" }
+        ),
         Event::ScheduleBAnswerSet {
             tax_year,
             answer_key,

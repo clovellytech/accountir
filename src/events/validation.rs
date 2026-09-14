@@ -386,6 +386,9 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::TaxStatementGroupingSet { account_id, .. } => {
             validate_non_empty(account_id, "account_id")?;
         }
+        Event::IllinoisTaxAddbackSet { account_id, .. } => {
+            validate_non_empty(account_id, "account_id")?;
+        }
         Event::AccountDeleted { account_id } => {
             validate_non_empty(account_id, "account_id")?;
         }

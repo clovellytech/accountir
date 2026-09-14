@@ -255,6 +255,21 @@ impl<'a> Projector<'a> {
                     params![account_id, effective_from, *grouped as i64, stored_event.id],
                 )?;
             }
+            Event::IllinoisTaxAddbackSet {
+                account_id,
+                added_back,
+                effective_from,
+            } => {
+                // A yes or a no, never deleted — see `TaxStatementGroupingSet`.
+                self.conn.execute(
+                    "INSERT INTO il_tax_addbacks
+                       (account_id, effective_from, added_back, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4)
+                     ON CONFLICT(account_id, effective_from) DO UPDATE SET
+                       added_back = ?3, updated_at = datetime('now'), updated_at_event = ?4",
+                    params![account_id, effective_from, *added_back as i64, stored_event.id],
+                )?;
+            }
             Event::TaxLineMappingCleared {
                 account_id,
                 effective_from,
@@ -1334,6 +1349,7 @@ impl<'a> Projector<'a> {
              -- events necessary in the first place.
              DELETE FROM tax_line_mappings;
              DELETE FROM tax_statement_groups;
+             DELETE FROM il_tax_addbacks;
              DELETE FROM schedule_b_answers;
              -- Projections too, and missing from this list until now: a rebuild
              -- that left them behind was a merge rather than a replay, so a

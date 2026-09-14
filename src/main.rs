@@ -395,6 +395,19 @@ enum TaxCliCommands {
         #[arg(long)]
         elect_pte: Option<bool>,
     },
+
+    /// Mark an account as Illinois income or replacement tax, so IL-1065 line 16
+    /// adds back what the federal return deducts from it
+    IlTaxAddback {
+        /// The account, by id or number
+        account: String,
+        /// The first tax year this applies to
+        #[arg(long)]
+        from: i32,
+        /// Stop adding it back from that year instead
+        #[arg(long)]
+        stop: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -811,6 +824,9 @@ async fn main() -> Result<()> {
 
         Commands::Tax(cmd) => {
             let mut store = EventStore::open(&cli.database)?;
+            // The tax commands read and write the tax setup tables, which newer
+            // migrations add — as the partnership commands do.
+            accountir::store::migrations::run_migrations(store.connection())?;
             handle_tax_command(&mut store, cmd)?;
         }
     }
@@ -1999,7 +2015,7 @@ fn parse_cli_date(s: &str, what: &str) -> Result<chrono::NaiveDate> {
 }
 
 /// A liability account's id, from its id or its number.
-fn liability_account_id(store: &EventStore, account: &str) -> anyhow::Result<String> {
+fn account_id_from(store: &EventStore, account: &str) -> anyhow::Result<String> {
     store
         .connection()
         .query_row(
@@ -2376,7 +2392,7 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
             guaranteed,
             note,
         } => {
-            let account_id = liability_account_id(store, &account)?;
+            let account_id = account_id_from(store, &account)?;
             let kind = accountir::domain::LiabilityKind::parse(&kind).ok_or_else(|| {
                 anyhow::anyhow!("--kind is nonrecourse, qualified-nonrecourse or recourse")
             })?;
@@ -2393,7 +2409,7 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
         }
 
         PartnershipCliCommands::ClearLiability { account } => {
-            let account_id = liability_account_id(store, &account)?;
+            let account_id = account_id_from(store, &account)?;
             pc::clear_liability_class(store, "cli-user", &account_id)?;
             println!("{account} is back on the entity's default classification.");
         }
@@ -2608,6 +2624,22 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
             );
             for w in &bundle.warnings {
                 println!("warning: {w}");
+            }
+        }
+
+        TaxCliCommands::IlTaxAddback { account, from, stop } => {
+            let account_id = account_id_from(store, &account)?;
+            accountir::commands::tax_setup_commands::set_illinois_tax_addback(
+                store,
+                "cli-user",
+                &account_id,
+                !stop,
+                from,
+            )?;
+            if stop {
+                println!("{account} is no longer added back on IL-1065 line 16 from {from}.");
+            } else {
+                println!("IL-1065 line 16 adds back what {account} deducts, from {from}.");
             }
         }
 
