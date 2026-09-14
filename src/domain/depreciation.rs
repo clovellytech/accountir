@@ -484,6 +484,19 @@ impl BonusElection {
     }
 }
 
+/// One year's depreciation on one asset, fixed by hand.
+///
+/// For the year the register cannot reproduce — a return already filed on a
+/// figure the statute's tables do not give. The books have to carry what the
+/// return claimed, so the override replaces that year's bonus and MACRS, and the
+/// note says why, because an override with no reason cannot be told apart from a
+/// mistake. §179 is an election of its own and is not touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepreciationOverride {
+    pub amount_cents: i64,
+    pub note: String,
+}
+
 /// One depreciable asset, as the register holds it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DepreciableAsset {
@@ -527,6 +540,10 @@ pub struct DepreciableAsset {
     pub disposed_on: Option<NaiveDate>,
     /// Free text — a serial number, a room, an invoice reference.
     pub notes: Option<String>,
+    /// Years whose depreciation is fixed by hand, by tax year. Not part of the
+    /// asset's own events: it arrives with its own, and a correction to the asset
+    /// leaves it alone.
+    pub overrides: std::collections::BTreeMap<i32, DepreciationOverride>,
 }
 
 impl DepreciableAsset {
@@ -618,6 +635,7 @@ mod tests {
             bonus: BonusElection::Take,
             disposed_on: None,
             notes: None,
+            overrides: Default::default(),
         }
     }
 

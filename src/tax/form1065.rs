@@ -2666,6 +2666,7 @@ mod tests {
             bonus: BonusElection::Decline,
             disposed_on: None,
             notes: None,
+            overrides: Default::default(),
         }];
 
         let bundle = build_return(&req).unwrap();
@@ -2754,6 +2755,7 @@ mod tests {
             bonus: BonusElection::Decline,
             disposed_on: None,
             notes: None,
+            overrides: Default::default(),
         }];
 
         let bundle = build_return(&req).unwrap();
@@ -3570,6 +3572,7 @@ mod tests {
                 bonus: BonusElection::Decline,
                 disposed_on: None,
                 notes: None,
+                overrides: Default::default(),
             }
         }
 
@@ -3771,6 +3774,7 @@ mod tests {
             bonus: BonusElection::Decline,
             disposed_on: None,
             notes: None,
+            overrides: Default::default(),
         }];
 
         let mut lines = crate::tax::lines::Form1065Lines::default();

@@ -1246,6 +1246,7 @@ mod tests {
             bonus: BonusElection::Decline,
             disposed_on: None,
             notes: None,
+            overrides: Default::default(),
         }
     }
 

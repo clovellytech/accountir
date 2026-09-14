@@ -148,6 +148,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             40,
             include_str!("../../migrations/040_statement_groups.sql"),
         ),
+        (
+            41,
+            include_str!("../../migrations/041_depreciation_overrides.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -662,6 +666,18 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
 
         CREATE INDEX IF NOT EXISTS idx_depreciable_assets_placed
             ON depreciable_assets(placed_in_service);
+
+        -- A year's depreciation on one asset fixed by hand, with the reason
+        -- (migration 041).
+        CREATE TABLE IF NOT EXISTS depreciation_overrides (
+            asset_id TEXT NOT NULL,
+            tax_year INTEGER NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            note TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (asset_id, tax_year)
+        );
 
         -- Which Form 1065 line each account is reported on (migration 024).
         -- Keyed by account because many accounts share one line, and because

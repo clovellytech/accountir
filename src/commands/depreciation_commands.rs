@@ -52,7 +52,7 @@ use uuid::Uuid;
 use crate::commands::entry_commands::{
     EntryCommands, EntryLine, PostEntryCommand, VoidEntryCommand,
 };
-use crate::domain::{BonusElection, DepreciableAsset, PropertyClass, System};
+use crate::domain::{BonusElection, DepreciableAsset, DepreciationOverride, PropertyClass, System};
 use crate::events::types::{DepreciableAssetData, Event, JournalEntrySource, StoredEvent};
 use crate::store::event_store::EventStore;
 use crate::tax::depreciation::{compute_year, YearSchedule};
@@ -189,7 +189,31 @@ pub fn list_assets(conn: &Connection) -> Vec<DepreciableAsset> {
             bonus,
             disposed_on: disposed.and_then(|d| NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()),
             notes,
+            overrides: Default::default(),
         });
+    }
+
+    // The years fixed by hand, onto the assets they belong to. A row for an asset
+    // no longer on the register cannot happen — removal deletes them — and would
+    // be ignored if it did.
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT asset_id, tax_year, amount_cents, note FROM depreciation_overrides")
+    {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i32>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        }) {
+            for (asset_id, year, amount_cents, note) in rows.flatten() {
+                if let Some(a) = out.iter_mut().find(|a| a.asset_id == asset_id) {
+                    a.overrides
+                        .insert(year, DepreciationOverride { amount_cents, note });
+                }
+            }
+        }
     }
     out
 }
@@ -349,6 +373,76 @@ pub fn remove_asset(
         user_id,
         Event::DepreciableAssetRemoved {
             asset_id: asset_id.to_string(),
+        },
+    )
+}
+
+/// Fix one year's depreciation on one asset by hand, with the reason.
+///
+/// For a year already filed on a figure the register cannot reproduce. The
+/// amount replaces that year's bonus and MACRS everywhere the register is read —
+/// the posting, Form 4562, and the accumulated depreciation later years build on
+/// — so a year posted before the override reads as stale until it is posted
+/// again, which is the prompt to do so.
+pub fn set_override(
+    store: &mut EventStore,
+    user_id: &str,
+    asset_id: &str,
+    tax_year: i32,
+    amount_cents: i64,
+    note: &str,
+) -> Result<StoredEvent, DepreciationError> {
+    let Some(asset) = get_asset(store.connection(), asset_id) else {
+        return Err(DepreciationError::NoSuchAsset(asset_id.to_string()));
+    };
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(DepreciationError::Invalid(
+            "an override needs a note saying why the computed figure is not the one to use"
+                .to_string(),
+        ));
+    }
+    if !(0..=asset.cost_cents).contains(&amount_cents) {
+        return Err(DepreciationError::Invalid(format!(
+            "a year's depreciation of ${:.2} is outside zero to the asset's cost of ${:.2}",
+            amount_cents as f64 / 100.0,
+            asset.cost_cents as f64 / 100.0
+        )));
+    }
+    if asset.recovery_year(tax_year).is_none() {
+        return Err(DepreciationError::Invalid(format!(
+            "{} was not in service in {tax_year}, so there is no depreciation to fix",
+            asset.description
+        )));
+    }
+    append(
+        store,
+        user_id,
+        Event::DepreciationOverrideSet {
+            asset_id: asset_id.to_string(),
+            tax_year,
+            amount_cents,
+            note: note.to_string(),
+        },
+    )
+}
+
+/// Put a year back to what the register computes.
+pub fn clear_override(
+    store: &mut EventStore,
+    user_id: &str,
+    asset_id: &str,
+    tax_year: i32,
+) -> Result<StoredEvent, DepreciationError> {
+    if get_asset(store.connection(), asset_id).is_none() {
+        return Err(DepreciationError::NoSuchAsset(asset_id.to_string()));
+    }
+    append(
+        store,
+        user_id,
+        Event::DepreciationOverrideCleared {
+            asset_id: asset_id.to_string(),
+            tax_year,
         },
     )
 }
@@ -657,7 +751,69 @@ mod tests {
             bonus: BonusElection::Decline,
             disposed_on: None,
             notes: None,
+            overrides: Default::default(),
         }
+    }
+
+    /// An override is what gets posted, the reason travels with it, and clearing
+    /// it leaves the posting visibly out of date.
+    #[test]
+    fn an_override_is_what_gets_posted_and_clearing_it_restores_the_computed_year() {
+        let mut s = store();
+        let (id, _) = add_asset(&mut s, "u", &kiln()).expect("added");
+        let computed = compute_year(&list_assets(s.connection()), 2025).line_16a_cents();
+
+        assert!(
+            set_override(&mut s, "u", &id, 2025, 50_000, "  ").is_err(),
+            "a note is required"
+        );
+        assert!(
+            set_override(&mut s, "u", &id, 2024, 50_000, "before it existed").is_err(),
+            "not in service in 2024"
+        );
+        set_override(
+            &mut s,
+            "u",
+            &id,
+            2025,
+            50_000,
+            "As filed on the 2025 return",
+        )
+        .expect("set");
+        let asset = get_asset(s.connection(), &id).unwrap();
+        assert_eq!(
+            asset.overrides.get(&2025).map(|o| o.note.as_str()),
+            Some("As filed on the 2025 return")
+        );
+
+        let posted = post_year(&mut s, "u", 2025, false).expect("posted");
+        assert_eq!(posted.depreciation_cents, 50_000);
+        assert!(posting_is_stale(s.connection(), 2025).is_none());
+
+        clear_override(&mut s, "u", &id, 2025).expect("cleared");
+        assert!(
+            posting_is_stale(s.connection(), 2025).is_some(),
+            "the posting now disagrees with the register"
+        );
+        assert_eq!(
+            compute_year(&list_assets(s.connection()), 2025).line_16a_cents(),
+            computed
+        );
+    }
+
+    #[test]
+    fn removing_an_asset_takes_its_overrides_with_it() {
+        let mut s = store();
+        let (id, _) = add_asset(&mut s, "u", &kiln()).expect("added");
+        set_override(&mut s, "u", &id, 2025, 1, "test").unwrap();
+        remove_asset(&mut s, "u", &id).unwrap();
+        let n: i64 = s
+            .connection()
+            .query_row("SELECT COUNT(*) FROM depreciation_overrides", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

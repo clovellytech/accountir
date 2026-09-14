@@ -538,6 +538,35 @@ impl<'a> Projector<'a> {
                     "DELETE FROM depreciable_assets WHERE id = ?1",
                     params![asset_id],
                 )?;
+                // An asset that never existed has no years to have fixed.
+                self.conn.execute(
+                    "DELETE FROM depreciation_overrides WHERE asset_id = ?1",
+                    params![asset_id],
+                )?;
+            }
+            Event::DepreciationOverrideSet {
+                asset_id,
+                tax_year,
+                amount_cents,
+                note,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO depreciation_overrides
+                        (asset_id, tax_year, amount_cents, note, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)
+                     ON CONFLICT(asset_id, tax_year) DO UPDATE SET
+                        amount_cents = excluded.amount_cents,
+                        note = excluded.note,
+                        updated_at = excluded.updated_at,
+                        updated_at_event = excluded.updated_at_event",
+                    params![asset_id, tax_year, amount_cents, note, stored_event.id],
+                )?;
+            }
+            Event::DepreciationOverrideCleared { asset_id, tax_year } => {
+                self.conn.execute(
+                    "DELETE FROM depreciation_overrides WHERE asset_id = ?1 AND tax_year = ?2",
+                    params![asset_id, tax_year],
+                )?;
             }
             Event::UserAdded {
                 user_id,
@@ -1214,6 +1243,7 @@ impl<'a> Projector<'a> {
              -- rest: an asset no event justifies would otherwise keep claiming
              -- depreciation on somebody's return after a replay.
              DELETE FROM depreciable_assets;
+             DELETE FROM depreciation_overrides;
              -- Projections too (migration 031). `sole_proprietor_tin` is
              -- deliberately NOT cleared, exactly as `partner_tins` is not: it is
              -- local configuration, not derived from the log, and a replay must

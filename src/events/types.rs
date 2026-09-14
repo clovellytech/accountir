@@ -556,6 +556,24 @@ pub enum Event {
     DepreciableAssetRemoved {
         asset_id: String,
     },
+    /// One year's depreciation on one asset, fixed by hand — with the reason.
+    ///
+    /// For the year the register cannot reproduce: a return already filed on a
+    /// figure the statute's tables do not give, which the books have to carry
+    /// because the return did. Replaces that year's bonus and MACRS; §179 is an
+    /// election of its own and is untouched. The note is required because an
+    /// override with no reason cannot be told apart from a mistake.
+    DepreciationOverrideSet {
+        asset_id: String,
+        tax_year: i32,
+        amount_cents: i64,
+        note: String,
+    },
+    /// The year goes back to what the register computes.
+    DepreciationOverrideCleared {
+        asset_id: String,
+        tax_year: i32,
+    },
 
     UserAdded {
         user_id: String,
@@ -867,6 +885,8 @@ impl Event {
             Event::DepreciableAssetUpdated(_) => "depreciable_asset_updated",
             Event::DepreciableAssetDisposed { .. } => "depreciable_asset_disposed",
             Event::DepreciableAssetRemoved { .. } => "depreciable_asset_removed",
+            Event::DepreciationOverrideSet { .. } => "depreciation_override_set",
+            Event::DepreciationOverrideCleared { .. } => "depreciation_override_cleared",
             Event::BusinessTypeSet { .. } => "business_type_set",
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
             Event::ScheduleCAnswerSet { .. } => "schedule_c_answer_set",
@@ -940,6 +960,8 @@ impl Event {
             Event::DepreciableAssetUpdated(d) => Some(&d.asset_id),
             Event::DepreciableAssetDisposed { asset_id, .. } => Some(asset_id),
             Event::DepreciableAssetRemoved { asset_id } => Some(asset_id),
+            Event::DepreciationOverrideSet { asset_id, .. } => Some(asset_id),
+            Event::DepreciationOverrideCleared { asset_id, .. } => Some(asset_id),
             // One business per book, so no id names the thing changed — the same
             // answer `BusinessProfileSet` gives.
             Event::BusinessTypeSet { .. } => None,

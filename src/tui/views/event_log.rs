@@ -330,6 +330,18 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::DepreciableAssetRemoved { asset_id } => {
             format!("Asset {asset_id} removed from the register")
         }
+        Event::DepreciationOverrideSet {
+            asset_id,
+            tax_year,
+            amount_cents,
+            note,
+        } => format!(
+            "Asset {asset_id}: {tax_year} depreciation forced to ${:.2} — {note}",
+            *amount_cents as f64 / 100.0
+        ),
+        Event::DepreciationOverrideCleared { asset_id, tax_year } => {
+            format!("Asset {asset_id}: {tax_year} depreciation back to the computed figure")
+        }
         Event::BusinessTypeSet { business_type } => {
             let t = crate::domain::BusinessType::parse(business_type)
                 .map(|t| t.label())

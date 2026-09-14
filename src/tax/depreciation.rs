@@ -385,26 +385,42 @@ fn accumulated_through(asset: &DepreciableAsset, through_year: i32, mid_quarter:
         &fractions,
     );
 
-    let mut total = section_179 + bonus;
+    let mut total = section_179;
     for year in 1..=last {
         let index = (year - 1) as usize;
+        let tax_year = asset.placed_in_service.year() + (year as i32 - 1);
+        if asset.disposed_on.is_some_and(|d| d.year() < tax_year) {
+            break;
+        }
+        // A year fixed by hand counts at the figure fixed: the books carry it, and
+        // every later year's accumulated depreciation is built on it.
+        if let Some(fixed) = asset.overrides.get(&tax_year) {
+            total += fixed.amount_cents;
+            if asset.disposed_during(tax_year) {
+                break;
+            }
+            continue;
+        }
         let Some(&amount) = schedule.get(index) else {
             break;
         };
-        let tax_year = asset.placed_in_service.year() + (year as i32 - 1);
+        let first_year_bonus = if year == 1 { bonus } else { 0 };
         // A disposal year is a part year, on the same convention that opened the
         // asset; after it there is nothing left to take.
-        if let Some(disposed) = asset.disposed_on {
-            if disposed.year() == tax_year {
+        let (amount, last_year) = match asset.disposed_on.filter(|d| d.year() == tax_year) {
+            Some(disposed) => {
                 let fraction = disposal_year_fraction(convention, disposed);
-                total += (amount as f64 * fraction).round() as i64;
-                break;
+                ((amount as f64 * fraction).round() as i64, true)
             }
-            if disposed.year() < tax_year {
-                break;
-            }
+            None => (amount, false),
+        };
+        // Never past the basis — the same cap `compute_year` applies, so the two
+        // cannot disagree about a year after one fixed above the table.
+        total +=
+            first_year_bonus + amount.min((asset.cost_cents - total - first_year_bonus).max(0));
+        if last_year {
+            break;
         }
-        total += amount;
     }
     total.min(asset.cost_cents)
 }
@@ -510,6 +526,29 @@ pub fn compute_year<'a>(assets: &'a [DepreciableAsset], tax_year: i32) -> YearSc
             (section_179, bonus, bonus_rate(asset))
         } else {
             (0, 0, 0.0)
+        };
+
+        // Never past the basis. The table recovers exactly the basis over the
+        // life, so this only bites after a year fixed above the table — and then
+        // it is what stops the asset deducting more than it cost.
+        let already = accumulated_through(asset, tax_year - 1, mid_quarter);
+        macrs = macrs.min((asset.cost_cents - already - section_179 - bonus).max(0));
+
+        // A year fixed by hand replaces bonus and MACRS with the figure fixed, and
+        // says so wherever the schedule's warnings are read — the return included.
+        let (bonus, macrs) = match asset.overrides.get(&tax_year) {
+            Some(fixed) => {
+                warnings.push(format!(
+                    "{}: {tax_year} depreciation is fixed by hand at ${:.2}; the register computes                      ${:.2}. Reason given: {}",
+                    asset.description,
+                    fixed.amount_cents as f64 / 100.0,
+                    (bonus + macrs) as f64 / 100.0,
+                    fixed.note
+                ));
+                let kept_bonus = bonus.min(fixed.amount_cents);
+                (kept_bonus, fixed.amount_cents - kept_bonus)
+            }
+            None => (bonus, macrs),
         };
 
         rows.push(AssetYear {
@@ -805,6 +844,7 @@ mod tests {
             bonus: BonusElection::Decline,
             disposed_on: None,
             notes: None,
+            overrides: Default::default(),
         }
     }
 
@@ -1394,5 +1434,59 @@ mod tests {
         let s = compute_year(&assets, 2025);
         assert_eq!(s.accumulated_cents(), 1_000_000);
         assert_eq!(s.rows[0].remaining_basis_cents(), 0);
+    }
+
+    /// A year fixed by hand is the year's figure, later years build on it, and
+    /// the asset still recovers exactly its cost — the case this exists for: a
+    /// 2023 return filed at $1,448 on a fit-out the tables put at $667.
+    #[test]
+    fn an_override_replaces_the_year_and_the_life_still_recovers_the_cost() {
+        let placed = NaiveDate::from_ymd_opt(2023, 10, 19).unwrap();
+        let mut fitout = asset(PropertyClass::Nonresidential, placed, 12_481_600);
+        let plain = vec![fitout.clone()];
+        fitout.overrides.insert(
+            2023,
+            crate::domain::DepreciationOverride {
+                amount_cents: 144_800,
+                note: "As filed: 39.5-year life".into(),
+            },
+        );
+        let fixed = vec![fitout];
+
+        let y2023 = compute_year(&fixed, 2023);
+        assert_eq!(y2023.rows[0].macrs_cents, 144_800);
+        assert_eq!(y2023.rows[0].accumulated_cents, 144_800);
+        assert!(
+            y2023
+                .warnings
+                .iter()
+                .any(|w| w.contains("As filed: 39.5-year life")),
+            "{:?}",
+            y2023.warnings
+        );
+
+        let y2024 = compute_year(&fixed, 2024);
+        assert_eq!(
+            y2024.rows[0].macrs_cents,
+            compute_year(&plain, 2024).rows[0].macrs_cents,
+            "2024 is the table's figure"
+        );
+        assert_eq!(
+            y2024.rows[0].accumulated_cents,
+            144_800 + y2024.rows[0].macrs_cents
+        );
+
+        let life: i64 = (2023..=2064)
+            .map(|y| {
+                compute_year(&fixed, y)
+                    .rows
+                    .first()
+                    .map_or(0, |r| r.total_cents())
+            })
+            .sum();
+        assert_eq!(
+            life, 12_481_600,
+            "the whole life recovers the cost, not more"
+        );
     }
 }

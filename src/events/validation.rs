@@ -246,6 +246,30 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::DepreciableAssetRemoved { asset_id } => {
             validate_non_empty(asset_id, "asset_id")?;
         }
+        Event::DepreciationOverrideSet {
+            asset_id,
+            tax_year,
+            amount_cents,
+            note,
+        } => {
+            validate_non_empty(asset_id, "asset_id")?;
+            // The reason is the point: an override nobody can explain is a
+            // figure on a return nobody can defend.
+            validate_non_empty(note, "note")?;
+            if *amount_cents < 0 {
+                return Err(ValidationError::InvalidValue(format!(
+                    "amount_cents: {amount_cents} — a year's depreciation cannot be negative"
+                )));
+            }
+            if !(1900..=2200).contains(tax_year) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "tax_year: {tax_year} is not a tax year"
+                )));
+            }
+        }
+        Event::DepreciationOverrideCleared { asset_id, .. } => {
+            validate_non_empty(asset_id, "asset_id")?;
+        }
         // --- sole proprietorships (migration 031) ---
         Event::BusinessTypeSet { business_type } => {
             // Checked against the catalogue rather than for emptiness: an
