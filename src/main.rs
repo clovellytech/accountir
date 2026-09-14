@@ -373,6 +373,9 @@ enum AccountCommands_ {
         number: String,
         #[arg(long)]
         name: String,
+        /// Id of the account this one sits under
+        #[arg(short, long)]
+        parent: Option<String>,
         #[arg(short, long)]
         currency: Option<String>,
         #[arg(short, long)]
@@ -916,6 +919,7 @@ fn handle_account_command(store: &mut EventStore, cmd: AccountCommands_) -> Resu
             account_type,
             number,
             name,
+            parent,
             currency,
             description,
         } => {
@@ -926,7 +930,7 @@ fn handle_account_command(store: &mut EventStore, cmd: AccountCommands_) -> Resu
                 account_type: acc_type,
                 account_number: number,
                 name: name.clone(),
-                parent_id: None,
+                parent_id: parent,
                 currency,
                 description,
             })?;
