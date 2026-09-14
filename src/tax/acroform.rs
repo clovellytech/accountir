@@ -542,10 +542,50 @@ pub fn strip_xfa(doc: &mut Document) {
 /// Applied to a Schedule K-1 before anything is written into it.
 pub fn namespace_fields(doc: &mut Document, namespace: &str) {
     let roots = root_fields(doc);
-    for f in roots {
-        if let Object::Reference(id) = f {
+
+    // One root — the IRS forms' `topmostSubform[0]` — is renamed, and everything
+    // beneath it follows.
+    if roots.len() == 1 {
+        if let Object::Reference(id) = roots[0] {
             if let Ok(dict) = doc.get_object_mut(id).and_then(|o| o.as_dict_mut()) {
                 dict.set("T", encode_pdf_string(namespace));
+            }
+        }
+        return;
+    }
+
+    // Many roots — Illinois' forms keep every box at the top level. Renaming each
+    // one would give them all the same name, and a viewer shows one value in
+    // every box that shares a name. So they are gathered under a new parent
+    // field that carries the namespace, and each keeps its own name beneath it.
+    let ids: Vec<ObjectId> = roots.iter().filter_map(|o| o.as_reference().ok()).collect();
+    if ids.is_empty() || ids.len() != roots.len() {
+        return;
+    }
+    let mut parent = Dictionary::new();
+    parent.set("T", encode_pdf_string(namespace));
+    parent.set(
+        "Kids",
+        Object::Array(ids.iter().map(|id| Object::Reference(*id)).collect()),
+    );
+    let parent_id = doc.add_object(Object::Dictionary(parent));
+    for id in &ids {
+        if let Ok(dict) = doc.get_object_mut(*id).and_then(|o| o.as_dict_mut()) {
+            dict.set("Parent", Object::Reference(parent_id));
+        }
+    }
+    let fields = Object::Array(vec![Object::Reference(parent_id)]);
+    match acroform_ref(doc) {
+        Some(form) => {
+            if let Ok(dict) = doc.get_object_mut(form).and_then(|o| o.as_dict_mut()) {
+                dict.set("Fields", fields);
+            }
+        }
+        None => {
+            if let Ok(catalog) = doc.catalog_mut() {
+                if let Ok(Object::Dictionary(form)) = catalog.get_mut(b"AcroForm") {
+                    form.set("Fields", fields);
+                }
             }
         }
     }

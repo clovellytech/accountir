@@ -223,4 +223,42 @@ mod tests {
         assert_eq!(v(f::TYPE_INDIVIDUAL).as_deref(), Some("/Individual"));
         assert!(warnings.is_empty(), "{warnings:?}");
     }
+
+    /// Two partners' schedules in one document keep every box apart: the blank
+    /// keeps its fields at the top level, and namespacing must not give them all
+    /// one name, or a viewer shows one value in every box.
+    #[test]
+    fn two_schedules_in_one_document_keep_their_own_values() {
+        use crate::tax::acroform::{append_document, get_value_in, namespace_fields};
+        let blank = {
+            let mut doc = Document::load_mem(K1P).unwrap();
+            strip_xfa(&mut doc);
+            doc
+        };
+        let per_copy = field_map(&blank).len();
+
+        let fill = |name: &str, tin: &str| {
+            let mut doc = blank.clone();
+            let map = field_map(&doc);
+            set_text(&mut doc, &map, f::MEMBER_NAME, name).unwrap();
+            set_text(&mut doc, &map, f::MEMBER_TIN, tin).unwrap();
+            doc
+        };
+        let mut bundle = fill("First Partner", "111-11-1111");
+        namespace_fields(&mut bundle, "K1P_1");
+        let mut second = fill("Second Partner", "222-22-2222");
+        namespace_fields(&mut second, "K1P_2");
+        append_document(&mut bundle, second).unwrap();
+
+        let map = field_map(&bundle);
+        assert_eq!(map.len(), per_copy * 2, "every box keeps a name of its own");
+        assert_eq!(
+            get_value_in(&bundle, &map, "K1P_1", f::MEMBER_NAME).as_deref(),
+            Some("First Partner")
+        );
+        assert_eq!(
+            get_value_in(&bundle, &map, "K1P_2", f::MEMBER_TIN).as_deref(),
+            Some("222-22-2222")
+        );
+    }
 }
