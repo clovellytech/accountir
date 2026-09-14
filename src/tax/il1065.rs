@@ -207,6 +207,9 @@ mod f {
     pub const IL4562_ATTACHED: &str = "Form IL-452 chk box";
     pub const IL4562_ON: &str = "Form IL-4562";
 
+    // Step 11, paid preparer: the firm's name box.
+    pub const PREPARER_FIRM_NAME: &str = "Preparer firm name";
+
     // Schedule B header (Section B, page 5).
     pub const SCHB_NAME: &str =
         "Schedule B. Enter your name as shown on your Form IL-1065 or Form IL-1120-ST";
@@ -868,6 +871,14 @@ pub fn build_with_special(
     let map = field_map(&doc);
 
     fill_identity(&mut doc, &map, profile, settings)?;
+    // A return the partnership prepares itself has no paid preparer, and the firm
+    // box says so rather than being left blank — as on the federal return.
+    set_text(
+        &mut doc,
+        &map,
+        f::PREPARER_FIRM_NAME,
+        super::form1065::SELF_PREPARED,
+    )?;
     if !special.rows.is_empty() {
         set_check(&mut doc, &map, f::IL4562_ATTACHED, f::IL4562_ON)?;
     }
@@ -1543,6 +1554,7 @@ mod tests {
             f::L64_TOTAL,
             f::L66_TOTAL_PAYMENTS,
             f::L16_ILLINOIS_TAXES,
+            f::PREPARER_FIRM_NAME,
             f::L71_TAX_DUE,
             f::SCHB_NAME,
             f::SCHB_FEIN_2,
@@ -1780,6 +1792,10 @@ mod tests {
         );
         assert_eq!(get_value(&doc, &map, f::L66_TOTAL_PAYMENTS).as_deref(), Some("0"));
         assert_eq!(get_value(&doc, &map, f::L71_TAX_DUE).as_deref(), Some("1,485"));
+        assert_eq!(
+            get_value(&doc, &map, f::PREPARER_FIRM_NAME).as_deref(),
+            Some("SELF PREPARED")
+        );
         // Box A shows ticked: the widget for "inside Illinois" is drawn on, not
         // just the field's value set.
         let parent = map.find(f::INSIDE_OUTSIDE).unwrap();
