@@ -987,6 +987,11 @@ pub fn partners_for_year_with_problems(
 /// so. Until then this reports the condition, because a return that is quietly
 /// wrong about who earned what is worse than one that says it might be.
 ///
+/// A partner whose percentages are dated from on or before `cutoff` is not
+/// named: item J reads the percentages in force from those periods, so an edit
+/// made afterwards cannot reach the year's K-1, and saying it might was a warning
+/// that could never be resolved.
+///
 /// Keyed on the edit event itself, not on `partners.updated_at_event`. That
 /// column moves when a partner is *admitted* too, so it fires for every partner
 /// entered after the year they are being reported for — which is most of them,
@@ -1001,6 +1006,9 @@ pub fn partners_changed_after(conn: &Connection, cutoff: NaiveDate) -> Vec<Strin
                JOIN partners p ON p.id = json_extract(e.payload, '$.partner_id')
                WHERE e.event_type = 'partner_details_updated'
                  AND date(e.timestamp) > ?1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM partner_share_periods s
+                      WHERE s.partner_id = p.id AND s.effective_from <= ?1)
                ORDER BY p.name";
     let Ok(mut stmt) = conn.prepare(sql) else {
         return out;

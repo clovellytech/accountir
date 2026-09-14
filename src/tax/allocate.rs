@@ -52,6 +52,27 @@ pub enum Basis {
     ProfitOrLoss,
     /// Capital-account figures.
     Capital,
+    /// The loss share, whatever the figure's sign. For an item the form prints
+    /// positive that still travels with the year's loss — see
+    /// [`nondeductible_basis`].
+    Loss,
+}
+
+/// The split nondeductible expenses — Schedule K line 18c — travel on.
+///
+/// The same one as the year's result: the loss percentages in a year the whole of
+/// Schedule K lost money, the profit percentages otherwise. Line 18c is printed
+/// positive, so splitting it on its own sign put it on the profit percentages even
+/// in a loss year — while the books close those same expenses, inside the year's
+/// loss, onto the loss percentages. Each partner's item L then ended the year on
+/// a different capital from their own ledger account, and a partner with a profit
+/// share and no loss share was charged an expense out of capital they did not have.
+pub fn nondeductible_basis(analysis: i64) -> Basis {
+    if analysis < 0 {
+        Basis::Loss
+    } else {
+        Basis::ProfitOrLoss
+    }
 }
 
 /// One partner's share of one figure.
@@ -115,6 +136,7 @@ pub fn allocate_as_of(
         };
         match basis {
             Basis::Capital => shares.capital_ppm,
+            Basis::Loss => shares.loss_ppm,
             Basis::ProfitOrLoss => {
                 if total < 0 {
                     shares.loss_ppm

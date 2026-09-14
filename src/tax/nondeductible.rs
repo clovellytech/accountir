@@ -149,6 +149,7 @@ pub fn for_return(
     year: i32,
     partners: &[crate::tax::form1065::PartnerFiling],
     components: &[LineDetail],
+    basis: Basis,
 ) -> Vec<PartnerStatement> {
     let (year_start, year_end) = crate::commands::partnership_commands::calendar_year(year);
     let filed: Vec<&Partner> = partners
@@ -156,7 +157,7 @@ pub fn for_return(
         .map(|f| &f.partner)
         .filter(|p| p.was_partner_during(year_start, year_end))
         .collect();
-    split(conn, year, &filed, components)
+    split(conn, year, &filed, components, basis)
 }
 
 /// Split every component of line 18c across `partners`.
@@ -182,6 +183,7 @@ pub fn split(
     year: i32,
     partners: &[&Partner],
     components: &[LineDetail],
+    basis: Basis,
 ) -> Vec<PartnerStatement> {
     let mut out: Vec<PartnerStatement> = partners
         .iter()
@@ -205,16 +207,16 @@ pub fn split(
     // in one half of the year, weighting by `k_analysis` put a statement of 140
     // beside a box of 180 on a $200 line.
     //
-    // Line 18c is positive — an expense, printed positive — so each prefix
-    // travels on the profit percentages. A component big enough to run the
+    // `basis` is the split box 18 code C and item L row 4 use — the one the
+    // year's result takes, see `allocate::nondeductible_basis` — so all three
+    // agree. On the profit-or-loss basis, a component big enough to run the
     // running total negative (an expense account in net credit) puts that prefix
-    // on the loss percentages instead, which is the rule [`super::allocate`]
-    // applies to every other figure and is deliberate rather than an artefact.
+    // on the loss percentages instead, which is deliberate rather than an artefact.
     let year_split = super::varying::year_split(
         conn,
         year,
         partners,
-        Basis::ProfitOrLoss,
+        basis,
         super::lines::NONDEDUCTIBLE_LINE,
     );
 
@@ -342,7 +344,13 @@ mod tests {
     fn run(store: &EventStore, components: &[LineDetail]) -> Vec<PartnerStatement> {
         let ps = partners(store);
         let refs: Vec<&Partner> = ps.iter().collect();
-        split(store.connection(), YEAR, &refs, components)
+        split(
+            store.connection(),
+            YEAR,
+            &refs,
+            components,
+            Basis::ProfitOrLoss,
+        )
     }
 
     /// The real scenario this was written against: one meals account, $279.12,
@@ -497,6 +505,7 @@ mod tests {
             YEAR,
             &refs,
             &[component("3055", "Partner meals — 50% disallowed", 139_56)],
+            Basis::ProfitOrLoss,
         );
 
         let jinny = statements.iter().find(|s| s.partner_id == "jinny").unwrap();
@@ -534,6 +543,7 @@ mod tests {
             YEAR,
             &refs,
             &[component("3055", "Refunded meals", -100_00)],
+            Basis::ProfitOrLoss,
         );
 
         let jinny = statements.iter().find(|s| s.partner_id == "jinny").unwrap();
@@ -678,7 +688,13 @@ mod tests {
             let ps = partners(&store);
             let refs: Vec<&Partner> = ps.iter().collect();
             for components in &component_sets {
-                let statements = split(store.connection(), YEAR, &refs, components);
+                let statements = split(
+                    store.connection(),
+                    YEAR,
+                    &refs,
+                    components,
+                    Basis::ProfitOrLoss,
+                );
                 // What `build_return_from_ledger` hands `capital`: the same sum
                 // of cents, rounded once.
                 let line_18c = cents_to_dollars(components.iter().map(|c| c.cents).sum());

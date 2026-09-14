@@ -221,6 +221,12 @@ pub struct Page1 {
     pub naics: &'static str,
     pub ein: &'static str,
     pub date_started: &'static str,
+    /// The tax-year space: "tax year beginning ____, 2023, ending ____, 20__".
+    /// Filled only for a short tax year — see [`short_tax_year`].
+    pub tax_year_begin: &'static str,
+    pub tax_year_end: &'static str,
+    /// The two-digit year after "20" in the ending date.
+    pub tax_year_end_yy: &'static str,
     pub k1_count: &'static str,
     pub preparer_name: &'static str,
     pub lines: Page1Lines,
@@ -272,6 +278,9 @@ pub const PAGE1_2023: Page1 = Page1 {
     naics: "f1_09[0]",
     ein: "f1_10[0]",
     date_started: "f1_11[0]",
+    tax_year_begin: "f1_01[0]",
+    tax_year_end: "f1_02[0]",
+    tax_year_end_yy: "f1_03[0]",
     k1_count: "f1_14[0]",
     preparer_name: "f1_49[0]",
     lines: Page1Lines {
@@ -322,6 +331,9 @@ pub const PAGE1_2024: Page1 = Page1 {
     naics: "f1_9[0]",
     ein: "f1_10[0]",
     date_started: "f1_11[0]",
+    tax_year_begin: "f1_1[0]",
+    tax_year_end: "f1_2[0]",
+    tax_year_end_yy: "f1_3[0]",
     k1_count: "f1_14[0]",
     preparer_name: "f1_49[1]",
     lines: Page1Lines {
@@ -370,6 +382,9 @@ pub const PAGE1_2025: Page1 = Page1 {
     naics: "f1_13[0]",
     ein: "f1_14[0]",
     date_started: "f1_15[0]",
+    tax_year_begin: "f1_01[0]",
+    tax_year_end: "f1_02[0]",
+    tax_year_end_yy: "f1_03[0]",
     k1_count: "f1_18[0]",
     preparer_name: "f1_57[0]",
     lines: Page1Lines {
@@ -492,19 +507,22 @@ mod k1 {
     pub const L_WITHDRAWN: &str = "f1_30[0]";
     pub const L_ENDING: &str = "f1_31[0]";
 
+    // --- The tax-year space, for a short tax year only ---
+    //
+    // "For calendar year 2025, or tax year beginning __/__/2025 ending __/__/____".
+    // A calendar-year filer leaves it blank; a partnership formed after the year
+    // opened fills it for that first, short, year. See `short_tax_year`.
+    pub const TAX_YEAR_BEGIN_MONTH: &str = "ForCalendarYear[0].f1_1[0]";
+    pub const TAX_YEAR_BEGIN_DAY: &str = "ForCalendarYear[0].f1_2[0]";
+    pub const TAX_YEAR_END_MONTH: &str = "ForCalendarYear[0].f1_3[0]";
+    pub const TAX_YEAR_END_DAY: &str = "ForCalendarYear[0].f1_4[0]";
+    pub const TAX_YEAR_END_YEAR: &str = "ForCalendarYear[0].f1_5[0]";
+
     // --- Boxes this program deliberately leaves blank ---
     //
     // Named here rather than left unmentioned, because "there is no constant for
     // it" and "we decided not to fill it" look identical from outside, and the
     // second is the one that has been reviewed.
-    //
-    // The header's tax-year boxes (`ForCalendarYear[0].f1_1` through `f1_5`) sit
-    // under "For calendar year 2025, or tax year beginning ... ending ...". They
-    // are the *fiscal year* boxes: a calendar-year filer leaves them blank and
-    // the pre-printed year on the form is their year. Every return this program
-    // builds runs January to December on that year's own blank, so filling them
-    // would turn a calendar-year return into a fiscal-year one. Page 1's
-    // equivalent boxes are left blank for the same reason.
     //
     // Item K (`f1_20`-`f1_25`) is the partner's share of partnership liabilities,
     // split three ways — nonrecourse, qualified nonrecourse financing, recourse.
@@ -865,8 +883,13 @@ pub fn build_return_from_ledger(
     // saying what it was spent on.
     if owned.nondeductible.is_empty() {
         if let Some(components) = computed.detail.get(super::lines::NONDEDUCTIBLE_LINE) {
-            owned.nondeductible =
-                super::nondeductible::for_return(conn, req.year, &req.partners, components);
+            owned.nondeductible = super::nondeductible::for_return(
+                conn,
+                req.year,
+                &req.partners,
+                components,
+                super::allocate::nondeductible_basis(computed.lines.k_analysis()),
+            );
         }
     }
     // §706(d) interim closing: the year cut at each change of interest, with each
@@ -940,9 +963,9 @@ pub fn build_return_from_ledger(
 
     let mut bundle = build_return_inner(req, &computed.lines, computed.warnings)?;
 
-    // Shares carry no effective date, so a partner edited since the year ended is
-    // shown here at today's split rather than that year's. See
-    // `partners_changed_after` for why this is a warning and not yet a fix.
+    // A partner edited since the year ended, with no dated percentages covering
+    // the year, is shown at today's split rather than that year's. See
+    // `partners_changed_after`.
     let changed = crate::commands::partnership_commands::partners_changed_after(conn, year_end);
     if !changed.is_empty() {
         bundle.warnings.push(format!(
@@ -1047,6 +1070,7 @@ fn build_return_inner(
         &req.profile,
         filed.len(),
         lines,
+        req.year,
     )?);
     warnings.extend(fill_schedule_k(&mut doc, &map, lines)?);
     // The revision's own question table. A year with none has no Schedule B —
@@ -1098,6 +1122,8 @@ fn build_return_inner(
             lines,
             req.schedule_l.as_ref(),
             lines.get(super::lines::NONDEDUCTIBLE_LINE),
+            // Line 2: what the partners paid in, as item L row 2 has it.
+            req.capital.accounts.iter().map(|a| a.contributed).sum(),
         );
         warnings.extend(super::schedule_m::fill(&mut doc, &map, &m, !exempt)?);
     } else {
@@ -1471,6 +1497,7 @@ fn fill_1065(
     profile: &BusinessProfile,
     k1_count: usize,
     lines: &Form1065Lines,
+    year: i32,
 ) -> Result<Vec<String>, FormError> {
     let addr = &profile.address;
     set_text(doc, map, page1.legal_name, &profile.legal_name)?;
@@ -1510,10 +1537,33 @@ fn fill_1065(
         set_text(doc, map, page1.principal_product, p)?;
     }
 
-    // The tax-year boxes at the top are deliberately left blank. The form reads
-    // "For calendar year 2025, or tax year beginning ___", so a calendar-year
-    // filer fills in nothing; writing the dates in would assert a fiscal year
-    // that was never chosen.
+    // The tax-year space at the top. A calendar-year filer leaves it blank — the
+    // printed year is their year — and writing dates in would assert a fiscal
+    // year nobody chose. The exception is a short tax year: a partnership formed
+    // after the year opened files its first return for the part of it that it
+    // existed, and the instructions say "for a fiscal year or a short tax year,
+    // fill in the tax year space at the top of Form 1065 and each Schedule K-1".
+    let (year_start, year_end) = crate::commands::partnership_commands::calendar_year(year);
+    if let Some((begin, end)) = short_tax_year(profile, year_start, year_end) {
+        set_text(
+            doc,
+            map,
+            page1.tax_year_begin,
+            &format!("{:02}/{:02}", begin.month(), begin.day()),
+        )?;
+        set_text(
+            doc,
+            map,
+            page1.tax_year_end,
+            &format!("{:02}/{:02}", end.month(), end.day()),
+        )?;
+        set_text(
+            doc,
+            map,
+            page1.tax_year_end_yy,
+            &format!("{:02}", end.year() % 100),
+        )?;
+    }
 
     set_text(doc, map, page1.preparer_name, SELF_PREPARED)?;
 
@@ -1904,10 +1954,17 @@ fn split_across_partners(
         if total == 0 {
             continue;
         }
+        // Line 18c travels on the split the year's result does — see
+        // `allocate::nondeductible_basis`. Everything else on its own sign.
+        let basis = if key == super::lines::NONDEDUCTIBLE_LINE {
+            super::allocate::nondeductible_basis(lines.k_analysis())
+        } else {
+            Basis::ProfitOrLoss
+        };
         let effective = if segs.is_empty() {
             None
         } else {
-            super::varying::effective_ppm(&partners, &segs, key, Basis::ProfitOrLoss)
+            super::varying::effective_ppm(&partners, &segs, key, basis)
         };
         let shares = match effective {
             Some(ppm) => allocate_with(total, &ppm),
@@ -1918,7 +1975,7 @@ fn split_across_partners(
                 if changed {
                     fell_back.push(key);
                 }
-                allocate_as_of(total, &partners, Basis::ProfitOrLoss, Some(year_end))
+                allocate_as_of(total, &partners, basis, Some(year_end))
             }
         };
         for share in shares {
@@ -2159,6 +2216,19 @@ fn fill_k1(
     set_text(doc, map, k1::PARTNER_ADDRESS, &p.address.as_block(&p.name))?;
     set_text(doc, map, k1::ENTITY_TYPE, &p.entity_type)?;
 
+    // The same short-year rule as page 1's tax-year space.
+    if let Some((begin, end)) = short_tax_year(profile, year_start, year_end) {
+        for (field, value) in [
+            (k1::TAX_YEAR_BEGIN_MONTH, format!("{:02}", begin.month())),
+            (k1::TAX_YEAR_BEGIN_DAY, format!("{:02}", begin.day())),
+            (k1::TAX_YEAR_END_MONTH, format!("{:02}", end.month())),
+            (k1::TAX_YEAR_END_DAY, format!("{:02}", end.day())),
+            (k1::TAX_YEAR_END_YEAR, end.year().to_string()),
+        ] {
+            set_text(doc, map, field, &value)?;
+        }
+    }
+
     match p.partner_type {
         PartnerType::General => set_check(doc, map, k1::TYPE_GENERAL, k1::ON)?,
         PartnerType::Limited => set_check(doc, map, k1::TYPE_LIMITED, k1::ON_SECOND)?,
@@ -2268,6 +2338,20 @@ fn fill_k1(
 }
 
 /// The date format the IRS forms use.
+/// The first, short, tax year of a partnership formed after the year opened:
+/// `(formed, year end)`, or `None` for an ordinary calendar year.
+///
+/// Only the opening short year. A final return for a partnership that ended
+/// mid-year is short too, but the books record no termination date to end it on.
+fn short_tax_year(
+    profile: &BusinessProfile,
+    year_start: NaiveDate,
+    year_end: NaiveDate,
+) -> Option<(NaiveDate, NaiveDate)> {
+    (profile.formation_date > year_start && profile.formation_date <= year_end)
+        .then_some((profile.formation_date, year_end))
+}
+
 fn us_date(d: NaiveDate) -> String {
     format!("{:02}/{:02}/{}", d.month(), d.day(), d.year())
 }
@@ -2446,6 +2530,73 @@ mod tests {
                 .any(|w| w.contains("No self-employment figures for Bob")),
             "{warnings:?}"
         );
+    }
+
+    /// A partnership formed after the year opened files a short first year and says
+    /// so at the top of page 1 and on every K-1; a calendar-year return leaves the
+    /// space blank.
+    #[test]
+    fn a_short_first_year_fills_the_tax_year_space() {
+        let mut req = two_partner_request();
+        req.year = 2023;
+        req.profile.formation_date = day(2023, 4, 13);
+        let bundle = build_return_inner(&req, &Form1065Lines::default(), Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        let page1 = |leaf: &str| acroform::get_value(&doc, &map, leaf);
+        assert_eq!(page1("Pg1Header[0].f1_01[0]").as_deref(), Some("04/13"));
+        assert_eq!(page1("Pg1Header[0].f1_02[0]").as_deref(), Some("12/31"));
+        assert_eq!(page1("Pg1Header[0].f1_03[0]").as_deref(), Some("23"));
+        let k1_box = |leaf: &str| acroform::get_value_in(&doc, &map, &k1_namespace(1), leaf);
+        assert_eq!(k1_box("ForCalendarYear[0].f1_1[0]").as_deref(), Some("04"));
+        assert_eq!(k1_box("ForCalendarYear[0].f1_2[0]").as_deref(), Some("13"));
+        assert_eq!(k1_box("ForCalendarYear[0].f1_4[0]").as_deref(), Some("31"));
+        assert_eq!(
+            k1_box("ForCalendarYear[0].f1_5[0]").as_deref(),
+            Some("2023")
+        );
+
+        let calendar = build_return_inner(
+            &two_partner_request(),
+            &Form1065Lines::default(),
+            Vec::new(),
+        )
+        .unwrap();
+        let doc = Document::load_mem(&calendar.pdf).unwrap();
+        let map = field_map(&doc);
+        assert_eq!(
+            acroform::get_value_in(&doc, &map, &k1_namespace(1), "ForCalendarYear[0].f1_1[0]"),
+            None,
+            "a calendar year leaves the space blank"
+        );
+    }
+
+    /// In a loss year, line 18c follows the loss percentages onto the K-1s — the
+    /// split the books close the same expenses on — and reproduces the filed 2023
+    /// boxes: 218 and 1 of 219 on 99.32% and 0.68%.
+    #[test]
+    fn nondeductible_expenses_follow_the_loss_split_in_a_loss_year() {
+        let mut req = two_partner_request();
+        req.partners[0].partner.shares = Shares {
+            profit_ppm: 500_000,
+            loss_ppm: 993_200,
+            capital_ppm: 500_000,
+        };
+        req.partners[1].partner.shares = Shares {
+            profit_ppm: 500_000,
+            loss_ppm: 6_800,
+            capital_ppm: 500_000,
+        };
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l21", 7_156);
+        lines.set_for_test("k18c", 219);
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        let box_18c = |n: usize| acroform::get_value_in(&doc, &map, &k1_namespace(n), "f1_88[0]");
+        assert_eq!(box_18c(1).as_deref(), Some("218"));
+        assert_eq!(box_18c(2).as_deref(), Some("1"));
     }
 
     /// The constants above name boxes by number, and nothing about `f1_14[0]`
@@ -5914,6 +6065,7 @@ mod tests {
             FORM_TAX_YEAR,
             &req.partners,
             &components,
+            crate::tax::allocate::Basis::ProfitOrLoss,
         );
         let ids: Vec<&str> = statements.iter().map(|s| s.partner_id.as_str()).collect();
         assert_eq!(
@@ -6006,6 +6158,7 @@ mod tests {
             FORM_TAX_YEAR,
             &req.partners,
             &components,
+            crate::tax::allocate::Basis::ProfitOrLoss,
         );
         assert_eq!(statements.len(), 3, "{statements:?}");
         assert_eq!(

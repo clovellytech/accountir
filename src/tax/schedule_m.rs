@@ -121,6 +121,9 @@ mod m1 {
 /// Schedule M-2.
 mod m2 {
     pub const L1_BEGIN: &str = "f6_142[0]";
+    /// Line 2a, capital contributed in cash. Line 2b, property, is left alone:
+    /// the books record what a contribution was worth, not what it was paid in.
+    pub const L2A_CASH: &str = "f6_143[0]";
     pub const L3_NET_INCOME: &str = "f6_145[0]";
     pub const L4_ITEMIZE: &str = "f6_146[0]";
     pub const L4_AMOUNT: &str = "f6_147[0]";
@@ -166,6 +169,12 @@ pub struct ScheduleM {
     // --- M-2 ---
     /// Line 1. Partners' capital at the start of the year.
     pub capital_begin: i64,
+    /// Line 2. Capital the partners contributed during the year — their linked
+    /// contribution accounts' movements, which is item L row 2 summed.
+    ///
+    /// Left out, every contribution fell into the unexplained increase, and the
+    /// nondeductible expenses it overwhelmed could never be named on line 7.
+    pub contributions: i64,
     /// Line 6a. Cash distributions — Schedule K line 19a.
     pub distributions_cash: i64,
     /// Line 6b. Property distributions — Schedule K line 19b.
@@ -225,7 +234,7 @@ impl ScheduleM {
 
     /// M-2 line 5. Add lines 1 through 4.
     pub fn m2_line_5(&self) -> i64 {
-        self.capital_begin + self.analysis + self.m2_other_increase()
+        self.capital_begin + self.contributions + self.analysis + self.m2_other_increase()
     }
 
     /// M-2 line 8. Add lines 6 and 7.
@@ -248,7 +257,7 @@ impl ScheduleM {
         if !self.has_balance_sheet {
             return 0;
         }
-        let without_adjustment = self.capital_begin + self.analysis
+        let without_adjustment = self.capital_begin + self.contributions + self.analysis
             - self.distributions_cash
             - self.distributions_property;
         self.capital_end_per_books - without_adjustment
@@ -318,6 +327,7 @@ pub fn reconcile(
     lines: &Form1065Lines,
     schedule_l: Option<&ScheduleL>,
     nondeductible: i64,
+    contributions: i64,
 ) -> ScheduleM {
     let book_income = super::lines::cents_to_dollars(book_income_cents);
     let guaranteed_payments = lines.k_line_4c();
@@ -338,6 +348,7 @@ pub fn reconcile(
         book_tax_difference: analysis - book_income - guaranteed_payments,
         nondeductible,
         capital_begin,
+        contributions,
         distributions_cash: lines.get("k19a"),
         distributions_property: lines.get("k19b"),
         capital_end_per_books,
@@ -443,6 +454,9 @@ pub fn fill(
     if m.has_balance_sheet {
         set_text(doc, map, m2::L1_BEGIN, &money(m.capital_begin))?;
     }
+    if m.contributions != 0 {
+        set_text(doc, map, m2::L2A_CASH, &money(m.contributions))?;
+    }
     set_text(doc, map, m2::L3_NET_INCOME, &money(m.analysis))?;
     if m.distributions_cash != 0 {
         set_text(doc, map, m2::L6A_CASH, &money(m.distributions_cash))?;
@@ -545,7 +559,7 @@ mod tests {
         lines.set_for_test("k4a", 30_000); // and reported on Schedule K
 
         // Books: 100,000 revenue less the 30,000 of guaranteed payments.
-        let m = reconcile(70_000_00, &lines, None, 0);
+        let m = reconcile(70_000_00, &lines, None, 0, 0);
         assert_eq!(m.book_income, 70_000);
         assert_eq!(m.guaranteed_payments, 30_000);
         assert_eq!(m.analysis, lines.k_analysis());
@@ -565,7 +579,7 @@ mod tests {
         lines.set_for_test("l1a", 100_000);
         // Books say 60,000 but the return computes 100,000 — a 40,000 difference,
         // say half a year of meals disallowed.
-        let m = reconcile(60_000_00, &lines, None, 0);
+        let m = reconcile(60_000_00, &lines, None, 0, 0);
         assert_eq!(m.book_tax_difference, 40_000);
 
         let (mut doc, map) = form();
@@ -594,7 +608,7 @@ mod tests {
         {
             let mut lines = Form1065Lines::default();
             lines.set_for_test("l1a", 100_000);
-            let m = reconcile(book_cents, &lines, None, 0);
+            let m = reconcile(book_cents, &lines, None, 0, 0);
             assert_eq!(
                 m.m1_line_5() - m.m1_line_8(),
                 m.analysis,
@@ -614,7 +628,7 @@ mod tests {
         lines.set_for_test("l1a", 30_000);
         lines.set_for_test("k19a", 12_000); // cash distributions
 
-        let m = reconcile(30_000_00, &lines, Some(&l), 0);
+        let m = reconcile(30_000_00, &lines, Some(&l), 0, 0);
         assert_eq!(m.capital_begin, 100_000);
         assert_eq!(m.distributions_cash, 12_000);
         // 100,000 + 30,000 - 12,000 = 118,000, which is what the books say.
@@ -634,7 +648,7 @@ mod tests {
         lines.set_for_test("l1a", 30_000);
         lines.set_for_test("k19a", 12_000);
 
-        let m = reconcile(30_000_00, &lines, Some(&l), 0);
+        let m = reconcile(30_000_00, &lines, Some(&l), 0, 0);
         assert_eq!(m.m2_line_9(), 143_000, "line 9 must still tie");
         assert!(m.m2_ties_to_the_balance_sheet());
 
@@ -658,7 +672,7 @@ mod tests {
 
         let mut lines = Form1065Lines::default();
         lines.set_for_test("l1a", 30_000);
-        let m = reconcile(30_000_00, &lines, Some(&l), 0);
+        let m = reconcile(30_000_00, &lines, Some(&l), 0, 0);
 
         let (mut doc, map) = form();
         fill(&mut doc, &map, &m, true).unwrap();
@@ -676,7 +690,7 @@ mod tests {
     /// page must say so rather than start from zero as though that were a fact.
     #[test]
     fn no_balance_sheet_means_m2_says_it_cannot_open() {
-        let m = reconcile(30_000_00, &Form1065Lines::default(), None, 0);
+        let m = reconcile(30_000_00, &Form1065Lines::default(), None, 0, 0);
         assert!(!m.has_balance_sheet);
 
         let (mut doc, map) = form();
@@ -691,7 +705,7 @@ mod tests {
     /// Completed under the exemption, with a note — not left blank.
     #[test]
     fn the_exemption_completes_the_pages_and_says_they_were_optional() {
-        let m = reconcile(30_000_00, &Form1065Lines::default(), None, 0);
+        let m = reconcile(30_000_00, &Form1065Lines::default(), None, 0, 0);
         let (mut doc, map) = form();
         let warnings = fill(&mut doc, &map, &m, false).unwrap();
 
@@ -747,8 +761,8 @@ mod tests {
                     lines.set_for_test("k19a", 12_000);
                     lines.set_for_test("k18c", nondeductible);
 
-                    let named = reconcile(book_cents, &lines, sheet, nondeductible);
-                    let anonymous = reconcile(book_cents, &lines, sheet, 0);
+                    let named = reconcile(book_cents, &lines, sheet, nondeductible, 0);
+                    let anonymous = reconcile(book_cents, &lines, sheet, 0, 0);
                     let case =
                         format!("books {book_cents}, capital {end_capital:?}, 18c {nondeductible}");
 
@@ -852,7 +866,7 @@ mod tests {
         lines.set_for_test("k18c", 140);
         // Books bear the whole meal; the return adds back the disallowed half,
         // and nothing else differs.
-        let m = reconcile(99_860_00, &lines, None, 140);
+        let m = reconcile(99_860_00, &lines, None, 140, 0);
 
         assert_eq!(m.book_tax_difference, 140);
         assert_eq!(m.m1_named(), 140);
@@ -889,7 +903,7 @@ mod tests {
         let mut lines = Form1065Lines::default();
         lines.set_for_test("l1a", 100_000);
         lines.set_for_test("k18c", 140);
-        let m = reconcile(60_000_00, &lines, None, 140);
+        let m = reconcile(60_000_00, &lines, None, 140, 0);
 
         assert_eq!(m.book_tax_difference, 40_000);
         assert_eq!(m.m1_named(), 140);
@@ -925,7 +939,7 @@ mod tests {
         let mut lines = Form1065Lines::default();
         lines.set_for_test("l1a", 100_000);
         lines.set_for_test("k18c", 140);
-        let m = reconcile(140_000_00, &lines, None, 140);
+        let m = reconcile(140_000_00, &lines, None, 140, 0);
 
         assert!(m.book_tax_difference < 0);
         assert_eq!(m.m1_named(), 0, "the additions side is empty");
@@ -947,7 +961,7 @@ mod tests {
         lines.set_for_test("l1a", 30_000);
         lines.set_for_test("k18c", 140);
 
-        let m = reconcile(30_000_00, &lines, Some(&l), 140);
+        let m = reconcile(30_000_00, &lines, Some(&l), 140, 0);
         assert_eq!(m.m2_named_decrease(), 140);
         assert_eq!(m.m2_unexplained_decrease(), 29_860);
 
@@ -976,6 +990,25 @@ mod tests {
             Some("100,000")
         );
         crate::tax::warning_shape::assert_all(&warnings);
+    }
+
+    /// Contributions are line 2, not an unexplained increase — and with them out of
+    /// the way the nondeductible expenses show on line 7 by name. Bunny Ears' 2023:
+    /// $73,500 paid in, a (7,156) return, $209 of disallowed meals, and $66,135 of
+    /// capital at year end.
+    #[test]
+    fn contributions_are_line_2_and_the_nondeductible_decrease_is_named() {
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l21", 7_156);
+        let mut l = ScheduleL::default();
+        l.set_for_test("sl21", 0, 66_135);
+
+        let m = reconcile(-7_365_00, &lines, Some(&l), 209, 73_500);
+        assert_eq!(m.m2_line_5(), 73_500 - 7_156);
+        assert_eq!(m.m2_named_decrease(), 209);
+        assert_eq!(m.m2_unexplained_decrease(), 0);
+        assert_eq!(m.m2_line_9(), 66_135);
+        assert!(m.m2_ties_to_the_balance_sheet());
     }
 
     #[test]

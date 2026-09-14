@@ -177,6 +177,7 @@ pub fn effective_ppm(
             let shares = p.shares_on(seg.from);
             let ppm = match basis {
                 Basis::Capital => shares.capital_ppm,
+                Basis::Loss => shares.loss_ppm,
                 // Per segment, on that segment's own sign. A year that earned to
                 // June and lost after allocates each part on the percentage that
                 // part calls for.

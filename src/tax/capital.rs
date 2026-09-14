@@ -502,10 +502,12 @@ pub fn compute(
     // evenly and bought its meals in one half of the year. See
     // `varying::allocate_over_year`.
     //
-    // `nondeductible` arrives positive, so this travels on the *profit*
-    // percentages — which is right: the expense was incurred out of the same
-    // year's operations that the profit split divides. It is the negation below,
-    // not the allocation, that turns it into a decrease.
+    // `nondeductible` arrives positive, but it travels on the split the year's
+    // result does — the loss percentages in a loss year — because the books close
+    // the same expenses, inside that result, onto those percentages. Anything else
+    // leaves item L ending on a different capital from the partner's own ledger
+    // account. See `allocate::nondeductible_basis`. It is the negation below, not
+    // the allocation, that turns it into a decrease.
     //
     // Skipped entirely when there is nothing to split, which is most
     // partnerships: the allocator reads the share periods and, on a segmented
@@ -518,7 +520,7 @@ pub fn compute(
             year,
             nondeductible,
             partners,
-            Basis::ProfitOrLoss,
+            super::allocate::nondeductible_basis(net_income),
             super::lines::NONDEDUCTIBLE_LINE,
         )
     };
