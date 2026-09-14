@@ -18,8 +18,8 @@
 //! route nobody intended.
 
 use crate::domain::{
-    is_valid_tin, Address, BusinessProfile, FixedAllocation, Il1065Settings, Partner,
-    PartnerRelationship, PartnerType, RelationshipKind, Residency, Shares,
+    is_valid_tin, Address, BusinessProfile, FixedAllocation, Il1065Settings, LiabilityClass,
+    LiabilityKind, Partner, PartnerRelationship, PartnerType, RelationshipKind, Residency, Shares,
 };
 use crate::events::types::{
     AddressData, BusinessProfileData, Event, EventEnvelope, Il1065SettingsData,
@@ -1037,6 +1037,177 @@ pub(crate) fn build_clear_fixed_allocation_in_txn(
     }))
 }
 
+/// Every liability account's classification for item K.
+///
+/// Empty on books predating migration 045, like fixed allocations: no table is no
+/// classifications, and every liability takes the entity's default. A row whose
+/// kind this crate did not write is skipped rather than guessed at.
+pub fn list_liability_classes(conn: &Connection) -> Vec<LiabilityClass> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT account_id, kind, partner_id, guaranteed, note FROM liability_classifications
+         ORDER BY account_id",
+    ) else {
+        return Vec::new();
+    };
+    let out = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, bool>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map(|rows| {
+            rows.flatten()
+                .filter_map(|(account_id, kind, partner_id, guaranteed, note)| {
+                    Some(LiabilityClass {
+                        account_id,
+                        kind: LiabilityKind::parse(&kind)?,
+                        partner_id,
+                        guaranteed,
+                        note,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out
+}
+
+/// Say how a liability account bears on item K — see `tax::liabilities`.
+///
+/// Setting it again replaces it. `partner_id` names the one partner who bears a
+/// recourse liability (a loan they made, a debt they guaranteed); `guaranteed`
+/// ticks their item K3.
+pub fn set_liability_class(
+    store: &mut EventStore,
+    user_id: &str,
+    account_id: &str,
+    kind: LiabilityKind,
+    partner_id: Option<&str>,
+    guaranteed: bool,
+    note: &str,
+) -> Result<StoredEvent, PartnershipError> {
+    check_set_liability_class_pure(kind, partner_id, guaranteed, note)?;
+    append_checked_locally(store, user_id, |tx| {
+        build_set_liability_class_in_txn(tx, account_id, kind, partner_id, guaranteed, note)
+    })
+}
+
+/// Put a liability back on the kind of entity's default classification.
+pub fn clear_liability_class(
+    store: &mut EventStore,
+    user_id: &str,
+    account_id: &str,
+) -> Result<StoredEvent, PartnershipError> {
+    append_checked_locally(store, user_id, |tx| {
+        build_clear_liability_class_in_txn(tx, account_id)
+    })
+}
+
+/// What is wrong with a liability classification that can be decided without
+/// the books.
+pub fn check_set_liability_class_pure(
+    kind: LiabilityKind,
+    partner_id: Option<&str>,
+    guaranteed: bool,
+    note: &str,
+) -> Result<(), PartnershipError> {
+    if partner_id.is_some() && kind != LiabilityKind::Recourse {
+        return Err(PartnershipError::InvalidData(
+            "Only a recourse liability belongs to one partner — a nonrecourse one is shared on \
+             the profit percentages."
+                .to_string(),
+        ));
+    }
+    if guaranteed && partner_id.is_none() {
+        return Err(PartnershipError::InvalidData(
+            "A guaranteed liability needs the partner who guaranteed it.".to_string(),
+        ));
+    }
+    if note.trim().is_empty() {
+        return Err(PartnershipError::InvalidData(
+            "A liability classification needs a note saying where it comes from — the loan \
+             documents, a guarantee."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Classify a liability account, against write-locked state. The account has to
+/// be a liability, and a named partner has to exist.
+pub(crate) fn build_set_liability_class_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    kind: LiabilityKind,
+    partner_id: Option<&str>,
+    guaranteed: bool,
+    note: &str,
+) -> Result<PartnerStep, EventStoreError> {
+    let account: Option<(String, String)> = tx
+        .query_row(
+            "SELECT name, account_type FROM accounts WHERE id = ?1",
+            [account_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((name, account_type)) = account else {
+        return Ok(PartnerStep::Reject(PartnershipError::InvalidData(format!(
+            "There is no account {account_id}."
+        ))));
+    };
+    if account_type != "liability" {
+        return Ok(PartnerStep::Reject(PartnershipError::InvalidData(format!(
+            "{name} is not a liability account, so it has no place in item K."
+        ))));
+    }
+    if let Some(pid) = partner_id {
+        let exists = tx
+            .query_row("SELECT 1 FROM partners WHERE id = ?1", [pid], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(PartnerStep::Reject(PartnershipError::NoSuchPartner(
+                pid.to_string(),
+            )));
+        }
+    }
+    Ok(PartnerStep::Append(Event::LiabilityClassified {
+        account_id: account_id.to_string(),
+        kind: kind.as_str().to_string(),
+        partner_id: partner_id.map(str::to_string),
+        guaranteed,
+        note: note.trim().to_string(),
+    }))
+}
+
+/// Clear a liability's classification, against write-locked state. Refused when
+/// there is none, for the reason clearing a fixed allocation is.
+pub(crate) fn build_clear_liability_class_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+) -> Result<PartnerStep, EventStoreError> {
+    let exists = tx
+        .query_row(
+            "SELECT 1 FROM liability_classifications WHERE account_id = ?1",
+            [account_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        return Ok(PartnerStep::Reject(PartnershipError::InvalidData(format!(
+            "Account {account_id} has no liability classification to clear."
+        ))));
+    }
+    Ok(PartnerStep::Append(Event::LiabilityClassificationCleared {
+        account_id: account_id.to_string(),
+    }))
+}
+
 /// Every recorded family tie between partners.
 ///
 /// An unreadable row — a relationship word this crate did not write — is skipped
@@ -2030,6 +2201,64 @@ mod tests {
         set_profile(&mut s, "u", &profile()).unwrap();
         let (id, _) = admit_partner(&mut s, "u", &a_partner("Zak")).unwrap();
         (s, id)
+    }
+
+    /// A liability is classified against a real liability account and a real
+    /// partner, a partner only with recourse, a note always; clearing removes it.
+    #[test]
+    fn a_liability_can_be_classified_and_cleared() {
+        let (mut s, zak) = a_partnership_with_one_partner();
+        s.connection()
+            .execute_batch(
+                "INSERT INTO accounts (id, account_type, account_number, name)
+                   VALUES ('loans', 'liability', '6006', 'Loans from partners');
+                 INSERT INTO accounts (id, account_type, account_number, name)
+                   VALUES ('cash', 'asset', '1001', 'Checking');",
+            )
+            .unwrap();
+
+        assert!(
+            set_liability_class(&mut s, "u", "loans", LiabilityKind::Recourse, Some(&zak), false, " ")
+                .is_err(),
+            "a note is required"
+        );
+        assert!(
+            set_liability_class(
+                &mut s,
+                "u",
+                "loans",
+                LiabilityKind::Nonrecourse,
+                Some(&zak),
+                false,
+                "Loan"
+            )
+            .is_err(),
+            "only recourse names a partner"
+        );
+        assert!(
+            set_liability_class(&mut s, "u", "cash", LiabilityKind::Nonrecourse, None, false, "No")
+                .is_err(),
+            "not a liability"
+        );
+        set_liability_class(
+            &mut s,
+            "u",
+            "loans",
+            LiabilityKind::Recourse,
+            Some(&zak),
+            true,
+            "Zak lent it",
+        )
+        .unwrap();
+        let rows = list_liability_classes(s.connection());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, LiabilityKind::Recourse);
+        assert_eq!(rows[0].partner_id.as_deref(), Some(zak.as_str()));
+        assert!(rows[0].guaranteed);
+
+        clear_liability_class(&mut s, "u", "loans").unwrap();
+        assert!(clear_liability_class(&mut s, "u", "loans").is_err());
+        assert!(list_liability_classes(s.connection()).is_empty());
     }
 
     #[test]

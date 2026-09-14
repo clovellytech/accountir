@@ -164,6 +164,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             44,
             include_str!("../../migrations/044_preferred_allocations.sql"),
         ),
+        (
+            45,
+            include_str!("../../migrations/045_liability_classifications.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -761,6 +765,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             updated_at_event INTEGER REFERENCES events(id),
             preferred INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (tax_year, partner_id)
+        );
+
+        -- How a liability account bears on K-1 item K (migration 045).
+        CREATE TABLE IF NOT EXISTS liability_classifications (
+            account_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            partner_id TEXT,
+            guaranteed INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id)
         );
 
         -- Dated since migration 038, like `tax_line_mappings`.

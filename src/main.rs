@@ -329,6 +329,34 @@ enum PartnershipCliCommands {
         #[arg(long)]
         year: Option<i32>,
     },
+
+    /// Say how a liability account bears on K-1 item K
+    ClassifyLiability {
+        /// The liability account, by id or number
+        account: String,
+        /// nonrecourse, qualified-nonrecourse or recourse
+        #[arg(long)]
+        kind: String,
+        /// For a recourse liability: the one partner who bears it. Omit to share
+        /// it on the loss percentages
+        #[arg(long)]
+        partner: Option<String>,
+        /// The partner guaranteed it (item K3)
+        #[arg(long, requires = "partner")]
+        guaranteed: bool,
+        /// Where the classification comes from — required
+        #[arg(long)]
+        note: String,
+    },
+
+    /// Put a liability back on the entity's default classification
+    ClearLiability {
+        /// The liability account, by id or number
+        account: String,
+    },
+
+    /// List the liabilities classified for item K
+    Liabilities,
 }
 
 #[derive(Subcommand)]
@@ -1970,6 +1998,18 @@ fn parse_cli_date(s: &str, what: &str) -> Result<chrono::NaiveDate> {
         .map_err(|_| anyhow::anyhow!("{what} must be YYYY-MM-DD, got {s:?}"))
 }
 
+/// A liability account's id, from its id or its number.
+fn liability_account_id(store: &EventStore, account: &str) -> anyhow::Result<String> {
+    store
+        .connection()
+        .query_row(
+            "SELECT id FROM accounts WHERE id = ?1 OR account_number = ?1",
+            [account],
+            |r| r.get(0),
+        )
+        .map_err(|_| anyhow::anyhow!("no account {account}"))
+}
+
 fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommands) -> Result<()> {
     use accountir::commands::partnership_commands as pc;
     use accountir::commands::share_period_commands as spc;
@@ -2329,6 +2369,66 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
             }
         }
 
+        PartnershipCliCommands::ClassifyLiability {
+            account,
+            kind,
+            partner,
+            guaranteed,
+            note,
+        } => {
+            let account_id = liability_account_id(store, &account)?;
+            let kind = accountir::domain::LiabilityKind::parse(&kind).ok_or_else(|| {
+                anyhow::anyhow!("--kind is nonrecourse, qualified-nonrecourse or recourse")
+            })?;
+            pc::set_liability_class(
+                store,
+                "cli-user",
+                &account_id,
+                kind,
+                partner.as_deref(),
+                guaranteed,
+                &note,
+            )?;
+            println!("{account} is {} for item K.", kind.label());
+        }
+
+        PartnershipCliCommands::ClearLiability { account } => {
+            let account_id = liability_account_id(store, &account)?;
+            pc::clear_liability_class(store, "cli-user", &account_id)?;
+            println!("{account} is back on the entity's default classification.");
+        }
+
+        PartnershipCliCommands::Liabilities => {
+            let rows = pc::list_liability_classes(store.connection());
+            if rows.is_empty() {
+                println!("No liability is classified; every one takes the entity's default.");
+            }
+            for c in &rows {
+                let label: String = store
+                    .connection()
+                    .query_row(
+                        "SELECT account_number || ' ' || name FROM accounts WHERE id = ?1",
+                        [&c.account_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_else(|_| c.account_id.clone());
+                let bearer = c
+                    .partner_id
+                    .as_deref()
+                    .map(|id| {
+                        let name = pc::get_partner(store.connection(), id)
+                            .map(|p| p.name)
+                            .unwrap_or_else(|| id.to_string());
+                        format!(
+                            " to {name}{}",
+                            if c.guaranteed { ", guaranteed" } else { "" }
+                        )
+                    })
+                    .unwrap_or_default();
+                println!("  {label}: {}{bearer} — {}", c.kind.label(), c.note);
+            }
+        }
+
         PartnershipCliCommands::Relationships => {
             let rels = pc::list_relationships(store.connection());
             if rels.is_empty() {
@@ -2465,6 +2565,7 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
                     options: Default::default(),
                     book_income_cents: 0,
                     fixed_allocations: Vec::new(),
+                    liabilities: Default::default(),
                 },
             )?;
 

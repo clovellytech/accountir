@@ -564,6 +564,66 @@ pub struct FixedAllocation {
     pub note: String,
 }
 
+/// How a liability bears on Schedule K-1 item K, under §752.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiabilityKind {
+    /// No partner bears the economic risk of loss; shared on the profit
+    /// percentages.
+    Nonrecourse,
+    /// Nonrecourse financing secured by real property from a qualified lender
+    /// (§465(b)(6)).
+    QualifiedNonrecourse,
+    /// A partner bears the economic risk of loss — they guaranteed or lent it,
+    /// or the partnership is a general one.
+    Recourse,
+}
+
+impl LiabilityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LiabilityKind::Nonrecourse => "nonrecourse",
+            LiabilityKind::QualifiedNonrecourse => "qualified_nonrecourse",
+            LiabilityKind::Recourse => "recourse",
+        }
+    }
+
+    /// Accepts the stored words, and hyphens for underscores as typed.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "nonrecourse" => Some(LiabilityKind::Nonrecourse),
+            "qualified_nonrecourse" => Some(LiabilityKind::QualifiedNonrecourse),
+            "recourse" => Some(LiabilityKind::Recourse),
+            _ => None,
+        }
+    }
+
+    /// As item K's rows name it.
+    pub fn label(self) -> &'static str {
+        match self {
+            LiabilityKind::Nonrecourse => "nonrecourse",
+            LiabilityKind::QualifiedNonrecourse => "qualified nonrecourse financing",
+            LiabilityKind::Recourse => "recourse",
+        }
+    }
+}
+
+/// A liability account's classification for item K, recorded where the kind of
+/// entity's default does not hold: a loan a partner made or guaranteed, financing
+/// that qualifies under §465(b)(6).
+///
+/// `partner_id` names the one partner who bears a recourse liability; without it
+/// a recourse liability is shared on the loss percentages. `guaranteed` ticks
+/// that partner's item K3. The note is required — a classification is a statement
+/// about loan documents somebody may have to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiabilityClass {
+    pub account_id: String,
+    pub kind: LiabilityKind,
+    pub partner_id: Option<String>,
+    pub guaranteed: bool,
+    pub note: String,
+}
+
 impl Partner {
     /// Whether the partner held an interest at any point in a tax year.
     ///

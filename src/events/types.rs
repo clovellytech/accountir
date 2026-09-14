@@ -396,6 +396,23 @@ pub enum Event {
         tax_year: i32,
         partner_id: String,
     },
+    /// How a liability account bears on Schedule K-1 item K: nonrecourse,
+    /// qualified nonrecourse financing, or recourse — to one partner, or on the
+    /// loss percentages when none is named. See `domain::LiabilityClass`.
+    LiabilityClassified {
+        account_id: String,
+        /// "nonrecourse", "qualified_nonrecourse" or "recourse".
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partner_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        guaranteed: bool,
+        note: String,
+    },
+    /// The liability goes back to the kind of entity's default classification.
+    LiabilityClassificationCleared {
+        account_id: String,
+    },
     /// An account created in error is removed from the chart entirely.
     ///
     /// Distinct from deactivating. A deactivated account is one that *was* used
@@ -908,6 +925,8 @@ impl Event {
             Event::PartnerEquityAccountUnlinked { .. } => "partner_equity_account_unlinked",
             Event::PartnerAllocationFixed { .. } => "partner_allocation_fixed",
             Event::PartnerAllocationCleared { .. } => "partner_allocation_cleared",
+            Event::LiabilityClassified { .. } => "liability_classified",
+            Event::LiabilityClassificationCleared { .. } => "liability_classification_cleared",
             Event::AccountDeleted { .. } => "account_deleted",
             Event::TaxDeductionLimitSet { .. } => "tax_deduction_limit_set",
             Event::TaxDeductionLimitCleared { .. } => "tax_deduction_limit_cleared",
@@ -988,6 +1007,8 @@ impl Event {
             Event::PartnerEquityAccountUnlinked { partner_id, .. } => Some(partner_id),
             Event::PartnerAllocationFixed { partner_id, .. } => Some(partner_id),
             Event::PartnerAllocationCleared { partner_id, .. } => Some(partner_id),
+            Event::LiabilityClassified { account_id, .. } => Some(account_id),
+            Event::LiabilityClassificationCleared { account_id } => Some(account_id),
             Event::AccountDeleted { account_id } => Some(account_id),
             Event::TaxDeductionLimitSet { account_id, .. } => Some(account_id),
             Event::TaxDeductionLimitCleared { account_id, .. } => Some(account_id),

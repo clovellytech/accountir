@@ -173,6 +173,34 @@ impl<'a> Projector<'a> {
                     params![tax_year, partner_id],
                 )?;
             }
+            Event::LiabilityClassified {
+                account_id,
+                kind,
+                partner_id,
+                guaranteed,
+                note,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO liability_classifications
+                       (account_id, kind, partner_id, guaranteed, note, updated_at,
+                        updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6)
+                     ON CONFLICT(account_id) DO UPDATE SET
+                       kind = excluded.kind,
+                       partner_id = excluded.partner_id,
+                       guaranteed = excluded.guaranteed,
+                       note = excluded.note,
+                       updated_at = excluded.updated_at,
+                       updated_at_event = excluded.updated_at_event",
+                    params![account_id, kind, partner_id, guaranteed, note, stored_event.id],
+                )?;
+            }
+            Event::LiabilityClassificationCleared { account_id } => {
+                self.conn.execute(
+                    "DELETE FROM liability_classifications WHERE account_id = ?1",
+                    params![account_id],
+                )?;
+            }
             Event::AccountDeleted { account_id } => {
                 // The command refuses unless nothing points at the account, so
                 // by the time this runs there is only the row itself to remove.
@@ -1315,6 +1343,7 @@ impl<'a> Projector<'a> {
              -- the log no longer justifies.
              DELETE FROM partner_relationships;
              DELETE FROM partner_fixed_allocations;
+             DELETE FROM liability_classifications;
              DELETE FROM il1065_settings;
              -- The asset register (migration 030). Derived from the log like the
              -- rest: an asset no event justifies would otherwise keep claiming

@@ -453,6 +453,38 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::PartnerAllocationCleared { partner_id, .. } => {
             validate_non_empty(partner_id, "partner_id")?;
         }
+        Event::LiabilityClassified {
+            account_id,
+            kind,
+            partner_id,
+            guaranteed,
+            note,
+        } => {
+            validate_non_empty(account_id, "account_id")?;
+            // A classification is a statement about loan documents.
+            validate_non_empty(note, "note")?;
+            match crate::domain::LiabilityKind::parse(kind) {
+                None => {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "kind: {kind:?} is not nonrecourse, qualified_nonrecourse or recourse"
+                    )))
+                }
+                Some(k) if partner_id.is_some() && k != crate::domain::LiabilityKind::Recourse => {
+                    return Err(ValidationError::InvalidValue(
+                        "partner_id: only a recourse liability belongs to one partner".to_string(),
+                    ))
+                }
+                _ => {}
+            }
+            if *guaranteed && partner_id.is_none() {
+                return Err(ValidationError::InvalidValue(
+                    "guaranteed: a guarantee needs the partner who gave it".to_string(),
+                ));
+            }
+        }
+        Event::LiabilityClassificationCleared { account_id } => {
+            validate_non_empty(account_id, "account_id")?;
+        }
         Event::ScheduleBAnswerSet {
             tax_year,
             answer_key,

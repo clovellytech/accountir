@@ -23,7 +23,7 @@ use super::commands::event_service::{
 };
 use super::commands::partnership::{
     AdmitPartnerRequest, AdmitPartnerResponse, ClearRelationshipRequest, LinkEquityAccountRequest,
-    SetBusinessProfileRequest, SetIl1065SettingsRequest, SetPartnerSharesRequest, SetFixedAllocationRequest, ClearFixedAllocationRequest,
+    SetBusinessProfileRequest, SetIl1065SettingsRequest, SetPartnerSharesRequest, SetFixedAllocationRequest, ClearFixedAllocationRequest, SetLiabilityClassRequest, ClearLiabilityClassRequest,
     SetRelationshipRequest, UnlinkEquityAccountRequest, UpdatePartnerRequest,
     WithdrawPartnerRequest,
 };
@@ -1930,6 +1930,44 @@ impl SyncClient {
                 expected_head_seq: head,
                 tax_year,
                 partner_id: partner_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Say how a liability account bears on K-1 item K.
+    pub async fn set_liability_class(
+        &mut self,
+        account_id: impl Into<String>,
+        kind: crate::domain::LiabilityKind,
+        partner_id: Option<String>,
+        guaranteed: bool,
+        note: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (account_id, note) = (account_id.into(), note.into());
+        self.submit_retrying("/sync/commands/set-liability-class", |head| {
+            SetLiabilityClassRequest {
+                expected_head_seq: head,
+                account_id: account_id.clone(),
+                kind: kind.as_str().to_string(),
+                partner_id: partner_id.clone(),
+                guaranteed,
+                note: note.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Put a liability back on the entity's default classification.
+    pub async fn clear_liability_class(
+        &mut self,
+        account_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let account_id = account_id.into();
+        self.submit_retrying("/sync/commands/clear-liability-class", |head| {
+            ClearLiabilityClassRequest {
+                expected_head_seq: head,
+                account_id: account_id.clone(),
             }
         })
         .await

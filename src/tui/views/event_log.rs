@@ -455,6 +455,26 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             "Partner {}'s share of {tax_year} back on their percentages",
             widgets::truncate(partner_id, 8)
         ),
+        Event::LiabilityClassified {
+            account_id,
+            kind,
+            partner_id,
+            guaranteed,
+            note,
+        } => format!(
+            "Liability {} is {}{}{} — {note}",
+            widgets::truncate(account_id, 8),
+            kind.replace('_', " "),
+            partner_id
+                .as_deref()
+                .map(|p| format!(" to partner {}", widgets::truncate(p, 8)))
+                .unwrap_or_default(),
+            if *guaranteed { ", guaranteed" } else { "" }
+        ),
+        Event::LiabilityClassificationCleared { account_id } => format!(
+            "Liability {} back on the default classification",
+            widgets::truncate(account_id, 8)
+        ),
         Event::AccountDeleted { account_id } => {
             format!("Account {} deleted", widgets::truncate(account_id, 8))
         }

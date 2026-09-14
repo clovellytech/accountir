@@ -51,6 +51,8 @@
 
 use crate::commands::partnership_commands::{
     build_admit_partner_in_txn, build_clear_fixed_allocation_in_txn,
+    build_clear_liability_class_in_txn, build_set_liability_class_in_txn,
+    check_set_liability_class_pure,
     build_clear_relationship_in_txn, build_set_fixed_allocation_in_txn,
     check_set_fixed_allocation_pure, build_link_equity_account_in_txn,
     build_set_il1065_settings_event, build_set_profile_event, build_set_relationship_in_txn,
@@ -98,6 +100,14 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/clear-fixed-allocation",
             post(submit_clear_fixed_allocation),
+        )
+        .route(
+            "/sync/commands/set-liability-class",
+            post(submit_set_liability_class),
+        )
+        .route(
+            "/sync/commands/clear-liability-class",
+            post(submit_clear_liability_class),
         )
         .route(
             "/sync/commands/link-equity-account",
@@ -495,6 +505,81 @@ async fn submit_clear_fixed_allocation(
         .append_checked(
             req.expected_head_seq,
             move |tx| match build_clear_fixed_allocation_in_txn(tx, req.tax_year, &req.partner_id)? {
+                PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SetLiabilityClassRequest {
+    pub expected_head_seq: i64,
+    pub account_id: String,
+    /// "nonrecourse", "qualified_nonrecourse" or "recourse".
+    pub kind: String,
+    /// The one partner who bears a recourse liability.
+    #[serde(default)]
+    pub partner_id: Option<String>,
+    #[serde(default)]
+    pub guaranteed: bool,
+    pub note: String,
+}
+
+/// Say how a liability account bears on item K.
+async fn submit_set_liability_class(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetLiabilityClassRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let kind = crate::domain::LiabilityKind::parse(&req.kind).ok_or_else(|| {
+        ApiError::domain(PartnershipError::InvalidData(format!(
+            "{:?} is not nonrecourse, qualified_nonrecourse or recourse.",
+            req.kind
+        )))
+    })?;
+    check_set_liability_class_pure(kind, req.partner_id.as_deref(), req.guaranteed, &req.note)
+        .map_err(ApiError::domain)?;
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_set_liability_class_in_txn(
+                tx,
+                &req.account_id,
+                kind,
+                req.partner_id.as_deref(),
+                req.guaranteed,
+                &req.note,
+            )? {
+                PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ClearLiabilityClassRequest {
+    pub expected_head_seq: i64,
+    pub account_id: String,
+}
+
+/// Put a liability back on the entity's default classification.
+async fn submit_clear_liability_class(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<ClearLiabilityClassRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_clear_liability_class_in_txn(tx, &req.account_id)? {
                 PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
                 PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
             },

@@ -513,6 +513,20 @@ mod k1 {
     pub const L_WITHDRAWN: &str = "f1_30[0]";
     pub const L_ENDING: &str = "f1_31[0]";
 
+    // --- Item K: the partner's share of liabilities ---
+    //
+    // The same boxes on every revision carried: nonrecourse, qualified
+    // nonrecourse financing and recourse, beginning then ending, down the left
+    // column, and K3's guarantee box. K2 (lower-tier partnerships) is left alone:
+    // the books hold no interest in another partnership to report through it.
+    pub const K_NONRECOURSE_BEGIN: &str = "f1_20[0]";
+    pub const K_NONRECOURSE_END: &str = "f1_21[0]";
+    pub const K_QUALIFIED_BEGIN: &str = "f1_22[0]";
+    pub const K_QUALIFIED_END: &str = "f1_23[0]";
+    pub const K_RECOURSE_BEGIN: &str = "f1_24[0]";
+    pub const K_RECOURSE_END: &str = "f1_25[0]";
+    pub const K_GUARANTEED: &str = "c1_10[0]";
+
     // --- The tax-year space, for a short tax year only ---
     //
     // "For calendar year 2025, or tax year beginning __/__/2025 ending __/__/____".
@@ -529,14 +543,6 @@ mod k1 {
     // Named here rather than left unmentioned, because "there is no constant for
     // it" and "we decided not to fill it" look identical from outside, and the
     // second is the one that has been reviewed.
-    //
-    // Item K (`f1_20`-`f1_25`) is the partner's share of partnership liabilities,
-    // split three ways — nonrecourse, qualified nonrecourse financing, recourse.
-    // The books hold the liabilities but not that classification: which of the
-    // three a loan is depends on who bears the economic risk of loss under
-    // §752, which lives in the loan documents and the partnership agreement. A
-    // total split on the profit percentage would land in real boxes, foot against
-    // Schedule L, and be an assertion about guarantees nobody made.
     //
     // Item N (`f1_32`, `f1_33`) is net unrecognized §704(c) gain or loss, which
     // needs each contributed asset's basis *and* its fair market value on the day
@@ -793,6 +799,15 @@ pub struct ReturnRequest {
     /// from the books by [`build_return_from_ledger`] when the caller leaves it
     /// empty, the way the asset register is. See `allocate::split_fixed`.
     pub fixed_allocations: Vec<crate::domain::FixedAllocation>,
+    /// Each partner's share of the partnership's liabilities — Schedule K-1 item
+    /// K.
+    ///
+    /// Default-empty like [`capital`], and filled by [`build_return_from_ledger`]
+    /// from Schedule L's liabilities and the classifications on file. See
+    /// [`super::liabilities`].
+    ///
+    /// [`capital`]: ReturnRequest::capital
+    pub liabilities: super::liabilities::ItemK,
 }
 
 /// Choices about the return that are not facts about the partnership.
@@ -890,6 +905,14 @@ pub fn build_return_from_ledger(
     if owned.fixed_allocations.is_empty() {
         owned.fixed_allocations =
             crate::commands::partnership_commands::list_fixed_allocations(conn);
+    }
+    if owned.liabilities.is_empty() {
+        owned.liabilities = super::liabilities::for_return(
+            conn,
+            req.year,
+            &req.partners,
+            req.schedule_b.get("b1"),
+        );
     }
     if owned.capital.is_empty() {
         owned.capital = super::capital::for_return(
@@ -1211,6 +1234,7 @@ fn build_return_inner(
     // any one partner. The per-partner ones — an unsupported loss, a partner with
     // no accounts linked — come out of `fill_k1` beside the K-1 they concern.
     warnings.extend(req.capital.warnings());
+    warnings.extend(req.liabilities.warnings.iter().cloned());
 
     // Split Schedule K before any K-1 is built, so every partner's share comes
     // out of one apportionment and the shares add back to the totals above.
@@ -1290,6 +1314,15 @@ fn build_return_inner(
             filing,
             &shares[i],
             req.capital.for_partner(&filing.partner.partner_id),
+            req.liabilities
+                .any
+                .then(|| {
+                    req.liabilities
+                        .for_partner(&filing.partner.partner_id)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .as_ref(),
             qbi_shares.get(i),
             year_start,
             year_end,
@@ -2369,6 +2402,7 @@ fn fill_k1(
     filing: &PartnerFiling,
     shares: &PartnerShares,
     capital: Option<&super::capital::CapitalAccount>,
+    liabilities: Option<&super::liabilities::PartnerLiabilities>,
     qbi: Option<&super::qbi::Share>,
     year_start: NaiveDate,
     year_end: NaiveDate,
@@ -2458,6 +2492,27 @@ fn fill_k1(
             write_money(doc, map, field, dollars, &mut warnings)?;
         }
         warnings.extend(cap.warnings());
+    }
+
+    // --- Item K: the partner's share of liabilities ---
+    //
+    // All six boxes once the partnership owed anything, zeros included, for the
+    // reason item L writes all six rows. `None` is a partnership with no
+    // liabilities, or a return built without a ledger.
+    if let Some(k) = liabilities {
+        for (field, dollars) in [
+            (k1::K_NONRECOURSE_BEGIN, k.nonrecourse.begin),
+            (k1::K_NONRECOURSE_END, k.nonrecourse.end),
+            (k1::K_QUALIFIED_BEGIN, k.qualified_nonrecourse.begin),
+            (k1::K_QUALIFIED_END, k.qualified_nonrecourse.end),
+            (k1::K_RECOURSE_BEGIN, k.recourse.begin),
+            (k1::K_RECOURSE_END, k.recourse.end),
+        ] {
+            write_money(doc, map, field, dollars, &mut warnings)?;
+        }
+        if k.guaranteed {
+            set_check(doc, map, k1::K_GUARANTEED, k1::ON)?;
+        }
     }
 
     for (line_key, field) in k1::PART_III {
@@ -2631,6 +2686,7 @@ mod tests {
             options: Default::default(),
             book_income_cents: 0,
             fixed_allocations: Vec::new(),
+            liabilities: Default::default(),
         }
     }
 
@@ -3022,6 +3078,13 @@ mod tests {
             k1::L_OTHER,
             k1::L_WITHDRAWN,
             k1::L_ENDING,
+            k1::K_NONRECOURSE_BEGIN,
+            k1::K_NONRECOURSE_END,
+            k1::K_QUALIFIED_BEGIN,
+            k1::K_QUALIFIED_END,
+            k1::K_RECOURSE_BEGIN,
+            k1::K_RECOURSE_END,
+            k1::K_GUARANTEED,
         ] {
             assert!(
                 smap.find(name).is_some(),
@@ -3603,6 +3666,7 @@ mod tests {
             options: Default::default(),
             book_income_cents: 0,
             fixed_allocations: Vec::new(),
+            liabilities: Default::default(),
         };
 
         // Admitted during the year, so nothing to say yet.
@@ -6636,5 +6700,45 @@ mod tests {
                 .as_deref(),
             Some("6,500")
         );
+    }
+
+    /// Item K reaches each partner's own K-1: all six boxes, zeros included, and
+    /// the guarantee box only for the partner who gave one.
+    #[test]
+    fn item_k_reaches_each_k1_and_ticks_the_guarantee_box() {
+        use crate::tax::liabilities::{ItemK, PartnerLiabilities};
+        use crate::tax::schedule_l::Period;
+
+        let mut req = two_partner_request();
+        req.liabilities = ItemK {
+            partners: vec![
+                PartnerLiabilities {
+                    partner_id: "alice".into(),
+                    nonrecourse: Period { begin: 2_129, end: 2_450 },
+                    ..Default::default()
+                },
+                PartnerLiabilities {
+                    partner_id: "bob".into(),
+                    nonrecourse: Period { begin: 2_045, end: 2_354 },
+                    recourse: Period { begin: 6_076, end: 0 },
+                    guaranteed: true,
+                    ..Default::default()
+                },
+            ],
+            any: true,
+            warnings: Vec::new(),
+        };
+        let bundle = build_return(&req).unwrap();
+        let doc = Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        let v = |n: usize, field: &str| acroform::get_value_in(&doc, &map, &k1_namespace(n), field);
+
+        assert_eq!(v(1, k1::K_NONRECOURSE_BEGIN).as_deref(), Some("2,129"));
+        assert_eq!(v(1, k1::K_NONRECOURSE_END).as_deref(), Some("2,450"));
+        assert_eq!(v(1, k1::K_RECOURSE_BEGIN).as_deref(), Some("0"));
+        assert_eq!(v(2, k1::K_RECOURSE_BEGIN).as_deref(), Some("6,076"));
+        assert_eq!(v(2, k1::K_NONRECOURSE_END).as_deref(), Some("2,354"));
+        assert_eq!(v(2, k1::K_GUARANTEED).as_deref(), Some("/1"));
+        assert_ne!(v(1, k1::K_GUARANTEED).as_deref(), Some("/1"));
     }
 }
