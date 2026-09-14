@@ -855,7 +855,7 @@ pub(crate) fn build_unlink_equity_account_in_txn(
 /// divides its years by percentage.
 pub fn list_fixed_allocations(conn: &Connection) -> Vec<FixedAllocation> {
     let Ok(mut stmt) = conn.prepare(
-        "SELECT tax_year, partner_id, amount_cents, note FROM partner_fixed_allocations
+        "SELECT tax_year, partner_id, amount_cents, preferred, note FROM partner_fixed_allocations
          ORDER BY tax_year, amount_cents IS NULL, partner_id",
     ) else {
         return Vec::new();
@@ -866,7 +866,8 @@ pub fn list_fixed_allocations(conn: &Connection) -> Vec<FixedAllocation> {
                 tax_year: r.get(0)?,
                 partner_id: r.get(1)?,
                 amount_cents: r.get(2)?,
-                note: r.get(3)?,
+                preferred: r.get(3)?,
+                note: r.get(4)?,
             })
         })
         .map(|rows| rows.flatten().collect())
@@ -889,11 +890,12 @@ pub fn set_fixed_allocation(
     tax_year: i32,
     partner_id: &str,
     amount_cents: Option<i64>,
+    preferred: bool,
     note: &str,
 ) -> Result<StoredEvent, PartnershipError> {
-    check_set_fixed_allocation_pure(tax_year, note)?;
+    check_set_fixed_allocation_pure(tax_year, amount_cents, preferred, note)?;
     append_checked_locally(store, user_id, |tx| {
-        build_set_fixed_allocation_in_txn(tx, tax_year, partner_id, amount_cents, note)
+        build_set_fixed_allocation_in_txn(tx, tax_year, partner_id, amount_cents, preferred, note)
     })
 }
 
@@ -910,7 +912,19 @@ pub fn clear_fixed_allocation(
 }
 
 /// What is wrong with a fixed allocation that can be decided without the books.
-pub fn check_set_fixed_allocation_pure(tax_year: i32, note: &str) -> Result<(), PartnershipError> {
+pub fn check_set_fixed_allocation_pure(
+    tax_year: i32,
+    amount_cents: Option<i64>,
+    preferred: bool,
+    note: &str,
+) -> Result<(), PartnershipError> {
+    if preferred && amount_cents.is_none() {
+        return Err(PartnershipError::InvalidData(
+            "A preferred share needs an amount — the partner takes that much of the year's income \
+             first, and the rest is divided on the percentages."
+                .to_string(),
+        ));
+    }
     if note.trim().is_empty() {
         return Err(PartnershipError::InvalidData(
             "A fixed allocation needs a note saying where it comes from — the partnership \
@@ -936,6 +950,7 @@ pub(crate) fn build_set_fixed_allocation_in_txn(
     tax_year: i32,
     partner_id: &str,
     amount_cents: Option<i64>,
+    preferred: bool,
     note: &str,
 ) -> Result<PartnerStep, EventStoreError> {
     let row: Option<(String, String, Option<String>)> = tx
@@ -980,6 +995,7 @@ pub(crate) fn build_set_fixed_allocation_in_txn(
         tax_year,
         partner_id: partner_id.to_string(),
         amount_cents,
+        preferred,
         note: note.trim().to_string(),
     }))
 }
@@ -2123,18 +2139,18 @@ mod tests {
         let (late, _) = admit_partner(&mut s, "u", &late).unwrap();
 
         assert!(
-            set_fixed_allocation(&mut s, "u", 2024, &lois, Some(184_356), " ").is_err(),
+            set_fixed_allocation(&mut s, "u", 2024, &lois, Some(184_356), false, " ").is_err(),
             "a note is required"
         );
         assert!(
-            set_fixed_allocation(&mut s, "u", 2024, &late, Some(1), "Joined in 2025").is_err(),
+            set_fixed_allocation(&mut s, "u", 2024, &late, Some(1), false, "Joined in 2025").is_err(),
             "not a partner in 2024"
         );
-        set_fixed_allocation(&mut s, "u", 2024, &lois, Some(184_356), "Exit terms").unwrap();
-        set_fixed_allocation(&mut s, "u", 2024, &jinny, None, "The rest, per the agreement")
+        set_fixed_allocation(&mut s, "u", 2024, &lois, Some(184_356), false, "Exit terms").unwrap();
+        set_fixed_allocation(&mut s, "u", 2024, &jinny, None, false, "The rest, per the agreement")
             .unwrap();
         assert!(
-            set_fixed_allocation(&mut s, "u", 2024, &lois, None, "Also the rest").is_err(),
+            set_fixed_allocation(&mut s, "u", 2024, &lois, None, false, "Also the rest").is_err(),
             "one remainder a year"
         );
 

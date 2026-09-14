@@ -557,6 +557,10 @@ pub struct FixedAllocation {
     pub partner_id: String,
     /// The fixed share in cents, or `None` for "whatever the fixed shares leave".
     pub amount_cents: Option<i64>,
+    /// The amount is a preferred share: taken first out of the year's income,
+    /// with the rest divided on the percentages among everybody, this partner
+    /// included. A loss year ignores it.
+    pub preferred: bool,
     pub note: String,
 }
 

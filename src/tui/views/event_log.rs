@@ -430,8 +430,14 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             tax_year,
             partner_id,
             amount_cents,
+            preferred,
             note,
         } => match amount_cents {
+            Some(cents) if *preferred => format!(
+                "Partner {} takes the first ${:.2} of {tax_year}, then a percentage share — {note}",
+                widgets::truncate(partner_id, 8),
+                *cents as f64 / 100.0
+            ),
             Some(cents) => format!(
                 "Partner {} takes ${:.2} of {tax_year} — {note}",
                 widgets::truncate(partner_id, 8),

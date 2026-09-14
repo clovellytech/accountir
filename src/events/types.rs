@@ -385,6 +385,10 @@ pub enum Event {
         partner_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         amount_cents: Option<i64>,
+        /// The amount is taken first out of the year's income and the rest is
+        /// divided on the percentages. Absent on events written before it existed.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        preferred: bool,
         note: String,
     },
     /// The partner's share of the year goes back to their percentages.

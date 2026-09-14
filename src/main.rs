@@ -306,6 +306,10 @@ enum PartnershipCliCommands {
         /// They take whatever the fixed amounts leave
         #[arg(long)]
         remainder: bool,
+        /// The amount is taken first out of the year's income, and the rest is
+        /// divided on the percentages
+        #[arg(long, requires = "amount")]
+        preferred: bool,
         /// Where the split comes from — required
         #[arg(long)]
         note: String,
@@ -2259,6 +2263,7 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
             year,
             amount,
             remainder,
+            preferred,
             note,
         } => {
             let amount_cents = match (amount, remainder) {
@@ -2266,8 +2271,21 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
                 (None, true) => None,
                 _ => Err(anyhow::anyhow!("give either --amount or --remainder"))?,
             };
-            pc::set_fixed_allocation(store, "cli-user", year, &partner_id, amount_cents, &note)?;
+            pc::set_fixed_allocation(
+                store,
+                "cli-user",
+                year,
+                &partner_id,
+                amount_cents,
+                preferred,
+                &note,
+            )?;
             match amount_cents {
+                Some(c) if preferred => println!(
+                    "{partner_id} takes the first ${:.2} of {year}'s ordinary income, then a \
+                     percentage share of the rest.",
+                    c as f64 / 100.0
+                ),
                 Some(c) => println!(
                     "{partner_id} takes ${:.2} of {year}'s ordinary income.",
                     c as f64 / 100.0
@@ -2294,6 +2312,12 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
                     .map(|p| p.name)
                     .unwrap_or_else(|| f.partner_id.clone());
                 match f.amount_cents {
+                    Some(c) if f.preferred => println!(
+                        "  {}  {name}: the first ${:.2}, then by percentage — {}",
+                        f.tax_year,
+                        c as f64 / 100.0,
+                        f.note
+                    ),
                     Some(c) => println!(
                         "  {}  {name}: ${:.2} — {}",
                         f.tax_year,

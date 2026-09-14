@@ -1723,9 +1723,9 @@ mod tests {
     fn the_income_row_follows_a_fixed_division_of_the_year() {
         let mut store = books();
         link_all(&mut store);
-        pc::set_fixed_allocation(&mut store, "u", YEAR, "zak", Some(184_356), "Exit terms")
+        pc::set_fixed_allocation(&mut store, "u", YEAR, "zak", Some(184_356), false, "Exit terms")
             .unwrap();
-        pc::set_fixed_allocation(&mut store, "u", YEAR, "jinny", None, "The rest").unwrap();
+        pc::set_fixed_allocation(&mut store, "u", YEAR, "jinny", None, false, "The rest").unwrap();
         let capital = run(&store, 10_000);
         assert_eq!(capital.for_partner("zak").unwrap().net_income, 1_844);
         assert_eq!(capital.for_partner("jinny").unwrap().net_income, 8_156);

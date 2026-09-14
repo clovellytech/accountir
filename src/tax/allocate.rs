@@ -253,6 +253,11 @@ pub fn allocate_on_ppm(total: i64, ppm: &[i64]) -> Vec<Share> {
 
 /// Split `total` where some partners' shares of `year` are fixed in dollars.
 ///
+/// A fixed amount marked `preferred` is taken first out of whatever income the
+/// fixed amounts leave — or all of it, when there is less — and the partner then
+/// shares in the rest on their percentage alongside everybody else. A year with
+/// nothing left to prefer (a loss) ignores the preference.
+///
 /// `None` when none of `partners` has a fixed share of the year, and the
 /// caller's percentage split stands. Otherwise each fixed partner gets their
 /// amount, the partner taking the remainder gets `total` less those, and every
@@ -291,9 +296,27 @@ pub fn split_fixed(
     };
     let mut out: Vec<i64> = mine
         .iter()
-        .map(|f| f.and_then(|f| f.amount_cents).map(unit).unwrap_or(0))
+        .map(|f| {
+            f.filter(|f| !f.preferred)
+                .and_then(|f| f.amount_cents)
+                .map(unit)
+                .unwrap_or(0)
+        })
         .collect();
-    let rest = total - out.iter().sum::<i64>();
+    let mut rest = total - out.iter().sum::<i64>();
+
+    // Preferred shares, out of what is left, while there is income to give.
+    for (i, f) in mine.iter().enumerate() {
+        let Some(amount) = f.filter(|f| f.preferred).and_then(|f| f.amount_cents) else {
+            continue;
+        };
+        if rest <= 0 {
+            break;
+        }
+        let take = unit(amount).clamp(0, rest);
+        out[i] += take;
+        rest -= take;
+    }
 
     if let Some(i) = mine
         .iter()
@@ -307,7 +330,9 @@ pub fn split_fixed(
             .iter()
             .zip(&mine)
             .map(|(p, f)| {
-                if f.is_some() {
+                // A partner with a plain fixed amount takes no part in the rest;
+                // one with a preferred share does.
+                if f.is_some_and(|f| !f.preferred) {
                     return 0;
                 }
                 let s = p.shares_on(year_end);

@@ -1901,6 +1901,7 @@ impl SyncClient {
         tax_year: i32,
         partner_id: impl Into<String>,
         amount_cents: Option<i64>,
+        preferred: bool,
         note: impl Into<String>,
     ) -> Result<i64, SyncClientError> {
         let (partner_id, note) = (partner_id.into(), note.into());
@@ -1910,6 +1911,7 @@ impl SyncClient {
                 tax_year,
                 partner_id: partner_id.clone(),
                 amount_cents,
+                preferred,
                 note: note.clone(),
             }
         })

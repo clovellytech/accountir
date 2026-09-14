@@ -441,6 +441,9 @@ pub struct SetFixedAllocationRequest {
     /// Cents, or absent for the partner who takes the remainder.
     #[serde(default)]
     pub amount_cents: Option<i64>,
+    /// The amount comes first out of the year's income; the rest by percentage.
+    #[serde(default)]
+    pub preferred: bool,
     pub note: String,
 }
 
@@ -451,7 +454,8 @@ async fn submit_set_fixed_allocation(
     State(st): State<SyncState>,
     Json(req): Json<SetFixedAllocationRequest>,
 ) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
-    check_set_fixed_allocation_pure(req.tax_year, &req.note).map_err(ApiError::domain)?;
+    check_set_fixed_allocation_pure(req.tax_year, req.amount_cents, req.preferred, &req.note)
+        .map_err(ApiError::domain)?;
     let mut store = st.store.lock().unwrap();
     let outcome = store
         .append_checked(
@@ -461,6 +465,7 @@ async fn submit_set_fixed_allocation(
                 req.tax_year,
                 &req.partner_id,
                 req.amount_cents,
+                req.preferred,
                 &req.note,
             )? {
                 PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),

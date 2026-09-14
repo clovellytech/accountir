@@ -2051,6 +2051,12 @@ fn split_across_partners(
                 .iter()
                 .find(|f| f.tax_year == year && f.partner_id == p.partner_id)
                 .map(|f| match f.amount_cents {
+                    Some(c) if f.preferred => format!(
+                        "{} the first ${:.2}, then a percentage share of the rest ({})",
+                        p.name,
+                        c as f64 / 100.0,
+                        f.note
+                    ),
                     Some(c) => format!("{} ${:.2} ({})", p.name, c as f64 / 100.0, f.note),
                     None => format!("{} the remainder ({})", p.name, f.note),
                 })
@@ -6341,12 +6347,14 @@ mod tests {
                 tax_year: 2025,
                 partner_id: "bob".into(),
                 amount_cents: Some(184_356),
+                preferred: false,
                 note: "Exit terms".into(),
             },
             crate::domain::FixedAllocation {
                 tax_year: 2025,
                 partner_id: "alice".into(),
                 amount_cents: None,
+                preferred: false,
                 note: "The rest".into(),
             },
         ];
@@ -6360,5 +6368,33 @@ mod tests {
             "{warnings:?}"
         );
         crate::tax::warning_shape::assert_all(&warnings);
+    }
+
+    /// A preferred share comes first out of the year's income, the rest follows
+    /// the percentages with that partner sharing in it, a small year goes wholly
+    /// to the preferred partner, and a loss ignores the preference.
+    #[test]
+    fn a_preferred_share_comes_first_and_the_rest_follows_the_percentages() {
+        use crate::tax::lines::Form1065Lines;
+
+        let req = two_partner_request();
+        let filed: Vec<&PartnerFiling> = req.partners.iter().collect();
+        let fixed = vec![crate::domain::FixedAllocation {
+            tax_year: 2025,
+            partner_id: "alice".into(),
+            amount_cents: Some(600_000),
+            preferred: true,
+            note: "Active member's first $6,000".into(),
+        }];
+        let split = |income: i64, costs: i64| {
+            let mut lines = Form1065Lines::default();
+            lines.set_for_test("l1a", income);
+            lines.set_for_test("l21", costs);
+            let (shares, _) = split_across_partners(&lines, &filed, 2025, &[], &fixed);
+            (shares[0].get("k1"), shares[1].get("k1"))
+        };
+        assert_eq!(split(10_000, 0), (8_000, 2_000), "6,000 first, then 50/50");
+        assert_eq!(split(4_000, 0), (4_000, 0), "less than the preference");
+        assert_eq!(split(10_000, 12_000), (-1_000, -1_000), "a loss ignores it");
     }
 }

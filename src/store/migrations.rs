@@ -160,6 +160,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             43,
             include_str!("../../migrations/043_depreciation_basis_adjustments.sql"),
         ),
+        (
+            44,
+            include_str!("../../migrations/044_preferred_allocations.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -755,6 +759,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             note TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at_event INTEGER REFERENCES events(id),
+            preferred INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (tax_year, partner_id)
         );
 

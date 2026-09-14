@@ -140,18 +140,28 @@ impl<'a> Projector<'a> {
                 tax_year,
                 partner_id,
                 amount_cents,
+                preferred,
                 note,
             } => {
                 self.conn.execute(
                     "INSERT INTO partner_fixed_allocations
-                       (tax_year, partner_id, amount_cents, note, updated_at, updated_at_event)
-                     VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)
+                       (tax_year, partner_id, amount_cents, preferred, note, updated_at,
+                        updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6)
                      ON CONFLICT(tax_year, partner_id) DO UPDATE SET
                        amount_cents = excluded.amount_cents,
+                       preferred = excluded.preferred,
                        note = excluded.note,
                        updated_at = excluded.updated_at,
                        updated_at_event = excluded.updated_at_event",
-                    params![tax_year, partner_id, amount_cents, note, stored_event.id],
+                    params![
+                        tax_year,
+                        partner_id,
+                        amount_cents,
+                        preferred,
+                        note,
+                        stored_event.id
+                    ],
                 )?;
             }
             Event::PartnerAllocationCleared {
