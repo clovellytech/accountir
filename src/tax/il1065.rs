@@ -108,6 +108,12 @@ pub fn supported_years() -> Vec<i32> {
 const REPLACEMENT_TAX_PER_MILLE: i64 = 15;
 /// Illinois' PTE-tax rate, 4.95%, as a numerator over 10_000.
 const PTE_TAX_PER_TEN_THOUSAND: i64 = 495;
+/// Step 7, line 52: the standard exemption, in whole dollars, before line 51's
+/// apportionment fraction.
+const STANDARD_EXEMPTION: i64 = 1_000;
+/// Unmodified base income (Step 3, line 13) above which the standard exemption
+/// is $0.
+const STANDARD_EXEMPTION_CEILING: i64 = 250_000;
 
 /// Illinois Schedule B, Section B prints three members per page; more need a
 /// continuation page, which this does not produce — see [`build`].
@@ -271,6 +277,9 @@ pub struct Figures {
     /// partnership; `None` when apportioning, because it depends on sales figures
     /// the books do not hold.
     pub line47: Option<i64>,
+    /// The standard exemption: $1,000 times line 51, or $0 when unmodified base
+    /// income (line 13) is over $250,000.
+    pub line52: Option<i64>,
     pub line53: Option<i64>,
     pub line54: Option<i64>,
     pub line58: Option<i64>,
@@ -344,6 +353,7 @@ pub fn figures_with(
             line30,
             line35,
             line47: None,
+            line52: None,
             line53: None,
             line54: None,
             line58: None,
@@ -352,13 +362,28 @@ pub fn figures_with(
         };
     }
 
-    // Illinois-only: base income flows straight through Step 7 (no NLD or
-    // exemption for a partnership), and the replacement tax is 1.5% of it. A net
-    // loss owes no tax.
-    let line47 = line35;
-    let line53 = line47; // line 48 NLD = 0, line 52 exemption = 0
-    let taxable = line53.max(0);
-    let line54 = round_rate(taxable, REPLACEMENT_TAX_PER_MILLE, 1000);
+    // Illinois-only: base income flows through Step 7, and the replacement tax is
+    // 1.5% of it after the standard exemption. Line 51 is exactly one, so the
+    // exemption is the whole $1,000 — or nothing when unmodified base income is
+    // over $250,000 — and it never deepens a loss. A first or final short year
+    // keeps the full exemption, per the instructions; a change of year end,
+    // which would prorate it, is not something this program models. A net loss
+    // owes no tax.
+    let line47 = line35; // line 48 NLD = 0, so line 49 is line 47
+    let line52 = if line13 > STANDARD_EXEMPTION_CEILING {
+        0
+    } else {
+        STANDARD_EXEMPTION
+    };
+    let line53 = if line47 <= 0 {
+        line47
+    } else {
+        (line47 - line52).max(0)
+    };
+    let line54 = round_rate(line53.max(0), REPLACEMENT_TAX_PER_MILLE, 1000);
+    // The PTE tax is figured on base income, not on the replacement tax's net
+    // income: the exemption belongs to the replacement tax alone.
+    let taxable = line47.max(0);
     let line58 = line54;
 
     let line61 = if settings.elects_pte_tax {
@@ -386,6 +411,7 @@ pub fn figures_with(
         line30,
         line35,
         line47: Some(line47),
+        line52: Some(line52),
         line53: Some(line53),
         line54: Some(line54),
         line58: Some(line58),
@@ -903,7 +929,13 @@ fn fill_tax(
     // makes 47 and 50 the same figure, so the ratio is exactly one.
     set_text(doc, map, f::L51_RATIO_WHOLE, "1")?;
     set_text(doc, map, f::L51_RATIO_FRAC, "000000")?;
-    write_money(doc, map, f::L52_EXEMPTION, 0, warnings)?; // no exemption for a partnership
+    write_money(
+        doc,
+        map,
+        f::L52_EXEMPTION,
+        figs.line52.expect("il-only figures are complete"),
+        warnings,
+    )?;
     write_money(doc, map, f::L53_NET_INCOME, line53, warnings)?;
 
     write_money(doc, map, f::L54_REPLACEMENT, line54, warnings)?;
@@ -912,7 +944,7 @@ fn fill_tax(
 
     if settings.elects_pte_tax {
         let line61 = figs.line61.expect("il-only figures are complete");
-        write_money(doc, map, f::L60_PTE_INCOME, line53.max(0), warnings)?;
+        write_money(doc, map, f::L60_PTE_INCOME, line47.max(0), warnings)?;
         write_money(doc, map, f::L61_PTE_TAX, line61, warnings)?;
     }
     write_money(doc, map, f::L59_TOTAL_WITHHOLDING, 0, warnings)?;
@@ -1288,11 +1320,33 @@ mod tests {
         assert_eq!(figs.line7, 100_000);
         assert_eq!(figs.line35, 100_000);
         assert_eq!(figs.line47, Some(100_000));
-        // 1.5% of 100,000 = 1,500.
-        assert_eq!(figs.line54, Some(1_500));
-        assert_eq!(figs.line58, Some(1_500));
+        assert_eq!(figs.line52, Some(1_000), "the standard exemption");
+        assert_eq!(figs.line53, Some(99_000));
+        // 1.5% of 99,000 = 1,485.
+        assert_eq!(figs.line54, Some(1_485));
+        assert_eq!(figs.line58, Some(1_485));
         assert_eq!(figs.line61, Some(0));
-        assert_eq!(figs.line62, Some(1_500));
+        assert_eq!(figs.line62, Some(1_485));
+    }
+
+    /// The standard exemption is $1,000, is gone when unmodified base income is
+    /// over $250,000, and never turns a small profit into a loss or deepens one.
+    #[test]
+    fn the_standard_exemption_follows_the_instructions() {
+        let over = figures(&federal_ordinary(250_001), &Il1065Settings::default());
+        assert_eq!(over.line52, Some(0));
+        assert_eq!(over.line53, Some(250_001));
+
+        let at = figures(&federal_ordinary(250_000), &Il1065Settings::default());
+        assert_eq!(at.line52, Some(1_000));
+        assert_eq!(at.line53, Some(249_000));
+
+        let small = figures(&federal_ordinary(600), &Il1065Settings::default());
+        assert_eq!(small.line53, Some(0));
+        assert_eq!(small.line54, Some(0));
+
+        let loss = figures(&federal_ordinary(-40_000), &Il1065Settings::default());
+        assert_eq!(loss.line53, Some(-40_000), "a loss is not increased");
     }
 
     #[test]
@@ -1311,9 +1365,9 @@ mod tests {
             elects_pte_tax: true,
         };
         let figs = figures(&fed, &s);
-        assert_eq!(figs.line54, Some(3_000)); // 1.5%
-        assert_eq!(figs.line61, Some(9_900)); // 4.95% of 200,000
-        assert_eq!(figs.line62, Some(12_900));
+        assert_eq!(figs.line54, Some(2_985)); // 1.5% of 199,000, after the exemption
+        assert_eq!(figs.line61, Some(9_900)); // 4.95% of 200,000 of base income
+        assert_eq!(figs.line62, Some(12_885));
     }
 
     #[test]
@@ -1364,8 +1418,12 @@ mod tests {
             Some("100,000")
         );
         assert_eq!(
+            get_value(&doc, &map, f::L52_EXEMPTION).as_deref(),
+            Some("1,000")
+        );
+        assert_eq!(
             get_value(&doc, &map, f::L54_REPLACEMENT).as_deref(),
-            Some("1,500")
+            Some("1,485")
         );
 
         // Schedule B row 1: the partner and their 60% share of base income.
@@ -1553,7 +1611,7 @@ mod tests {
         );
         assert_eq!(
             get_value(&doc, &map, f::L54_REPLACEMENT).as_deref(),
-            Some("1,500")
+            Some("1,485")
         );
         // The sole partner's 100% share of base income lands on Schedule B.
         assert_eq!(
