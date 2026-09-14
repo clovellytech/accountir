@@ -586,6 +586,16 @@ mod k1 {
     pub const BOX_14_ROWS: [(&str, &str); 2] =
         [("Line14[0]", "f1_60[0]"), ("f1_61[0]", "f1_62[0]")];
 
+    /// Box 20's printed rows, code box then amount box, top to bottom. Codes A and
+    /// B keep the first two rows `CODED_BOXES` gives them; code Z takes the first
+    /// row they leave free.
+    pub const BOX_20_ROWS: [(&str, &str); 4] = [
+        ("Line20[0]", "f1_92[0]"),
+        ("f1_93[0]", "f1_94[0]"),
+        ("f1_95[0]", "f1_96[0]"),
+        ("f1_97[0]", "f1_98[0]"),
+    ];
+
     /// Lines the K-1 reports as a code plus an amount.
     ///
     /// `code` is the letter the IRS assigns, or `None` where the letter depends
@@ -1172,6 +1182,31 @@ fn build_return_inner(
         }
     }
 
+    // --- Section 199A: box 20 code Z on every K-1 ---
+    //
+    // After the split, because a partner's QBI is their box 1 and their shares of
+    // W-2 wages and UBIA are apportioned in proportion to it.
+    let qbi_schedule = super::depreciation::compute_year(&req.assets, req.year);
+    let qbi_totals = super::qbi::totals(lines, &qbi_schedule);
+    let qbi_shares = super::qbi::split(
+        qbi_totals,
+        &shares.iter().map(|s| s.get("k1")).collect::<Vec<_>>(),
+        &shares.iter().map(|s| s.get("k12")).collect::<Vec<_>>(),
+    );
+    if qbi_shares.iter().any(|q| !q.is_empty()) {
+        warnings.push(format!(
+            "Section 199A: every K-1 carries box 20 code Z and a statement of the partner's \
+             qualified business income, W-2 wages ({}) and UBIA of qualified property ({}). \
+             W-2 wages and UBIA are apportioned in proportion to each partner's box 1, the way \
+             wage and depreciation expense travel with the partnership's income. The statements \
+             say the business is not a specified service trade or business and is not aggregated \
+             with another — confirm both, and adjust the statements if the agreement allocates \
+             wages or depreciation differently.",
+            format_dollars(qbi_totals.w2_wages),
+            format_dollars(qbi_totals.ubia)
+        ));
+    }
+
     // --- one K-1 per partner ---
     for (i, filing) in filed.iter().enumerate() {
         let mut sched = Document::load_mem(blanks.sk1)?;
@@ -1187,6 +1222,7 @@ fn build_return_inner(
             filing,
             &shares[i],
             req.capital.for_partner(&filing.partner.partner_id),
+            qbi_shares.get(i),
             year_start,
             year_end,
         )?);
@@ -1205,6 +1241,15 @@ fn build_return_inner(
         warnings.extend(nondeductible_statement(
             &mut doc, req, filing, &filed, &shares[i],
         )?);
+
+        // --- and their Section 199A statement, which box 20 code Z points to ---
+        if let Some(share) = qbi_shares.get(i) {
+            if let Some(page) =
+                super::qbi::statement(&req.profile, req.year, &filing.partner.name, share)?
+            {
+                append_document(&mut doc, page)?;
+            }
+        }
     }
 
     // --- Schedule B-1 and B-2 ---
@@ -2255,6 +2300,7 @@ fn fill_k1(
     filing: &PartnerFiling,
     shares: &PartnerShares,
     capital: Option<&super::capital::CapitalAccount>,
+    qbi: Option<&super::qbi::Share>,
     year_start: NaiveDate,
     year_end: NaiveDate,
 ) -> Result<Vec<String>, FormError> {
@@ -2395,6 +2441,27 @@ fn fill_k1(
             p.name,
             format_dollars(*amount)
         ));
+    }
+
+    // Box 20 code Z: Section 199A, itemised on the statement behind this K-1.
+    if qbi.is_some_and(|q| !q.is_empty()) {
+        let taken = [shares.get("k20a") != 0, shares.get("k20b") != 0];
+        let free = k1::BOX_20_ROWS
+            .iter()
+            .enumerate()
+            .find(|(i, _)| !taken.get(*i).copied().unwrap_or(false))
+            .map(|(_, row)| *row);
+        match free {
+            Some((code_field, amount_field)) => {
+                set_text(doc, map, code_field, "Z")?;
+                set_text(doc, map, amount_field, "STMT")?;
+            }
+            None => warnings.push(format!(
+                "{}: box 20 has no free row for code Z, so the Section 199A statement behind \
+                 this K-1 is not referenced on it. Enter code Z by hand.",
+                p.name
+            )),
+        }
     }
 
     Ok(warnings)
@@ -6284,7 +6351,9 @@ mod tests {
             .filter_map(|p| doc.extract_text(&[*p]).ok())
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(!text.contains("Partner:"), "{text:?}");
+        // No nondeductible statement. Checked by its heading rather than by any
+        // partner's name, because the Section 199A statement names them too.
+        assert!(!text.contains("line 18c statement"), "{text:?}");
     }
 
     /// The identity-only path has no ledger, so item L is left blank and
@@ -6368,6 +6437,35 @@ mod tests {
             "{warnings:?}"
         );
         crate::tax::warning_shape::assert_all(&warnings);
+    }
+
+    /// Section 199A reaches every K-1: box 20 code Z on the form, a statement
+    /// behind it, and a warning naming how wages and UBIA were split.
+    #[test]
+    fn every_k1_reports_section_199a_in_box_20_code_z() {
+        use crate::tax::lines::Form1065Lines;
+
+        let req = two_partner_request();
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l1a", 10_000);
+        lines.set_for_test("l9", 2_000);
+
+        let bundle = build_return_inner(&req, &lines, Vec::new()).unwrap();
+        assert!(
+            bundle.warnings.iter().any(|w| w.contains("Section 199A")),
+            "{:?}",
+            bundle.warnings
+        );
+        let doc = lopdf::Document::load_mem(&bundle.pdf).unwrap();
+        let map = acroform::field_map(&doc);
+        for n in 1..=2 {
+            assert_eq!(
+                acroform::get_value_in(&doc, &map, &k1_namespace(n), "Line20[0]").as_deref(),
+                Some("Z"),
+                "K-1 {n}"
+            );
+        }
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
     }
 
     /// A preferred share comes first out of the year's income, the rest follows
