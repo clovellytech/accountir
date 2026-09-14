@@ -136,6 +136,33 @@ impl<'a> Projector<'a> {
                     params![partner_id, account_id],
                 )?;
             }
+            Event::PartnerAllocationFixed {
+                tax_year,
+                partner_id,
+                amount_cents,
+                note,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO partner_fixed_allocations
+                       (tax_year, partner_id, amount_cents, note, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)
+                     ON CONFLICT(tax_year, partner_id) DO UPDATE SET
+                       amount_cents = excluded.amount_cents,
+                       note = excluded.note,
+                       updated_at = excluded.updated_at,
+                       updated_at_event = excluded.updated_at_event",
+                    params![tax_year, partner_id, amount_cents, note, stored_event.id],
+                )?;
+            }
+            Event::PartnerAllocationCleared {
+                tax_year,
+                partner_id,
+            } => {
+                self.conn.execute(
+                    "DELETE FROM partner_fixed_allocations WHERE tax_year = ?1 AND partner_id = ?2",
+                    params![tax_year, partner_id],
+                )?;
+            }
             Event::AccountDeleted { account_id } => {
                 // The command refuses unless nothing points at the account, so
                 // by the time this runs there is only the row itself to remove.
@@ -1238,6 +1265,7 @@ impl<'a> Projector<'a> {
              -- ownership under §267(c) and puts a partner on Schedule B-1 that
              -- the log no longer justifies.
              DELETE FROM partner_relationships;
+             DELETE FROM partner_fixed_allocations;
              DELETE FROM il1065_settings;
              -- The asset register (migration 030). Derived from the log like the
              -- rest: an asset no event justifies would otherwise keep claiming

@@ -412,6 +412,29 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 widgets::truncate(account_id, 8)
             )
         }
+        Event::PartnerAllocationFixed {
+            tax_year,
+            partner_id,
+            amount_cents,
+            note,
+        } => match amount_cents {
+            Some(cents) => format!(
+                "Partner {} takes ${:.2} of {tax_year} — {note}",
+                widgets::truncate(partner_id, 8),
+                *cents as f64 / 100.0
+            ),
+            None => format!(
+                "Partner {} takes the rest of {tax_year} — {note}",
+                widgets::truncate(partner_id, 8)
+            ),
+        },
+        Event::PartnerAllocationCleared {
+            tax_year,
+            partner_id,
+        } => format!(
+            "Partner {}'s share of {tax_year} back on their percentages",
+            widgets::truncate(partner_id, 8)
+        ),
         Event::AccountDeleted { account_id } => {
             format!("Account {} deleted", widgets::truncate(account_id, 8))
         }

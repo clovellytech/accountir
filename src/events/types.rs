@@ -376,6 +376,22 @@ pub enum Event {
         partner_id: String,
         account_id: String,
     },
+    /// A partner's share of one year's result, fixed in dollars rather than by
+    /// percentage — or, with no amount, whatever the fixed shares leave. See
+    /// `domain::FixedAllocation`. The note is required: a split that departs
+    /// from the percentages on file has to say where it came from.
+    PartnerAllocationFixed {
+        tax_year: i32,
+        partner_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amount_cents: Option<i64>,
+        note: String,
+    },
+    /// The partner's share of the year goes back to their percentages.
+    PartnerAllocationCleared {
+        tax_year: i32,
+        partner_id: String,
+    },
     /// An account created in error is removed from the chart entirely.
     ///
     /// Distinct from deactivating. A deactivated account is one that *was* used
@@ -871,6 +887,8 @@ impl Event {
             Event::PartnerSharesChanged { .. } => "partner_shares_changed",
             Event::PartnerEquityAccountLinked { .. } => "partner_equity_account_linked",
             Event::PartnerEquityAccountUnlinked { .. } => "partner_equity_account_unlinked",
+            Event::PartnerAllocationFixed { .. } => "partner_allocation_fixed",
+            Event::PartnerAllocationCleared { .. } => "partner_allocation_cleared",
             Event::AccountDeleted { .. } => "account_deleted",
             Event::TaxDeductionLimitSet { .. } => "tax_deduction_limit_set",
             Event::TaxDeductionLimitCleared { .. } => "tax_deduction_limit_cleared",
@@ -945,6 +963,8 @@ impl Event {
             Event::PartnerSharesChanged { partner_id, .. } => Some(partner_id),
             Event::PartnerEquityAccountLinked { partner_id, .. } => Some(partner_id),
             Event::PartnerEquityAccountUnlinked { partner_id, .. } => Some(partner_id),
+            Event::PartnerAllocationFixed { partner_id, .. } => Some(partner_id),
+            Event::PartnerAllocationCleared { partner_id, .. } => Some(partner_id),
             Event::AccountDeleted { account_id } => Some(account_id),
             Event::TaxDeductionLimitSet { account_id, .. } => Some(account_id),
             Event::TaxDeductionLimitCleared { account_id, .. } => Some(account_id),

@@ -23,7 +23,7 @@ use super::commands::event_service::{
 };
 use super::commands::partnership::{
     AdmitPartnerRequest, AdmitPartnerResponse, ClearRelationshipRequest, LinkEquityAccountRequest,
-    SetBusinessProfileRequest, SetIl1065SettingsRequest, SetPartnerSharesRequest,
+    SetBusinessProfileRequest, SetIl1065SettingsRequest, SetPartnerSharesRequest, SetFixedAllocationRequest, ClearFixedAllocationRequest,
     SetRelationshipRequest, UnlinkEquityAccountRequest, UpdatePartnerRequest,
     WithdrawPartnerRequest,
 };
@@ -1889,6 +1889,45 @@ impl SyncClient {
                 partner_id: partner_id.clone(),
                 effective_from,
                 shares,
+            }
+        })
+        .await
+    }
+
+    /// Fix a partner's share of one year's ordinary income in dollars, or — with
+    /// `amount_cents` of `None` — make them the partner who takes the rest.
+    pub async fn set_fixed_allocation(
+        &mut self,
+        tax_year: i32,
+        partner_id: impl Into<String>,
+        amount_cents: Option<i64>,
+        note: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (partner_id, note) = (partner_id.into(), note.into());
+        self.submit_retrying("/sync/commands/set-fixed-allocation", |head| {
+            SetFixedAllocationRequest {
+                expected_head_seq: head,
+                tax_year,
+                partner_id: partner_id.clone(),
+                amount_cents,
+                note: note.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Put a partner's share of a year back on their percentages.
+    pub async fn clear_fixed_allocation(
+        &mut self,
+        tax_year: i32,
+        partner_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let partner_id = partner_id.into();
+        self.submit_retrying("/sync/commands/clear-fixed-allocation", |head| {
+            ClearFixedAllocationRequest {
+                expected_head_seq: head,
+                tax_year,
+                partner_id: partner_id.clone(),
             }
         })
         .await

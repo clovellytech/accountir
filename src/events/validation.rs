@@ -409,6 +409,24 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             validate_non_empty(partner_id, "partner_id")?;
             validate_non_empty(account_id, "account_id")?;
         }
+        Event::PartnerAllocationFixed {
+            tax_year,
+            partner_id,
+            note,
+            ..
+        } => {
+            validate_non_empty(partner_id, "partner_id")?;
+            // A split that departs from the percentages on file has to say why.
+            validate_non_empty(note, "note")?;
+            if !(1900..=2200).contains(tax_year) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "tax_year: {tax_year} is not a tax year"
+                )));
+            }
+        }
+        Event::PartnerAllocationCleared { partner_id, .. } => {
+            validate_non_empty(partner_id, "partner_id")?;
+        }
         Event::ScheduleBAnswerSet {
             tax_year,
             answer_key,

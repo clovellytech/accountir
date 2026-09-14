@@ -152,6 +152,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             41,
             include_str!("../../migrations/041_depreciation_overrides.sql"),
         ),
+        (
+            42,
+            include_str!("../../migrations/042_partner_fixed_allocations.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -727,6 +731,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_equity_accounts_account
             ON partner_equity_accounts(account_id);
+
+        -- A partner's share of a year fixed in dollars (migration 042).
+        CREATE TABLE IF NOT EXISTS partner_fixed_allocations (
+            tax_year INTEGER NOT NULL,
+            partner_id TEXT NOT NULL,
+            amount_cents INTEGER,
+            note TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (tax_year, partner_id)
+        );
 
         -- Dated since migration 038, like `tax_line_mappings`.
         CREATE TABLE IF NOT EXISTS tax_deduction_limits (

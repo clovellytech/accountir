@@ -478,16 +478,23 @@ pub fn compute(
     // 155,560 — two figures for the same partner's share of the same year, on
     // the same page, differing by the part of the year they held a different
     // percentage.
-    let shares = super::varying::allocate_over_year(
-        conn,
-        year,
-        net_income,
-        partners,
-        Basis::ProfitOrLoss,
-        // Row 3 is a share of the whole of Schedule K, so the year's parts are
-        // weighted by what the whole of Schedule K did in each of them.
-        super::varying::ANALYSIS,
-    );
+    //
+    // Unless the year is divided in fixed amounts, which box 1 follows too — see
+    // `allocate::split_fixed`.
+    let fixed = crate::commands::partnership_commands::list_fixed_allocations(conn);
+    let shares = match super::allocate::split_fixed(net_income, partners, year, &fixed, false) {
+        Some(shares) => shares,
+        None => super::varying::allocate_over_year(
+            conn,
+            year,
+            net_income,
+            partners,
+            Basis::ProfitOrLoss,
+            // Row 3 is a share of the whole of Schedule K, so the year's parts are
+            // weighted by what the whole of Schedule K did in each of them.
+            super::varying::ANALYSIS,
+        ),
+    };
 
     // Row 4, on the same allocator as row 3 and for the same reason: a single
     // split applied to a year that contained a change of interest is a §706(d)
@@ -1708,5 +1715,19 @@ mod tests {
             "{warnings:?}"
         );
         crate::tax::warning_shape::assert_all(&warnings);
+    }
+
+    /// A year divided in fixed amounts puts those amounts in row 3, rounded to
+    /// dollars the way box 1 rounds them.
+    #[test]
+    fn the_income_row_follows_a_fixed_division_of_the_year() {
+        let mut store = books();
+        link_all(&mut store);
+        pc::set_fixed_allocation(&mut store, "u", YEAR, "zak", Some(184_356), "Exit terms")
+            .unwrap();
+        pc::set_fixed_allocation(&mut store, "u", YEAR, "jinny", None, "The rest").unwrap();
+        let capital = run(&store, 10_000);
+        assert_eq!(capital.for_partner("zak").unwrap().net_income, 1_844);
+        assert_eq!(capital.for_partner("jinny").unwrap().net_income, 8_156);
     }
 }

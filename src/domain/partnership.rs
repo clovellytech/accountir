@@ -543,6 +543,23 @@ pub struct SharePeriod {
     pub shares: Shares,
 }
 
+/// A partner's share of one year's result, fixed in dollars instead of by
+/// percentage.
+///
+/// For an agreement that divides a year by amount — "the departing partner takes
+/// what she was paid out, Jinny the rest" — which no set of percentages can
+/// express. At most one partner a year takes the remainder (`amount_cents` of
+/// `None`). The note is required, because a split that departs from the
+/// percentages on file is one somebody may have to show came from the agreement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedAllocation {
+    pub tax_year: i32,
+    pub partner_id: String,
+    /// The fixed share in cents, or `None` for "whatever the fixed shares leave".
+    pub amount_cents: Option<i64>,
+    pub note: String,
+}
+
 impl Partner {
     /// Whether the partner held an interest at any point in a tax year.
     ///

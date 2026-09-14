@@ -251,6 +251,100 @@ pub fn allocate_on_ppm(total: i64, ppm: &[i64]) -> Vec<Share> {
         .collect()
 }
 
+/// Split `total` where some partners' shares of `year` are fixed in dollars.
+///
+/// `None` when none of `partners` has a fixed share of the year, and the
+/// caller's percentage split stands. Otherwise each fixed partner gets their
+/// amount, the partner taking the remainder gets `total` less those, and every
+/// other partner gets nothing. With no remainder partner named, what is left is
+/// shared among the partners without a fixed amount in proportion to the
+/// percentages they held at the year's end — profit or loss by its sign — and
+/// left unallocated if they held none, which the closing entry then refuses.
+///
+/// `in_cents` says what unit `total` is in. The amounts are recorded in cents; a
+/// return in whole dollars rounds each one, and the remainder absorbs the
+/// rounding, so the shares still add back to `total` exactly.
+pub fn split_fixed(
+    total: i64,
+    partners: &[&Partner],
+    year: i32,
+    fixed: &[crate::domain::FixedAllocation],
+    in_cents: bool,
+) -> Option<Vec<Share>> {
+    let mine: Vec<Option<&crate::domain::FixedAllocation>> = partners
+        .iter()
+        .map(|p| {
+            fixed
+                .iter()
+                .find(|f| f.tax_year == year && f.partner_id == p.partner_id)
+        })
+        .collect();
+    if mine.iter().all(Option::is_none) {
+        return None;
+    }
+    let unit = |cents: i64| {
+        if in_cents {
+            cents
+        } else {
+            (cents + cents.signum() * 50) / 100
+        }
+    };
+    let mut out: Vec<i64> = mine
+        .iter()
+        .map(|f| f.and_then(|f| f.amount_cents).map(unit).unwrap_or(0))
+        .collect();
+    let rest = total - out.iter().sum::<i64>();
+
+    if let Some(i) = mine
+        .iter()
+        .position(|f| f.is_some_and(|f| f.amount_cents.is_none()))
+    {
+        out[i] = rest;
+    } else if rest != 0 {
+        let year_end =
+            NaiveDate::from_ymd_opt(year, 12, 31).expect("December 31 exists in every year");
+        let weights: Vec<i64> = partners
+            .iter()
+            .zip(&mine)
+            .map(|(p, f)| {
+                if f.is_some() {
+                    return 0;
+                }
+                let s = p.shares_on(year_end);
+                if rest < 0 {
+                    s.loss_ppm
+                } else {
+                    s.profit_ppm
+                }
+            })
+            .collect();
+        let sum: i64 = weights.iter().sum();
+        if sum > 0 {
+            // Scaled to the whole, so all of what is left is shared out; the
+            // scaling's own rounding goes to the largest holder.
+            let ppm: Vec<i64> = weights
+                .iter()
+                .map(|w| (*w as i128 * PPM_WHOLE as i128 / sum as i128) as i64)
+                .collect();
+            let mut shared = 0;
+            for share in allocate_on_ppm(rest, &ppm) {
+                out[share.partner] += share.dollars;
+                shared += share.dollars;
+            }
+            if let Some((largest, _)) = weights.iter().enumerate().max_by_key(|(_, w)| **w) {
+                out[largest] += rest - shared;
+            }
+        }
+    }
+
+    Some(
+        out.into_iter()
+            .enumerate()
+            .map(|(partner, dollars)| Share { partner, dollars })
+            .collect(),
+    )
+}
+
 /// Whether any partner's profit and loss shares differ.
 ///
 /// When they do, which percentage an item travels on becomes visible on the

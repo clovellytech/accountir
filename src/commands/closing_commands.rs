@@ -520,15 +520,22 @@ fn partner_capital_lines(
     }
 
     let refs: Vec<&crate::domain::Partner> = partners.iter().collect();
-    let shares = crate::tax::varying::allocate_over_year(
-        tx,
-        year,
-        net_income_cents,
-        &refs,
-        crate::tax::allocate::Basis::ProfitOrLoss,
-        // The whole of Schedule K, because that is what is being split.
-        crate::tax::varying::ANALYSIS,
-    );
+    // A year divided in fixed amounts closes on those amounts, in cents, so the
+    // ledger carries what the K-1s say.
+    let fixed = crate::commands::partnership_commands::list_fixed_allocations(tx);
+    let shares = match crate::tax::allocate::split_fixed(net_income_cents, &refs, year, &fixed, true)
+    {
+        Some(shares) => shares,
+        None => crate::tax::varying::allocate_over_year(
+            tx,
+            year,
+            net_income_cents,
+            &refs,
+            crate::tax::allocate::Basis::ProfitOrLoss,
+            // The whole of Schedule K, because that is what is being split.
+            crate::tax::varying::ANALYSIS,
+        ),
+    };
 
     // The percentages are apportioned as given — a partnership whose shares sum
     // to 90% gets 90% allocated and the rest belongs to nobody. That is the right

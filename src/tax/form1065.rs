@@ -771,6 +771,12 @@ pub struct ReturnRequest {
     /// from the books when the caller leaves it empty, the same way it reads
     /// Schedule L.
     pub assets: Vec<crate::domain::DepreciableAsset>,
+    /// Partners' shares of the year fixed in dollars rather than by percentage.
+    ///
+    /// Empty is the ordinary case: every figure splits on the percentages. Read
+    /// from the books by [`build_return_from_ledger`] when the caller leaves it
+    /// empty, the way the asset register is. See `allocate::split_fixed`.
+    pub fixed_allocations: Vec<crate::domain::FixedAllocation>,
 }
 
 /// Choices about the return that are not facts about the partnership.
@@ -865,6 +871,10 @@ pub fn build_return_from_ledger(
     // *whole* of Schedule K, so a partnership with capital gains or charitable
     // contributions would otherwise close the year on a capital account short by
     // exactly those.
+    if owned.fixed_allocations.is_empty() {
+        owned.fixed_allocations =
+            crate::commands::partnership_commands::list_fixed_allocations(conn);
+    }
     if owned.capital.is_empty() {
         owned.capital = super::capital::for_return(
             conn,
@@ -1143,14 +1153,14 @@ fn build_return_inner(
     // Split Schedule K before any K-1 is built, so every partner's share comes
     // out of one apportionment and the shares add back to the totals above.
     let (mut shares, split_warnings) =
-        split_across_partners(lines, &filed, req.year, &req.segments);
+        split_across_partners(lines, &filed, req.year, &req.segments, &req.fixed_allocations);
     warnings.extend(split_warnings);
 
     // --- self-employment: Schedule K lines 14a and 14c, and box 14 ---
     //
     // After the split, because the worksheet allocates "the same way page 1, line
     // 23, is allocated", and the partners' shares of line 1 are that allocation.
-    let ((line_14a, line_14c), se_warnings) = self_employment(lines, &filed, &mut shares, req.year);
+    let ((line_14a, line_14c), se_warnings) = self_employment(lines, &filed, &mut shares, req.year, &req.fixed_allocations);
     warnings.extend(se_warnings);
     for (key, amount) in [("k14a", line_14a), ("k14c", line_14c)] {
         if amount == 0 {
@@ -1899,6 +1909,7 @@ fn split_across_partners(
     filed: &[&PartnerFiling],
     year: i32,
     segments: &[super::varying::Segment],
+    fixed: &[crate::domain::FixedAllocation],
 ) -> (Vec<PartnerShares>, Vec<String>) {
     use super::allocate::{allocate_as_of, profit_and_loss_shares_differ, Basis};
 
@@ -1966,7 +1977,16 @@ fn split_across_partners(
         } else {
             super::varying::effective_ppm(&partners, &segs, key, basis)
         };
+        // Ordinary business income divided in fixed amounts, where the agreement
+        // does that for the year. Only line 1: every other line still travels
+        // on the percentages.
+        let fixed_shares = if key == "k1" {
+            super::allocate::split_fixed(total, &partners, year, fixed, false)
+        } else {
+            None
+        };
         let shares = match effective {
+            _ if fixed_shares.is_some() => fixed_shares.unwrap_or_default(),
             Some(ppm) => allocate_with(total, &ppm),
             // A line every segment carries nothing on gives no basis for
             // preferring one partner's percentage to another's. The year-end
@@ -2010,6 +2030,29 @@ fn split_across_partners(
             "Special allocation: {}. Income items and loss items were split on different \
              percentages — confirm once that this matches the partnership agreement.",
             special.join("; ")
+        ));
+    }
+
+    // A fixed division is stated with its reasons, because nothing on the K-1
+    // shows that box 1 did not come from item J's percentages.
+    let fixed_here: Vec<String> = partners
+        .iter()
+        .filter_map(|p| {
+            fixed
+                .iter()
+                .find(|f| f.tax_year == year && f.partner_id == p.partner_id)
+                .map(|f| match f.amount_cents {
+                    Some(c) => format!("{} ${:.2} ({})", p.name, c as f64 / 100.0, f.note),
+                    None => format!("{} the remainder ({})", p.name, f.note),
+                })
+        })
+        .collect();
+    if !fixed_here.is_empty() {
+        warnings.push(format!(
+            "Ordinary business income for {year} is divided in fixed amounts rather than by \
+             percentage: {}. Item L row 3 and the closing entry follow the same division; every \
+             other Schedule K line is still divided on the percentages.",
+            fixed_here.join("; ")
         ));
     }
 
@@ -2087,6 +2130,7 @@ fn self_employment(
     filed: &[&PartnerFiling],
     shares: &mut [PartnerShares],
     year: i32,
+    fixed: &[crate::domain::FixedAllocation],
 ) -> ((i64, i64), Vec<String>) {
     let mut warnings = Vec::new();
     let partners: Vec<&Partner> = filed.iter().map(|f| &f.partner).collect();
@@ -2103,7 +2147,11 @@ fn self_employment(
     // weighting that agrees with it.
     let owned: Vec<Partner> = partners.iter().map(|p| (*p).clone()).collect();
     let changed = super::varying::segments(&owned, year_start, year_end).len() > 1;
-    let ppm: Vec<i64> = if changed && line_23 != 0 {
+    // Likewise a year whose line 23 was divided in fixed amounts.
+    let divided_by_amount = fixed
+        .iter()
+        .any(|f| f.tax_year == year && partners.iter().any(|p| p.partner_id == f.partner_id));
+    let ppm: Vec<i64> = if (changed || divided_by_amount) && line_23 != 0 {
         shares
             .iter()
             .map(|s| (s.get("k1") as i128 * 1_000_000 / line_23 as i128) as i64)
@@ -2431,6 +2479,7 @@ mod tests {
             detail: Default::default(),
             options: Default::default(),
             book_income_cents: 0,
+            fixed_allocations: Vec::new(),
         }
     }
 
@@ -3400,6 +3449,7 @@ mod tests {
             detail: Default::default(),
             options: Default::default(),
             book_income_cents: 0,
+            fixed_allocations: Vec::new(),
         };
 
         // Admitted during the year, so nothing to say yet.
@@ -4850,7 +4900,7 @@ mod tests {
         lines.set_for_test("k13a", -101);
 
         let filed: Vec<&PartnerFiling> = req.partners.iter().collect();
-        let (shares, _) = split_across_partners(&lines, &filed, 2025, &[]);
+        let (shares, _) = split_across_partners(&lines, &filed, 2025, &[], &[]);
 
         for key in ["k1", "k5", "k13a"] {
             let total: i64 = shares.iter().map(|s| s.get(key)).sum();
@@ -4901,7 +4951,7 @@ mod tests {
         lines.set_for_test("k5", 1000); // income
         lines.set_for_test("k10", -1000); // loss
 
-        let (shares, warnings) = split_across_partners(&lines, &filed, 2025, &[]);
+        let (shares, warnings) = split_across_partners(&lines, &filed, 2025, &[], &[]);
         assert_eq!(shares[0].get("k5"), 100, "Alice takes 10% of the income");
         assert_eq!(shares[1].get("k5"), 900);
         assert_eq!(shares[0].get("k10"), -900, "Alice takes 90% of the loss");
@@ -6259,5 +6309,43 @@ mod tests {
             bundle.warnings
         );
         crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// Box 1 follows a year divided in fixed amounts, rounded to dollars with the
+    /// remainder absorbing the rounding — and every other line stays on the
+    /// percentages.
+    #[test]
+    fn box_1_follows_a_fixed_division_and_other_lines_do_not() {
+        use crate::tax::lines::Form1065Lines;
+
+        let req = two_partner_request();
+        let filed: Vec<&PartnerFiling> = req.partners.iter().collect();
+        let mut lines = Form1065Lines::default();
+        lines.set_for_test("l1a", 10_000);
+        lines.set_for_test("k5", 1_000);
+        let fixed = vec![
+            crate::domain::FixedAllocation {
+                tax_year: 2025,
+                partner_id: "bob".into(),
+                amount_cents: Some(184_356),
+                note: "Exit terms".into(),
+            },
+            crate::domain::FixedAllocation {
+                tax_year: 2025,
+                partner_id: "alice".into(),
+                amount_cents: None,
+                note: "The rest".into(),
+            },
+        ];
+
+        let (shares, warnings) = split_across_partners(&lines, &filed, 2025, &[], &fixed);
+        assert_eq!(shares[1].get("k1"), 1_844);
+        assert_eq!(shares[0].get("k1"), 10_000 - 1_844);
+        assert_eq!(shares[0].get("k5"), 500, "other lines stay on the percentages");
+        assert!(
+            warnings.iter().any(|w| w.contains("fixed amounts")),
+            "{warnings:?}"
+        );
+        crate::tax::warning_shape::assert_all(&warnings);
     }
 }

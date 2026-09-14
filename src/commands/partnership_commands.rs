@@ -18,8 +18,8 @@
 //! route nobody intended.
 
 use crate::domain::{
-    is_valid_tin, Address, BusinessProfile, Il1065Settings, Partner, PartnerRelationship,
-    PartnerType, RelationshipKind, Residency, Shares,
+    is_valid_tin, Address, BusinessProfile, FixedAllocation, Il1065Settings, Partner,
+    PartnerRelationship, PartnerType, RelationshipKind, Residency, Shares,
 };
 use crate::events::types::{
     AddressData, BusinessProfileData, Event, EventEnvelope, Il1065SettingsData,
@@ -844,6 +844,180 @@ pub(crate) fn build_unlink_equity_account_in_txn(
     Ok(PartnerStep::Append(Event::PartnerEquityAccountUnlinked {
         partner_id: partner_id.to_string(),
         account_id: account_id.to_string(),
+    }))
+}
+
+/// Every fixed share of a year, for every year and partner.
+///
+/// Remainder partners sort after the fixed amounts within a year, the order the
+/// split is worked out in. Empty on books predating migration 042 rather than an
+/// error: no table is no fixed allocations, which is every partnership that
+/// divides its years by percentage.
+pub fn list_fixed_allocations(conn: &Connection) -> Vec<FixedAllocation> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT tax_year, partner_id, amount_cents, note FROM partner_fixed_allocations
+         ORDER BY tax_year, amount_cents IS NULL, partner_id",
+    ) else {
+        return Vec::new();
+    };
+    let out = stmt
+        .query_map([], |r| {
+            Ok(FixedAllocation {
+                tax_year: r.get(0)?,
+                partner_id: r.get(1)?,
+                amount_cents: r.get(2)?,
+                note: r.get(3)?,
+            })
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    out
+}
+
+/// Fix a partner's share of one year's result in dollars — or, with
+/// `amount_cents` of `None`, make them the partner who takes what the fixed
+/// shares leave.
+///
+/// For an agreement that divides a year by amount, which no percentages express:
+/// a departing partner takes what they were paid out, another the rest. Setting
+/// it again replaces it. Schedule K line 1, item L row 3 and the closing
+/// allocation follow it; every other line still splits on the percentages. The
+/// arithmetic is [`crate::tax::allocate::split_fixed`].
+pub fn set_fixed_allocation(
+    store: &mut EventStore,
+    user_id: &str,
+    tax_year: i32,
+    partner_id: &str,
+    amount_cents: Option<i64>,
+    note: &str,
+) -> Result<StoredEvent, PartnershipError> {
+    check_set_fixed_allocation_pure(tax_year, note)?;
+    append_checked_locally(store, user_id, |tx| {
+        build_set_fixed_allocation_in_txn(tx, tax_year, partner_id, amount_cents, note)
+    })
+}
+
+/// Put a partner's share of a year back on their percentages.
+pub fn clear_fixed_allocation(
+    store: &mut EventStore,
+    user_id: &str,
+    tax_year: i32,
+    partner_id: &str,
+) -> Result<StoredEvent, PartnershipError> {
+    append_checked_locally(store, user_id, |tx| {
+        build_clear_fixed_allocation_in_txn(tx, tax_year, partner_id)
+    })
+}
+
+/// What is wrong with a fixed allocation that can be decided without the books.
+pub fn check_set_fixed_allocation_pure(tax_year: i32, note: &str) -> Result<(), PartnershipError> {
+    if note.trim().is_empty() {
+        return Err(PartnershipError::InvalidData(
+            "A fixed allocation needs a note saying where it comes from — the partnership \
+             agreement, a partner's exit terms."
+                .to_string(),
+        ));
+    }
+    if !(1900..=2200).contains(&tax_year) {
+        return Err(PartnershipError::InvalidData(format!(
+            "{tax_year} is not a tax year."
+        )));
+    }
+    Ok(())
+}
+
+/// Fix a partner's share of a year, against write-locked state.
+///
+/// The partner has to have been one during the year, and only one partner a year
+/// can take the remainder — two claiming what is left is a split nobody could
+/// work out.
+pub(crate) fn build_set_fixed_allocation_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    tax_year: i32,
+    partner_id: &str,
+    amount_cents: Option<i64>,
+    note: &str,
+) -> Result<PartnerStep, EventStoreError> {
+    let row: Option<(String, String, Option<String>)> = tx
+        .query_row(
+            "SELECT name, start_date, end_date FROM partners WHERE id = ?1",
+            [partner_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((name, start, end)) = row else {
+        return Ok(PartnerStep::Reject(PartnershipError::NoSuchPartner(
+            partner_id.to_string(),
+        )));
+    };
+    let (year_start, year_end) = calendar_year(tax_year);
+    let parse = |s: &str| NaiveDate::parse_from_str(s.get(..10).unwrap_or(s), "%Y-%m-%d").ok();
+    let joined_after = parse(&start).is_some_and(|d| d > year_end);
+    let left_before = end.as_deref().and_then(parse).is_some_and(|d| d < year_start);
+    if joined_after || left_before {
+        return Ok(PartnerStep::Reject(PartnershipError::InvalidData(format!(
+            "{name} was not a partner during {tax_year}, so they have no share of it to fix."
+        ))));
+    }
+    if amount_cents.is_none() {
+        let other: Option<String> = tx
+            .query_row(
+                "SELECT p.name FROM partner_fixed_allocations f
+                   JOIN partners p ON p.id = f.partner_id
+                  WHERE f.tax_year = ?1 AND f.amount_cents IS NULL AND f.partner_id != ?2",
+                params![tax_year, partner_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(other) = other {
+            return Ok(PartnerStep::Reject(PartnershipError::InvalidData(format!(
+                "{other} already takes the remainder of {tax_year}. Clear theirs first — two \
+                 partners cannot both take what is left."
+            ))));
+        }
+    }
+    Ok(PartnerStep::Append(Event::PartnerAllocationFixed {
+        tax_year,
+        partner_id: partner_id.to_string(),
+        amount_cents,
+        note: note.trim().to_string(),
+    }))
+}
+
+/// Clear a partner's fixed share of a year, against write-locked state.
+///
+/// Refused when there is none, for the reason [`build_unlink_equity_account_in_txn`]
+/// refuses: an event that changed nothing later reads as evidence of a split
+/// somebody once had.
+pub(crate) fn build_clear_fixed_allocation_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    tax_year: i32,
+    partner_id: &str,
+) -> Result<PartnerStep, EventStoreError> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM partner_fixed_allocations WHERE tax_year = ?1 AND partner_id = ?2",
+            params![tax_year, partner_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        let partner = tx
+            .query_row(
+                "SELECT name FROM partners WHERE id = ?1",
+                [partner_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| partner_id.to_string());
+        return Ok(PartnerStep::Reject(PartnershipError::InvalidData(format!(
+            "{partner} has no fixed share of {tax_year} to clear."
+        ))));
+    }
+    Ok(PartnerStep::Append(Event::PartnerAllocationCleared {
+        tax_year,
+        partner_id: partner_id.to_string(),
     }))
 }
 
@@ -1931,5 +2105,54 @@ mod tests {
         let links = crate::tax::capital::load_partner_equity_accounts(s.connection());
         assert_eq!(links.len(), 1);
         assert_eq!(links[0].account_id, "4002");
+    }
+
+    /// A year divided in fixed amounts: a sum for one partner, the rest for
+    /// another. A note is required, only one partner a year takes the rest, the
+    /// partner has to have been one that year, and clearing puts them back on
+    /// their percentages.
+    #[test]
+    fn a_year_can_be_divided_in_fixed_amounts_with_one_remainder() {
+        let mut s = store();
+        set_profile(&mut s, "u", &profile()).unwrap();
+        let (lois, _) = admit_partner(&mut s, "u", &a_partner("Lois")).unwrap();
+        let (jinny, _) = admit_partner(&mut s, "u", &a_partner("Jinny")).unwrap();
+        let mut late = a_partner("Late");
+        late.start_date = Some(day(2025, 1, 1));
+        late.tin = None;
+        let (late, _) = admit_partner(&mut s, "u", &late).unwrap();
+
+        assert!(
+            set_fixed_allocation(&mut s, "u", 2024, &lois, Some(184_356), " ").is_err(),
+            "a note is required"
+        );
+        assert!(
+            set_fixed_allocation(&mut s, "u", 2024, &late, Some(1), "Joined in 2025").is_err(),
+            "not a partner in 2024"
+        );
+        set_fixed_allocation(&mut s, "u", 2024, &lois, Some(184_356), "Exit terms").unwrap();
+        set_fixed_allocation(&mut s, "u", 2024, &jinny, None, "The rest, per the agreement")
+            .unwrap();
+        assert!(
+            set_fixed_allocation(&mut s, "u", 2024, &lois, None, "Also the rest").is_err(),
+            "one remainder a year"
+        );
+
+        let rows = list_fixed_allocations(s.connection());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].amount_cents,
+            Some(184_356),
+            "fixed amounts sort before the remainder"
+        );
+        assert_eq!(rows[1].partner_id, jinny);
+        assert_eq!(rows[1].amount_cents, None);
+
+        clear_fixed_allocation(&mut s, "u", 2024, &lois).unwrap();
+        assert!(
+            clear_fixed_allocation(&mut s, "u", 2024, &lois).is_err(),
+            "nothing left to clear"
+        );
+        assert_eq!(list_fixed_allocations(s.connection()).len(), 1);
     }
 }

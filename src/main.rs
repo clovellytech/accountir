@@ -292,6 +292,39 @@ enum PartnershipCliCommands {
 
     /// List the recorded family ties between partners
     Relationships,
+
+    /// Fix a partner's share of one year's ordinary income in dollars instead of
+    /// by percentage — or make them the partner who takes the rest
+    SetAllocation {
+        partner_id: String,
+        /// The tax year
+        #[arg(long)]
+        year: i32,
+        /// Their share in dollars, e.g. 1843.56. Omit when using --remainder
+        #[arg(long, allow_hyphen_values = true, conflicts_with = "remainder")]
+        amount: Option<f64>,
+        /// They take whatever the fixed amounts leave
+        #[arg(long)]
+        remainder: bool,
+        /// Where the split comes from — required
+        #[arg(long)]
+        note: String,
+    },
+
+    /// Put a partner's share of a year back on their percentages
+    ClearAllocation {
+        partner_id: String,
+        /// The tax year
+        #[arg(long)]
+        year: i32,
+    },
+
+    /// List the years whose income is divided in fixed amounts
+    Allocations {
+        /// Only this year
+        #[arg(long)]
+        year: Option<i32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2221,6 +2254,57 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
             println!("Removed the relationship between {partner_id} and {related_partner_id}.");
         }
 
+        PartnershipCliCommands::SetAllocation {
+            partner_id,
+            year,
+            amount,
+            remainder,
+            note,
+        } => {
+            let amount_cents = match (amount, remainder) {
+                (Some(a), false) if a.is_finite() => Some((a * 100.0).round() as i64),
+                (None, true) => None,
+                _ => Err(anyhow::anyhow!("give either --amount or --remainder"))?,
+            };
+            pc::set_fixed_allocation(store, "cli-user", year, &partner_id, amount_cents, &note)?;
+            match amount_cents {
+                Some(c) => println!(
+                    "{partner_id} takes ${:.2} of {year}'s ordinary income.",
+                    c as f64 / 100.0
+                ),
+                None => println!("{partner_id} takes what the fixed amounts leave of {year}."),
+            }
+        }
+
+        PartnershipCliCommands::ClearAllocation { partner_id, year } => {
+            pc::clear_fixed_allocation(store, "cli-user", year, &partner_id)?;
+            println!("{partner_id}'s share of {year} is back on their percentages.");
+        }
+
+        PartnershipCliCommands::Allocations { year } => {
+            let rows: Vec<_> = pc::list_fixed_allocations(store.connection())
+                .into_iter()
+                .filter(|f| year.is_none_or(|y| y == f.tax_year))
+                .collect();
+            if rows.is_empty() {
+                println!("No year is divided in fixed amounts.");
+            }
+            for f in &rows {
+                let name = pc::get_partner(store.connection(), &f.partner_id)
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| f.partner_id.clone());
+                match f.amount_cents {
+                    Some(c) => println!(
+                        "  {}  {name}: ${:.2} — {}",
+                        f.tax_year,
+                        c as f64 / 100.0,
+                        f.note
+                    ),
+                    None => println!("  {}  {name}: the remainder — {}", f.tax_year, f.note),
+                }
+            }
+        }
+
         PartnershipCliCommands::Relationships => {
             let rels = pc::list_relationships(store.connection());
             if rels.is_empty() {
@@ -2356,6 +2440,7 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
                     detail: Default::default(),
                     options: Default::default(),
                     book_income_cents: 0,
+                    fixed_allocations: Vec::new(),
                 },
             )?;
 

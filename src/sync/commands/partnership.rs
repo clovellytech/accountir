@@ -50,7 +50,9 @@
 //! shared predicate under the client's `expected_head_seq`, map the outcome.
 
 use crate::commands::partnership_commands::{
-    build_admit_partner_in_txn, build_clear_relationship_in_txn, build_link_equity_account_in_txn,
+    build_admit_partner_in_txn, build_clear_fixed_allocation_in_txn,
+    build_clear_relationship_in_txn, build_set_fixed_allocation_in_txn,
+    check_set_fixed_allocation_pure, build_link_equity_account_in_txn,
     build_set_il1065_settings_event, build_set_profile_event, build_set_relationship_in_txn,
     build_unlink_equity_account_in_txn, build_update_partner_in_txn, build_withdraw_partner_in_txn,
     check_admit_partner_pure, check_set_profile_pure, check_set_relationship_pure,
@@ -88,6 +90,14 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/set-partner-shares",
             post(submit_set_partner_shares),
+        )
+        .route(
+            "/sync/commands/set-fixed-allocation",
+            post(submit_set_fixed_allocation),
+        )
+        .route(
+            "/sync/commands/clear-fixed-allocation",
+            post(submit_clear_fixed_allocation),
         )
         .route(
             "/sync/commands/link-equity-account",
@@ -422,6 +432,72 @@ fn many_outcome_to_response(
 // Which ledger account holds whose capital is a fact about the books, not about
 // a person, so it crosses this boundary like the partners themselves do. A TIN
 // does not; see the module docs.
+
+#[derive(Serialize, Deserialize)]
+pub struct SetFixedAllocationRequest {
+    pub expected_head_seq: i64,
+    pub tax_year: i32,
+    pub partner_id: String,
+    /// Cents, or absent for the partner who takes the remainder.
+    #[serde(default)]
+    pub amount_cents: Option<i64>,
+    pub note: String,
+}
+
+/// Fix a partner's share of one year's ordinary income in dollars, or make them
+/// the partner who takes the rest.
+async fn submit_set_fixed_allocation(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetFixedAllocationRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    check_set_fixed_allocation_pure(req.tax_year, &req.note).map_err(ApiError::domain)?;
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_set_fixed_allocation_in_txn(
+                tx,
+                req.tax_year,
+                &req.partner_id,
+                req.amount_cents,
+                &req.note,
+            )? {
+                PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ClearFixedAllocationRequest {
+    pub expected_head_seq: i64,
+    pub tax_year: i32,
+    pub partner_id: String,
+}
+
+/// Put a partner's share of a year back on their percentages.
+async fn submit_clear_fixed_allocation(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<ClearFixedAllocationRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| match build_clear_fixed_allocation_in_txn(tx, req.tax_year, &req.partner_id)? {
+                PartnerStep::Append(event) => Ok(Verdict::Append(stamp(event, &actor))),
+                PartnerStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<PartnershipError>)
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct LinkEquityAccountRequest {
