@@ -177,6 +177,21 @@ pub fn fold(
                     continue;
                 }
                 let oriented = orient * line.balance;
+                // The result of a year not closed yet comes through as a line of
+                // its own with no account behind it, so nobody can map it. It is
+                // the partners' capital all the same — line 21 is where a close
+                // will put it — and leaving it off takes the page out of balance
+                // by exactly the year's income. Returns are routinely prepared
+                // before the books are closed.
+                if line.account_id == "__net_income__" {
+                    let slot = cents.entry("sl21").or_insert((0, 0));
+                    if is_end {
+                        slot.1 += oriented;
+                    } else {
+                        slot.0 += oriented;
+                    }
+                    continue;
+                }
                 // Deliberately on no line — see `lines::OFF_RETURN`. Skipped
                 // before `lookup`, which would call it unmapped and report it.
                 if mapping.get(&line.account_id).map(String::as_str)
@@ -518,6 +533,37 @@ mod tests {
                 end: 800
             }
         );
+        assert_eq!(s.balances(), (true, true));
+    }
+
+    /// A year still open carries its income as a synthetic equity line. It is
+    /// partners' capital, not an unmapped account, and the page balances with it.
+    #[test]
+    fn income_not_yet_closed_is_partners_capital() {
+        let begin = sheet(
+            d(2024, 12, 31),
+            vec![line("cash", "1000", "Checking", AccountType::Asset, 300_00)],
+            vec![],
+            vec![line("cap", "3000", "Partners Capital", AccountType::Equity, -300_00)],
+        );
+        let end = sheet(
+            d(2025, 12, 31),
+            vec![line("cash", "1000", "Checking", AccountType::Asset, 800_00)],
+            vec![],
+            vec![
+                line("cap", "3000", "Partners Capital", AccountType::Equity, -300_00),
+                line(
+                    "__net_income__",
+                    "",
+                    "Current Year Net Income",
+                    AccountType::Equity,
+                    -500_00,
+                ),
+            ],
+        );
+        let s = fold(&begin, &end, &mapping(&[("cash", "sl1"), ("cap", "sl21")]));
+        assert_eq!(s.get("sl21"), Period { begin: 300, end: 800 });
+        assert!(s.unmapped.is_empty());
         assert_eq!(s.balances(), (true, true));
     }
 
