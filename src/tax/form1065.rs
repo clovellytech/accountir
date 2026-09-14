@@ -1388,6 +1388,7 @@ fn build_return_inner(
         req.year,
         lines,
         req.schedule_l.as_ref(),
+        &req.schedule_b,
     )?;
     warnings.extend(f1125a_warnings);
     if let Some(mut sched) = form_1125a {
@@ -3325,7 +3326,7 @@ mod tests {
         assert!(bundle
             .warnings
             .iter()
-            .any(|w| w.contains("question 9 is unanswered")));
+            .any(|w| w.contains("question 9 is incomplete")));
     }
 
     /// No cost of goods sold and no inventory, no Form 1125-A.

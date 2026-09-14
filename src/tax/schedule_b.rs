@@ -2196,6 +2196,8 @@ pub fn known_key(key: &str) -> bool {
         .iter()
         .any(|q| q.key == key || q.follow_ups.iter().any(|(_, f)| f.key == key))
         || PARTNERSHIP_REP.iter().any(|f| f.key == key)
+        // Form 1125-A's question 9, kept with these answers — see `form1125a`.
+        || super::form1125a::known_key(key)
 }
 
 /// Save one answer for one year, writing straight to the table.
