@@ -149,6 +149,9 @@ const LANDSCAPE_W: f32 = 792.0;
 const LANDSCAPE_H: f32 = 612.0;
 const TABLE_SIZE: f32 = 8.5;
 const TABLE_LINE_H: f32 = 12.0;
+/// Characters of a note per printed line, at the note's size across a landscape
+/// page.
+const NOTE_WIDTH: usize = 150;
 
 /// One column of a table statement. `x` is where the column starts, or where it
 /// ends when `right` is set — figures line up on their last digit.
@@ -186,7 +189,21 @@ pub fn build_table(req: &TableStatement) -> Result<Option<Document>, FormError> 
     }
     let reserved = 110.0 + req.footnotes.len() as f32 * TABLE_LINE_H * 3.0;
     let per_page = (((LANDSCAPE_H - 2.0 * MARGIN - reserved) / TABLE_LINE_H) as usize).max(10);
-    let chunks: Vec<&[TableLine]> = req.lines.chunks(per_page).collect();
+    // A note runs on over as many printed lines as it needs rather than being cut
+    // short — it is the explanation the row exists to give. Broken into lines
+    // before the pages are counted, so a long note moves the rows after it.
+    let printed: Vec<TableLine> = req
+        .lines
+        .iter()
+        .flat_map(|line| match line {
+            TableLine::Cells(cells) => vec![TableLine::Cells(cells.clone())],
+            TableLine::Note(note) => wrap(note, NOTE_WIDTH)
+                .into_iter()
+                .map(TableLine::Note)
+                .collect(),
+        })
+        .collect();
+    let chunks: Vec<&[TableLine]> = printed.chunks(per_page).collect();
     let page_count = chunks.len();
     let pages = chunks
         .iter()
@@ -241,7 +258,7 @@ fn table_page_ops(
                 }
             }
             TableLine::Note(s) => {
-                text(&mut ops, "F1", TABLE_SIZE - 0.5, MARGIN + 12.0, y, &truncate(s, 150));
+                text(&mut ops, "F1", TABLE_SIZE - 0.5, MARGIN + 12.0, y, s);
             }
         }
         y -= TABLE_LINE_H;
@@ -762,5 +779,38 @@ mod tests {
             .filter_map(|p| doc.extract_text(&[*p]).ok())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// A note longer than a line wraps onto the lines below it, whole, instead of
+    /// being cut off with an ellipsis.
+    #[test]
+    fn a_long_table_note_wraps_rather_than_being_cut_off() {
+        let note = format!("{} closing-word", "reimbursed build-out costs ".repeat(12));
+        let doc = build_table(&TableStatement {
+            legal_name: "Acme Trading LLP",
+            ein: "12-3456789",
+            heading: "Heading".to_string(),
+            subheading: "Subheading".to_string(),
+            columns: vec![Column {
+                title: "Asset".to_string(),
+                x: 54.0,
+                right: false,
+            }],
+            lines: vec![
+                TableLine::Cells(vec!["Fit-out".to_string()]),
+                TableLine::Note(note),
+            ],
+            footnotes: Vec::new(),
+        })
+        .unwrap()
+        .unwrap();
+        let page = doc.get_pages()[&1];
+        let content = String::from_utf8_lossy(&doc.get_page_content(page)).to_string();
+        assert!(content.contains("closing-word"), "the end of the note is printed");
+        assert!(!content.contains('\u{85}'), "no ellipsis byte");
+        assert!(
+            content.matches("reimbursed").count() == 12,
+            "every part of the note is printed"
+        );
     }
 }
