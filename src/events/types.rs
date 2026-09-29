@@ -1,6 +1,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A journal entry line for the JournalEntryPosted event
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,6 +276,74 @@ fn is_any_year(year: &i32) -> bool {
     *year == ANY_YEAR
 }
 
+/// A file attached to the books, as the log records it: what it is and the
+/// digest of its bytes, never the bytes. See [`crate::documents`] for why.
+///
+/// Boxed into its variant, as [`BusinessProfileSet`](Event::BusinessProfileSet)
+/// is, to keep [`Event`] small.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentAttachedData {
+    pub document_id: String,
+    /// Lowercase hex SHA-256 of the file: the key its bytes are stored under,
+    /// and what any copy of them is checked against.
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+    /// The name it was attached under. Display only, and never a path.
+    pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tax_year: Option<i32>,
+    /// A [`crate::tax::information_returns::FormKind`] code, when the document
+    /// is a statement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
+}
+
+/// What a received statement says, box by box.
+///
+/// Figures rather than a file, because a return is computed from numbers: the
+/// document a statement was read from is linked by id, and the amounts are what
+/// a return picks up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxStatementData {
+    pub statement_id: String,
+    pub tax_year: i32,
+    /// A [`crate::tax::information_returns::FormKind`] code.
+    pub form: String,
+    /// Who sent it: the employer, the bank, the partnership.
+    pub issuer: String,
+    /// Box code to amount, in cents. A `BTreeMap` so the payload — and so the
+    /// event's hash — does not depend on insertion order.
+    pub amounts: BTreeMap<String, i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub document_ids: Vec<String>,
+    #[serde(default)]
+    pub source: StatementSourceData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Where a statement's figures came from, as the log records it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StatementSourceData {
+    /// Typed in from the paper.
+    #[default]
+    Entered,
+    /// Computed by another set of books managed in accountir, as of one event
+    /// in that ledger's log — see [`crate::domain::documents::LedgerProvenance`].
+    Ledger {
+        ledger_id: String,
+        ledger_name: String,
+        partner_id: String,
+        partner_name: String,
+        through_event: i64,
+        event_hash: String,
+    },
+}
+
 /// All event types in the accounting system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -475,6 +544,41 @@ pub enum Event {
         /// The first tax year this applies to.
         effective_from: i32,
     },
+    /// A file is attached to the books. Metadata and digest only; the bytes go
+    /// to a [`crate::documents::BlobStore`] first.
+    DocumentAttached(Box<DocumentAttachedData>),
+    /// A document is taken off the books.
+    ///
+    /// Its bytes are left where they are. The log still names them, a removal
+    /// can be a mistake, and tax records have to be kept for years — deleting
+    /// the file itself is a separate, deliberate act.
+    DocumentRemoved { document_id: String },
+    /// A received statement is recorded, or re-recorded under the same id.
+    ///
+    /// Re-recording replaces rather than adds: a corrected 1099 or a re-pulled
+    /// K-1 is the same statement with new figures, and counting both would put
+    /// the income on the return twice.
+    TaxStatementRecorded(Box<TaxStatementData>),
+    TaxStatementRemoved { statement_id: String },
+    /// These books receive a Schedule K-1 from another set of books managed in
+    /// accountir: `partner_id`'s K-1 from the partnership whose ledger is
+    /// `ledger_id`.
+    ///
+    /// A standing link rather than a one-off import, so each year knows what to
+    /// fetch and a year whose K-1 has not been fetched is visibly missing. The
+    /// figures arrive separately, as [`Event::TaxStatementRecorded`] carrying
+    /// their provenance: a return is computed from its own books' log, never by
+    /// reaching into another file.
+    ///
+    /// The id is `<ledger_id>:<partner_id>`, so linking twice is one link.
+    K1SourceLinked {
+        link_id: String,
+        ledger_id: String,
+        ledger_name: String,
+        partner_id: String,
+        partner_name: String,
+    },
+    K1SourceUnlinked { link_id: String },
     /// An account is taken off the return.
     TaxLineMappingCleared {
         account_id: String,
@@ -942,6 +1046,12 @@ impl Event {
             Event::TaxDeductionLimitCleared { .. } => "tax_deduction_limit_cleared",
             Event::TaxStatementGroupingSet { .. } => "tax_statement_grouping_set",
             Event::IllinoisTaxAddbackSet { .. } => "illinois_tax_addback_set",
+            Event::DocumentAttached(_) => "document_attached",
+            Event::DocumentRemoved { .. } => "document_removed",
+            Event::TaxStatementRecorded(_) => "tax_statement_recorded",
+            Event::TaxStatementRemoved { .. } => "tax_statement_removed",
+            Event::K1SourceLinked { .. } => "k1_source_linked",
+            Event::K1SourceUnlinked { .. } => "k1_source_unlinked",
             Event::ScheduleBAnswerSet { .. } => "schedule_b_answer_set",
             Event::ScheduleBAnswerCleared { .. } => "schedule_b_answer_cleared",
             Event::PartnerWithdrawn { .. } => "partner_withdrawn",
@@ -1025,6 +1135,12 @@ impl Event {
             Event::TaxDeductionLimitCleared { account_id, .. } => Some(account_id),
             Event::TaxStatementGroupingSet { account_id, .. } => Some(account_id),
             Event::IllinoisTaxAddbackSet { account_id, .. } => Some(account_id),
+            Event::DocumentAttached(d) => Some(&d.document_id),
+            Event::DocumentRemoved { document_id } => Some(document_id),
+            Event::TaxStatementRecorded(s) => Some(&s.statement_id),
+            Event::TaxStatementRemoved { statement_id } => Some(statement_id),
+            Event::K1SourceLinked { link_id, .. } => Some(link_id),
+            Event::K1SourceUnlinked { link_id } => Some(link_id),
             // Keyed by (year, question), so no single id names the thing changed.
             Event::ScheduleBAnswerSet { .. } => None,
             Event::ScheduleBAnswerCleared { .. } => None,
@@ -1475,6 +1591,49 @@ mod tests {
                 name: "Euro".to_string(),
                 symbol: "\u{20AC}".to_string(),
                 decimal_places: 2,
+            },
+            Event::DocumentAttached(Box::new(DocumentAttachedData {
+                document_id: "doc-1".to_string(),
+                sha256: "0".repeat(64),
+                size_bytes: 1024,
+                media_type: "application/pdf".to_string(),
+                filename: "1099-INT.pdf".to_string(),
+                title: None,
+                tax_year: Some(2025),
+                form: Some("1099_int".to_string()),
+            })),
+            Event::DocumentRemoved {
+                document_id: "doc-1".to_string(),
+            },
+            Event::TaxStatementRecorded(Box::new(TaxStatementData {
+                statement_id: "st-1".to_string(),
+                tax_year: 2025,
+                form: "k1_1065".to_string(),
+                issuer: "A partnership".to_string(),
+                amounts: BTreeMap::from([("1".to_string(), 732_900)]),
+                document_ids: Vec::new(),
+                source: StatementSourceData::Ledger {
+                    ledger_id: "ledger".to_string(),
+                    ledger_name: "A partnership".to_string(),
+                    partner_id: "partner".to_string(),
+                    partner_name: "A partner".to_string(),
+                    through_event: 10,
+                    event_hash: "ab".repeat(32),
+                },
+                note: None,
+            })),
+            Event::TaxStatementRemoved {
+                statement_id: "st-1".to_string(),
+            },
+            Event::K1SourceLinked {
+                link_id: "ledger:partner".to_string(),
+                ledger_id: "ledger".to_string(),
+                ledger_name: "A partnership".to_string(),
+                partner_id: "partner".to_string(),
+                partner_name: "A partner".to_string(),
+            },
+            Event::K1SourceUnlinked {
+                link_id: "ledger:partner".to_string(),
             },
             Event::ReconciliationStarted {
                 reconciliation_id: "recon-001".to_string(),

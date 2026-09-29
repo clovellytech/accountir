@@ -36,6 +36,18 @@ fn validate_tax_year(year: i32) -> Result<(), ValidationError> {
     }
 }
 
+/// A statement form code this version knows.
+///
+/// Refused rather than stored when it is not: a statement under a code nothing
+/// recognises is a set of figures no return will ever pick up.
+fn validate_form(code: &str) -> Result<crate::tax::information_returns::FormKind, ValidationError> {
+    crate::tax::information_returns::FormKind::parse(code).ok_or_else(|| {
+        ValidationError::InvalidValue(format!(
+            "form: {code:?} is not a statement this version knows"
+        ))
+    })
+}
+
 /// Validate an event before storing
 pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
     match event {
@@ -388,6 +400,107 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         }
         Event::IllinoisTaxAddbackSet { account_id, .. } => {
             validate_non_empty(account_id, "account_id")?;
+        }
+        Event::DocumentAttached(d) => {
+            validate_non_empty(&d.document_id, "document_id")?;
+            // The digest is the key the bytes are fetched by and checked against,
+            // so one in any other shape names a file nobody can ever find.
+            if !crate::documents::is_sha256_hex(&d.sha256) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "sha256: {:?} is not a lowercase hex SHA-256 digest",
+                    d.sha256
+                )));
+            }
+            if d.size_bytes == 0 || d.size_bytes > crate::documents::MAX_DOCUMENT_BYTES {
+                return Err(ValidationError::InvalidValue(format!(
+                    "size_bytes: {} is not between 1 and {}",
+                    d.size_bytes,
+                    crate::documents::MAX_DOCUMENT_BYTES
+                )));
+            }
+            validate_non_empty(&d.media_type, "media_type")?;
+            validate_non_empty(&d.filename, "filename")?;
+            if d.filename.contains(['/', '\\']) {
+                return Err(ValidationError::InvalidValue(
+                    "filename: a document's name, not a path".to_string(),
+                ));
+            }
+            if let Some(year) = d.tax_year {
+                validate_tax_year(year)?;
+            }
+            if let Some(form) = &d.form {
+                validate_form(form)?;
+            }
+        }
+        Event::DocumentRemoved { document_id } => {
+            validate_non_empty(document_id, "document_id")?;
+        }
+        Event::TaxStatementRecorded(s) => {
+            validate_non_empty(&s.statement_id, "statement_id")?;
+            validate_tax_year(s.tax_year)?;
+            let form = validate_form(&s.form)?;
+            validate_non_empty(&s.issuer, "issuer")?;
+            for code in s.amounts.keys() {
+                if !form.accepts_box(code) {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "{} has no box {code:?}",
+                        form.label()
+                    )));
+                }
+            }
+            for id in &s.document_ids {
+                validate_non_empty(id, "document_ids")?;
+            }
+            if let crate::events::types::StatementSourceData::Ledger {
+                ledger_id,
+                partner_id,
+                through_event,
+                event_hash,
+                ..
+            } = &s.source
+            {
+                validate_non_empty(ledger_id, "source.ledger_id")?;
+                validate_non_empty(partner_id, "source.partner_id")?;
+                // Provenance that pins nothing cannot later say whether the
+                // source books have moved on.
+                if *through_event < 1 {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "source.through_event: {through_event} is not an event"
+                    )));
+                }
+                let hex = !event_hash.is_empty()
+                    && event_hash.len() % 2 == 0
+                    && event_hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+                if !hex {
+                    return Err(ValidationError::InvalidValue(
+                        "source.event_hash: not a lowercase hex digest".to_string(),
+                    ));
+                }
+            }
+        }
+        Event::TaxStatementRemoved { statement_id } => {
+            validate_non_empty(statement_id, "statement_id")?;
+        }
+        Event::K1SourceLinked {
+            link_id,
+            ledger_id,
+            ledger_name,
+            partner_id,
+            partner_name,
+        } => {
+            validate_non_empty(ledger_id, "ledger_id")?;
+            validate_non_empty(ledger_name, "ledger_name")?;
+            validate_non_empty(partner_id, "partner_id")?;
+            validate_non_empty(partner_name, "partner_name")?;
+            if *link_id != crate::domain::documents::K1Link::id_for(ledger_id, partner_id) {
+                return Err(ValidationError::InvalidValue(
+                    "link_id: must be <ledger_id>:<partner_id>, so linking twice is one link"
+                        .to_string(),
+                ));
+            }
+        }
+        Event::K1SourceUnlinked { link_id } => {
+            validate_non_empty(link_id, "link_id")?;
         }
         Event::AccountDeleted { account_id } => {
             validate_non_empty(account_id, "account_id")?;

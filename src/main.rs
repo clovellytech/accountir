@@ -109,6 +109,133 @@ enum Commands {
     /// Generate tax forms from the books
     #[command(subcommand)]
     Tax(TaxCliCommands),
+
+    /// Files attached to these books: statements received, notices, anything a
+    /// return points at
+    #[command(subcommand)]
+    Document(DocumentCliCommands),
+
+    /// Tax statements these books received (W-2s, 1099s, K-1s), box by box
+    #[command(subcommand)]
+    Statement(StatementCliCommands),
+
+    /// Schedules K-1: packages from a partnership's books, and links that pull
+    /// them into a partner's own books
+    #[command(subcommand)]
+    K1(K1CliCommands),
+}
+
+#[derive(Subcommand)]
+enum DocumentCliCommands {
+    /// Attach a file. Everyone with access to these books can open it
+    Attach {
+        file: PathBuf,
+        #[arg(long)]
+        title: Option<String>,
+        /// The tax year it belongs to
+        #[arg(long)]
+        year: Option<i32>,
+        /// Which statement it is, by code — see `accountir statement forms`
+        #[arg(long)]
+        form: Option<String>,
+    },
+    /// List attached documents
+    List {
+        #[arg(long)]
+        year: Option<i32>,
+    },
+    /// Write a document to a file, after checking its bytes against the log
+    Export {
+        /// The document id, or enough of its start to be unique
+        id: String,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    /// Take a document off the books. Its bytes are kept
+    Remove { id: String },
+    /// Check that every document's bytes are on this machine and intact
+    Check,
+}
+
+#[derive(Subcommand)]
+enum StatementCliCommands {
+    /// List the statement forms, or one form's boxes and where each goes
+    Forms { form: Option<String> },
+    /// Record a statement typed in from the paper
+    Record {
+        #[arg(long)]
+        year: i32,
+        /// The form's code — see `accountir statement forms`
+        #[arg(long)]
+        form: String,
+        /// Who sent it: the employer, the bank, the partnership
+        #[arg(long)]
+        issuer: String,
+        /// A box and its amount in dollars, e.g. `--box 1=1234.56`. Repeat per box
+        #[arg(long = "box", value_name = "CODE=AMOUNT")]
+        boxes: Vec<String>,
+        /// An attached document the statement was read from. Repeatable
+        #[arg(long = "document")]
+        documents: Vec<String>,
+        #[arg(long)]
+        note: Option<String>,
+        /// Replace this statement instead of recording a new one
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// List recorded statements, box by box
+    List {
+        #[arg(long)]
+        year: Option<i32>,
+    },
+    /// Remove a statement
+    Remove { id: String },
+    /// A tax year's inputs, gathered by where each amount goes on Form 1040
+    Summary {
+        #[arg(long)]
+        year: i32,
+    },
+}
+
+#[derive(Subcommand)]
+enum K1CliCommands {
+    /// In a partnership's books: each partner's K-1 as box amounts
+    Package {
+        #[arg(long)]
+        year: i32,
+        /// Only this partner, by id or name
+        #[arg(long)]
+        partner: Option<String>,
+    },
+    /// In a partner's own books: receive a partner's K-1 from a partnership's books
+    Link {
+        /// The partnership's database
+        #[arg(long)]
+        source: PathBuf,
+        /// The partner, by id or name
+        #[arg(long)]
+        partner: String,
+    },
+    /// List the partnerships these books receive K-1s from
+    Links {
+        /// Also say whether that year's K-1 is pulled and still current
+        #[arg(long)]
+        year: Option<i32>,
+    },
+    /// Stop receiving K-1s through a link. K-1s already pulled stay
+    Unlink { link: String },
+    /// Pull a year's K-1s through every link, or one
+    Pull {
+        #[arg(long)]
+        year: i32,
+        /// One link, by id or partnership name
+        #[arg(long)]
+        link: Option<String>,
+        /// The partnership's database, when this machine's registry does not
+        /// know where it is. Pulls only the links to those books
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -361,6 +488,10 @@ enum PartnershipCliCommands {
 
 #[derive(Subcommand)]
 enum TaxCliCommands {
+    /// Show or set which return these books file: partnership (Form 1065),
+    /// sole_proprietorship (Schedule C), or individual (Form 1040, personal books)
+    BusinessType { kind: Option<String> },
+
     /// Build Form 1065 with a Schedule K-1 per partner, as one fillable PDF
     Form1065 {
         /// Tax year to file
@@ -828,6 +959,24 @@ async fn main() -> Result<()> {
             // migrations add — as the partnership commands do.
             accountir::store::migrations::run_migrations(store.connection())?;
             handle_tax_command(&mut store, cmd)?;
+        }
+
+        Commands::Document(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            accountir::store::migrations::run_migrations(store.connection())?;
+            handle_document_command(&mut store, cmd)?;
+        }
+
+        Commands::Statement(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            accountir::store::migrations::run_migrations(store.connection())?;
+            handle_statement_command(&mut store, cmd)?;
+        }
+
+        Commands::K1(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            accountir::store::migrations::run_migrations(store.connection())?;
+            handle_k1_command(&mut store, cmd)?;
         }
     }
 
@@ -2534,56 +2683,556 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
     Ok(())
 }
 
+/// Dollars as typed — `1234.56`, `1,234`, `$12.5`, `-40`, `(40.00)` — in cents.
+fn parse_dollars_to_cents(s: &str) -> Result<i64> {
+    let t = s.trim().replace([',', '$'], "");
+    let (negative, t) = if let Some(rest) = t.strip_prefix('-') {
+        (true, rest.to_string())
+    } else if let Some(rest) = t.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        (true, rest.to_string())
+    } else {
+        (false, t)
+    };
+    let (whole, fraction) = t.split_once('.').unwrap_or((t.as_str(), ""));
+    let digits = |p: &str| p.chars().all(|c| c.is_ascii_digit());
+    if (whole.is_empty() && fraction.is_empty()) || !digits(whole) || !digits(fraction) || fraction.len() > 2 {
+        anyhow::bail!("{s:?} is not a dollar amount");
+    }
+    let whole: i64 = if whole.is_empty() { 0 } else { whole.parse()? };
+    let fraction: i64 = format!("{fraction:0<2}").parse()?;
+    let cents = whole
+        .checked_mul(100)
+        .and_then(|w| w.checked_add(fraction))
+        .ok_or_else(|| anyhow::anyhow!("{s:?} is too large"))?;
+    Ok(if negative { -cents } else { cents })
+}
+
+fn show_cents(cents: i64) -> String {
+    format!(
+        "{}{}.{:02}",
+        if cents < 0 { "-" } else { "" },
+        cents.abs() / 100,
+        cents.abs() % 100
+    )
+}
+
+/// The one id among `ids` that starts with `needle`.
+fn unique_prefix(ids: impl IntoIterator<Item = String>, needle: &str, what: &str) -> Result<String> {
+    let matches: Vec<String> = ids.into_iter().filter(|id| id.starts_with(needle)).collect();
+    match matches.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => anyhow::bail!("no {what} {needle:?}"),
+        _ => anyhow::bail!(
+            "{needle:?} matches {} {what}s — give more of the id",
+            matches.len()
+        ),
+    }
+}
+
+fn resolve_document(conn: &rusqlite::Connection, needle: &str) -> Result<String> {
+    let ids = accountir::commands::document_commands::list(conn, None)
+        .into_iter()
+        .map(|d| d.document_id);
+    unique_prefix(ids, needle, "document")
+}
+
+fn resolve_statement(conn: &rusqlite::Connection, needle: &str) -> Result<String> {
+    let ids = accountir::commands::tax_statement_commands::list(conn, None)
+        .into_iter()
+        .map(|s| s.statement_id);
+    unique_prefix(ids, needle, "statement")
+}
+
+fn parse_form(code: &str) -> Result<accountir::tax::information_returns::FormKind> {
+    accountir::tax::information_returns::FormKind::parse(code).ok_or_else(|| {
+        anyhow::anyhow!("{code:?} is not a statement form — see `accountir statement forms`")
+    })
+}
+
+fn handle_document_command(store: &mut EventStore, cmd: DocumentCliCommands) -> Result<()> {
+    use accountir::commands::document_commands as dc;
+    use accountir::documents::BlobStore;
+
+    match cmd {
+        DocumentCliCommands::Attach {
+            file,
+            title,
+            year,
+            form,
+        } => {
+            let form = form.as_deref().map(parse_form).transpose()?;
+            let doc = dc::attach_file(store, "cli-user", &file, title, year, form)?;
+            println!(
+                "Attached {} ({} bytes, {}) as {}",
+                doc.filename, doc.size_bytes, doc.media_type, doc.document_id
+            );
+            println!("sha256 {}", doc.sha256);
+            let kind =
+                accountir::commands::sole_proprietor_commands::business_type(store.connection());
+            if !kind.is_individual() {
+                println!(
+                    "\nnote: these are {} books, and everyone with access to them can open this \
+                     document. A personal statement belongs in personal books.",
+                    kind.label().to_lowercase()
+                );
+            }
+        }
+        DocumentCliCommands::List { year } => {
+            let conn = store.connection();
+            let docs = dc::list(conn, year);
+            if docs.is_empty() {
+                println!("No documents.");
+            }
+            let blobs = dc::local_store(conn).ok();
+            for d in docs {
+                let here = blobs.as_ref().is_some_and(|b| b.contains(&d.sha256));
+                println!(
+                    "{}  {}  {:>9} B  {}{}{}{}",
+                    d.document_id,
+                    d.attached_at.format("%Y-%m-%d"),
+                    d.size_bytes,
+                    d.filename,
+                    d.tax_year.map(|y| format!("  {y}")).unwrap_or_default(),
+                    d.form.map(|f| format!("  {}", f.label())).unwrap_or_default(),
+                    if here { "" } else { "  (not on this machine)" }
+                );
+                if let Some(title) = &d.title {
+                    println!("    {title}");
+                }
+            }
+        }
+        DocumentCliCommands::Export { id, output } => {
+            let conn = store.connection();
+            let id = resolve_document(conn, &id)?;
+            let blobs = dc::local_store(conn)?;
+            let bytes = dc::read(conn, &blobs, &id)?;
+            std::fs::write(&output, &bytes)?;
+            println!(
+                "Wrote {} ({} bytes, checked against the log)",
+                output.display(),
+                bytes.len()
+            );
+        }
+        DocumentCliCommands::Remove { id } => {
+            let id = resolve_document(store.connection(), &id)?;
+            dc::remove(store, "cli-user", &id)?;
+            println!("Removed {id}. Its bytes are kept.");
+        }
+        DocumentCliCommands::Check => {
+            let conn = store.connection();
+            let blobs = dc::local_store(conn)?;
+            let results = dc::check(conn, &blobs);
+            let mut intact = 0;
+            for (d, availability) in &results {
+                match availability {
+                    dc::Availability::Present => intact += 1,
+                    dc::Availability::Missing => {
+                        println!("missing  {}  {}", d.document_id, d.filename)
+                    }
+                    dc::Availability::Damaged(why) => {
+                        println!("damaged  {}  {}: {why}", d.document_id, d.filename)
+                    }
+                }
+            }
+            println!(
+                "{} document(s), {intact} on this machine and intact. Stored under {}",
+                results.len(),
+                blobs.root().display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn handle_statement_command(store: &mut EventStore, cmd: StatementCliCommands) -> Result<()> {
+    use accountir::commands::tax_statement_commands as tsc;
+    use accountir::domain::documents::{StatementSource, TaxStatement};
+    use accountir::tax::information_returns::FormKind;
+
+    match cmd {
+        StatementCliCommands::Forms { form: None } => {
+            for kind in FormKind::ALL {
+                println!(
+                    "{:18} {}{}",
+                    kind.as_str(),
+                    kind.label(),
+                    if kind.is_open() { "  (any box code)" } else { "" }
+                );
+            }
+        }
+        StatementCliCommands::Forms { form: Some(code) } => {
+            let kind = parse_form(&code)?;
+            println!("{}", kind.label());
+            if kind.is_open() {
+                println!("  No box catalogue yet — any code of letters, digits and underscores.");
+            }
+            for b in kind.boxes() {
+                println!("  {:34} {}", b.code, b.label);
+                println!(
+                    "  {:34} → {}{}",
+                    "",
+                    b.destination,
+                    if b.summed { "" } else { "  (shown, not added)" }
+                );
+            }
+        }
+        StatementCliCommands::Record {
+            year,
+            form,
+            issuer,
+            boxes,
+            documents,
+            note,
+            id,
+        } => {
+            let form = parse_form(&form)?;
+            let mut amounts = std::collections::BTreeMap::new();
+            for b in &boxes {
+                let (code, amount) = b
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("--box takes CODE=AMOUNT, got {b:?}"))?;
+                let code = code.trim().to_string();
+                if amounts
+                    .insert(code.clone(), parse_dollars_to_cents(amount)?)
+                    .is_some()
+                {
+                    anyhow::bail!("box {code} was given twice");
+                }
+            }
+            let conn = store.connection();
+            let document_ids = documents
+                .iter()
+                .map(|d| resolve_document(conn, d))
+                .collect::<Result<Vec<_>>>()?;
+            let statement_id = match id {
+                Some(id) => resolve_statement(conn, &id)?,
+                None => tsc::new_statement_id(),
+            };
+            let statement = TaxStatement {
+                statement_id,
+                tax_year: year,
+                form,
+                issuer,
+                amounts,
+                document_ids,
+                source: StatementSource::Entered,
+                note,
+            };
+            tsc::record(store, "cli-user", &statement)?;
+            println!(
+                "Recorded {year} {} from {} as {}",
+                form.label(),
+                statement.issuer.trim(),
+                statement.statement_id
+            );
+        }
+        StatementCliCommands::List { year } => {
+            let statements = tsc::list(store.connection(), year);
+            if statements.is_empty() {
+                println!("No statements.");
+            }
+            for s in statements {
+                let source = match &s.source {
+                    StatementSource::Entered => "entered".to_string(),
+                    StatementSource::Ledger(p) => format!(
+                        "pulled from {}'s books, through event {}",
+                        p.ledger_name, p.through_event
+                    ),
+                };
+                println!(
+                    "{}  {}  {}  {}  ({source})",
+                    s.statement_id,
+                    s.tax_year,
+                    s.form.label(),
+                    s.issuer
+                );
+                for (code, cents) in &s.amounts {
+                    let label = s.form.box_def(code).map_or("", |d| d.label);
+                    println!("  {code:>34}  {:>14}  {label}", show_cents(*cents));
+                }
+                if !s.document_ids.is_empty() {
+                    println!("  documents: {}", s.document_ids.join(", "));
+                }
+                if let Some(note) = &s.note {
+                    println!("  note: {note}");
+                }
+            }
+        }
+        StatementCliCommands::Remove { id } => {
+            let id = resolve_statement(store.connection(), &id)?;
+            tsc::remove(store, "cli-user", &id)?;
+            println!("Removed {id}.");
+        }
+        StatementCliCommands::Summary { year } => {
+            let inputs = accountir::tax::personal::inputs_for_year(store.connection(), year);
+            println!("{year}: {} statement(s)\n", inputs.statements.len());
+            for d in &inputs.destinations {
+                println!("{:>14}  {}", show_cents(d.cents), d.destination);
+                for c in &d.contributions {
+                    println!(
+                        "{:>14}      {} box {}, {}",
+                        show_cents(c.cents),
+                        c.form.label(),
+                        c.box_code,
+                        c.issuer
+                    );
+                }
+            }
+            if !inputs.informational.is_empty() {
+                println!("\nShown, not added:");
+                for c in &inputs.informational {
+                    println!(
+                        "{:>14}  {} box {} ({}), {}",
+                        show_cents(c.cents),
+                        c.form.label(),
+                        c.box_code,
+                        c.label,
+                        c.issuer
+                    );
+                }
+            }
+            if !inputs.unrouted.is_empty() {
+                println!("\nOn forms with no box catalogue yet, so not gathered:");
+                for c in &inputs.unrouted {
+                    println!(
+                        "{:>14}  {} box {}, {}",
+                        show_cents(c.cents),
+                        c.form.label(),
+                        c.box_code,
+                        c.issuer
+                    );
+                }
+            }
+            for link in &inputs.missing_k1s {
+                println!(
+                    "\nmissing: no {year} K-1 from {} for {} — `accountir k1 pull --year {year}`",
+                    link.ledger_name, link.partner_name
+                );
+            }
+            for d in &inputs.unread_documents {
+                println!(
+                    "unread: {} ({}) — attached for {year}, but no statement was recorded from it",
+                    d.filename, d.document_id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Open another set of books by path, refusing to create one that is not there.
+fn open_existing_books(path: &std::path::Path) -> Result<EventStore> {
+    if !path.is_file() {
+        anyhow::bail!("{} is not a database file", path.display());
+    }
+    let store = EventStore::open(path)?;
+    accountir::store::migrations::run_migrations(store.connection())?;
+    Ok(store)
+}
+
+/// Where a linked partnership's books are on this machine, by ledger id.
+fn locate_linked_books(link: &accountir::domain::documents::K1Link) -> Result<PathBuf> {
+    let registry = accountir::registry::Registry::open_default()?;
+    registry
+        .find_by_ledger_id(&link.ledger_id)?
+        .map(|b| b.db_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}'s books are not registered on this machine — pass --source <its database>",
+                link.ledger_name
+            )
+        })
+}
+
+fn resolve_link(
+    conn: &rusqlite::Connection,
+    needle: &str,
+) -> Result<accountir::domain::documents::K1Link> {
+    let lowered = needle.to_lowercase();
+    let matches: Vec<_> = accountir::commands::tax_statement_commands::list_k1_links(conn)
+        .into_iter()
+        .filter(|l| l.link_id.starts_with(needle) || l.ledger_name.to_lowercase().contains(&lowered))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("exactly one")),
+        0 => anyhow::bail!("no K-1 link {needle:?}"),
+        n => anyhow::bail!("{needle:?} matches {n} K-1 links — use the link id"),
+    }
+}
+
+fn handle_k1_command(store: &mut EventStore, cmd: K1CliCommands) -> Result<()> {
+    use accountir::commands::tax_statement_commands as tsc;
+    use accountir::tax::information_returns::FormKind;
+
+    match cmd {
+        K1CliCommands::Package { year, partner } => {
+            let mut packages = accountir::tax::k1_package::for_year(store.connection(), year)?;
+            if let Some(needle) = &partner {
+                let lowered = needle.to_lowercase();
+                packages.retain(|k| {
+                    k.partner_id.starts_with(needle.as_str()) || k.partner_name.to_lowercase() == lowered
+                });
+                if packages.is_empty() {
+                    anyhow::bail!("no partner {needle:?} has a {year} K-1");
+                }
+            }
+            for k in &packages {
+                println!(
+                    "{} — {year} Schedule K-1 (Form 1065) for {} ({})",
+                    k.partnership_name, k.partner_name, k.partner_id
+                );
+                for (code, cents) in &k.amounts {
+                    let label = FormKind::K1Partnership.box_def(code).map_or("", |d| d.label);
+                    println!("  {code:>34}  {:>14}  {label}", show_cents(*cents));
+                }
+                println!();
+            }
+            if let Some(k) = packages.first() {
+                println!(
+                    "As of event {} ({}…).{}",
+                    k.through_event,
+                    &k.event_hash[..12.min(k.event_hash.len())],
+                    if k.warnings.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " The return has {} warning(s); `accountir tax form1065` lists them.",
+                            k.warnings.len()
+                        )
+                    }
+                );
+            }
+        }
+        K1CliCommands::Link { source, partner } => {
+            let source = open_existing_books(&source)?;
+            // Before looking for the partner, so books that issue no K-1s say so
+            // rather than reporting a partner they could never have had.
+            let kind = accountir::commands::sole_proprietor_commands::business_type(source.connection());
+            if kind != accountir::domain::BusinessType::Partnership {
+                anyhow::bail!("those books file {}, not Form 1065, so they issue no K-1s", kind.form_name());
+            }
+            let partners = accountir::commands::partnership_commands::list_partners(source.connection());
+            let lowered = partner.to_lowercase();
+            let matches: Vec<_> = partners
+                .iter()
+                .filter(|p| p.partner_id.starts_with(&partner) || p.name.to_lowercase() == lowered)
+                .collect();
+            let chosen = match matches.as_slice() {
+                [one] => one.partner_id.clone(),
+                [] => anyhow::bail!("no partner {partner:?} in those books"),
+                _ => anyhow::bail!("{partner:?} matches {} partners — use the id", matches.len()),
+            };
+            let link = tsc::link_k1_source(store, "cli-user", source.connection(), &chosen)?;
+            println!(
+                "These books now receive {}'s K-1 from {} (link {}).",
+                link.partner_name, link.ledger_name, link.link_id
+            );
+        }
+        K1CliCommands::Links { year } => {
+            let links = tsc::list_k1_links(store.connection());
+            if links.is_empty() {
+                println!("These books receive no K-1s through a link.");
+            }
+            for link in links {
+                println!("{}  {} — {}", link.link_id, link.ledger_name, link.partner_name);
+                let Some(year) = year else { continue };
+                let freshness = locate_linked_books(&link)
+                    .and_then(|path| open_existing_books(&path))
+                    .and_then(|source| {
+                        Ok(tsc::k1_freshness(store.connection(), source.connection(), &link, year)?)
+                    });
+                match freshness {
+                    Ok(tsc::K1Freshness::NotPulled) => println!("  {year}: not pulled"),
+                    Ok(tsc::K1Freshness::EnteredByHand) => println!("  {year}: entered by hand"),
+                    Ok(tsc::K1Freshness::Current) => println!("  {year}: pulled, and still current"),
+                    Ok(tsc::K1Freshness::Changed(changes)) => {
+                        println!("  {year}: CHANGED since it was pulled — pull again");
+                        for c in changes {
+                            println!(
+                                "    box {:>34}: {} recorded, {} now",
+                                c.code,
+                                show_cents(c.recorded),
+                                show_cents(c.now)
+                            );
+                        }
+                    }
+                    Err(e) => println!("  {year}: cannot check — {e}"),
+                }
+            }
+        }
+        K1CliCommands::Unlink { link } => {
+            let link = resolve_link(store.connection(), &link)?;
+            tsc::unlink_k1_source(store, "cli-user", &link.link_id)?;
+            println!(
+                "No longer receiving {}'s K-1 from {}. K-1s already pulled are kept.",
+                link.partner_name, link.ledger_name
+            );
+        }
+        K1CliCommands::Pull { year, link, source } => {
+            let source = source.as_deref().map(open_existing_books).transpose()?;
+            let mut links = match &link {
+                Some(needle) => vec![resolve_link(store.connection(), needle)?],
+                None => tsc::list_k1_links(store.connection()),
+            };
+            if let Some(source) = &source {
+                let id = accountir::documents::ledger_id(source.connection()).unwrap_or_default();
+                links.retain(|l| l.ledger_id == id);
+            }
+            if links.is_empty() {
+                anyhow::bail!(
+                    "No K-1 links to pull through. Link one first: \
+                     `accountir k1 link --source <partnership.db> --partner <name>`"
+                );
+            }
+            for link in links {
+                let located;
+                let from = match &source {
+                    Some(source) => source,
+                    None => {
+                        located = open_existing_books(&locate_linked_books(&link)?)?;
+                        &located
+                    }
+                };
+                let pulled = tsc::pull_k1(store, "cli-user", from.connection(), &link, year)?;
+                println!(
+                    "{} {year} K-1 for {} from {}: box 1 {}, {} box(es) in all.",
+                    if pulled.replaced { "Re-pulled" } else { "Pulled" },
+                    link.partner_name,
+                    link.ledger_name,
+                    show_cents(pulled.statement.amount("1")),
+                    pulled.statement.amounts.len()
+                );
+                if !pulled.warnings.is_empty() {
+                    println!(
+                        "  The partnership's return has {} warning(s) — review them before relying on this K-1.",
+                        pulled.warnings.len()
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()> {
     use accountir::commands::partnership_commands as pc;
-    use accountir::tax::{build_return_from_ledger, PartnerFiling, ReturnRequest};
+    use accountir::tax::build_return_from_ledger;
 
     match cmd {
         TaxCliCommands::Form1065 { year, output } => {
             let conn = store.connection();
-            let profile = pc::get_profile(conn).ok_or_else(|| {
-                anyhow::anyhow!(
+            // The same request a K-1 package is read from, so the return and the
+            // packages cannot describe different things.
+            let request = match accountir::tax::k1_package::return_request(conn, year) {
+                Err(accountir::tax::k1_package::K1PackageError::NoProfile) => anyhow::bail!(
                     "No partnership details yet. Run `accountir partnership profile ...` first."
-                )
-            })?;
-
-            let partners: Vec<PartnerFiling> =
-                accountir::commands::share_period_commands::partners_for_year(conn, year)
-                    .into_iter()
-                    .map(|partner| PartnerFiling {
-                        tin: pc::get_tin(conn, &partner.partner_id),
-                        partner,
-                    })
-                    .collect();
-
+                ),
+                other => other?,
+            };
+            let partner_count = request.partners.len();
             // The ledger entry point, not `build_return`: the latter fills identity
             // only and leaves every money line blank.
-            let partner_count = partners.len();
-            let bundle = build_return_from_ledger(
-                conn,
-                &ReturnRequest {
-                    year,
-                    profile,
-                    partners,
-                    schedule_b: accountir::tax::schedule_b::load(conn, year),
-                    // Family ties for Schedule B-1's §267(c) attribution. Read here
-                    // like the partners are; empty means nobody is attributed
-                    // anything but their own share.
-                    relationships: pc::list_relationships(conn),
-                    // All three left to `build_return_from_ledger`, which has
-                    // the connection and reads them from the books.
-                    assets: Vec::new(),
-                    schedule_l: None,
-                    capital: Default::default(),
-                    nondeductible: Vec::new(),
-                    segments: Vec::new(),
-                    detail: Default::default(),
-                    options: Default::default(),
-                    book_income_cents: 0,
-                    fixed_allocations: Vec::new(),
-                    liabilities: Default::default(),
-                },
-            )?;
+            let bundle = build_return_from_ledger(conn, &request)?;
 
             std::fs::write(&output, &bundle.pdf)?;
             println!(
@@ -2600,6 +3249,20 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
                  come from the books via the Form 1065 line mappings; Schedule K, the \
                  capital accounts, and Schedule B are deliberately left blank."
             );
+        }
+
+        TaxCliCommands::BusinessType { kind } => {
+            use accountir::commands::sole_proprietor_commands as spc;
+            use accountir::domain::BusinessType;
+            if let Some(kind) = kind {
+                let parsed = BusinessType::parse(&kind).ok_or_else(|| {
+                    let known: Vec<&str> = BusinessType::ALL.iter().map(|t| t.as_str()).collect();
+                    anyhow::anyhow!("{kind:?} is not a business type; use one of {}", known.join(", "))
+                })?;
+                spc::set_business_type(store, "cli-user", parsed)?;
+            }
+            let current = spc::business_type(store.connection());
+            println!("These books are {} and file {}.", current.label(), current.form_name());
         }
 
         TaxCliCommands::Il1065 { year, output } => {

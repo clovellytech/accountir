@@ -88,6 +88,7 @@ pub fn stale_mappings(conn: &Connection) -> Vec<(String, String, &'static str)> 
     let want = match business_type(conn) {
         BusinessType::Partnership => "Form 1065",
         BusinessType::SoleProprietorship => "Schedule C",
+        BusinessType::Individual => "Form 1040",
     };
     let mut out = Vec::new();
     let Ok(mut stmt) = conn.prepare(
@@ -279,10 +280,9 @@ pub fn build_from_ledger(
     year: i32,
     home_office_dollars: Option<i64>,
 ) -> Result<crate::tax::schedule_c::Bundle, SoleProprietorError> {
-    if business_type(conn) != BusinessType::SoleProprietorship {
-        return Err(SoleProprietorError::NotASoleProprietorship(
-            BusinessType::Partnership.label(),
-        ));
+    let kind = business_type(conn);
+    if kind != BusinessType::SoleProprietorship {
+        return Err(SoleProprietorError::NotASoleProprietorship(kind.label()));
     }
 
     // Named where they are, because the last version of this message said only

@@ -270,6 +270,85 @@ impl<'a> Projector<'a> {
                     params![account_id, effective_from, *added_back as i64, stored_event.id],
                 )?;
             }
+            Event::DocumentAttached(d) => {
+                // Replaces a row with the same id, so a document attached again
+                // after a removal comes back as it was attached the second time.
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO documents
+                       (document_id, sha256, size_bytes, media_type, filename, title,
+                        tax_year, form, attached_at, attached_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        d.document_id,
+                        d.sha256,
+                        d.size_bytes as i64,
+                        d.media_type,
+                        d.filename,
+                        d.title,
+                        d.tax_year,
+                        d.form,
+                        stored_event.timestamp.to_rfc3339(),
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::DocumentRemoved { document_id } => {
+                self.conn.execute(
+                    "DELETE FROM documents WHERE document_id = ?1",
+                    [document_id],
+                )?;
+            }
+            Event::TaxStatementRecorded(s) => {
+                // Replaces: a re-recorded statement is the same statement with new
+                // figures — see the event.
+                let amounts = serde_json::to_string(&s.amounts)
+                    .expect("a map of strings to integers always serializes");
+                let document_ids = serde_json::to_string(&s.document_ids)
+                    .expect("a list of strings always serializes");
+                let source = serde_json::to_string(&s.source)
+                    .expect("a statement source always serializes");
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO tax_statements
+                       (statement_id, tax_year, form, issuer, amounts, document_ids,
+                        source, note, recorded_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        s.statement_id,
+                        s.tax_year,
+                        s.form,
+                        s.issuer,
+                        amounts,
+                        document_ids,
+                        source,
+                        s.note,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::TaxStatementRemoved { statement_id } => {
+                self.conn.execute(
+                    "DELETE FROM tax_statements WHERE statement_id = ?1",
+                    [statement_id],
+                )?;
+            }
+            Event::K1SourceLinked {
+                link_id,
+                ledger_id,
+                ledger_name,
+                partner_id,
+                partner_name,
+            } => {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO k1_links
+                       (link_id, ledger_id, ledger_name, partner_id, partner_name, linked_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![link_id, ledger_id, ledger_name, partner_id, partner_name, stored_event.id],
+                )?;
+            }
+            Event::K1SourceUnlinked { link_id } => {
+                self.conn
+                    .execute("DELETE FROM k1_links WHERE link_id = ?1", [link_id])?;
+            }
             Event::TaxLineMappingCleared {
                 account_id,
                 effective_from,
@@ -1350,6 +1429,12 @@ impl<'a> Projector<'a> {
              DELETE FROM tax_line_mappings;
              DELETE FROM tax_statement_groups;
              DELETE FROM il_tax_addbacks;
+             -- Documents, statements and K-1 links (migration 047). Projections:
+             -- the documents' bytes are not in the database at all, so nothing
+             -- here is anything a replay cannot rebuild.
+             DELETE FROM documents;
+             DELETE FROM tax_statements;
+             DELETE FROM k1_links;
              DELETE FROM schedule_b_answers;
              -- Projections too, and missing from this list until now: a rebuild
              -- that left them behind was a merge rather than a replay, so a

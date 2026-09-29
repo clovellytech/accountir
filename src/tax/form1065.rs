@@ -845,6 +845,29 @@ pub struct Bundle {
     /// rather than swallowed, because each one is a rejected return later.
     pub warnings: Vec<String>,
     pub page_count: usize,
+    /// What each Schedule K-1 in the PDF carries, in the order they appear.
+    ///
+    /// For anything that needs a K-1's figures rather than its paper — a
+    /// partner's own books receiving it, above all. Taken from the very values
+    /// the K-1 pages were filled from, so the figures and the form cannot
+    /// disagree.
+    pub k1s: Vec<K1Figures>,
+}
+
+/// One partner's Schedule K-1, as figures.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct K1Figures {
+    pub partner_id: String,
+    pub partner_name: String,
+    /// Their share of each Schedule K line, in whole dollars, keyed by line key
+    /// (`k1`, `k14a`, `k19a`, …). A line that came to nothing is absent.
+    pub by_line: std::collections::BTreeMap<&'static str, i64>,
+    /// Box 20 code Z, when there are Section 199A figures.
+    pub qbi: Option<super::qbi::Share>,
+    /// Item L.
+    pub capital: Option<super::capital::CapitalAccount>,
+    /// Item K, when the return reports liabilities.
+    pub liabilities: Option<super::liabilities::PartnerLiabilities>,
 }
 
 /// Build the 1065 and one K-1 per partner into a single fillable PDF, filling
@@ -1300,7 +1323,21 @@ fn build_return_inner(
     }
 
     // --- one K-1 per partner ---
+    let mut k1s: Vec<K1Figures> = Vec::with_capacity(filed.len());
     for (i, filing) in filed.iter().enumerate() {
+        k1s.push(K1Figures {
+            partner_id: filing.partner.partner_id.clone(),
+            partner_name: filing.partner.name.clone(),
+            by_line: shares[i].by_line.clone(),
+            qbi: qbi_shares.get(i).copied().filter(|q| !q.is_empty()),
+            capital: req.capital.for_partner(&filing.partner.partner_id).cloned(),
+            liabilities: req.liabilities.any.then(|| {
+                req.liabilities
+                    .for_partner(&filing.partner.partner_id)
+                    .cloned()
+                    .unwrap_or_default()
+            }),
+        });
         let mut sched = Document::load_mem(blanks.sk1)?;
         strip_xfa(&mut sched);
         // Namespace this copy before anything is written into it, so partner
@@ -1552,6 +1589,7 @@ fn build_return_inner(
         pdf,
         warnings,
         page_count,
+        k1s,
     })
 }
 

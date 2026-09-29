@@ -172,6 +172,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             46,
             include_str!("../../migrations/046_illinois_tax_addbacks.sql"),
         ),
+        (
+            47,
+            include_str!("../../migrations/047_documents_and_tax_statements.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -813,6 +817,42 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at_event INTEGER REFERENCES events(id),
             PRIMARY KEY (account_id, effective_from)
+        );
+
+        -- Attached documents (metadata only — the bytes are in the blob store),
+        -- recorded tax statements, and K-1 links (migration 047).
+        CREATE TABLE IF NOT EXISTS documents (
+            document_id TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            media_type TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            title TEXT,
+            tax_year INTEGER,
+            form TEXT,
+            attached_at TEXT NOT NULL,
+            attached_at_event INTEGER REFERENCES events(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_documents_tax_year ON documents(tax_year);
+        CREATE TABLE IF NOT EXISTS tax_statements (
+            statement_id TEXT PRIMARY KEY,
+            tax_year INTEGER NOT NULL,
+            form TEXT NOT NULL,
+            issuer TEXT NOT NULL,
+            amounts TEXT NOT NULL,
+            document_ids TEXT NOT NULL DEFAULT '[]',
+            source TEXT NOT NULL,
+            note TEXT,
+            recorded_at_event INTEGER REFERENCES events(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tax_statements_year ON tax_statements(tax_year, form);
+        CREATE TABLE IF NOT EXISTS k1_links (
+            link_id TEXT PRIMARY KEY,
+            ledger_id TEXT NOT NULL,
+            ledger_name TEXT NOT NULL,
+            partner_id TEXT NOT NULL,
+            partner_name TEXT NOT NULL,
+            linked_at_event INTEGER REFERENCES events(id)
         );
 
         -- Local only, never replicated — see migration 023.

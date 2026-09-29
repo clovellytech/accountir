@@ -4,6 +4,7 @@ pub mod amazon_reconcile;
 pub mod bill_commands;
 pub mod closing_commands;
 pub mod depreciation_commands;
+pub mod document_commands;
 pub mod entry_commands;
 pub mod event_service_commands;
 pub mod fiscal_year_commands;
@@ -21,6 +22,7 @@ pub mod sole_proprietor_commands;
 pub mod square_commands;
 pub mod stripe_commands;
 pub mod tax_setup_commands;
+pub mod tax_statement_commands;
 pub mod vendor_rules;
 
 pub use account_commands::*;

@@ -519,6 +519,31 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             widgets::truncate(account_id, 8),
             if *added_back { "is" } else { "is no longer" }
         ),
+        Event::DocumentAttached(d) => format!(
+            "Document attached: {}{}",
+            d.filename,
+            d.tax_year.map(|y| format!(" ({y})")).unwrap_or_default()
+        ),
+        Event::DocumentRemoved { document_id } => {
+            format!("Document {} removed", widgets::truncate(document_id, 8))
+        }
+        Event::TaxStatementRecorded(s) => {
+            let form = crate::tax::information_returns::FormKind::parse(&s.form)
+                .map(|f| f.label())
+                .unwrap_or(s.form.as_str());
+            format!("{} {form} from {} recorded", s.tax_year, s.issuer)
+        }
+        Event::TaxStatementRemoved { statement_id } => {
+            format!("Tax statement {} removed", widgets::truncate(statement_id, 8))
+        }
+        Event::K1SourceLinked {
+            ledger_name,
+            partner_name,
+            ..
+        } => format!("Receives {partner_name}'s K-1 from {ledger_name}"),
+        Event::K1SourceUnlinked { link_id } => {
+            format!("K-1 link {} removed", widgets::truncate(link_id, 8))
+        }
         Event::ScheduleBAnswerSet {
             tax_year,
             answer_key,

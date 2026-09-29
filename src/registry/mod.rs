@@ -148,6 +148,29 @@ impl Registry {
             .map_err(Into::into)
     }
 
+    /// The business whose books carry this ledger id — the `company_id` in their
+    /// log — among every business this machine knows, archived ones included.
+    ///
+    /// By id and not by path, because a link between two sets of books is
+    /// recorded in a log other machines replay, where this machine's path means
+    /// nothing. A file that cannot be opened is skipped rather than fatal: one
+    /// unplugged drive should not stop the others being found.
+    pub fn find_by_ledger_id(&self, ledger_id: &str) -> Result<Option<Business>> {
+        let mut all = self.list_active()?;
+        all.extend(self.list_archived()?);
+        for business in all {
+            let Ok(conn) =
+                Connection::open_with_flags(&business.db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            else {
+                continue;
+            };
+            if crate::documents::ledger_id(&conn).as_deref() == Some(ledger_id) {
+                return Ok(Some(business));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn find_by_path(&self, path: &Path) -> Result<Option<Business>> {
         let canonical = canonicalize_existing_or_parent(path)?;
         self.conn

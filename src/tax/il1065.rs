@@ -968,6 +968,7 @@ pub fn build_with_special(
         pdf,
         warnings,
         page_count,
+        k1s: Vec::new(),
     })
 }
 

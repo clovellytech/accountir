@@ -54,17 +54,24 @@ pub enum BusinessType {
     Partnership,
     /// Schedule C, attached to the owner's Form 1040.
     SoleProprietorship,
+    /// A person's own books: Form 1040, fed by the statements they receive —
+    /// W-2s, 1099s, and the K-1s of partnerships whose books are kept here too.
+    Individual,
 }
 
 impl BusinessType {
-    pub const ALL: [BusinessType; 2] =
-        [BusinessType::Partnership, BusinessType::SoleProprietorship];
+    pub const ALL: [BusinessType; 3] = [
+        BusinessType::Partnership,
+        BusinessType::SoleProprietorship,
+        BusinessType::Individual,
+    ];
 
     /// The stable string the event log stores.
     pub fn as_str(self) -> &'static str {
         match self {
             BusinessType::Partnership => "partnership",
             BusinessType::SoleProprietorship => "sole_proprietorship",
+            BusinessType::Individual => "individual",
         }
     }
 
@@ -76,6 +83,7 @@ impl BusinessType {
         match self {
             BusinessType::Partnership => "Partnership",
             BusinessType::SoleProprietorship => "Sole proprietorship",
+            BusinessType::Individual => "Individual (personal)",
         }
     }
 
@@ -84,11 +92,16 @@ impl BusinessType {
         match self {
             BusinessType::Partnership => "Form 1065",
             BusinessType::SoleProprietorship => "Schedule C (Form 1040)",
+            BusinessType::Individual => "Form 1040",
         }
     }
 
     pub fn is_sole_proprietorship(self) -> bool {
         self == BusinessType::SoleProprietorship
+    }
+
+    pub fn is_individual(self) -> bool {
+        self == BusinessType::Individual
     }
 }
 
