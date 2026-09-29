@@ -7,9 +7,10 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::tax::information_returns::FormKind;
+use crate::tax::schedule_d::Category;
 
 /// A file attached to the books.
 ///
@@ -95,5 +96,61 @@ impl K1Link {
     /// twice is one link rather than two K-1s for the same interest.
     pub fn id_for(ledger_id: &str, partner_id: &str) -> String {
         format!("{ledger_id}:{partner_id}")
+    }
+}
+
+/// One transaction on a received statement — a Form 8949 row.
+///
+/// Only a 1099-B has these, and only where the form requires a transaction to be
+/// listed rather than subtotalled: the noncovered categories, anything not
+/// reported on a 1099-B, and any transaction the broker adjusted. See
+/// [`crate::tax::schedule_d`] for which is which, and
+/// [`crate::events::types::TaxStatementLineData`] for why the gain is not stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementLine {
+    pub statement_id: String,
+    pub line_id: String,
+    pub category: Category,
+    /// Column (a).
+    pub description: String,
+    /// Column (b): a date, or the word that stands in its place.
+    pub acquired: Acquired,
+    /// Column (c).
+    pub sold_on: NaiveDate,
+    /// Column (d), in cents.
+    pub proceeds_cents: i64,
+    /// Column (e), in cents.
+    pub basis_cents: i64,
+    /// Column (f).
+    pub adjustment_code: Option<String>,
+    /// Column (g), in cents. Positive increases the gain.
+    pub adjustment_cents: i64,
+}
+
+impl StatementLine {
+    /// Column (h): proceeds less basis, plus the adjustment. Computed, never
+    /// stored — see [`crate::events::types::TaxStatementLineData`].
+    pub fn gain_cents(&self) -> i64 {
+        self.proceeds_cents - self.basis_cents + self.adjustment_cents
+    }
+}
+
+/// Form 8949 column (b): when the shares were acquired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Acquired {
+    On(NaiveDate),
+    /// One of the words the form takes in a date's place — `VARIOUS` for a sale
+    /// across lots bought on different days, `INHERITED` for a holding whose basis
+    /// is its value at death.
+    Stated(String),
+}
+
+impl Acquired {
+    /// What column (b) prints.
+    pub fn as_printed(&self) -> String {
+        match self {
+            Acquired::On(date) => date.to_string(),
+            Acquired::Stated(word) => word.clone(),
+        }
     }
 }

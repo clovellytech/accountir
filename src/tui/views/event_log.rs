@@ -681,6 +681,20 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::TaxStatementRemoved { statement_id } => {
             format!("Tax statement {} removed", widgets::truncate(statement_id, 8))
         }
+        Event::TaxStatementLinesRecorded(l) => match l.lines.len() {
+            0 => format!(
+                "Transaction detail cleared on statement {}",
+                widgets::truncate(&l.statement_id, 8)
+            ),
+            1 => format!(
+                "1 transaction recorded on statement {}",
+                widgets::truncate(&l.statement_id, 8)
+            ),
+            n => format!(
+                "{n} transactions recorded on statement {}",
+                widgets::truncate(&l.statement_id, 8)
+            ),
+        },
         Event::K1SourceLinked {
             ledger_name,
             partner_name,

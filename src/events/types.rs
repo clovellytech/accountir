@@ -211,7 +211,9 @@ pub struct SecurityDefinedData {
 ///
 /// A closed enum, unlike [`SecurityDefinedData::kind`], because the statute
 /// closes it: §1222 knows two answers and no third is possible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Ordered and hashable so a report can key by term. `Short` sorts before `Long`,
+/// which is the order Schedule D and Form 8949 put them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldingTerm {
     Short,
@@ -846,6 +848,76 @@ pub enum StatementSourceData {
     },
 }
 
+/// One transaction on a received statement: a Form 8949 row, as the log records
+/// it.
+///
+/// # Why a statement has lines as well as boxes
+///
+/// [`TaxStatementData`] is box code → cents, which is everything a W-2 or a
+/// 1099-INT says. A 1099-B is the exception: it reports subtotals per Form 8949
+/// category, and for three of the six categories — and for any transaction the
+/// broker adjusted — the form requires each sale to be *listed*. A list of sales
+/// is not a map of box codes to amounts, so it is its own payload.
+///
+/// # What is deliberately not here
+///
+/// The **gain**. Column (h) is `proceeds − basis + adjustment` on every row, and
+/// recording a subtraction is recording a second answer to a question that already
+/// has one. The *category's* gain is on the statement's boxes, because that figure
+/// is one the broker printed and worth checking against.
+///
+/// The **wash-sale computation**. Spec §4 puts it out of scope: the 30-day rule
+/// reaches across accounts, and the broker has already applied it on the form we
+/// are transcribing. [`adjustment_cents`](TaxStatementLineData::adjustment_cents)
+/// is the broker's figure, carried.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxStatementLineData {
+    /// Stable within the statement, so a corrected row replaces one rather than
+    /// adding one.
+    pub line_id: String,
+    /// The Form 8949 category, lowercase: `"a"`…`"f"`. See
+    /// [`crate::tax::schedule_d::Category`], which owns the vocabulary.
+    pub category: String,
+    /// Column (a): "100 sh. XYZ Co."
+    pub description: String,
+    /// Column (b) as a date, when the shares were bought on one day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquired_on: Option<NaiveDate>,
+    /// Column (b) as one of the words the form allows in a date's place —
+    /// `VARIOUS`, `INHERITED`. Exactly one of the two is set: which applies is a
+    /// fact about the shares that no ledger holds, so the statement or the person
+    /// supplies it (spec §8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquired_label: Option<String>,
+    /// Column (c).
+    pub sold_on: NaiveDate,
+    /// Column (d). Signed: a settlement can come to less than nothing.
+    pub proceeds_cents: i64,
+    /// Column (e).
+    pub basis_cents: i64,
+    /// Column (f): `W` for a wash sale, `B` for a basis correction, and the rest
+    /// of the form's letters. Several can apply at once, so it is a short string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adjustment_code: Option<String>,
+    /// Column (g). Positive increases the gain, which is the direction a
+    /// disallowed wash-sale loss goes.
+    #[serde(default)]
+    pub adjustment_cents: i64,
+}
+
+/// The whole of one statement's transaction detail, replacing whatever it had.
+///
+/// Boxed inside its `Event` variant for the reason [`SecuritySoldData`] is: it
+/// carries a `Vec`, and an enum is as wide as its widest variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxStatementLinesData {
+    pub statement_id: String,
+    /// The rows, in the order Form 8949 prints them. Empty clears the detail,
+    /// which is how a list entered by mistake is withdrawn without removing the
+    /// statement it belongs to.
+    pub lines: Vec<TaxStatementLineData>,
+}
+
 /// All event types in the accounting system
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1062,6 +1134,17 @@ pub enum Event {
     /// the income on the return twice.
     TaxStatementRecorded(Box<TaxStatementData>),
     TaxStatementRemoved { statement_id: String },
+    /// A statement's transaction-by-transaction detail, replacing whatever it
+    /// had: the Form 8949 rows a 1099-B's category subtotals are not enough for
+    /// (INVESTMENTS-SPEC.md §8).
+    ///
+    /// Whole rather than row by row, for the reason
+    /// [`Event::TaxStatementRecorded`] replaces rather than adds: a corrected
+    /// consolidated statement is re-entered from the paper, and merging the new
+    /// rows into the old ones would list the sales the correction removed.
+    ///
+    /// Removing the statement removes its lines — see the projection.
+    TaxStatementLinesRecorded(Box<TaxStatementLinesData>),
     /// These books receive a Schedule K-1 from another set of books managed in
     /// accountir: `partner_id`'s K-1 from the partnership whose ledger is
     /// `ledger_id`.
@@ -1710,6 +1793,7 @@ impl Event {
             Event::DocumentRemoved { .. } => "document_removed",
             Event::TaxStatementRecorded(_) => "tax_statement_recorded",
             Event::TaxStatementRemoved { .. } => "tax_statement_removed",
+            Event::TaxStatementLinesRecorded(_) => "tax_statement_lines_recorded",
             Event::K1SourceLinked { .. } => "k1_source_linked",
             Event::K1SourceUnlinked { .. } => "k1_source_unlinked",
             Event::ScheduleBAnswerSet { .. } => "schedule_b_answer_set",
@@ -1812,6 +1896,7 @@ impl Event {
             Event::DocumentRemoved { document_id } => Some(document_id),
             Event::TaxStatementRecorded(s) => Some(&s.statement_id),
             Event::TaxStatementRemoved { statement_id } => Some(statement_id),
+            Event::TaxStatementLinesRecorded(l) => Some(&l.statement_id),
             Event::K1SourceLinked { link_id, .. } => Some(link_id),
             Event::K1SourceUnlinked { link_id } => Some(link_id),
             // Keyed by (year, question), so no single id names the thing changed.

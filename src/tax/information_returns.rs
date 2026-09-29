@@ -101,6 +101,39 @@ const BASIS_RECORDS: &str = "Your basis records — a capital account is not bas
 const AT_RISK: &str = "Basis, and at-risk limits (Form 6198)";
 const PROPERTY: &str = "Schedule A, line 5b — or Schedule E or C for a rental or business property";
 
+/// Schedule D's capital-transaction lines, column by column.
+///
+/// One destination per column of per line, because a destination is a total and a
+/// line's four columns are four unlike totals. A category that may reach either of
+/// two lines says so: box A goes on line 1a as a subtotal when nothing on it was
+/// adjusted, and on line 1b through Form 8949 when something was. A column (g)
+/// destination names only the Form 8949 line, because an adjustment is the very
+/// thing that rules out the no-8949 line.
+const SD_1A_D: &str = "Schedule D, line 1a or 1b, column (d) — proceeds";
+const SD_1A_E: &str = "Schedule D, line 1a or 1b, column (e) — cost basis";
+const SD_1B_G: &str = "Schedule D, line 1b, column (g) — adjustments, through Form 8949 Part I box A";
+const SD_1A_H: &str = "Schedule D, line 1a or 1b, column (h) — gain or loss, checked against the columns it comes from";
+const SD_2_D: &str = "Schedule D, line 2, column (d) — proceeds, through Form 8949 Part I box B";
+const SD_2_E: &str = "Schedule D, line 2, column (e) — cost basis, through Form 8949 Part I box B";
+const SD_2_G: &str = "Schedule D, line 2, column (g) — adjustments, through Form 8949 Part I box B";
+const SD_2_H: &str = "Schedule D, line 2, column (h) — gain or loss, checked against the columns it comes from";
+const SD_3_D: &str = "Schedule D, line 3, column (d) — proceeds, through Form 8949 Part I box C";
+const SD_3_E: &str = "Schedule D, line 3, column (e) — cost basis, through Form 8949 Part I box C";
+const SD_3_G: &str = "Schedule D, line 3, column (g) — adjustments, through Form 8949 Part I box C";
+const SD_3_H: &str = "Schedule D, line 3, column (h) — gain or loss, checked against the columns it comes from";
+const SD_8A_D: &str = "Schedule D, line 8a or 8b, column (d) — proceeds";
+const SD_8A_E: &str = "Schedule D, line 8a or 8b, column (e) — cost basis";
+const SD_8B_G: &str = "Schedule D, line 8b, column (g) — adjustments, through Form 8949 Part II box D";
+const SD_8A_H: &str = "Schedule D, line 8a or 8b, column (h) — gain or loss, checked against the columns it comes from";
+const SD_9_D: &str = "Schedule D, line 9, column (d) — proceeds, through Form 8949 Part II box E";
+const SD_9_E: &str = "Schedule D, line 9, column (e) — cost basis, through Form 8949 Part II box E";
+const SD_9_G: &str = "Schedule D, line 9, column (g) — adjustments, through Form 8949 Part II box E";
+const SD_9_H: &str = "Schedule D, line 9, column (h) — gain or loss, checked against the columns it comes from";
+const SD_10_D: &str = "Schedule D, line 10, column (d) — proceeds, through Form 8949 Part II box F";
+const SD_10_E: &str = "Schedule D, line 10, column (e) — cost basis, through Form 8949 Part II box F";
+const SD_10_G: &str = "Schedule D, line 10, column (g) — adjustments, through Form 8949 Part II box F";
+const SD_10_H: &str = "Schedule D, line 10, column (h) — gain or loss, checked against the columns it comes from";
+
 const W2: &[BoxDef] = &[
     money("1", "Wages, tips, other compensation", "Form 1040, line 1a"),
     money("2", "Federal income tax withheld", "Form 1040, line 25a"),
@@ -157,9 +190,130 @@ const F1099_DIV: &[BoxDef] = &[
     money("7", "Foreign tax paid", "Schedule 3, line 1, or Form 1116"),
 ];
 
+/// A 1099-B, captured the way the form is organised: **per Form 8949 category**,
+/// not per transaction (INVESTMENTS-SPEC.md §8).
+///
+/// # Why there is no plain box 1d or 1e
+///
+/// There was, and it was wrong. Boxes 1d and 1e are *per transaction* on the form,
+/// and a consolidated 1099-B reports them subtotalled by category, because the
+/// category is what decides where the figures land: whether basis was reported to
+/// the IRS, whether the sale was reported to the IRS at all, and short term or
+/// long. One box 1d for a whole brokerage year answers none of those, and beside
+/// the category boxes it would double every figure it held.
+///
+/// # The six categories
+///
+/// Short term: **A** basis reported to the IRS, **B** basis not reported, **C** not
+/// reported on a 1099-B at all. Long term: **D**, **E**, **F**, the same three.
+///
+/// A and D with no adjustment go straight onto Schedule D lines 1a and 8a with
+/// **no Form 8949**, which for an ordinary brokerage year is the whole return. The
+/// rest are listed on Form 8949 — see [`super::schedule_d`].
+///
+/// # Why each column is its own destination
+///
+/// Because a destination is summed across statements, and proceeds, basis,
+/// adjustment and gain are four different columns of one line. Two brokers'
+/// category A proceeds *do* add — that is exactly what Schedule D line 1a column
+/// (d) is — but a broker's proceeds and its basis do not.
 const F1099_B: &[BoxDef] = &[
-    money("1d", "Proceeds", "Form 8949"),
-    money("1e", "Cost or other basis", "Form 8949"),
+    money("a_proceeds", "Box A (short term, basis reported) — proceeds", SD_1A_D),
+    money("a_basis", "Box A (short term, basis reported) — cost basis", SD_1A_E),
+    money(
+        "a_adjustments",
+        "Box A (short term, basis reported) — wash sale and other adjustments",
+        SD_1B_G,
+    ),
+    info("a_gain", "Box A (short term, basis reported) — gain or loss", SD_1A_H),
+    money(
+        "b_proceeds",
+        "Box B (short term, basis not reported) — proceeds",
+        SD_2_D,
+    ),
+    money(
+        "b_basis",
+        "Box B (short term, basis not reported) — cost basis",
+        SD_2_E,
+    ),
+    money(
+        "b_adjustments",
+        "Box B (short term, basis not reported) — wash sale and other adjustments",
+        SD_2_G,
+    ),
+    info(
+        "b_gain",
+        "Box B (short term, basis not reported) — gain or loss",
+        SD_2_H,
+    ),
+    money(
+        "c_proceeds",
+        "Box C (short term, not reported on a 1099-B) — proceeds",
+        SD_3_D,
+    ),
+    money(
+        "c_basis",
+        "Box C (short term, not reported on a 1099-B) — cost basis",
+        SD_3_E,
+    ),
+    money(
+        "c_adjustments",
+        "Box C (short term, not reported on a 1099-B) — adjustments",
+        SD_3_G,
+    ),
+    info(
+        "c_gain",
+        "Box C (short term, not reported on a 1099-B) — gain or loss",
+        SD_3_H,
+    ),
+    money("d_proceeds", "Box D (long term, basis reported) — proceeds", SD_8A_D),
+    money("d_basis", "Box D (long term, basis reported) — cost basis", SD_8A_E),
+    money(
+        "d_adjustments",
+        "Box D (long term, basis reported) — wash sale and other adjustments",
+        SD_8B_G,
+    ),
+    info("d_gain", "Box D (long term, basis reported) — gain or loss", SD_8A_H),
+    money(
+        "e_proceeds",
+        "Box E (long term, basis not reported) — proceeds",
+        SD_9_D,
+    ),
+    money(
+        "e_basis",
+        "Box E (long term, basis not reported) — cost basis",
+        SD_9_E,
+    ),
+    money(
+        "e_adjustments",
+        "Box E (long term, basis not reported) — wash sale and other adjustments",
+        SD_9_G,
+    ),
+    info(
+        "e_gain",
+        "Box E (long term, basis not reported) — gain or loss",
+        SD_9_H,
+    ),
+    money(
+        "f_proceeds",
+        "Box F (long term, not reported on a 1099-B) — proceeds",
+        SD_10_D,
+    ),
+    money(
+        "f_basis",
+        "Box F (long term, not reported on a 1099-B) — cost basis",
+        SD_10_E,
+    ),
+    money(
+        "f_adjustments",
+        "Box F (long term, not reported on a 1099-B) — adjustments",
+        SD_10_G,
+    ),
+    info(
+        "f_gain",
+        "Box F (long term, not reported on a 1099-B) — gain or loss",
+        SD_10_H,
+    ),
     money("4", "Federal income tax withheld", WITHHELD),
 ];
 
@@ -681,6 +835,38 @@ mod tests {
         let ubia = k1.box_def("20z_ubia").unwrap().destination;
         assert!(qbi != wages && wages != ubia && qbi != ubia);
         assert_ne!(FormKind::F1099Div.box_def("5").unwrap().destination, qbi);
+    }
+
+    /// The 1099-B's four columns per category are four unlike totals, so each has
+    /// its own destination — and the gain is never summed, because it is the other
+    /// three subtracted and added.
+    #[test]
+    fn every_1099b_column_has_its_own_destination_and_the_gain_is_not_summed() {
+        let b = FormKind::F1099B;
+        let mut destinations = std::collections::BTreeSet::new();
+        for letter in ["a", "b", "c", "d", "e", "f"] {
+            for (column, summed) in [
+                ("proceeds", true),
+                ("basis", true),
+                ("adjustments", true),
+                ("gain", false),
+            ] {
+                let code = format!("{letter}_{column}");
+                let def = b
+                    .box_def(&code)
+                    .unwrap_or_else(|| panic!("the catalogue is missing {code}"));
+                assert_eq!(def.summed, summed, "{code}");
+                assert!(
+                    destinations.insert(def.destination),
+                    "{code} shares a destination with another column, so the two would be added"
+                );
+            }
+        }
+        // Boxes 1d and 1e are per transaction on the form; beside the category
+        // boxes they would double every figure they held.
+        assert!(!b.accepts_box("1d"));
+        assert!(!b.accepts_box("1e"));
+        assert!(b.accepts_box("4"));
     }
 
     /// A total and its parts must not both be summed toward one destination.

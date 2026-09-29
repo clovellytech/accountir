@@ -385,6 +385,155 @@ pub fn consumed_lots(conn: &rusqlite::Connection, sale_id: &str) -> Vec<Consumed
         .collect()
 }
 
+/// One sale, as the register recorded it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sale {
+    pub sale_id: String,
+    pub security_id: String,
+    pub securities_account_id: String,
+    pub quantity: i64,
+    /// Gross, as the sale was recorded.
+    pub proceeds_cents: i64,
+    /// Taken out of the proceeds.
+    pub fee_cents: i64,
+    pub basis_cents: i64,
+    pub realized_gain_cents: i64,
+    pub trade_date: NaiveDate,
+}
+
+impl Sale {
+    /// Proceeds after the sale fee — the figure a 1099-B reports, and so the
+    /// figure a reconciliation against one compares. See the module docs on why a
+    /// sale fee reduces proceeds rather than posting as an expense.
+    pub fn net_proceeds_cents(&self) -> i64 {
+        self.proceeds_cents - self.fee_cents
+    }
+}
+
+/// Every sale with a trade date in `year`, oldest first.
+pub fn sales_in_year(conn: &rusqlite::Connection, year: i32) -> Vec<Sale> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, security_id, securities_account_id, quantity, proceeds_cents, fee_cents,
+                basis_cents, realized_gain_cents, trade_date
+           FROM investment_sales
+          WHERE trade_date >= ?1 AND trade_date <= ?2
+          ORDER BY trade_date, rowid",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt.query_map(
+        params![format!("{year}-01-01"), format!("{year}-12-31")],
+        |r| {
+            Ok((
+                Sale {
+                    sale_id: r.get(0)?,
+                    security_id: r.get(1)?,
+                    securities_account_id: r.get(2)?,
+                    quantity: r.get(3)?,
+                    proceeds_cents: r.get(4)?,
+                    fee_cents: r.get(5)?,
+                    basis_cents: r.get(6)?,
+                    realized_gain_cents: r.get(7)?,
+                    trade_date: NaiveDate::default(),
+                },
+                r.get::<_, String>(8)?,
+            ))
+        },
+    );
+    let Ok(rows) = rows else { return Vec::new() };
+    rows.flatten()
+        .filter_map(|(mut sale, date)| {
+            sale.trade_date = NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?;
+            Some(sale)
+        })
+        .collect()
+}
+
+/// A year's realized gain, split the way a 1099-B splits it: by security and by
+/// term.
+///
+/// This is the cross-check side of spec §8 — the figure compared against the
+/// broker's form, never the figure filed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealizedPortion {
+    pub security_id: String,
+    pub term: HoldingTerm,
+    /// Net of the sale fee. See [`Sale::net_proceeds_cents`].
+    pub proceeds_cents: i64,
+    pub basis_cents: i64,
+    /// `proceeds − basis`, and across a whole sale exactly the
+    /// `realized_gain_cents` the sale event recorded.
+    pub gain_cents: i64,
+    /// What the sales behind it charged in fees. A broker that reports **gross**
+    /// proceeds on its 1099-B differs from us by exactly this, and a
+    /// reconciliation that could not say so would call it a missing trade.
+    pub fee_cents: i64,
+}
+
+/// A year's realized gain per security and term, read out of the sale register.
+///
+/// # Read, not recomputed
+///
+/// The lots a sale consumed, their basis and their term are recorded **on the sale
+/// event** (spec §4) and projected into `investment_sale_lots` verbatim. This
+/// function reads those figures. It does not re-select lots, re-date a holding
+/// period or re-apply a rule, because a filed gain must not be restated by a later
+/// change of the default method.
+///
+/// # The one allocation, and why it cannot be avoided
+///
+/// A sale event records basis **per lot** and therefore per term, but proceeds only
+/// as one total — because that is what the broker reports and what the cash line
+/// posted. A sale that consumed both a short-term and a long-term lot therefore has
+/// no recorded per-term proceeds, and a comparison against a 1099-B needs one. It
+/// is allocated by quantity, with the last term taking the remainder, so the parts
+/// sum to the recorded total exactly and the per-term gains sum to the recorded
+/// `realized_gain_cents` to the cent. A sale entirely within one term — nearly all
+/// of them — is not allocated at all.
+pub fn realized_in_year(conn: &rusqlite::Connection, year: i32) -> Vec<RealizedPortion> {
+    let mut by_key: std::collections::BTreeMap<(String, &'static str), RealizedPortion> =
+        std::collections::BTreeMap::new();
+    for sale in sales_in_year(conn, year) {
+        let lots = consumed_lots(conn, &sale.sale_id);
+        if lots.is_empty() {
+            continue;
+        }
+        let net = sale.net_proceeds_cents();
+        let total_quantity: i64 = lots.iter().map(|l| l.quantity).sum();
+        let mut allocated = 0;
+        for (index, lot) in lots.iter().enumerate() {
+            let proceeds = if index + 1 == lots.len() || total_quantity == 0 {
+                net - allocated
+            } else {
+                let share = (net as i128 * lot.quantity as i128) / total_quantity as i128;
+                share as i64
+            };
+            allocated += proceeds;
+            let entry = by_key
+                .entry((sale.security_id.clone(), lot.term.as_str()))
+                .or_insert_with(|| RealizedPortion {
+                    security_id: sale.security_id.clone(),
+                    term: lot.term,
+                    proceeds_cents: 0,
+                    basis_cents: 0,
+                    gain_cents: 0,
+                    fee_cents: 0,
+                });
+            entry.proceeds_cents += proceeds;
+            entry.basis_cents += lot.basis_cents;
+            entry.gain_cents += proceeds - lot.basis_cents;
+        }
+        // The fee belongs to the sale, not to a lot: attributed to the term of the
+        // first lot consumed, so it is counted once and can still be named.
+        if let Some(first) = lots.first() {
+            if let Some(entry) = by_key.get_mut(&(sale.security_id.clone(), first.term.as_str())) {
+                entry.fee_cents += sale.fee_cents;
+            }
+        }
+    }
+    by_key.into_values().collect()
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -2358,6 +2507,109 @@ mod tests {
         assert_eq!(
             holding_of(s.connection(), &id, SECURITIES),
             (sh(5), 100_000)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reading a year's realized gain back, for the 1099-B cross-check
+    // -----------------------------------------------------------------------
+
+    /// A sale across the one-year boundary splits both ways, and the split has to
+    /// add back up to the gain the sale event recorded — to the cent, because that
+    /// figure is what the books posted.
+    #[test]
+    fn a_sale_across_both_terms_splits_its_proceeds_and_still_sums_to_the_recorded_gain() {
+        let mut s = store();
+        let id = acme(&mut s);
+        // 10 shares held since 2023 (long), 10 bought in 2025 (short).
+        buy(&mut s, &id, sh(10), 100_000, day(2023, 1, 6));
+        buy(&mut s, &id, sh(10), 300_000, day(2025, 3, 6));
+        let sold = sell_security(
+            &mut s,
+            "u",
+            &SellSecurityCommand {
+                fee_cents: 995,
+                ..sale(&id, sh(20), 600_000, day(2025, 8, 6))
+            },
+        )
+        .expect("sold");
+        assert_eq!(sold.basis_cents, 400_000);
+        assert_eq!(sold.realized_gain_cents, 600_000 - 995 - 400_000);
+
+        let portions = realized_in_year(s.connection(), 2025);
+        assert_eq!(portions.len(), 2, "one per term");
+        let long = portions.iter().find(|p| p.term == HoldingTerm::Long).unwrap();
+        let short = portions.iter().find(|p| p.term == HoldingTerm::Short).unwrap();
+
+        // Net proceeds 599,005 split by quantity, half each; the last lot takes
+        // the remainder, so the odd cent lands there and nothing is invented.
+        assert_eq!(long.proceeds_cents, 299_502);
+        assert_eq!(short.proceeds_cents, 299_503);
+        assert_eq!(long.proceeds_cents + short.proceeds_cents, 599_005);
+        assert_eq!(long.basis_cents, 100_000);
+        assert_eq!(short.basis_cents, 300_000);
+        assert_eq!(long.gain_cents, 199_502);
+        assert_eq!(short.gain_cents, -497);
+        assert_eq!(
+            long.gain_cents + short.gain_cents,
+            sold.realized_gain_cents,
+            "a term split that does not add back up would restate a filed gain"
+        );
+        // The sale's fee is counted once, against the first lot consumed.
+        assert_eq!(long.fee_cents + short.fee_cents, 995);
+    }
+
+    /// Two sales of two securities in one year, aggregated per security and term —
+    /// the shape the reconciliation compares against a 1099-B.
+    #[test]
+    fn a_years_realized_gain_is_aggregated_per_security_and_term() {
+        let mut s = store();
+        let acme_id = acme(&mut s);
+        let fund_id = define_security(
+            &mut s,
+            "u",
+            &NewSecurity {
+                ticker: "VFIAX".into(),
+                name: "Vanguard 500 Index".into(),
+                kind: "mutual fund".into(),
+                cusip: None,
+                currency: "USD".into(),
+            },
+        )
+        .expect("defined")
+        .0;
+
+        buy(&mut s, &acme_id, sh(10), 100_000, day(2025, 1, 6));
+        buy(&mut s, &acme_id, sh(10), 120_000, day(2025, 2, 6));
+        sell_security(&mut s, "u", &sale(&acme_id, sh(10), 150_000, day(2025, 9, 6))).unwrap();
+        sell_security(&mut s, "u", &sale(&acme_id, sh(10), 160_000, day(2025, 10, 6))).unwrap();
+        buy(&mut s, &fund_id, sh(100), 1_000_000, day(2022, 5, 6));
+        sell_security(&mut s, "u", &sale(&fund_id, sh(100), 1_600_000, day(2025, 7, 6))).unwrap();
+
+        // A sale outside the year is not in it.
+        buy(&mut s, &acme_id, sh(5), 50_000, day(2024, 1, 6));
+        sell_security(&mut s, "u", &sale(&acme_id, sh(5), 70_000, day(2024, 6, 6))).unwrap();
+
+        let portions = realized_in_year(s.connection(), 2025);
+        assert_eq!(portions.len(), 2);
+        let short = portions
+            .iter()
+            .find(|p| p.security_id == acme_id && p.term == HoldingTerm::Short)
+            .expect("Acme is short term");
+        assert_eq!(short.proceeds_cents, 310_000);
+        assert_eq!(short.basis_cents, 220_000);
+        assert_eq!(short.gain_cents, 90_000);
+        let long = portions
+            .iter()
+            .find(|p| p.security_id == fund_id && p.term == HoldingTerm::Long)
+            .expect("the fund is long term");
+        assert_eq!(long.gain_cents, 600_000);
+
+        assert_eq!(sales_in_year(s.connection(), 2025).len(), 3);
+        assert_eq!(sales_in_year(s.connection(), 2024).len(), 1);
+        assert_eq!(
+            sales_in_year(s.connection(), 2025)[0].net_proceeds_cents(),
+            1_600_000
         );
     }
 }

@@ -829,6 +829,90 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::TaxStatementRemoved { statement_id } => {
             validate_non_empty(statement_id, "statement_id")?;
         }
+        Event::TaxStatementLinesRecorded(l) => {
+            validate_non_empty(&l.statement_id, "statement_id")?;
+            let mut seen = std::collections::BTreeSet::new();
+            for line in &l.lines {
+                validate_non_empty(&line.line_id, "lines[].line_id")?;
+                if !seen.insert(&line.line_id) {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "lines[].line_id: {:?} twice — one row cannot be two rows",
+                        line.line_id
+                    )));
+                }
+                if crate::tax::schedule_d::Category::parse(&line.category).is_none() {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "lines[].category: {:?} is not a Form 8949 category; they are a, b, c, \
+                         d, e and f",
+                        line.category
+                    )));
+                }
+                validate_non_empty(&line.description, "lines[].description")?;
+                if line.description.chars().count() > 200 {
+                    return Err(ValidationError::InvalidValue(
+                        "lines[].description: longer than 200 characters".to_string(),
+                    ));
+                }
+                // Column (b) is one answer, and a row with neither is a row Form
+                // 8949 cannot print: the date acquired decides the holding period,
+                // and "VARIOUS" or "INHERITED" is what stands in its place when
+                // there is no single date.
+                match (&line.acquired_on, &line.acquired_label) {
+                    (Some(_), None) => {}
+                    (None, Some(label)) => {
+                        validate_non_empty(label, "lines[].acquired_label")?;
+                        if !label.bytes().all(|b| b.is_ascii_uppercase()) {
+                            return Err(ValidationError::InvalidValue(format!(
+                                "lines[].acquired_label: {label:?} — Form 8949 column (b) takes \
+                                 a date or one of its own words, in capitals"
+                            )));
+                        }
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(ValidationError::InvalidValue(
+                            "lines[]: acquired on a date and acquired \"various\" are two \
+                             answers to column (b)"
+                                .to_string(),
+                        ))
+                    }
+                    (None, None) => {
+                        return Err(ValidationError::InvalidValue(
+                            "lines[]: column (b) needs the date acquired, or the word that \
+                             stands in its place"
+                                .to_string(),
+                        ))
+                    }
+                }
+                if let Some(acquired) = line.acquired_on {
+                    if acquired > line.sold_on {
+                        return Err(ValidationError::InvalidValue(format!(
+                            "lines[]: acquired {acquired} and sold {} — a holding period cannot \
+                             run backwards",
+                            line.sold_on
+                        )));
+                    }
+                }
+                if let Some(code) = &line.adjustment_code {
+                    let shape = !code.is_empty()
+                        && code.len() <= 4
+                        && code.bytes().all(|b| b.is_ascii_uppercase());
+                    if !shape {
+                        return Err(ValidationError::InvalidValue(format!(
+                            "lines[].adjustment_code: {code:?} — column (f) takes up to four of \
+                             the form's own capital letters"
+                        )));
+                    }
+                }
+                // The reverse is allowed: code M with no amount is a real row.
+                if line.adjustment_cents != 0 && line.adjustment_code.is_none() {
+                    return Err(ValidationError::InvalidValue(
+                        "lines[]: an amount in column (g) needs the letter in column (f) that \
+                         says what the adjustment is"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         Event::K1SourceLinked {
             link_id,
             ledger_id,

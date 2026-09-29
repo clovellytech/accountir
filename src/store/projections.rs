@@ -330,6 +330,47 @@ impl<'a> Projector<'a> {
                     "DELETE FROM tax_statements WHERE statement_id = ?1",
                     [statement_id],
                 )?;
+                // The rows go with it. They are the statement's own transaction
+                // detail and mean nothing without it; left behind, they would put
+                // sales on a Form 8949 whose 1099-B the log no longer holds.
+                self.conn.execute(
+                    "DELETE FROM tax_statement_lines WHERE statement_id = ?1",
+                    [statement_id],
+                )?;
+            }
+            Event::TaxStatementLinesRecorded(l) => {
+                // Replaces the whole list: a corrected consolidated statement is
+                // re-entered from the paper, and merging would keep the sales the
+                // correction removed. See the event.
+                self.conn.execute(
+                    "DELETE FROM tax_statement_lines WHERE statement_id = ?1",
+                    [&l.statement_id],
+                )?;
+                for (position, line) in l.lines.iter().enumerate() {
+                    self.conn.execute(
+                        "INSERT INTO tax_statement_lines
+                           (statement_id, line_id, position, category, description,
+                            acquired_on, acquired_label, sold_on, proceeds_cents,
+                            basis_cents, adjustment_code, adjustment_cents,
+                            recorded_at_event)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                        params![
+                            l.statement_id,
+                            line.line_id,
+                            position as i64,
+                            line.category,
+                            line.description,
+                            line.acquired_on.map(|d| d.to_string()),
+                            line.acquired_label,
+                            line.sold_on.to_string(),
+                            line.proceeds_cents,
+                            line.basis_cents,
+                            line.adjustment_code,
+                            line.adjustment_cents,
+                            stored_event.id
+                        ],
+                    )?;
+                }
             }
             Event::K1SourceLinked {
                 link_id,
@@ -1772,6 +1813,7 @@ impl<'a> Projector<'a> {
              -- the documents' bytes are not in the database at all, so nothing
              -- here is anything a replay cannot rebuild.
              DELETE FROM documents;
+             DELETE FROM tax_statement_lines;
              DELETE FROM tax_statements;
              DELETE FROM k1_links;
              DELETE FROM schedule_b_answers;

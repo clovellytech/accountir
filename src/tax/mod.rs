@@ -5,6 +5,14 @@
 //! [`acroform`] is the general machinery underneath it and knows nothing about
 //! any particular form. [`schedule_b`] holds the "Other Information" questions,
 //! their answers, and the IRS links a preparer needs while answering them.
+//!
+//! The personal side is separate, and reads the other way round. [`personal`] is
+//! what paperwork has arrived and where each box goes; [`personal_return`]
+//! assembles what a year's investment tax output says, from [`schedule_d`] (the
+//! 1099-B is the source of the filed capital-gains figures, not our lot register —
+//! INVESTMENTS-SPEC.md §8), [`personal_schedule_b`] and
+//! [`investment_reconciliation`], which compares the books against the broker's
+//! form and reports the differences without adjusting either.
 
 pub mod acroform;
 pub mod allocate;
@@ -19,16 +27,20 @@ pub mod il1065;
 pub mod il4562;
 pub mod il_k1p;
 pub mod information_returns;
+pub mod investment_reconciliation;
 pub mod k1_package;
 pub mod liabilities;
 pub mod lines;
 pub mod nondeductible;
 pub mod personal;
+pub mod personal_return;
+pub mod personal_schedule_b;
 pub mod qbi;
 pub mod schedule_b;
 pub mod schedule_b1;
 pub mod schedule_b2;
 pub mod schedule_c;
+pub mod schedule_d;
 pub mod schedule_l;
 pub mod schedule_m;
 pub mod statement;

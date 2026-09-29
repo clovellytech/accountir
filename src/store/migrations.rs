@@ -198,6 +198,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             50,
             include_str!("../../migrations/050_investment_imports.sql"),
         ),
+        (
+            51,
+            include_str!("../../migrations/051_tax_statement_lines.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -942,6 +946,29 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             recorded_at_event INTEGER REFERENCES events(id)
         );
         CREATE INDEX IF NOT EXISTS idx_tax_statements_year ON tax_statements(tax_year, form);
+        -- A statement's transaction-by-transaction detail: the Form 8949 rows a
+        -- 1099-B's category subtotals are not enough for (migration 051). See
+        -- 051_tax_statement_lines.sql for why a 1099-B needs a list where every
+        -- other statement needs only boxes, and why the covered categories
+        -- usually leave this table empty.
+        CREATE TABLE IF NOT EXISTS tax_statement_lines (
+            statement_id TEXT NOT NULL,
+            line_id TEXT NOT NULL,
+            position INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT NOT NULL,
+            acquired_on TEXT,
+            acquired_label TEXT,
+            sold_on TEXT NOT NULL,
+            proceeds_cents INTEGER NOT NULL,
+            basis_cents INTEGER NOT NULL,
+            adjustment_code TEXT,
+            adjustment_cents INTEGER NOT NULL DEFAULT 0,
+            recorded_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (statement_id, line_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tax_statement_lines_order
+            ON tax_statement_lines(statement_id, position);
         CREATE TABLE IF NOT EXISTS k1_links (
             link_id TEXT PRIMARY KEY,
             ledger_id TEXT NOT NULL,
@@ -1657,9 +1684,6 @@ mod tests {
         );
     }
 
-    /// And a database that predates it gets it too, by the route the others here use:
-    /// the pre-050 shape, stamped at version 49, then migrated.
-    #[test]
     /// A version below the high-water mark still gets applied.
     ///
     /// The failure this pins is the one that actually happened: `main` numbered
@@ -1723,6 +1747,14 @@ mod tests {
         assert_eq!(stamped, 1, "and it is recorded as applied afterwards");
     }
 
+    /// And a database that predates it gets it too, by the route the others here use:
+    /// the pre-050 shape, stamped at version 49, then migrated.
+    ///
+    /// The `#[test]` was landed on the wrong function when this arrived on `main`,
+    /// between the test above's doc comment and its body, so this one never ran at
+    /// all. Restored here because a test nobody runs is worse than no test: it looks
+    /// like coverage.
+    #[test]
     fn migration_050_adds_the_investment_import_registers_to_an_existing_database() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
@@ -1774,6 +1806,53 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rows, 1, "a re-run must not recreate the table empty");
+    }
+
+    /// The statement-line register (migration 051) is in `init_schema` as well as
+    /// in the migration, and a database that predates it gets it by the same route
+    /// the tables above do.
+    #[test]
+    fn init_schema_and_migration_051_both_give_a_statement_its_transaction_detail() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(has_table(&conn, "tax_statement_lines"));
+
+        conn.execute_batch(
+            "DROP TABLE tax_statement_lines;
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO schema_migrations (version) VALUES (50);",
+        )
+        .unwrap();
+        assert!(!has_table(&conn, "tax_statement_lines"));
+
+        run_migrations(&conn).unwrap();
+        assert!(has_table(&conn, "tax_statement_lines"));
+        conn.execute(
+            "INSERT INTO tax_statement_lines
+               (statement_id, line_id, position, category, description, acquired_on,
+                sold_on, proceeds_cents, basis_cents)
+             VALUES ('s1','l1',0,'b','100 sh. ACME','2023-04-05','2025-08-09',500000,300000)",
+            [],
+        )
+        .expect("a Form 8949 row lands");
+        let dup = conn.execute(
+            "INSERT INTO tax_statement_lines
+               (statement_id, line_id, position, category, description, acquired_on,
+                sold_on, proceeds_cents, basis_cents)
+             VALUES ('s1','l1',1,'b','100 sh. ACME','2023-04-05','2025-08-09',1,1)",
+            [],
+        );
+        assert!(dup.is_err(), "one row cannot be two rows");
+
+        // And running it again changes nothing.
+        run_migrations(&conn).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tax_statement_lines", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 }
 #[cfg(test)]

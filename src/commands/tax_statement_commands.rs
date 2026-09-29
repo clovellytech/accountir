@@ -33,11 +33,17 @@ use uuid::Uuid;
 
 use crate::commands::{document_commands, partnership_commands as pc, sole_proprietor_commands};
 use crate::documents;
-use crate::domain::documents::{K1Link, LedgerProvenance, StatementSource, TaxStatement};
+use crate::domain::documents::{
+    Acquired, K1Link, LedgerProvenance, StatementLine, StatementSource, TaxStatement,
+};
 use crate::domain::BusinessType;
-use crate::events::types::{Event, StatementSourceData, StoredEvent, TaxStatementData};
+use crate::events::types::{
+    Event, StatementSourceData, StoredEvent, TaxStatementData, TaxStatementLineData,
+    TaxStatementLinesData,
+};
 use crate::store::event_store::EventStore;
 use crate::tax::information_returns::FormKind;
+use crate::tax::schedule_d::Category;
 use crate::tax::k1_package::{self, K1PackageError};
 
 #[derive(Debug, Error)]
@@ -64,6 +70,12 @@ pub enum StatementError {
         "those are not the books this link points at (expected ledger {expected}, found {found})"
     )]
     WrongSource { expected: String, found: String },
+    #[error(
+        "{form} has no transactions to list. Only a 1099-B does: it reports subtotals per Form \
+         8949 category, and the form requires the transactions behind some of those subtotals to \
+         be listed one by one."
+    )]
+    NotA1099B { form: &'static str },
     #[error(transparent)]
     Package(#[from] K1PackageError),
 }
@@ -156,6 +168,75 @@ pub fn get(conn: &Connection, statement_id: &str) -> Option<TaxStatement> {
     .ok()
     .flatten()
     .and_then(to_statement)
+}
+
+// ---------------------------------------------------------------------------
+// A statement's transaction detail: the Form 8949 rows
+// ---------------------------------------------------------------------------
+
+/// A fresh id for a transaction entered against a statement.
+pub fn new_line_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Record the transactions behind a 1099-B's subtotals, replacing whatever the
+/// statement had.
+///
+/// # Why only a 1099-B
+///
+/// Because no other statement has transactions. A W-2 or a 1099-INT is a set of
+/// boxes and nothing else; a 1099-B reports subtotals per Form 8949 category and
+/// the form requires some of those categories to be *listed*. Which ones is
+/// [`crate::tax::schedule_d::Brokerage1099B::needs_form8949`]'s answer, not this
+/// function's: entering detail for a covered category is allowed, because a person
+/// transcribing a consolidated statement should not have to know the rule before
+/// they start typing, and Schedule D will still subtotal it if nothing in it was
+/// adjusted.
+///
+/// # Why the whole list at once
+///
+/// The same reason [`record`] replaces a statement rather than merging into it: a
+/// corrected consolidated 1099-B is re-entered from the paper, and merging the new
+/// rows into the old ones would leave the return listing the sales the correction
+/// removed. An empty list clears the detail without removing the statement.
+pub fn record_lines(
+    store: &mut EventStore,
+    user_id: &str,
+    statement_id: &str,
+    lines: &[StatementLine],
+) -> Result<StoredEvent, StatementError> {
+    let Some(statement) = get(store.connection(), statement_id) else {
+        return Err(StatementError::NoSuchStatement(statement_id.to_string()));
+    };
+    if statement.form != FormKind::F1099B {
+        return Err(StatementError::NotA1099B {
+            form: statement.form.label(),
+        });
+    }
+    append(
+        store,
+        user_id,
+        Event::TaxStatementLinesRecorded(Box::new(TaxStatementLinesData {
+            statement_id: statement_id.to_string(),
+            lines: lines.iter().map(to_line_data).collect(),
+        })),
+    )
+}
+
+/// One statement's transactions, in the order Form 8949 prints them.
+pub fn lines_of(conn: &Connection, statement_id: &str) -> Vec<StatementLine> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT statement_id, line_id, category, description, acquired_on, acquired_label,
+                sold_on, proceeds_cents, basis_cents, adjustment_code, adjustment_cents
+           FROM tax_statement_lines
+          WHERE statement_id = ?1
+          ORDER BY position, line_id",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map([statement_id], raw_line)
+        .map(|rows| rows.filter_map(Result::ok).filter_map(to_line).collect())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -486,6 +567,96 @@ fn to_statement(raw: RawStatement) -> Option<TaxStatement> {
         document_ids: serde_json::from_str(&document_ids).ok()?,
         source,
         note,
+    })
+}
+
+fn to_line_data(l: &StatementLine) -> TaxStatementLineData {
+    let (acquired_on, acquired_label) = match &l.acquired {
+        Acquired::On(date) => (Some(*date), None),
+        Acquired::Stated(word) => (None, Some(word.trim().to_uppercase())),
+    };
+    TaxStatementLineData {
+        line_id: l.line_id.clone(),
+        category: l.category.code().to_string(),
+        description: l.description.trim().to_string(),
+        acquired_on,
+        acquired_label,
+        sold_on: l.sold_on,
+        proceeds_cents: l.proceeds_cents,
+        basis_cents: l.basis_cents,
+        adjustment_code: l
+            .adjustment_code
+            .as_ref()
+            .map(|c| c.trim().to_uppercase())
+            .filter(|c| !c.is_empty()),
+        adjustment_cents: l.adjustment_cents,
+    }
+}
+
+type RawLine = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    Option<String>,
+    i64,
+);
+
+fn raw_line(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawLine> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+    ))
+}
+
+/// A projected row as a transaction. `None` for a row this version cannot read —
+/// a category it does not know, or a date it cannot parse — which is the choice
+/// [`to_statement`] makes, and for the same reason: a register that will not open
+/// is worse than one visibly missing a row.
+fn to_line(raw: RawLine) -> Option<StatementLine> {
+    let (
+        statement_id,
+        line_id,
+        category,
+        description,
+        acquired_on,
+        acquired_label,
+        sold_on,
+        proceeds_cents,
+        basis_cents,
+        adjustment_code,
+        adjustment_cents,
+    ) = raw;
+    let acquired = match (acquired_on, acquired_label) {
+        (Some(date), _) => Acquired::On(chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok()?),
+        (None, Some(word)) => Acquired::Stated(word),
+        (None, None) => return None,
+    };
+    Some(StatementLine {
+        statement_id,
+        line_id,
+        category: Category::parse(&category)?,
+        description,
+        acquired,
+        sold_on: chrono::NaiveDate::parse_from_str(&sold_on, "%Y-%m-%d").ok()?,
+        proceeds_cents,
+        basis_cents,
+        adjustment_code,
+        adjustment_cents,
     })
 }
 
@@ -824,5 +995,226 @@ mod tests {
 
         remove(&mut me, "user", &statement.statement_id).unwrap();
         assert!(list(me.connection(), None).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // A 1099-B's transaction detail
+    // -----------------------------------------------------------------------
+
+    fn a_1099b(store: &mut EventStore) -> String {
+        let id = new_statement_id();
+        record(
+            store,
+            "user",
+            &TaxStatement {
+                statement_id: id.clone(),
+                tax_year: YEAR,
+                form: FormKind::F1099B,
+                issuer: "Broad Street Brokerage".to_string(),
+                amounts: BTreeMap::from([
+                    ("b_proceeds".to_string(), 500_000),
+                    ("b_basis".to_string(), 300_000),
+                ]),
+                document_ids: Vec::new(),
+                source: StatementSource::Entered,
+                note: None,
+            },
+        )
+        .unwrap();
+        id
+    }
+
+    fn line(statement_id: &str, line_id: &str, proceeds: i64) -> StatementLine {
+        StatementLine {
+            statement_id: statement_id.to_string(),
+            line_id: line_id.to_string(),
+            category: Category::B,
+            description: "100 sh. ACME CORP".to_string(),
+            acquired: Acquired::On(NaiveDate::from_ymd_opt(2023, 4, 5).unwrap()),
+            sold_on: NaiveDate::from_ymd_opt(YEAR, 8, 9).unwrap(),
+            proceeds_cents: proceeds,
+            basis_cents: 300_000,
+            adjustment_code: None,
+            adjustment_cents: 0,
+        }
+    }
+
+    #[test]
+    fn transactions_recorded_against_a_1099b_read_back_in_the_order_they_were_entered() {
+        let mut me = personal();
+        let id = a_1099b(&mut me);
+        record_lines(
+            &mut me,
+            "user",
+            &id,
+            &[line(&id, "second", 200_000), line(&id, "first", 300_000)],
+        )
+        .unwrap();
+
+        let read = lines_of(me.connection(), &id);
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].line_id, "second", "entry order, not id order");
+        assert_eq!(read[0].proceeds_cents, 200_000);
+        assert_eq!(read[1].line_id, "first");
+        assert_eq!(read[0].gain_cents(), -100_000);
+        assert_eq!(read[1].gain_cents(), 0);
+    }
+
+    /// Re-recording replaces. A corrected consolidated statement is re-entered
+    /// from the paper, and merging would leave the sales the correction removed.
+    #[test]
+    fn recording_transactions_again_replaces_them_rather_than_adding_to_them() {
+        let mut me = personal();
+        let id = a_1099b(&mut me);
+        record_lines(
+            &mut me,
+            "user",
+            &id,
+            &[line(&id, "a", 100_000), line(&id, "b", 200_000)],
+        )
+        .unwrap();
+        record_lines(&mut me, "user", &id, &[line(&id, "a", 150_000)]).unwrap();
+
+        let read = lines_of(me.connection(), &id);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].proceeds_cents, 150_000);
+
+        // And an empty list withdraws the detail without removing the statement.
+        record_lines(&mut me, "user", &id, &[]).unwrap();
+        assert!(lines_of(me.connection(), &id).is_empty());
+        assert!(get(me.connection(), &id).is_some());
+    }
+
+    #[test]
+    fn removing_a_statement_removes_the_transactions_entered_against_it() {
+        let mut me = personal();
+        let id = a_1099b(&mut me);
+        record_lines(&mut me, "user", &id, &[line(&id, "a", 100_000)]).unwrap();
+        remove(&mut me, "user", &id).unwrap();
+        assert!(
+            lines_of(me.connection(), &id).is_empty(),
+            "rows without their 1099-B would put sales on a Form 8949 the log no longer holds"
+        );
+    }
+
+    #[test]
+    fn a_replay_reproduces_the_transactions_exactly() {
+        let mut me = personal();
+        let id = a_1099b(&mut me);
+        record_lines(
+            &mut me,
+            "user",
+            &id,
+            &[line(&id, "a", 100_000), line(&id, "b", 200_000)],
+        )
+        .unwrap();
+        let before = lines_of(me.connection(), &id);
+
+        let events = me.get_all().unwrap();
+        crate::store::projections::Projector::new(me.connection())
+            .rebuild(&events)
+            .unwrap();
+
+        assert_eq!(lines_of(me.connection(), &id), before);
+    }
+
+    #[test]
+    fn only_a_1099b_takes_transactions() {
+        let mut me = personal();
+        let id = new_statement_id();
+        record(
+            &mut me,
+            "user",
+            &TaxStatement {
+                statement_id: id.clone(),
+                tax_year: YEAR,
+                form: FormKind::F1099Int,
+                issuer: "First Bank".to_string(),
+                amounts: BTreeMap::from([("1".to_string(), 1_000)]),
+                document_ids: Vec::new(),
+                source: StatementSource::Entered,
+                note: None,
+            },
+        )
+        .unwrap();
+        let refused = record_lines(&mut me, "user", &id, &[line(&id, "a", 1)])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("Form 1099-INT has no transactions to list"), "{refused}");
+
+        assert!(matches!(
+            record_lines(&mut me, "user", "nope", &[]),
+            Err(StatementError::NoSuchStatement(_))
+        ));
+    }
+
+    /// Form 8949 column (b) takes a date or one of the form's own words, and a row
+    /// with neither is a row the form cannot print.
+    #[test]
+    fn a_stated_acquisition_is_kept_in_capitals_and_a_row_needs_one_answer_or_the_other() {
+        let mut me = personal();
+        let id = a_1099b(&mut me);
+        let mut inherited = line(&id, "a", 100_000);
+        inherited.acquired = Acquired::Stated("inherited".to_string());
+        record_lines(&mut me, "user", &id, &[inherited]).unwrap();
+        assert_eq!(
+            lines_of(me.connection(), &id)[0].acquired,
+            Acquired::Stated("INHERITED".to_string())
+        );
+        assert_eq!(
+            lines_of(me.connection(), &id)[0].acquired.as_printed(),
+            "INHERITED"
+        );
+
+        let mut blank = line(&id, "a", 100_000);
+        blank.acquired = Acquired::Stated(String::new());
+        assert!(record_lines(&mut me, "user", &id, &[blank]).is_err());
+    }
+
+    /// An amount in column (g) with no letter in column (f) is an adjustment the
+    /// form cannot say the reason for.
+    #[test]
+    fn an_adjustment_amount_without_its_code_is_refused_and_a_code_alone_is_not() {
+        let mut me = personal();
+        let id = a_1099b(&mut me);
+
+        let mut amount_only = line(&id, "a", 100_000);
+        amount_only.adjustment_cents = 5_000;
+        let refused = record_lines(&mut me, "user", &id, &[amount_only])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("column (f)"), "{refused}");
+
+        // Code M with nothing in column (g) is a real row.
+        let mut code_only = line(&id, "a", 100_000);
+        code_only.adjustment_code = Some("m".to_string());
+        record_lines(&mut me, "user", &id, &[code_only]).unwrap();
+        assert_eq!(
+            lines_of(me.connection(), &id)[0].adjustment_code.as_deref(),
+            Some("M"),
+            "column (f) is capital letters"
+        );
+    }
+
+    #[test]
+    fn two_rows_cannot_share_an_id_and_a_holding_period_cannot_run_backwards() {
+        let mut me = personal();
+        let id = a_1099b(&mut me);
+        let refused = record_lines(
+            &mut me,
+            "user",
+            &id,
+            &[line(&id, "same", 100_000), line(&id, "same", 200_000)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("twice"), "{refused}");
+
+        let mut backwards = line(&id, "a", 100_000);
+        backwards.acquired = Acquired::On(NaiveDate::from_ymd_opt(YEAR, 12, 31).unwrap());
+        let refused = record_lines(&mut me, "user", &id, &[backwards])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("backwards"), "{refused}");
     }
 }
