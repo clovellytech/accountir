@@ -44,8 +44,9 @@ use crate::commands::investment_commands::{
     InvestmentStep, LotSelection, NewSecurity, RecordInvestmentIncomeCommand, SellSecurityCommand,
 };
 use crate::commands::investment_import::{
-    build_configure_in_txn, classify_subtype, ConfigureInvestmentAccountCommand, ImportError,
-    ImportStep,
+    build_configure_in_txn, build_import_in_txn, build_resolve_security_in_txn,
+    build_snapshot_in_txn, classify_subtype, ConfigureInvestmentAccountCommand, ImportError,
+    ImportRecord, ImportStep, MasterSecurity, PlannedWrite,
 };
 use crate::commands::retirement_commands::{
     build_contribution_in_txn, build_distribution_in_txn, build_registration_in_txn,
@@ -53,7 +54,8 @@ use crate::commands::retirement_commands::{
     RetirementDistributionCommand, RetirementError, RetirementStep, SetRetirementValueCommand,
 };
 use crate::events::types::{
-    Event, InvestmentIncomeKind, InvestmentPostingAccounts, RetirementKind, SaleLotData,
+    Event, HoldingsSnapshotData, InvestmentIncomeKind, InvestmentPostingAccounts, RetirementKind,
+    SaleLotData,
 };
 use crate::store::event_store::{EventStoreError, Verdict};
 use crate::sync::{
@@ -96,6 +98,22 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/record-retirement-distribution",
             post(submit_record_distribution),
+        )
+        // The importer's own three (phase 4 over the transport). Everything above is
+        // a command a person gives; these three are what a provider payload becomes,
+        // and they exist because an import that appended locally would fork a
+        // replica's log exactly as a hand-entered trade would.
+        .route(
+            "/sync/commands/resolve-plaid-security",
+            post(submit_resolve_plaid_security),
+        )
+        .route(
+            "/sync/commands/import-investment-activity",
+            post(submit_import_investment_activity),
+        )
+        .route(
+            "/sync/commands/record-holdings-snapshot",
+            post(submit_record_holdings_snapshot),
         )
 }
 
@@ -916,6 +934,228 @@ async fn submit_record_distribution(
     }))
 }
 
+
+// ---------------------------------------------------------------------------
+// resolve-plaid-security
+// ---------------------------------------------------------------------------
+
+/// Which of the group's securities a provider's security is — finding it, or putting
+/// it on the master.
+#[derive(Serialize, Deserialize)]
+pub struct ResolvePlaidSecurityRequest {
+    pub expected_head_seq: i64,
+    /// The provider's own id, which is what the mapping is keyed on and what
+    /// survives a ticker change.
+    pub plaid_security_id: String,
+    /// The security as our master would hold it, normalised by
+    /// [`crate::commands::investment_import::provider_security_as_new`] on the client. The same [`NewSecurity`] a local
+    /// import would have written, so the group's master gets the same row either way.
+    pub security: NewSecurity,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ResolvePlaidSecurityResponse {
+    pub head: i64,
+    /// The id the **server** chose, and the kind its master holds. The client uses
+    /// both from here on: a locally invented id would be a second master for one
+    /// holding the moment the group's log came back with the real one, and a kind
+    /// read out of a replica that has not pulled the definition yet would file a
+    /// stock under "other securities".
+    pub master: MasterSecurity,
+    /// Whether a master was minted, which is the one thing the id alone cannot say
+    /// and the number the import report shows.
+    pub created: bool,
+}
+
+/// Resolve a provider security against the group's master.
+///
+/// The whole decision — the mapping, then the CUSIP, then the ticker, then minting
+/// one — runs inside the append transaction, which is exactly why the importer's
+/// hosted path cannot do it locally and push the answer: two members importing at
+/// once would both miss the mapping, both mint a master for the same CUSIP, and split
+/// one holding across two masters that neither add up on the balance sheet nor
+/// reconcile against a 1099-B.
+///
+/// A security already mapped appends nothing and answers with the head it was sent.
+async fn submit_resolve_plaid_security(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<ResolvePlaidSecurityRequest>,
+) -> Result<Json<ResolvePlaidSecurityResponse>, ApiError> {
+    let expected = req.expected_head_seq;
+    let plaid_security_id = req.plaid_security_id;
+    let security = req.security;
+    let chosen: Sink<(MasterSecurity, bool)> = sink();
+    let recorder = chosen.clone();
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            expected,
+            move |tx| {
+                let resolved = build_resolve_security_in_txn(tx, &plaid_security_id, &security)?;
+                if let Ok(mut slot) = recorder.lock() {
+                    *slot = Some((resolved.master, resolved.created));
+                }
+                match resolved.step {
+                    ImportStep::Append(events) => Ok(Verdict::Append(
+                        events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                    )),
+                    ImportStep::Reject(e) => Ok(Verdict::Reject(e)),
+                }
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    let head = outcome_to_response_many(outcome, expected, ApiError::domain::<ImportError>)?
+        .0
+        .head;
+    let (master, created) = taken(&chosen, "which security the provider's security is")?;
+    Ok(Json(ResolvePlaidSecurityResponse {
+        head,
+        master,
+        created,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// import-investment-activity
+// ---------------------------------------------------------------------------
+
+/// One provider transaction, imported into the group's books.
+///
+/// Not five endpoints. A purchase, a sale, income, a fee and a cash movement differ
+/// in what they post and agree in everything that makes them an *import*: the dedup
+/// fence and the register event that carries it. Those are the reason this exists at
+/// all, so they are what the endpoint is about, and [`PlannedWrite`] carries the
+/// difference.
+#[derive(Serialize, Deserialize)]
+pub struct ImportInvestmentActivityRequest {
+    pub expected_head_seq: i64,
+    /// Which provider transaction this is the import of.
+    pub record: ImportRecord,
+    /// What the importer decided, with nothing left to decide — the same value the
+    /// local path hands to [`build_import_in_txn`].
+    pub write: PlannedWrite,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ImportInvestmentActivityResponse {
+    pub head: i64,
+    /// The entry the import posted, read off the event rather than minted here.
+    pub entry_id: String,
+}
+
+/// Import one provider transaction, validated server-side.
+///
+/// [`build_import_in_txn`] is the same function the local importer runs, so the
+/// batch is the same batch: the trade or the entry, its phase-1 register event, and
+/// the `InvestmentActivityImported` that fences it — appended as one unit inside the
+/// server's write lock. That atomicity is the point of the endpoint. A posting whose
+/// import record did not land is re-imported on the next rolling fetch with a freshly
+/// minted lot id, and the same purchase is then deducted twice on a Form 8949.
+///
+/// A second import of the same provider transaction is a `422` whose wording the
+/// client recognises, because on a replica it means only that the client's register
+/// had not pulled yet.
+async fn submit_import_investment_activity(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<ImportInvestmentActivityRequest>,
+) -> Result<Json<ImportInvestmentActivityResponse>, ApiError> {
+    let expected = req.expected_head_seq;
+    let (write, record) = (req.write, req.record);
+    let posted: Sink<String> = sink();
+    let recorder = posted.clone();
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            expected,
+            move |tx| match build_import_in_txn(tx, &write, &record)? {
+                ImportStep::Append(events) => {
+                    if let (Ok(mut slot), Some(id)) = (recorder.lock(), entry_id_of(&events)) {
+                        *slot = Some(id);
+                    }
+                    Ok(Verdict::Append(
+                        events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                    ))
+                }
+                ImportStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    let head = outcome_to_response_many(outcome, expected, ApiError::domain::<ImportError>)?
+        .0
+        .head;
+    let entry_id = taken(&posted, "the imported transaction's journal entry")?;
+    Ok(Json(ImportInvestmentActivityResponse { head, entry_id }))
+}
+
+// ---------------------------------------------------------------------------
+// record-holdings-snapshot
+// ---------------------------------------------------------------------------
+
+/// What the broker said one account held, on a date.
+#[derive(Serialize, Deserialize)]
+pub struct RecordHoldingsSnapshotRequest {
+    pub expected_head_seq: i64,
+    /// The snapshot as the event carries it, including the `snapshot_id` the client
+    /// minted — so the id in the group's log is the id the client already reported.
+    pub snapshot: HoldingsSnapshotData,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RecordHoldingsSnapshotResponse {
+    pub head: i64,
+    /// `false` when the group already held this exact snapshot for this date, so
+    /// nothing was appended. That is a success, and it is what makes re-importing a
+    /// holdings payload append literally nothing.
+    pub recorded: bool,
+}
+
+/// Record a holdings snapshot on the group's books.
+///
+/// The snapshot has no journal entry behind it and posts no money, which is what
+/// makes it tempting to leave local — and it must not be. The reconciliation
+/// (spec §7) and the market-value report both read it, so a snapshot only one machine
+/// held would make one member's reconciliation disagree with another's about what the
+/// broker said; and a snapshot appended locally on a replica would take a sequence
+/// number the server is also going to hand out.
+///
+/// Whether this snapshot is new is decided **inside** the transaction, compared line
+/// by line, so two members reading the same holdings at the same moment record one
+/// snapshot between them rather than two.
+async fn submit_record_holdings_snapshot(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<RecordHoldingsSnapshotRequest>,
+) -> Result<Json<RecordHoldingsSnapshotResponse>, ApiError> {
+    let expected = req.expected_head_seq;
+    let snapshot = req.snapshot;
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            expected,
+            move |tx| match build_snapshot_in_txn(tx, &snapshot)? {
+                ImportStep::Append(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
+                ImportStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    // Nothing appended means the head did not move, which is exactly how the client
+    // is told the snapshot was already on file.
+    let head = outcome_to_response_many(outcome, expected, ApiError::domain::<ImportError>)?
+        .0
+        .head;
+    Ok(Json(RecordHoldingsSnapshotResponse {
+        head,
+        recorded: head != expected,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,6 +1188,11 @@ mod tests {
     const SECURITIES: &str = "1102";
     const PREPAID_TAX: &str = "1300";
     const IRA: &str = "1500";
+    /// A securities slot distinct from the stocks one, so a test can see which slot a
+    /// position was filed in. See `importing_accounts`.
+    const OTHER_SECURITIES: &str = "1103";
+    /// Where the other leg of a brokerage transfer waits for the bank feed.
+    const CLEARING: &str = "1200";
     const DIVIDENDS: &str = "4100";
     const INTEREST: &str = "4110";
     const GAIN: &str = "4120";
@@ -986,6 +1231,8 @@ mod tests {
             (BANK, "Checking", AccountType::Asset),
             (CASH, "Brokerage cash", AccountType::Asset),
             (SECURITIES, "Securities at cost", AccountType::Asset),
+            (OTHER_SECURITIES, "Other securities at cost", AccountType::Asset),
+            (CLEARING, "Cash in transit", AccountType::Asset),
             (PREPAID_TAX, "Prepaid tax", AccountType::Asset),
             (IRA, "Fidelity IRA ••5678", AccountType::Asset),
             (DIVIDENDS, "Dividends", AccountType::Revenue),
@@ -2158,5 +2405,678 @@ mod tests {
             let right = scrub_ids(&serde_json::to_string_pretty(&h.event).unwrap());
             assert_eq!(left, right, "event {i} differs between local and hosted");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The importer, hosted
+    // -----------------------------------------------------------------------
+    //
+    // One planner, two sinks: everything below is about the sinks agreeing. The
+    // planner's own decisions — which subtype becomes what, which rows are held —
+    // are `investment_import`'s tests and are not repeated here.
+
+    use crate::commands::investment_import as imp;
+    use crate::sync::client::SyncClient;
+    use crate::sync::replica;
+    use rusqlite::OptionalExtension;
+
+    /// A provider connection, as the importer's local tables hold it. Machine-local,
+    /// so it does not arrive with the log and every copy inserts its own.
+    fn connect_item(store: &EventStore) {
+        store
+            .connection()
+            .execute(
+                "INSERT OR IGNORE INTO plaid_items (id, proxy_item_id, institution_name)
+                 VALUES ('item1','p1','Fidelity')",
+                [],
+            )
+            .unwrap();
+    }
+
+    /// A replica of the group's books, arrived at the only way a replica ever arrives
+    /// at anything: by pulling the server's log.
+    fn replica_of(handle: &Arc<Mutex<EventStore>>) -> EventStore {
+        let mut replica = EventStore::in_memory().unwrap();
+        replica.init_schema().unwrap();
+        connect_item(&replica);
+        pull(handle, &mut replica);
+        replica
+    }
+
+    /// Bring a replica up to the server's head, as the sync tick does.
+    fn pull(handle: &Arc<Mutex<EventStore>>, replica: &mut EventStore) {
+        let from = replica::local_cursor(replica).unwrap();
+        let events: Vec<crate::sync::SyncEvent> = handle
+            .lock()
+            .unwrap()
+            .get_after(from)
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        replica::apply_batch(replica, &events).unwrap();
+    }
+
+    /// A client pointed at the loopback server, with the head it currently has.
+    async fn client_for(wire: &Wire) -> SyncClient {
+        SyncClient::with_head(wire.base.clone(), TOKEN, wire.head().await)
+    }
+
+    /// The taxable configuration the import tests use.
+    ///
+    /// `other_securities_account_id` is a **different account** from the stocks slot
+    /// on purpose: which slot a position is carried in comes from the kind our master
+    /// holds, and a hosted import that read that kind out of a replica which has not
+    /// pulled the definition yet would find nothing and file a stock in here. With
+    /// both slots pointing at one account no test could see the difference.
+    fn importing_accounts() -> InvestmentPostingAccounts {
+        InvestmentPostingAccounts::Taxable(Box::new(TaxableBrokerageAccounts {
+            stocks_account_id: SECURITIES.into(),
+            mutual_funds_account_id: None,
+            other_securities_account_id: Some(OTHER_SECURITIES.into()),
+            cash_account_id: CASH.into(),
+            dividend_income_account_id: DIVIDENDS.into(),
+            interest_income_account_id: INTEREST.into(),
+            tax_exempt_interest_account_id: None,
+            capital_gain_distribution_account_id: None,
+            realized_gain_account_id: GAIN.into(),
+            fee_expense_account_id: FEES.into(),
+            transfer_clearing_account_id: Some(CLEARING.into()),
+        }))
+    }
+
+    /// The chart, the connection, the retirement register and both account
+    /// configurations — everything an import needs before it starts, appended the
+    /// same way into whichever book is about to run one.
+    fn ready_to_import() -> EventStore {
+        let mut store = store();
+        register_account(
+            &mut store,
+            "u",
+            &RegisterRetirementAccountCommand {
+                account_id: IRA.into(),
+                institution: "Fidelity ••5678".into(),
+                kind: RetirementKind::Traditional,
+                value_change_account_id: VALUE_CHANGE.into(),
+            },
+        )
+        .expect("registered");
+        configure_account(
+            &mut store,
+            "u",
+            &ConfigureInvestmentAccountCommand {
+                item_id: "item1".into(),
+                plaid_account_id: "acct-1".into(),
+                accounts: importing_accounts(),
+                plaid_subtype: Some("brokerage".into()),
+            },
+        )
+        .expect("configured the brokerage");
+        configure_account(
+            &mut store,
+            "u",
+            &ConfigureInvestmentAccountCommand {
+                item_id: "item1".into(),
+                plaid_account_id: "acct-2".into(),
+                accounts: InvestmentPostingAccounts::Sheltered {
+                    retirement_account_id: IRA.into(),
+                },
+                plaid_subtype: Some("ira".into()),
+            },
+        )
+        .expect("configured the IRA");
+        store
+    }
+
+    fn provider_accounts() -> Vec<imp::ProviderAccount> {
+        vec![
+            imp::ProviderAccount {
+                account_id: "acct-1".into(),
+                name: "Brokerage".into(),
+                subtype: Some("brokerage".into()),
+                mask: Some("1234".into()),
+            },
+            imp::ProviderAccount {
+                account_id: "acct-2".into(),
+                name: "Rollover IRA".into(),
+                subtype: Some("ira".into()),
+                mask: Some("5678".into()),
+            },
+        ]
+    }
+
+    fn acme_security() -> imp::ProviderSecurity {
+        imp::ProviderSecurity {
+            security_id: "sec-acme".into(),
+            ticker: Some("ACME".into()),
+            name: Some("Acme Corp".into()),
+            security_type: Some("stock".into()),
+            cusip: Some("037833100".into()),
+            ..Default::default()
+        }
+    }
+
+    fn fund_security() -> imp::ProviderSecurity {
+        imp::ProviderSecurity {
+            security_id: "sec-fund".into(),
+            ticker: Some("TDF2050".into()),
+            name: Some("Target 2050".into()),
+            security_type: Some("mutual fund".into()),
+            ..Default::default()
+        }
+    }
+
+    /// One payload exercising every branch that writes: a purchase, a sale out of
+    /// it, a dividend, a fee, a cash transfer, a corporate action that is held, and a
+    /// trade inside the sheltered account that is ignored.
+    fn provider_transactions() -> Vec<imp::ProviderInvestmentTransaction> {
+        let on_acme = |id: &str, ty: &str, sub: &str| imp::ProviderInvestmentTransaction {
+            investment_transaction_id: id.into(),
+            account_id: "acct-1".into(),
+            security_id: Some("sec-acme".into()),
+            security: Some(acme_security()),
+            date: "2025-03-10".into(),
+            name: format!("ACME {sub}"),
+            transaction_type: ty.into(),
+            subtype: sub.into(),
+            ..Default::default()
+        };
+        vec![
+            imp::ProviderInvestmentTransaction {
+                quantity: 10.0,
+                price: 100.0,
+                amount: 1_000.0,
+                ..on_acme("tx-buy", "buy", "buy")
+            },
+            imp::ProviderInvestmentTransaction {
+                date: "2025-04-01".into(),
+                quantity: -4.0,
+                price: 150.0,
+                fees: Some(9.95),
+                amount: -590.05,
+                ..on_acme("tx-sell", "sell", "sell")
+            },
+            imp::ProviderInvestmentTransaction {
+                date: "2025-04-15".into(),
+                amount: -12.34,
+                ..on_acme("tx-dividend", "cash", "dividend")
+            },
+            imp::ProviderInvestmentTransaction {
+                investment_transaction_id: "tx-fee".into(),
+                account_id: "acct-1".into(),
+                date: "2025-04-30".into(),
+                name: "Advisory fee".into(),
+                transaction_type: "fee".into(),
+                subtype: "management fee".into(),
+                amount: 5.0,
+                ..Default::default()
+            },
+            imp::ProviderInvestmentTransaction {
+                investment_transaction_id: "tx-deposit".into(),
+                account_id: "acct-1".into(),
+                date: "2025-05-02".into(),
+                name: "Transfer in".into(),
+                transaction_type: "cash".into(),
+                subtype: "deposit".into(),
+                amount: -500.0,
+                ..Default::default()
+            },
+            // Never guessed, on either path: a split applied wrongly restates every
+            // gain on the security for ever.
+            imp::ProviderInvestmentTransaction {
+                date: "2025-05-10".into(),
+                quantity: 10.0,
+                ..on_acme("tx-split", "cash", "split")
+            },
+            // Inside the sheltered account: ignored by design, and recorded nowhere.
+            imp::ProviderInvestmentTransaction {
+                investment_transaction_id: "tx-ira-buy".into(),
+                account_id: "acct-2".into(),
+                security_id: Some("sec-fund".into()),
+                security: Some(fund_security()),
+                date: "2025-05-15".into(),
+                name: "TDF2050 buy".into(),
+                transaction_type: "buy".into(),
+                subtype: "buy".into(),
+                quantity: 12.0,
+                amount: 480.0,
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn provider_holdings() -> Vec<imp::ProviderHolding> {
+        vec![
+            imp::ProviderHolding {
+                account_id: "acct-1".into(),
+                security_id: "sec-acme".into(),
+                security: Some(acme_security()),
+                quantity: 6.0,
+                cost_basis: Some(600.0),
+                institution_value: Some(720.0),
+                ..Default::default()
+            },
+            imp::ProviderHolding {
+                account_id: "acct-2".into(),
+                security_id: "sec-fund".into(),
+                security: Some(fund_security()),
+                quantity: 100.0,
+                cost_basis: Some(1_000.0),
+                institution_value: Some(1_234.56),
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn as_of() -> NaiveDate {
+        day(2025, 6, 30)
+    }
+
+    /// The property the whole hosted path exists to have: the same payload imported
+    /// into a local book and into a group's produces the same log.
+    ///
+    /// Not the same balances and not the same entries — the same **events**, in the
+    /// same order, scrubbed only of the ids each book mints for itself. That is what
+    /// catches an importer that grew a second opinion on the way over the wire: a
+    /// missing `InvestmentActivityImported` (so the next fetch imports the purchase
+    /// again and a Form 8949 deducts it twice), a position filed in the wrong
+    /// securities slot because the kind was read off a replica that had not pulled the
+    /// definition, a memo built from something the server does not have, a snapshot
+    /// left local, a sheltered account's value never set.
+    #[tokio::test]
+    async fn a_hosted_import_and_a_local_import_of_one_payload_produce_the_same_log() {
+        let accounts = provider_accounts();
+        let transactions = provider_transactions();
+        let holdings = provider_holdings();
+
+        // --- the local book ---
+        let mut local = ready_to_import();
+        let baseline = local.latest_id().unwrap().unwrap_or(0);
+        let local_report =
+            imp::import_transactions(&mut local, "u", "item1", &accounts, &transactions)
+                .expect("imported locally");
+        let local_holdings =
+            imp::import_holdings(&mut local, "u", "item1", as_of(), &holdings, &accounts)
+                .expect("holdings locally");
+        let local_log = local.get_after(baseline).unwrap();
+
+        // --- the group's books, over the wire ---
+        let (wire, handle) = serve(ready_to_import()).await;
+        assert_eq!(
+            wire.head().await,
+            baseline,
+            "the two books start from the same chart and the same configuration"
+        );
+        let replica = replica_of(&handle);
+        let mut client = client_for(&wire).await;
+        let hosted_report =
+            imp::import_transactions_hosted(&replica, &mut client, "item1", &accounts, &transactions)
+                .await
+                .expect("imported to the group");
+        let hosted_holdings = imp::import_holdings_hosted(
+            &replica,
+            &mut client,
+            "item1",
+            as_of(),
+            &holdings,
+            &accounts,
+        )
+        .await
+        .expect("holdings to the group");
+        let hosted_log = events_after(&handle, baseline);
+
+        assert_eq!(
+            local_log.len(),
+            hosted_log.len(),
+            "the two books appended a different number of events"
+        );
+        for (i, (l, h)) in local_log.iter().zip(hosted_log.iter()).enumerate() {
+            assert_eq!(
+                scrub_ids(&serde_json::to_string_pretty(&l.event).unwrap()),
+                scrub_ids(&serde_json::to_string_pretty(&h.event).unwrap()),
+                "event {i} of the import differs between a local book and a hosted one"
+            );
+        }
+
+        // And the reports agree about everything a person is shown, bar the
+        // reconciliation the hosted path leaves to the caller (both halves of it are
+        // one pull behind).
+        assert_eq!(local_report, hosted_report);
+        assert_eq!(
+            (local_holdings.recorded, local_holdings.unchanged),
+            (hosted_holdings.recorded, hosted_holdings.unchanged)
+        );
+        assert_eq!(
+            local_holdings.securities_created,
+            hosted_holdings.securities_created
+        );
+        assert_eq!(
+            local_holdings
+                .values_set
+                .iter()
+                .map(|(a, v)| (a.clone(), v.change_cents))
+                .collect::<Vec<_>>(),
+            hosted_holdings
+                .values_set
+                .iter()
+                .map(|(a, v)| (a.clone(), v.change_cents))
+                .collect::<Vec<_>>(),
+            "the sheltered account's value update has to come to the same thing"
+        );
+        assert_eq!(local_report.bought, 1, "the payload did post something");
+        assert_eq!(local_report.held, 1, "and held the corporate action");
+        assert!(!local_holdings.reconciliations.is_empty());
+        assert!(
+            hosted_holdings.reconciliations.is_empty(),
+            "a hosted reconciliation would be computed from a replica that is one pull behind"
+        );
+    }
+
+    /// The pull is what brings a hosted import home: the register, the security
+    /// master and the mapping all arrive through the mirror path, under the ids the
+    /// **server** chose.
+    #[tokio::test]
+    async fn a_security_minted_by_the_server_reaches_the_local_mapping_under_the_servers_id() {
+        let accounts = provider_accounts();
+        let transactions = provider_transactions();
+        let (wire, handle) = serve(ready_to_import()).await;
+        let mut replica = replica_of(&handle);
+        let mut client = client_for(&wire).await;
+
+        let report =
+            imp::import_transactions_hosted(&replica, &mut client, "item1", &accounts, &transactions)
+                .await
+                .expect("imported");
+        assert_eq!(report.securities_created, 1, "ACME was minted server-side");
+
+        // The id the server chose, read off the group's own log.
+        let server_id: String = handle
+            .lock()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT security_id FROM plaid_securities WHERE plaid_security_id = 'sec-acme'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Nothing locally yet: the importer appended nothing to the replica, which is
+        // the whole point of the hosted path.
+        let mapped: Option<String> = replica
+            .connection()
+            .query_row(
+                "SELECT security_id FROM plaid_securities WHERE plaid_security_id = 'sec-acme'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(mapped, None, "a replica's projections have one writer");
+
+        pull(&handle, &mut replica);
+        let mapped: String = replica
+            .connection()
+            .query_row(
+                "SELECT security_id FROM plaid_securities WHERE plaid_security_id = 'sec-acme'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mapped, server_id,
+            "the local mapping must hold the id the server minted, never one of its own"
+        );
+        // And the lot the purchase opened is carried in the stocks slot, because the
+        // kind came back with the id rather than being read out of a replica that had
+        // never heard of the security.
+        let account: String = replica
+            .connection()
+            .query_row(
+                "SELECT securities_account_id FROM investment_lots WHERE security_id = ?1",
+                [&mapped],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(account, SECURITIES);
+    }
+
+    /// Interrupted **before** the server accepted: nothing is recorded as imported,
+    /// anywhere, and the next run posts the transaction exactly once.
+    ///
+    /// The interruption is a server that is not there, which is the honest shape of
+    /// one: the submit fails, the run fails, and the question is what was left behind.
+    #[tokio::test]
+    async fn an_import_interrupted_before_the_server_accepted_records_nothing() {
+        let accounts = provider_accounts();
+        let transactions = provider_transactions();
+        let (wire, handle) = serve(ready_to_import()).await;
+        let head_before = wire.head().await;
+        let mut replica = replica_of(&handle);
+
+        // A client pointed at nothing at all.
+        let mut broken = SyncClient::with_head("http://127.0.0.1:1", TOKEN, head_before);
+        let outcome =
+            imp::import_transactions_hosted(&replica, &mut broken, "item1", &accounts, &transactions)
+                .await;
+        assert!(
+            outcome.is_err(),
+            "a transport that is down must fail the run, not hold every row as refused"
+        );
+
+        assert_eq!(wire.head().await, head_before, "the group's log did not move");
+        let registered: i64 = replica
+            .connection()
+            .query_row("SELECT COUNT(*) FROM investment_imports", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(registered, 0, "nothing was recorded as imported");
+        let held: i64 = replica
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM investment_staged_activity",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(held, 0, "and nothing was held either");
+
+        // And the run that follows posts each transaction once.
+        let mut client = client_for(&wire).await;
+        let report =
+            imp::import_transactions_hosted(&replica, &mut client, "item1", &accounts, &transactions)
+                .await
+                .expect("imported");
+        assert_eq!((report.bought, report.sold, report.duplicates), (1, 1, 0));
+        pull(&handle, &mut replica);
+        let buys: i64 = replica
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM investment_imports WHERE outcome = 'buy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(buys, 1);
+    }
+
+    /// Interrupted **after** the server accepted: the register is not lost. It is in
+    /// the group's log, it arrives at the next pull, and a re-import that beats the
+    /// pull is refused by the server's own fence and counted as the duplicate it is —
+    /// not posted twice, and not parked in the review list.
+    #[tokio::test]
+    async fn an_import_interrupted_after_the_server_accepted_leaves_the_register_consistent() {
+        let accounts = provider_accounts();
+        let one = vec![provider_transactions()[0].clone()];
+        let (wire, handle) = serve(ready_to_import()).await;
+        let mut replica = replica_of(&handle);
+        let mut client = client_for(&wire).await;
+
+        let report = imp::import_transactions_hosted(&replica, &mut client, "item1", &accounts, &one)
+            .await
+            .expect("imported");
+        assert_eq!(report.bought, 1);
+
+        // The interruption: the process stopped here, so this copy never pulled. The
+        // fence is nonetheless in the group's log.
+        let fenced: i64 = handle
+            .lock()
+            .unwrap()
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM investment_imports WHERE provider_transaction_id = 'tx-buy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fenced, 1, "the group holds the record the local copy is missing");
+        let locally: i64 = replica
+            .connection()
+            .query_row("SELECT COUNT(*) FROM investment_imports", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(locally, 0, "and the local copy does not know yet");
+
+        // The next run, still before any pull: the planner cannot see the fence, the
+        // server can.
+        let head = wire.head().await;
+        let mut client = client_for(&wire).await;
+        let again = imp::import_transactions_hosted(&replica, &mut client, "item1", &accounts, &one)
+            .await
+            .expect("imported again");
+        assert_eq!(
+            (again.bought, again.duplicates, again.held),
+            (0, 1, 0),
+            "a re-import that beat the pull is a duplicate, not a posting and not a hold"
+        );
+        assert_eq!(wire.head().await, head, "and nothing was appended for it");
+
+        // Then the pull, and the register is consistent with no repair.
+        pull(&handle, &mut replica);
+        let locally: i64 = replica
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM investment_imports WHERE provider_transaction_id = 'tx-buy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(locally, 1);
+        let third = imp::import_transactions_hosted(&replica, &mut client, "item1", &accounts, &one)
+            .await
+            .expect("imported a third time");
+        assert_eq!((third.bought, third.duplicates), (0, 1));
+    }
+
+    /// A `422` is the books refusing this transaction, and the row is held carrying
+    /// the server's own wording — exactly as a local refusal is.
+    ///
+    /// The refusal here is a sale of more shares than the position holds, which is a
+    /// judgement only the write lock can make.
+    #[tokio::test]
+    async fn a_refusal_from_the_server_holds_the_row_with_the_servers_wording() {
+        let accounts = provider_accounts();
+        let oversold = imp::ProviderInvestmentTransaction {
+            investment_transaction_id: "tx-oversell".into(),
+            account_id: "acct-1".into(),
+            security_id: Some("sec-acme".into()),
+            security: Some(acme_security()),
+            date: "2025-04-01".into(),
+            name: "ACME sell".into(),
+            transaction_type: "sell".into(),
+            subtype: "sell".into(),
+            quantity: -400.0,
+            amount: -60_000.0,
+            ..Default::default()
+        };
+        let (wire, handle) = serve(ready_to_import()).await;
+        let replica = replica_of(&handle);
+        let mut client = client_for(&wire).await;
+
+        let report = imp::import_transactions_hosted(
+            &replica,
+            &mut client,
+            "item1",
+            &accounts,
+            &[oversold],
+        )
+        .await
+        .expect("the run survives a refusal");
+        assert_eq!((report.sold, report.held), (0, 1));
+
+        let (reason, detail): (String, String) = replica
+            .connection()
+            .query_row(
+                "SELECT reason, detail FROM investment_staged_activity
+                  WHERE provider_transaction_id = 'tx-oversell'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, "rejected");
+        assert!(
+            detail.contains("There are no lots of"),
+            "the held row has to carry the server's own sentence, not ours: {detail}"
+        );
+        assert!(
+            detail.contains("The books refused this one"),
+            "and the guidance a person acts on: {detail}"
+        );
+        // Nothing posted, and the row is not fenced as imported — it is waiting for a
+        // person, which is what makes importing it again after they act possible.
+        assert_eq!(
+            events_after(&handle, wire.head().await).len(),
+            0,
+            "a refusal appends nothing"
+        );
+    }
+
+    /// Re-importing the same payload on a group's books changes nothing: not a
+    /// transaction, not a snapshot, not a sheltered account's value.
+    #[tokio::test]
+    async fn re_importing_the_same_payload_on_hosted_books_changes_nothing() {
+        let accounts = provider_accounts();
+        let transactions = provider_transactions();
+        let holdings = provider_holdings();
+        let (wire, handle) = serve(ready_to_import()).await;
+        let mut replica = replica_of(&handle);
+        let mut client = client_for(&wire).await;
+
+        imp::import_transactions_hosted(&replica, &mut client, "item1", &accounts, &transactions)
+            .await
+            .expect("imported");
+        imp::import_holdings_hosted(&replica, &mut client, "item1", as_of(), &holdings, &accounts)
+            .await
+            .expect("holdings");
+        pull(&handle, &mut replica);
+        let settled = wire.head().await;
+
+        let report =
+            imp::import_transactions_hosted(&replica, &mut client, "item1", &accounts, &transactions)
+                .await
+                .expect("imported again");
+        let holdings_report = imp::import_holdings_hosted(
+            &replica,
+            &mut client,
+            "item1",
+            as_of(),
+            &holdings,
+            &accounts,
+        )
+        .await
+        .expect("holdings again");
+
+        assert_eq!(
+            wire.head().await,
+            settled,
+            "a second import of one payload appended {} event(s)",
+            wire.head().await - settled
+        );
+        assert_eq!(report.posted(), 0);
+        assert_eq!(report.duplicates, 6, "every row was already dealt with");
+        assert_eq!(
+            (holdings_report.recorded, holdings_report.unchanged),
+            (0, 2),
+            "both snapshots were already on file"
+        );
+        assert!(holdings_report.values_set.is_empty());
     }
 }

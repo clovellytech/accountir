@@ -20,10 +20,12 @@ use super::commands::entry_ops::{
 use super::commands::investments::{
     BuySecurityRequest, BuySecurityResponse, ChargeInvestmentFeeRequest,
     ConfigureInvestmentAccountRequest, DefineSecurityRequest, DefineSecurityResponse,
-    PostedEntryResponse, RecordInvestmentIncomeRequest, RecordRetirementContributionRequest,
-    RecordRetirementDistributionRequest, RecordRetirementDistributionResponse,
-    RegisterRetirementAccountRequest, SellSecurityRequest, SellSecurityResponse,
-    SetRetirementValueRequest, SetRetirementValueResponse,
+    ImportInvestmentActivityRequest, ImportInvestmentActivityResponse, PostedEntryResponse,
+    RecordHoldingsSnapshotRequest, RecordHoldingsSnapshotResponse, RecordInvestmentIncomeRequest,
+    RecordRetirementContributionRequest, RecordRetirementDistributionRequest,
+    RecordRetirementDistributionResponse, RegisterRetirementAccountRequest,
+    ResolvePlaidSecurityRequest, ResolvePlaidSecurityResponse, SellSecurityRequest,
+    SellSecurityResponse, SetRetirementValueRequest, SetRetirementValueResponse,
 };
 use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
@@ -48,7 +50,9 @@ use crate::commands::investment_commands::{
     BuySecurityCommand, ChargeInvestmentFeeCommand, NewSecurity, RecordInvestmentIncomeCommand,
     SellSecurityCommand,
 };
-use crate::commands::investment_import::ConfigureInvestmentAccountCommand;
+use crate::commands::investment_import::{
+    ConfigureInvestmentAccountCommand, ImportRecord, PlannedWrite,
+};
 use crate::commands::partnership_commands::UpdatePartner;
 use crate::commands::retirement_commands::{
     RegisterRetirementAccountCommand, RetirementContributionCommand,
@@ -2476,6 +2480,94 @@ impl SyncClient {
         )
         .await
     }
+
+    // -----------------------------------------------------------------------
+    // The importer's three (phase 4 over the transport)
+    // -----------------------------------------------------------------------
+
+    /// Find or mint the group's master for a provider security, and hand back the
+    /// id **the server chose**.
+    ///
+    /// The whole resolution — the mapping, the CUSIP, the ticker, then minting one —
+    /// happens on the server inside its append transaction, rather than here against
+    /// a replica that may not have pulled the last member's definition. A client that
+    /// decided for itself would mint a second master for a security the group already
+    /// has, and two masters for one holding neither add up on a balance sheet nor
+    /// reconcile against a 1099-B.
+    ///
+    /// The answer carries the kind the master holds as well as the id, because that is
+    /// what decides which securities subaccount a position is carried in and a replica
+    /// cannot read it back for a security that was just defined.
+    pub async fn resolve_plaid_security(
+        &mut self,
+        plaid_security_id: &str,
+        security: &NewSecurity,
+    ) -> Result<ResolvePlaidSecurityResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/resolve-plaid-security",
+            "adding a security from a brokerage feed",
+            |head| ResolvePlaidSecurityRequest {
+                expected_head_seq: head,
+                plaid_security_id: plaid_security_id.to_string(),
+                security: security.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Import one provider transaction into the group's books.
+    ///
+    /// Takes the same [`PlannedWrite`] the local importer hands to
+    /// `build_import_in_txn`, so the planning is done once and only the destination
+    /// differs. The server appends the posting, its register event and the import
+    /// record as one batch, which is why this is one command rather than a posting
+    /// followed by a note about it: a posting whose fence did not land is re-imported
+    /// on the next rolling fetch and deducted twice.
+    ///
+    /// A `422` here is the books refusing this transaction, and the caller holds the
+    /// row with the wording the server sent. One `422` is not a refusal to show
+    /// anybody — "already imported", which on a replica means the local register had
+    /// not pulled yet; [`import_transactions_hosted`] recognises it by the message
+    /// both sides build from one constructor.
+    ///
+    /// [`PlannedWrite`]: crate::commands::investment_import::PlannedWrite
+    /// [`import_transactions_hosted`]: crate::commands::investment_import::import_transactions_hosted
+    pub async fn import_investment_activity(
+        &mut self,
+        write: &PlannedWrite,
+        record: &ImportRecord,
+    ) -> Result<ImportInvestmentActivityResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/import-investment-activity",
+            "importing brokerage activity",
+            |head| ImportInvestmentActivityRequest {
+                expected_head_seq: head,
+                record: record.clone(),
+                write: write.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Record what a broker said an account held, on the group's books.
+    ///
+    /// `recorded` is `false` when the group already held this exact snapshot for this
+    /// date, which is a success: it is what makes re-importing a holdings payload
+    /// append nothing.
+    pub async fn record_holdings_snapshot(
+        &mut self,
+        snapshot: &crate::events::types::HoldingsSnapshotData,
+    ) -> Result<RecordHoldingsSnapshotResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/record-holdings-snapshot",
+            "recording a brokerage holdings snapshot",
+            |head| RecordHoldingsSnapshotRequest {
+                expected_head_seq: head,
+                snapshot: snapshot.clone(),
+            },
+        )
+        .await
+    }
 }
 
 /// A command response that carries the new log head.
@@ -2499,6 +2591,9 @@ macro_rules! has_head {
 
 has_head!(
     DefineSecurityResponse,
+    ResolvePlaidSecurityResponse,
+    ImportInvestmentActivityResponse,
+    RecordHoldingsSnapshotResponse,
     BuySecurityResponse,
     SellSecurityResponse,
     PostedEntryResponse,

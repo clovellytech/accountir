@@ -60,17 +60,54 @@
 //! be re-imported on the next fetch with a freshly minted lot id, which sails past
 //! migration 014's reference fence because the reference contains that id — and the
 //! same purchase is then deducted twice on a Form 8949.
+//!
+//! # One planner, two sinks
+//!
+//! The same payload has to import into local books and into a group's, and on a
+//! group's the local copy is a **replica**: the server owns the log and the only
+//! writer to the replica's copy of it is the mirror path in [`crate::sync::replica`].
+//! An append here would fork it.
+//!
+//! So the importer is split at the one place the two differ. Everything that is a
+//! judgement — the classification, the subtype rules, the corporate-action holds, the
+//! `f64` → integer conversion, the dedup fence, which securities subaccount a
+//! position is carried in, which account a kind of income posts to — happens once, in
+//! [`plan_payload`], and produces a [`PlannedWrite`] per transaction with nothing left
+//! to decide. Where that write lands is the only fork:
+//!
+//! * [`import_transactions`] and [`import_holdings`] append it here;
+//! * [`import_transactions_hosted`] and [`import_holdings_hosted`] submit it to the
+//!   group server, which runs [`build_import_in_txn`] — *this* module's builder —
+//!   inside its own append transaction.
+//!
+//! That last point is what makes the two paths equivalent rather than merely similar:
+//! the fences are not re-implemented on the server, they are the same functions run
+//! under a different write lock. `sync::commands::investments`'s
+//! `a_hosted_import_and_a_local_import_of_one_payload_produce_the_same_log` is what
+//! holds it to be true.
+//!
+//! One consequence worth naming: a payload's security masters are all resolved before
+//! any of its postings, because resolution is the one thing the planner has to ask a
+//! sink for and asking it up front is what keeps the planner free of writes. The log
+//! of one import run therefore lists its `SecurityDefined` events first rather than
+//! interleaved with the trades — on both paths, and with no effect on any balance,
+//! any basis or any fence.
+//!
+//! The review list and the fetch window stay **local in both modes**: what this
+//! machine is still looking at and how far it has fetched are facts about the machine
+//! rather than about the books (migration 050).
 
 use chrono::{Days, Months, NaiveDate};
 use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::commands::investment_commands::{
     self, build_buy_in_txn, build_define_security_in_txn, build_fee_in_txn, build_income_in_txn,
-    build_sell_in_txn, BuySecurityCommand, ChargeInvestmentFeeCommand, InvestmentStep,
-    LotSelection, NewSecurity, RecordInvestmentIncomeCommand, SellSecurityCommand,
+    build_sell_in_txn, BuySecurityCommand, ChargeInvestmentFeeCommand, InvestmentError,
+    InvestmentStep, LotSelection, NewSecurity, RecordInvestmentIncomeCommand, SellSecurityCommand,
 };
 use crate::commands::retirement_commands::{self, SetRetirementValueCommand, ValueSet};
 use crate::events::types::{
@@ -1067,10 +1104,224 @@ fn run(
     }
 }
 
-/// Turn a phase-1 step into one of ours, carrying the refusal through as a
-/// [`ImportError::Refused`] so the caller can hold the row instead of failing the
-/// whole run.
-fn from_investment_step(step: InvestmentStep, import: ImportRecord) -> ImportStep {
+// ---------------------------------------------------------------------------
+// One import's decided write: the plan, and the two places it can land
+// ---------------------------------------------------------------------------
+
+/// Cash into or out of a taxable brokerage, against the configured clearing
+/// account.
+///
+/// The one imported write with no phase-1 command behind it — it is an ordinary
+/// two-line transfer — and it gets a command type of its own anyway so that it can
+/// travel the same road as the other four: one planner decides it, and either sink
+/// writes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportedCashMovement {
+    pub cash_account_id: String,
+    /// Where the other leg goes while the bank feed has not reported it yet.
+    pub clearing_account_id: String,
+    /// **Signed**: positive is cash arriving at the brokerage, negative is cash
+    /// leaving it. One signed field rather than two branches, because the sign is
+    /// the whole content of this entry and two branches is two places to get it
+    /// wrong.
+    pub into_brokerage_cents: i64,
+    pub on: NaiveDate,
+    pub memo: String,
+}
+
+/// What the importer decided to write for one provider transaction, with nothing
+/// left to decide.
+///
+/// This is the seam between the planner and the sink. Everything difficult — the
+/// classification, the subtype rules, the corporate-action holds, the `f64` →
+/// integer conversion, which securities subaccount a holding lives in, which
+/// account a kind of income posts to — has already happened by the time one of
+/// these exists. What is left is *where the write lands*: the append loop in this
+/// module on a local book, or [`SyncClient::import_investment_activity`] on a
+/// group's, which posts this very value to the group server.
+///
+/// One type on both paths rather than a wire twin of it, for the reason
+/// [`LotSelection`] gives: a hosted import has to post exactly what a local one
+/// would, and two types that have to agree about that are two types that can stop
+/// agreeing.
+///
+/// [`SyncClient::import_investment_activity`]: crate::sync::SyncClient::import_investment_activity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedWrite {
+    Buy {
+        /// Minted by the planner, not by whichever sink writes it, so the lot id
+        /// in the register, in the entry's reference and in the import record is
+        /// one id however the write travelled. It is also what makes a retry after
+        /// a 409 idempotent against migration 014's reference fence.
+        lot_id: String,
+        cmd: BuySecurityCommand,
+    },
+    Sell {
+        sale_id: String,
+        cmd: SellSecurityCommand,
+    },
+    Income {
+        cmd: RecordInvestmentIncomeCommand,
+    },
+    Fee {
+        cmd: ChargeInvestmentFeeCommand,
+    },
+    Cash {
+        cmd: ImportedCashMovement,
+    },
+}
+
+impl PlannedWrite {
+    /// What the import register will call this. Derived rather than carried beside
+    /// the write, so the two cannot disagree about what was imported.
+    pub fn outcome(&self) -> ImportedActivityKind {
+        match self {
+            PlannedWrite::Buy { .. } => ImportedActivityKind::Buy,
+            PlannedWrite::Sell { .. } => ImportedActivityKind::Sell,
+            PlannedWrite::Income { cmd } => match cmd.kind {
+                InvestmentIncomeKind::Dividend => ImportedActivityKind::Dividend,
+                // Tax-exempt interest is recorded as interest in the import
+                // register: the importer never chooses it (Plaid has no subtype
+                // for it — see the field on `TaxableBrokerageAccounts`), and a
+                // caller that passes it anyway has posted interest to a different
+                // account, which is what the entry says.
+                InvestmentIncomeKind::Interest | InvestmentIncomeKind::TaxExemptInterest => {
+                    ImportedActivityKind::Interest
+                }
+                InvestmentIncomeKind::CapitalGainDistribution => {
+                    ImportedActivityKind::CapitalGainDistribution
+                }
+            },
+            PlannedWrite::Fee { .. } => ImportedActivityKind::Fee,
+            PlannedWrite::Cash { .. } => ImportedActivityKind::Cash,
+        }
+    }
+
+    fn lot_id(&self) -> Option<&str> {
+        match self {
+            PlannedWrite::Buy { lot_id, .. } => Some(lot_id),
+            _ => None,
+        }
+    }
+
+    fn sale_id(&self) -> Option<&str> {
+        match self {
+            PlannedWrite::Sell { sale_id, .. } => Some(sale_id),
+            _ => None,
+        }
+    }
+}
+
+/// Which provider transaction a [`PlannedWrite`] is the import of.
+///
+/// The dedup fence's key, and what the log records beside the entry. Everything
+/// else the register holds — the outcome, the lot, the sale — is read off the write
+/// and off the entry the command built, rather than repeated here where it could
+/// drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportRecord {
+    pub provider_transaction_id: String,
+    pub item_id: String,
+    pub plaid_account_id: String,
+}
+
+/// The refusal a second import of the same provider transaction gets.
+///
+/// One constructor because both sinks read it: the local path holds the row
+/// carrying it, and the hosted path recognises it coming back as a `422` and
+/// counts a duplicate instead of holding one. See
+/// [`import_transactions_hosted`] for why that case is reachable at all.
+pub(crate) fn already_imported_message(provider_transaction_id: &str) -> String {
+    format!("{provider_transaction_id} has already been imported")
+}
+
+/// Build one import's batch: the trade or the entry, its register event, and the
+/// import record that fences it against the next fetch — as one unit.
+///
+/// The **whole** of what an import writes to a book, and the reason the hosted path
+/// is a different sink rather than a different importer: this function runs inside
+/// the append transaction either way, locally under [`run`] and on a group's books
+/// inside the server's own `append_checked_many`. So FIFO, the over-sale refusal,
+/// the closed-year fence, the reference uniqueness *and* the dedup fence are
+/// re-decided against locked state on both paths, and neither path can grow a
+/// second opinion about any of them.
+pub(crate) fn build_import_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    write: &PlannedWrite,
+    record: &ImportRecord,
+) -> Result<ImportStep, EventStoreError> {
+    // Under the write lock, and repeated although the planner already looked: the
+    // planner's read happened outside the lock, and two imports of the same payload
+    // running at once would both pass it. Here the second one is refused.
+    if already_imported_in_txn(tx, &record.provider_transaction_id)? {
+        return Ok(ImportStep::Reject(ImportError::Refused(
+            already_imported_message(&record.provider_transaction_id),
+        )));
+    }
+    let step = match write {
+        PlannedWrite::Buy { lot_id, cmd } => build_buy_in_txn(tx, lot_id, cmd)?,
+        PlannedWrite::Sell { sale_id, cmd } => build_sell_in_txn(tx, sale_id, cmd)?,
+        PlannedWrite::Income { cmd } => build_income_in_txn(tx, cmd)?,
+        PlannedWrite::Fee { cmd } => build_fee_in_txn(tx, cmd)?,
+        PlannedWrite::Cash { cmd } => build_cash_in_txn(tx, cmd)?,
+    };
+    Ok(from_investment_step(step, write, record))
+}
+
+/// The imported cash movement's entry.
+///
+/// The zero check is here as well as in the planner for the same reason the dedup
+/// check is: [`investment_commands::entry_or_reject`] would pass two lines of zero
+/// — they balance — and a hosted caller is not to be trusted to have looked.
+fn build_cash_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &ImportedCashMovement,
+) -> Result<InvestmentStep, EventStoreError> {
+    if cmd.into_brokerage_cents == 0 {
+        return Ok(InvestmentStep::Reject(InvestmentError::Invalid(
+            NOTHING_MOVED.to_string(),
+        )));
+    }
+    let currency = base_currency_in_txn(tx)?;
+    let lines = vec![
+        (
+            cmd.cash_account_id.clone(),
+            cmd.into_brokerage_cents,
+            "Brokerage cash",
+        ),
+        (
+            cmd.clearing_account_id.clone(),
+            -cmd.into_brokerage_cents,
+            "Cash in transit",
+        ),
+    ];
+    Ok(
+        match investment_commands::entry_or_reject(
+            tx,
+            cmd.on,
+            cmd.memo.clone(),
+            None,
+            &lines,
+            &currency,
+        )? {
+            Ok(entry) => InvestmentStep::Append(vec![entry]),
+            Err(e) => InvestmentStep::Reject(e),
+        },
+    )
+}
+
+/// What a cash movement of nothing is refused with, on either path.
+const NOTHING_MOVED: &str = "a cash movement of nothing moves no money";
+
+/// Turn a phase-1 step into one of ours, appending the import record to the batch
+/// and carrying a refusal through as an [`ImportError::Refused`] so the caller can
+/// hold the row instead of failing the whole run.
+fn from_investment_step(
+    step: InvestmentStep,
+    write: &PlannedWrite,
+    record: &ImportRecord,
+) -> ImportStep {
     match step {
         InvestmentStep::Append(mut events) => {
             let Some(entry_id) = events.iter().find_map(|e| match e {
@@ -1085,30 +1336,19 @@ fn from_investment_step(step: InvestmentStep, import: ImportRecord) -> ImportSte
             };
             events.push(Event::InvestmentActivityImported(Box::new(
                 InvestmentActivityImportedData {
-                    provider_transaction_id: import.provider_transaction_id,
-                    item_id: import.item_id,
-                    plaid_account_id: import.plaid_account_id,
-                    outcome: import.outcome,
+                    provider_transaction_id: record.provider_transaction_id.clone(),
+                    item_id: record.item_id.clone(),
+                    plaid_account_id: record.plaid_account_id.clone(),
+                    outcome: write.outcome(),
                     entry_id,
-                    lot_id: import.lot_id,
-                    sale_id: import.sale_id,
+                    lot_id: write.lot_id().map(str::to_string),
+                    sale_id: write.sale_id().map(str::to_string),
                 },
             )));
             ImportStep::Append(events)
         }
         InvestmentStep::Reject(e) => ImportStep::Reject(ImportError::Refused(e.to_string())),
     }
-}
-
-/// What the import record will say, minus the entry id, which is read off the
-/// entry the command built rather than minted here.
-struct ImportRecord {
-    provider_transaction_id: String,
-    item_id: String,
-    plaid_account_id: String,
-    outcome: ImportedActivityKind,
-    lot_id: Option<String>,
-    sale_id: Option<String>,
 }
 
 /// Has this provider transaction already been dealt with?
@@ -1182,78 +1422,35 @@ pub fn ticker_for(security: &ProviderSecurity) -> String {
     format!("PLAID:{}", security.security_id)
 }
 
-/// Find or create the security master for a provider security, and return our id.
+/// Which of our securities a provider's security is, and what our master calls its
+/// type.
 ///
-/// Three ways of finding it before creating one, in order of trust:
-///
-/// 1. `plaid_securities`, which is the answer once it exists;
-/// 2. the CUSIP, which survives a ticker change, so a security whose symbol changed
-///    between two imports is recognised rather than duplicated;
-/// 3. the ticker, which catches a security somebody already entered by hand.
-///
-/// Whichever way it is found, the link is appended so that the next import takes
-/// the first route. Creating a master is its own append rather than part of the
-/// trade's batch:
-/// the master is harmless on its own (a security nobody holds is a row in a list),
-/// while a trade that could not be posted must not take a security definition down
-/// with it, because the next attempt would then have to create it again.
-fn resolve_security(
-    store: &mut EventStore,
-    user_id: &str,
-    security: &ProviderSecurity,
-    created: &mut u32,
-) -> Result<String, ImportError> {
-    if let Some(existing) = store
-        .connection()
-        .query_row(
-            "SELECT security_id FROM plaid_securities WHERE plaid_security_id = ?1",
-            [&security.security_id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        return Ok(existing);
-    }
+/// The kind travels with the id because [`TaxableBrokerageAccounts::securities_account_for_kind`]
+/// needs it and **our** master is the only honest source for it — see
+/// [`plan_post`]. On a replica the master may hold a security the local copy has
+/// not pulled yet, so reading the kind back out of the local `securities` table
+/// after a hosted define would find nothing and file a stock under "other
+/// securities". The server answers with the kind it holds instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MasterSecurity {
+    pub security_id: String,
+    pub kind: String,
+}
 
+/// The provider's security as our master would hold it.
+///
+/// Every normalisation the master needs happens here and nowhere else, so a hosted
+/// import sends the server the same description a local import would have written
+/// itself.
+pub fn provider_security_as_new(security: &ProviderSecurity) -> NewSecurity {
     let ticker = ticker_for(security);
-    let cusip = security
-        .cusip
-        .as_ref()
-        .map(|c| c.trim().to_uppercase())
-        .filter(|c| !c.is_empty());
-
-    let matched: Option<String> = match &cusip {
-        Some(cusip) => store
-            .connection()
-            .query_row("SELECT id FROM securities WHERE cusip = ?1", [cusip], |r| {
-                r.get::<_, String>(0)
-            })
-            .optional()?,
-        None => None,
-    }
-    .or(store
-        .connection()
-        .query_row(
-            "SELECT id FROM securities WHERE ticker = ?1",
-            [&ticker],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?);
-
-    if let Some(security_id) = matched {
-        link_security(store, user_id, &security.security_id, &security_id)?;
-        return Ok(security_id);
-    }
-
-    let security_id = Uuid::new_v4().to_string();
-    let new = NewSecurity {
-        ticker,
+    NewSecurity {
         name: security
             .name
             .as_ref()
             .map(|n| n.trim().to_string())
             .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| ticker_for(security)),
+            .unwrap_or_else(|| ticker.clone()),
         // Plaid's own vocabulary, which is exactly what phase 1 left `kind` free
         // text for. "unknown" rather than a guess when it says nothing: a label
         // nothing branches on is better wrong-shaped than invented.
@@ -1263,59 +1460,224 @@ fn resolve_security(
             .map(|k| k.trim().to_string())
             .filter(|k| !k.is_empty())
             .unwrap_or_else(|| "unknown".to_string()),
-        cusip,
+        cusip: security
+            .cusip
+            .as_ref()
+            .map(|c| c.trim().to_uppercase())
+            .filter(|c| !c.is_empty()),
         currency: security
             .iso_currency_code
             .clone()
             .unwrap_or_else(|| "USD".to_string()),
-    };
-    let plaid_security_id = security.security_id.clone();
-    let events = run(store, user_id, |tx| {
-        match build_define_security_in_txn(tx, &security_id, &new)? {
-            InvestmentStep::Append(mut events) => {
-                // The link goes in the same batch as the definition: a master
-                // created without one would be found again by ticker next time,
-                // which works, but a master created and *not* linked is
-                // indistinguishable from one somebody typed, and the difference
-                // matters when a ticker is reassigned.
-                events.push(Event::PlaidSecurityLinked(Box::new(
-                    PlaidSecurityLinkData {
-                        plaid_security_id: plaid_security_id.clone(),
-                        security_id: security_id.clone(),
-                    },
-                )));
-                Ok(ImportStep::Append(events))
-            }
-            InvestmentStep::Reject(e) => {
-                Ok(ImportStep::Reject(ImportError::Refused(e.to_string())))
-            }
-        }
-    })?;
-    if events
-        .iter()
-        .any(|e| matches!(e.event, Event::SecurityDefined(_)))
-    {
-        *created += 1;
+        ticker,
     }
-    Ok(security_id)
 }
 
-fn link_security(
+/// What resolving a provider security came to, and the batch that records it.
+pub(crate) struct SecurityResolution {
+    pub master: MasterSecurity,
+    /// Whether a master was minted for it. Counted in the report, and the one thing
+    /// a caller cannot work out from the id alone.
+    pub created: bool,
+    pub step: ImportStep,
+}
+
+/// Find or create the security master for a provider security, and link it —
+/// inside the append transaction.
+///
+/// Three ways of finding it before creating one, in order of trust:
+///
+/// 1. `plaid_securities`, which is the answer once it exists;
+/// 2. the CUSIP, which survives a ticker change, so a security whose symbol changed
+///    between two imports is recognised rather than duplicated;
+/// 3. the ticker, which catches a security somebody already entered by hand.
+///
+/// Whichever way it is found, the link is appended so that the next import takes
+/// the first route. A master created **and not linked** is indistinguishable from
+/// one somebody typed, and the difference matters when a ticker is reassigned —
+/// which is why the definition and the link are one batch.
+///
+/// All three lookups are under the write lock rather than before it, and on a
+/// group's books that is what stops two members importing at once from minting two
+/// masters for one CUSIP and splitting a holding across them. An already-mapped
+/// security appends nothing at all, so re-resolving is free of events.
+pub(crate) fn build_resolve_security_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    plaid_security_id: &str,
+    new: &NewSecurity,
+) -> Result<SecurityResolution, EventStoreError> {
+    let found = |tx: &rusqlite::Transaction<'_>, security_id: String| {
+        let kind = investment_commands::get_security(tx, &security_id)
+            .map(|s| s.kind)
+            .unwrap_or_default();
+        MasterSecurity { security_id, kind }
+    };
+
+    if let Some(existing) = tx
+        .query_row(
+            "SELECT security_id FROM plaid_securities WHERE plaid_security_id = ?1",
+            [plaid_security_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(SecurityResolution {
+            master: found(tx, existing),
+            created: false,
+            step: ImportStep::Append(Vec::new()),
+        });
+    }
+
+    let ticker = new.ticker.trim().to_uppercase();
+    let matched: Option<String> = match &new.cusip {
+        Some(cusip) => tx
+            .query_row("SELECT id FROM securities WHERE cusip = ?1", [cusip], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?,
+        None => None,
+    }
+    .or(tx
+        .query_row("SELECT id FROM securities WHERE ticker = ?1", [&ticker], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?);
+
+    let link = |security_id: &str| {
+        Event::PlaidSecurityLinked(Box::new(PlaidSecurityLinkData {
+            plaid_security_id: plaid_security_id.to_string(),
+            security_id: security_id.to_string(),
+        }))
+    };
+
+    if let Some(security_id) = matched {
+        return Ok(SecurityResolution {
+            master: found(tx, security_id.clone()),
+            created: false,
+            step: ImportStep::Append(vec![link(&security_id)]),
+        });
+    }
+
+    let security_id = Uuid::new_v4().to_string();
+    match build_define_security_in_txn(tx, &security_id, new)? {
+        InvestmentStep::Append(mut events) => {
+            events.push(link(&security_id));
+            Ok(SecurityResolution {
+                master: MasterSecurity {
+                    security_id,
+                    kind: new.kind.trim().to_string(),
+                },
+                created: true,
+                step: ImportStep::Append(events),
+            })
+        }
+        InvestmentStep::Reject(e) => Ok(SecurityResolution {
+            master: MasterSecurity::default(),
+            created: false,
+            step: ImportStep::Reject(ImportError::Refused(e.to_string())),
+        }),
+    }
+}
+
+/// The local sink's half of security resolution: run the shared resolver, append
+/// what it decided.
+///
+/// Creating a master is its own append rather than part of the trade's batch: the
+/// master is harmless on its own (a security nobody holds is a row in a list), while
+/// a trade that could not be posted must not take a security definition down with
+/// it, because the next attempt would then have to create it again.
+fn resolve_security_locally(
     store: &mut EventStore,
     user_id: &str,
-    plaid_security_id: &str,
-    security_id: &str,
-) -> Result<(), ImportError> {
-    let link = PlaidSecurityLinkData {
-        plaid_security_id: plaid_security_id.to_string(),
-        security_id: security_id.to_string(),
-    };
-    run(store, user_id, |_tx| {
-        Ok(ImportStep::Append(vec![Event::PlaidSecurityLinked(
-            Box::new(link.clone()),
-        )]))
+    security: &ProviderSecurity,
+    created: &mut u32,
+) -> Result<MasterSecurity, ImportError> {
+    let plaid_security_id = security.security_id.clone();
+    let new = provider_security_as_new(security);
+    // A slot rather than a return value, for the reason `sync::commands::investments`
+    // uses one: what the resolver decided is decided *inside* the transaction, and
+    // the head-mismatch retry runs the closure again.
+    let outcome: std::cell::RefCell<Option<(MasterSecurity, bool)>> = std::cell::RefCell::new(None);
+    run(store, user_id, |tx| {
+        let resolved = build_resolve_security_in_txn(tx, &plaid_security_id, &new)?;
+        *outcome.borrow_mut() = Some((resolved.master, resolved.created));
+        Ok(resolved.step)
     })?;
-    Ok(())
+    let (master, made) = outcome.into_inner().ok_or_else(|| {
+        ImportError::Store("the security resolution landed without recording what it chose".into())
+    })?;
+    if made {
+        *created += 1;
+    }
+    Ok(master)
+}
+
+/// The mapping row, when this copy already holds it.
+///
+/// The one lookup that stays outside the transaction, and only as a short cut: a
+/// security already mapped needs no append and no round trip, and
+/// [`build_resolve_security_in_txn`] re-checks under the lock anyway. On a replica a
+/// miss here is not "no such mapping", only "not pulled yet", which is exactly what
+/// makes asking the server the right next step rather than minting one locally.
+fn mapped_security(conn: &Connection, plaid_security_id: &str) -> Option<MasterSecurity> {
+    let security_id: String = conn
+        .query_row(
+            "SELECT security_id FROM plaid_securities WHERE plaid_security_id = ?1",
+            [plaid_security_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let kind = investment_commands::get_security(conn, &security_id)
+        .map(|s| s.kind)
+        .unwrap_or_default();
+    Some(MasterSecurity { security_id, kind })
+}
+
+/// How the planner asks for our id for a provider security.
+///
+/// Two implementations, and neither does any work: [`Demand`] records the question
+/// on a first pass so the sink can answer it — locally by appending, on a group's
+/// books by asking the server — and [`Known`] answers it on the second. That is
+/// what keeps the planner free of writes without the planner having to know which
+/// securities will be needed: the code that asks is the code that decides, so the
+/// set resolved is exactly the set a local import would have resolved, in the same
+/// order.
+trait SecurityIds {
+    fn resolve(&mut self, security: &ProviderSecurity) -> MasterSecurity;
+}
+
+/// The first pass: collect, answer with nothing.
+#[derive(Default)]
+struct Demand {
+    wanted: Vec<ProviderSecurity>,
+    seen: std::collections::BTreeSet<String>,
+}
+
+impl SecurityIds for Demand {
+    fn resolve(&mut self, security: &ProviderSecurity) -> MasterSecurity {
+        if self.seen.insert(security.security_id.clone()) {
+            self.wanted.push(security.clone());
+        }
+        MasterSecurity::default()
+    }
+}
+
+/// The second pass: answer from what the sink resolved.
+struct Known<'a>(&'a BTreeMap<String, MasterSecurity>);
+
+impl SecurityIds for Known<'_> {
+    fn resolve(&mut self, security: &ProviderSecurity) -> MasterSecurity {
+        // A miss is unreachable — the demand pass asked the same questions in the
+        // same order — and a security id of `""` is refused by every builder as
+        // "no such security", so an unreachable miss holds the row rather than
+        // posting a trade against nothing.
+        self.0
+            .get(&security.security_id)
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,12 +1769,424 @@ impl ImportReport {
     }
 }
 
-/// Import investment transactions for one connection.
+// ---------------------------------------------------------------------------
+// The plan: one decision per provider transaction, and no writes
+// ---------------------------------------------------------------------------
+
+/// What the importer decided about one transaction.
+#[derive(Debug, Clone)]
+pub(crate) enum PlannedStep {
+    /// Already imported, or already held.
+    Duplicate,
+    /// Inside a sheltered account, and ignored by design (spec §2b).
+    IgnoreSheltered,
+    /// For the review list.
+    Hold {
+        reason: HoldReason,
+        detail: Option<String>,
+    },
+    Post {
+        /// Boxed for the reason the big event payloads are: five command shapes
+        /// inline would make every step of a payload as wide as the widest one, and
+        /// most steps of a rolling re-fetch are a one-word `Duplicate`.
+        write: Box<PlannedWrite>,
+        record: ImportRecord,
+    },
+}
+
+/// One transaction and what is to become of it.
+pub(crate) struct Planned<'a> {
+    txn: &'a ProviderInvestmentTransaction,
+    step: PlannedStep,
+}
+
+/// Decide what happens to every transaction in a payload, writing nothing.
+///
+/// The whole of the importer's judgement, and the reason a hosted import is a
+/// different sink rather than a different importer: this runs identically on a local
+/// book and on a replica of a group's, and what comes out of it is a list of
+/// decisions somebody else writes.
+fn plan_payload<'a>(
+    conn: &Connection,
+    item_id: &str,
+    transactions: &'a [ProviderInvestmentTransaction],
+    ids: &mut impl SecurityIds,
+) -> Vec<Planned<'a>> {
+    transactions
+        .iter()
+        .map(|txn| Planned {
+            txn,
+            step: plan_one(conn, item_id, txn, ids),
+        })
+        .collect()
+}
+
+fn plan_one(
+    conn: &Connection,
+    item_id: &str,
+    txn: &ProviderInvestmentTransaction,
+    ids: &mut impl SecurityIds,
+) -> PlannedStep {
+    if already_seen(conn, &txn.investment_transaction_id) {
+        return PlannedStep::Duplicate;
+    }
+    let Some(config) = get_config(conn, item_id, &txn.account_id) else {
+        return PlannedStep::Hold {
+            reason: HoldReason::Unconfigured,
+            detail: None,
+        };
+    };
+    match plan(config.treatment(), &txn.transaction_type, &txn.subtype) {
+        // Not recorded anywhere, and that is deliberate. Ignoring is idempotent by
+        // construction — the same trade ignored twice is still ignored — so a
+        // register row would buy nothing, and a sheltered account's four hundred
+        // yearly trades in a replicated log is exactly the noise spec §2b exists to
+        // avoid.
+        Plan::IgnoreSheltered => PlannedStep::IgnoreSheltered,
+        Plan::Hold(reason) => PlannedStep::Hold {
+            reason,
+            detail: None,
+        },
+        Plan::Post(post) => match plan_post(txn, &config, post, ids) {
+            Ok(write) => PlannedStep::Post {
+                write: Box::new(write),
+                record: ImportRecord {
+                    provider_transaction_id: txn.investment_transaction_id.clone(),
+                    item_id: item_id.to_string(),
+                    plaid_account_id: txn.account_id.clone(),
+                },
+            },
+            Err(ImportError::Held { reason, detail }) => PlannedStep::Hold { reason, detail },
+            // A refusal the planner can see for itself — a cash movement of
+            // nothing. Held exactly as one the books hand back under the write
+            // lock, because to the person reading the list they are the same
+            // finding.
+            Err(other) => PlannedStep::Hold {
+                reason: HoldReason::Refused,
+                detail: Some(other.to_string()),
+            },
+        },
+    }
+}
+
+/// Turn one importable transaction into the write it becomes.
+///
+/// Every float in the payload becomes an integer here, before anything else happens
+/// with it, and a conversion that fails holds the row rather than posting an
+/// approximation. No database and no network: the securities are already resolved
+/// and the accounts come off the configuration, which is what lets the same function
+/// decide a local import and a hosted one.
+fn plan_post(
+    txn: &ProviderInvestmentTransaction,
+    config: &AccountConfig,
+    post: PostAs,
+    ids: &mut impl SecurityIds,
+) -> Result<PlannedWrite, ImportError> {
+    let Some(taxable) = config.taxable() else {
+        // Unreachable by construction: `plan` never returns `Post` for a sheltered
+        // account. Stated rather than unwrapped, because the cost of being wrong is
+        // a trade posted into a sheltered account's single value-carried balance.
+        return Err(ImportError::Held {
+            reason: HoldReason::UnhandledType,
+            detail: Some("a sheltered account has no accounts to post a trade to".to_string()),
+        });
+    };
+
+    let Some(date) = NaiveDate::parse_from_str(txn.date.trim(), "%Y-%m-%d").ok() else {
+        return Err(ImportError::Held {
+            reason: HoldReason::BadAmount,
+            detail: Some(format!("{:?} is not a date this can read", txn.date)),
+        });
+    };
+
+    let bad = |e: ConversionError| ImportError::Held {
+        reason: HoldReason::BadAmount,
+        detail: Some(e.to_string()),
+    };
+    let amount_cents = to_cents(txn.amount).map_err(bad)?;
+    let fee_cents = match txn.fees {
+        Some(fees) => to_cents(fees).map_err(bad)?,
+        None => 0,
+    };
+    let quantity = to_micro_shares(txn.quantity.abs()).map_err(bad)?;
+
+    let memo = memo_for(txn);
+
+    match post {
+        PostAs::Buy => {
+            let master = traded_security(txn, ids)?;
+            // Which securities subaccount the position is carried in is read off
+            // **our** master's kind rather than the provider's payload: a security
+            // matched to an existing master by CUSIP is carried where that master
+            // says it is, so a purchase, a later sale and the holdings report all
+            // agree about which account the position lives in. Taking it from the
+            // payload would let a provider that changed its mind about a security's
+            // type split one holding across two accounts, and the sale of it would
+            // then find no lots.
+            let securities_account_id = taxable
+                .securities_account_for_kind(&master.kind)
+                .to_string();
+            // `amount` and not `price * quantity + fees`. The provider's amount is
+            // the cash that actually left the account, commission included, which
+            // is both what the cash account has to be credited and — because a
+            // purchase commission capitalises into basis — exactly the lot's cost.
+            // Rebuilding it from price and quantity would re-round the same money
+            // and leave the lot disagreeing with the bank.
+            Ok(PlannedWrite::Buy {
+                lot_id: Uuid::new_v4().to_string(),
+                cmd: BuySecurityCommand {
+                    security_id: master.security_id,
+                    securities_account_id,
+                    cash_account_id: taxable.cash_account_id.clone(),
+                    quantity,
+                    total_cost_cents: amount_cents.abs(),
+                    trade_date: date,
+                    memo: Some(memo),
+                },
+            })
+        }
+        PostAs::Sell => {
+            let master = traded_security(txn, ids)?;
+            // The same slot the purchase used, by the same rule: lots are keyed by
+            // `(security, securities account)`, so a sale looking in another
+            // account finds no lots at all and is refused for want of a basis.
+            let securities_account_id = taxable
+                .securities_account_for_kind(&master.kind)
+                .to_string();
+            // The provider's amount on a sale is the **net** credited to cash. A
+            // 1099-B reports proceeds gross with the fee shown separately, and
+            // phase 1's command takes them that way and posts the difference — so
+            // the gross is reconstructed as net + fee. Posting the net as the gross
+            // would understate proceeds on every reconciliation against the form,
+            // which is the one comparison spec §8 says the ledger exists to make.
+            Ok(PlannedWrite::Sell {
+                sale_id: Uuid::new_v4().to_string(),
+                cmd: SellSecurityCommand {
+                    security_id: master.security_id,
+                    securities_account_id,
+                    cash_account_id: taxable.cash_account_id.clone(),
+                    realized_gain_account_id: taxable.realized_gain_account_id.clone(),
+                    quantity,
+                    proceeds_cents: amount_cents.abs() + fee_cents,
+                    fee_cents,
+                    trade_date: date,
+                    // FIFO, which is both spec §4's default and what the IRS assumes
+                    // when a seller specifies nothing. A specific-lot choice is a
+                    // decision made at the point of sale by a person; an importer
+                    // reading a month-old trade cannot make it, and guessing would
+                    // put a basis on a filed return that nobody chose.
+                    selection: LotSelection::Fifo,
+                    memo: Some(memo),
+                },
+            })
+        }
+        PostAs::Income(kind) => {
+            // Sweep interest belongs to the account and to no holding, which is why
+            // phase 1 made the security optional on income.
+            let security_id = txn
+                .security
+                .as_ref()
+                .map(|security| ids.resolve(security).security_id);
+            // One lookup on the configuration rather than a match here, so that the
+            // rule about which account each kind of income posts to lives in one
+            // place — beside the fields it reads. The `None` is the capital gain
+            // distribution with no account configured, which is held rather than
+            // posted to a guess.
+            let Some(income_account_id) = taxable.income_account_for(kind).map(str::to_string)
+            else {
+                return Err(ImportError::Held {
+                    reason: HoldReason::NoIncomeAccount,
+                    detail: None,
+                });
+            };
+            Ok(PlannedWrite::Income {
+                cmd: RecordInvestmentIncomeCommand {
+                    kind,
+                    security_id,
+                    cash_account_id: taxable.cash_account_id.clone(),
+                    income_account_id,
+                    // Income arrives as a credit to cash, so the provider's amount
+                    // is negative. The magnitude is the income.
+                    amount_cents: amount_cents.abs(),
+                    received_on: date,
+                    memo: Some(memo),
+                },
+            })
+        }
+        PostAs::Fee => {
+            let security_id = txn
+                .security
+                .as_ref()
+                .map(|security| ids.resolve(security).security_id);
+            Ok(PlannedWrite::Fee {
+                cmd: ChargeInvestmentFeeCommand {
+                    cash_account_id: taxable.cash_account_id.clone(),
+                    expense_account_id: taxable.fee_expense_account_id.clone(),
+                    amount_cents: amount_cents.abs(),
+                    charged_on: date,
+                    security_id,
+                    memo: Some(memo),
+                },
+            })
+        }
+        PostAs::Cash => {
+            let Some(clearing_account_id) = taxable.transfer_clearing_account_id.clone() else {
+                return Err(ImportError::Held {
+                    reason: HoldReason::NoClearingAccount,
+                    detail: None,
+                });
+            };
+            // A transfer, so the sign is the provider's own: positive amount means
+            // cash left the brokerage, negative means it arrived.
+            let into_brokerage_cents = -amount_cents;
+            if into_brokerage_cents == 0 {
+                return Err(ImportError::Refused(NOTHING_MOVED.to_string()));
+            }
+            Ok(PlannedWrite::Cash {
+                cmd: ImportedCashMovement {
+                    cash_account_id: taxable.cash_account_id.clone(),
+                    clearing_account_id,
+                    into_brokerage_cents,
+                    on: date,
+                    memo,
+                },
+            })
+        }
+    }
+}
+
+/// The security a trade is a trade of, or a held row.
+fn traded_security(
+    txn: &ProviderInvestmentTransaction,
+    ids: &mut impl SecurityIds,
+) -> Result<MasterSecurity, ImportError> {
+    let Some(security) = txn.security.as_ref() else {
+        return Err(ImportError::Held {
+            reason: HoldReason::UnknownSecurity,
+            detail: None,
+        });
+    };
+    Ok(ids.resolve(security))
+}
+
+/// The securities the plan will ask for, in the order it asks.
+///
+/// The plan is built and thrown away: what is wanted is not the plan but the
+/// questions it asked, and asking them with the real planner is what guarantees the
+/// set resolved is exactly the set a local import resolves. A payload of four
+/// hundred sheltered trades asks for none of them, and a transaction whose amount
+/// will not convert asks for none either — both are decided before a security is
+/// ever needed.
+fn demanded_securities(
+    conn: &Connection,
+    item_id: &str,
+    transactions: &[ProviderInvestmentTransaction],
+) -> Vec<ProviderSecurity> {
+    let mut demand = Demand::default();
+    let _ = plan_payload(conn, item_id, transactions, &mut demand);
+    demand.wanted
+}
+
+/// The flags, per account, for one payload.
+fn payload_flags(
+    conn: &Connection,
+    item_id: &str,
+    accounts: &[ProviderAccount],
+) -> Vec<SubtypeFlag> {
+    accounts
+        .iter()
+        .filter_map(|account| {
+            let config = get_config(conn, item_id, &account.account_id);
+            flag_for(&account.account_id, account.subtype.as_deref(), &config)
+        })
+        .collect()
+}
+
+/// Apply everything about one planned step that is the same on both paths, and hand
+/// back the ledger write when there is one.
+///
+/// A duplicate counted, a sheltered trade ignored, a row written to the local review
+/// list: none of those touch the log, so none of them differ between a local book
+/// and a group's. What is handed back is the one thing that does.
+fn apply_step(
+    conn: &Connection,
+    item_id: &str,
+    txn: &ProviderInvestmentTransaction,
+    step: PlannedStep,
+    report: &mut ImportReport,
+) -> Result<Option<(Box<PlannedWrite>, ImportRecord)>, ImportError> {
+    match step {
+        PlannedStep::Duplicate => {
+            report.duplicates += 1;
+            Ok(None)
+        }
+        PlannedStep::IgnoreSheltered => {
+            report.ignored_sheltered += 1;
+            Ok(None)
+        }
+        PlannedStep::Hold { reason, detail } => {
+            hold(conn, item_id, txn, reason, detail.as_deref())?;
+            report.held += 1;
+            Ok(None)
+        }
+        PlannedStep::Post { write, record } => Ok(Some((write, record))),
+    }
+}
+
+/// Record what became of one write.
+///
+/// A refusal is a finding, not a failed run: the rest of the payload still has to
+/// land, and this row has to be visible with the reason attached. Anything else is a
+/// broken database, a broken log or a transport that is down, and carrying on through
+/// one of those would write more of whatever is wrong.
+fn record_outcome(
+    conn: &Connection,
+    item_id: &str,
+    txn: &ProviderInvestmentTransaction,
+    kind: ImportedActivityKind,
+    outcome: Result<(), ImportError>,
+    report: &mut ImportReport,
+) -> Result<(), ImportError> {
+    match outcome {
+        Ok(()) => {
+            count(report, kind);
+            Ok(())
+        }
+        Err(ImportError::Refused(message)) => {
+            hold(conn, item_id, txn, HoldReason::Refused, Some(&message))?;
+            report.held += 1;
+            Ok(())
+        }
+        Err(ImportError::Held { reason, detail }) => {
+            hold(conn, item_id, txn, reason, detail.as_deref())?;
+            report.held += 1;
+            Ok(())
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn count(report: &mut ImportReport, kind: ImportedActivityKind) {
+    match kind {
+        ImportedActivityKind::Buy => report.bought += 1,
+        ImportedActivityKind::Sell => report.sold += 1,
+        ImportedActivityKind::Dividend => report.dividends += 1,
+        ImportedActivityKind::Interest => report.interest += 1,
+        ImportedActivityKind::CapitalGainDistribution => report.capital_gain_distributions += 1,
+        ImportedActivityKind::Fee => report.fees += 1,
+        ImportedActivityKind::Cash => report.cash_movements += 1,
+    }
+}
+
+/// Import investment transactions for one connection, into local books.
 ///
 /// `accounts` is the payload's account list, used only for the subtype flags: what
 /// an account is imported *as* comes from the configuration register, never from
 /// the subtype, because the subtype is the provider's opinion and the configuration
 /// is the book's decision.
+///
+/// See [`import_transactions_hosted`] for the same import into a group's books. The
+/// two share the planner and differ only in where a write lands.
 pub fn import_transactions(
     store: &mut EventStore,
     user_id: &str,
@@ -1420,77 +2194,174 @@ pub fn import_transactions(
     accounts: &[ProviderAccount],
     transactions: &[ProviderInvestmentTransaction],
 ) -> Result<ImportReport, ImportError> {
-    let mut report = ImportReport::default();
+    let mut report = ImportReport {
+        // The flags first, per account, so that a payload whose every transaction is
+        // a duplicate still reports an account nobody has confirmed the kind of.
+        flags: payload_flags(store.connection(), item_id, accounts),
+        ..Default::default()
+    };
 
-    // The flags first, per account, so that a payload whose every transaction is a
-    // duplicate still reports an account nobody has confirmed the kind of.
-    for account in accounts {
-        let config = get_config(store.connection(), item_id, &account.account_id);
-        if let Some(flag) = flag_for(&account.account_id, account.subtype.as_deref(), &config) {
-            report.flags.push(flag);
-        }
+    let mut known = BTreeMap::new();
+    for security in demanded_securities(store.connection(), item_id, transactions) {
+        let master = match mapped_security(store.connection(), &security.security_id) {
+            Some(master) => master,
+            None => resolve_security_locally(
+                store,
+                user_id,
+                &security,
+                &mut report.securities_created,
+            )?,
+        };
+        known.insert(security.security_id.clone(), master);
     }
 
-    for txn in transactions {
-        if already_seen(store.connection(), &txn.investment_transaction_id) {
-            report.duplicates += 1;
-            continue;
-        }
-
-        let Some(config) = get_config(store.connection(), item_id, &txn.account_id) else {
-            hold(
-                store.connection(),
-                item_id,
-                txn,
-                HoldReason::Unconfigured,
-                None,
-            )?;
-            report.held += 1;
+    for planned in plan_payload(
+        store.connection(),
+        item_id,
+        transactions,
+        &mut Known(&known),
+    ) {
+        let Planned { txn, step } = planned;
+        let Some((write, record)) =
+            apply_step(store.connection(), item_id, txn, step, &mut report)?
+        else {
             continue;
         };
-
-        match plan(config.treatment(), &txn.transaction_type, &txn.subtype) {
-            Plan::IgnoreSheltered => {
-                // Not recorded anywhere, and that is deliberate. Ignoring is
-                // idempotent by construction — the same trade ignored twice is
-                // still ignored — so a register row would buy nothing, and a
-                // sheltered account's four hundred yearly trades in a replicated
-                // log is exactly the noise spec §2b exists to avoid.
-                report.ignored_sheltered += 1;
-            }
-            Plan::Hold(reason) => {
-                hold(store.connection(), item_id, txn, reason, None)?;
-                report.held += 1;
-            }
-            Plan::Post(post) => {
-                match post_one(store, user_id, item_id, txn, &config, post, &mut report) {
-                    Ok(()) => {}
-                    // A refusal is a finding, not a failed run: the rest of the
-                    // payload still has to land, and this row has to be visible with
-                    // the reason attached.
-                    Err(ImportError::Refused(message)) => {
-                        hold(
-                            store.connection(),
-                            item_id,
-                            txn,
-                            HoldReason::Refused,
-                            Some(&message),
-                        )?;
-                        report.held += 1;
-                    }
-                    Err(ImportError::Held { reason, detail }) => {
-                        hold(store.connection(), item_id, txn, reason, detail.as_deref())?;
-                        report.held += 1;
-                    }
-                    // Anything else is a broken database or a broken log, and
-                    // carrying on through one would write more of whatever is wrong.
-                    Err(other) => return Err(other),
-                }
-            }
-        }
+        let outcome = run(store, user_id, |tx| {
+            build_import_in_txn(tx, &write, &record)
+        })
+        .map(|_| ());
+        record_outcome(
+            store.connection(),
+            item_id,
+            txn,
+            write.outcome(),
+            outcome,
+            &mut report,
+        )?;
     }
 
     Ok(report)
+}
+
+/// The same import, into a group's books.
+///
+/// Every ledger write goes through the group server; not one event is appended
+/// locally, which is why this takes the store immutably. A replica's log has exactly
+/// one writer — the mirror path in [`crate::sync::replica`] — and an import that
+/// appended beside it would fork it.
+///
+/// # What is written where
+///
+/// The **review list** and the **fetch window** are written locally in both modes:
+/// what this machine is still looking at and how far it has fetched are facts about
+/// this machine, not about the books (migration 050). Everything else — the entry,
+/// the lot, the security master, the provider-security mapping and the import
+/// register — is appended by the server, in the same batches a local import would
+/// have appended them in, and reaches this copy through the ordinary pull.
+///
+/// # The ordering, and what an interruption leaves behind
+///
+/// One submit per transaction, and the import record is part of that submit rather
+/// than a step after it: [`build_import_in_txn`] runs inside the server's append
+/// transaction and puts the `InvestmentActivityImported` in the same batch as the
+/// entry. So there is no window in which a trade is posted and unfenced.
+///
+/// * **Interrupted before the server accepted** — nothing is recorded anywhere. The
+///   next run re-plans the transaction and posts it once.
+/// * **Interrupted after the server accepted** — the posting *and* its fence are in
+///   the group's log, durably. This copy's register does not know yet; it learns at
+///   the next pull, and nothing needs to be repaired. A re-import that beats the pull
+///   is refused by the server's own fence under its write lock, and that refusal is
+///   counted as the duplicate it is rather than held for review — see
+///   [`already_imported_message`].
+///
+/// Nothing is echoed into the local projections to close that window early, and that
+/// is the point: a row written into a replica's projections beside the mirror path is
+/// a second writer, and the whole of [`crate::sync::replica`] exists to have only
+/// one.
+///
+/// # Refusals
+///
+/// A `409` is ordinary — another member's write moved the head — and
+/// [`SyncClient`](crate::sync::SyncClient) retries it. A `422` is the books refusing
+/// this transaction, and the row is held carrying the server's own wording, exactly
+/// as a local refusal is. Anything else (no token, a server too old, a transport that
+/// is down) fails the run rather than holding four hundred rows as refused.
+pub async fn import_transactions_hosted(
+    store: &EventStore,
+    client: &mut crate::sync::SyncClient,
+    item_id: &str,
+    accounts: &[ProviderAccount],
+    transactions: &[ProviderInvestmentTransaction],
+) -> Result<ImportReport, ImportError> {
+    let conn = store.connection();
+    let mut report = ImportReport {
+        flags: payload_flags(conn, item_id, accounts),
+        ..Default::default()
+    };
+
+    let mut known = BTreeMap::new();
+    for security in demanded_securities(conn, item_id, transactions) {
+        let master = match mapped_security(conn, &security.security_id) {
+            Some(master) => master,
+            None => {
+                // The server mints it, and the id it chose is the id used from here
+                // on. A locally invented id would be a second master for the same
+                // holding the moment the group's log came back with the real one.
+                let resolved = client
+                    .resolve_plaid_security(
+                        &security.security_id,
+                        &provider_security_as_new(&security),
+                    )
+                    .await
+                    .map_err(from_sync_error)?;
+                if resolved.created {
+                    report.securities_created += 1;
+                }
+                resolved.master
+            }
+        };
+        known.insert(security.security_id.clone(), master);
+    }
+
+    for planned in plan_payload(conn, item_id, transactions, &mut Known(&known)) {
+        let Planned { txn, step } = planned;
+        let Some((write, record)) = apply_step(conn, item_id, txn, step, &mut report)? else {
+            continue;
+        };
+        let outcome = client
+            .import_investment_activity(&write, &record)
+            .await
+            .map(|_| ())
+            .map_err(from_sync_error);
+        // The one refusal that is not a finding: this copy's register had not caught
+        // up, so the server was asked to import something it already holds. Counted
+        // where the planner would have counted it.
+        if let Err(ImportError::Refused(message)) = &outcome {
+            if *message == already_imported_message(&record.provider_transaction_id) {
+                report.duplicates += 1;
+                continue;
+            }
+        }
+        record_outcome(conn, item_id, txn, write.outcome(), outcome, &mut report)?;
+    }
+
+    Ok(report)
+}
+
+/// What the group server said, as this module's error.
+///
+/// A domain refusal becomes [`ImportError::Refused`], which holds the row with the
+/// server's own wording. Everything else becomes [`ImportError::Store`], which fails
+/// the run: a transport that is down has not refused anything, and recording four
+/// hundred rows as "the books refused this" would be a lie somebody has to undo by
+/// hand.
+fn from_sync_error(e: crate::sync::client::SyncClientError) -> ImportError {
+    match e {
+        crate::sync::client::SyncClientError::Rejected(why) => ImportError::Refused(why),
+        other => ImportError::Store(other.to_string()),
+    }
 }
 
 /// The flag, if any, for one account in the payload.
@@ -1527,371 +2398,6 @@ fn flag_for(
             }
         }
     }
-}
-
-/// Post one transaction, as one append batch: the journal entry, the phase-1
-/// register event, and the import record that fences it against the next fetch.
-fn post_one(
-    store: &mut EventStore,
-    user_id: &str,
-    item_id: &str,
-    txn: &ProviderInvestmentTransaction,
-    config: &AccountConfig,
-    post: PostAs,
-    report: &mut ImportReport,
-) -> Result<(), ImportError> {
-    let Some(taxable) = config.taxable() else {
-        // Unreachable by construction: `plan` never returns `Post` for a sheltered
-        // account. Stated rather than unwrapped, because the cost of being wrong is
-        // a trade posted into a sheltered account's single value-carried balance.
-        return Err(ImportError::Held {
-            reason: HoldReason::UnhandledType,
-            detail: Some("a sheltered account has no accounts to post a trade to".to_string()),
-        });
-    };
-    let taxable = taxable.clone();
-
-    let Some(date) = NaiveDate::parse_from_str(txn.date.trim(), "%Y-%m-%d").ok() else {
-        return Err(ImportError::Held {
-            reason: HoldReason::BadAmount,
-            detail: Some(format!("{:?} is not a date this can read", txn.date)),
-        });
-    };
-
-    // Every float in the payload becomes an integer here, before anything else
-    // happens with it, and a conversion that fails holds the row rather than
-    // posting an approximation.
-    let bad = |e: ConversionError| ImportError::Held {
-        reason: HoldReason::BadAmount,
-        detail: Some(e.to_string()),
-    };
-    let amount_cents = to_cents(txn.amount).map_err(bad)?;
-    let fee_cents = match txn.fees {
-        Some(fees) => to_cents(fees).map_err(bad)?,
-        None => 0,
-    };
-    let quantity = to_micro_shares(txn.quantity.abs()).map_err(bad)?;
-
-    let provider_transaction_id = txn.investment_transaction_id.clone();
-    let memo = memo_for(txn);
-
-    match post {
-        PostAs::Buy => {
-            let Some(security) = txn.security.as_ref() else {
-                return Err(ImportError::Held {
-                    reason: HoldReason::UnknownSecurity,
-                    detail: None,
-                });
-            };
-            let security_id =
-                resolve_security(store, user_id, security, &mut report.securities_created)?;
-            let securities_account_id =
-                securities_account_for(store.connection(), &taxable, &security_id);
-            let lot_id = Uuid::new_v4().to_string();
-            // `amount` and not `price * quantity + fees`. The provider's amount is
-            // the cash that actually left the account, commission included, which
-            // is both what the cash account has to be credited and — because a
-            // purchase commission capitalises into basis — exactly the lot's cost.
-            // Rebuilding it from price and quantity would re-round the same money
-            // and leave the lot disagreeing with the bank.
-            let cmd = BuySecurityCommand {
-                security_id,
-                securities_account_id,
-                cash_account_id: taxable.cash_account_id.clone(),
-                quantity,
-                total_cost_cents: amount_cents.abs(),
-                trade_date: date,
-                memo: Some(memo),
-            };
-            let record = ImportRecord {
-                provider_transaction_id: provider_transaction_id.clone(),
-                item_id: item_id.to_string(),
-                plaid_account_id: txn.account_id.clone(),
-                outcome: ImportedActivityKind::Buy,
-                lot_id: Some(lot_id.clone()),
-                sale_id: None,
-            };
-            append_import(store, user_id, &provider_transaction_id, move |tx| {
-                Ok(from_investment_step(
-                    build_buy_in_txn(tx, &lot_id, &cmd)?,
-                    clone_record(&record),
-                ))
-            })?;
-            report.bought += 1;
-        }
-        PostAs::Sell => {
-            let Some(security) = txn.security.as_ref() else {
-                return Err(ImportError::Held {
-                    reason: HoldReason::UnknownSecurity,
-                    detail: None,
-                });
-            };
-            let security_id =
-                resolve_security(store, user_id, security, &mut report.securities_created)?;
-            // The same slot the purchase used, by the same rule: lots are keyed by
-            // `(security, securities account)`, so a sale looking in another
-            // account finds no lots at all and is refused for want of a basis.
-            let securities_account_id =
-                securities_account_for(store.connection(), &taxable, &security_id);
-            let sale_id = Uuid::new_v4().to_string();
-            // The provider's amount on a sale is the **net** credited to cash. A
-            // 1099-B reports proceeds gross with the fee shown separately, and
-            // phase 1's command takes them that way and posts the difference — so
-            // the gross is reconstructed as net + fee. Posting the net as the gross
-            // would understate proceeds on every reconciliation against the form,
-            // which is the one comparison spec §8 says the ledger exists to make.
-            let net_cents = amount_cents.abs();
-            let cmd = SellSecurityCommand {
-                security_id,
-                securities_account_id,
-                cash_account_id: taxable.cash_account_id.clone(),
-                realized_gain_account_id: taxable.realized_gain_account_id.clone(),
-                quantity,
-                proceeds_cents: net_cents + fee_cents,
-                fee_cents,
-                trade_date: date,
-                // FIFO, which is both spec §4's default and what the IRS assumes
-                // when a seller specifies nothing. A specific-lot choice is a
-                // decision made at the point of sale by a person; an importer
-                // reading a month-old trade cannot make it, and guessing would put
-                // a basis on a filed return that nobody chose.
-                selection: LotSelection::Fifo,
-                memo: Some(memo),
-            };
-            let record = ImportRecord {
-                provider_transaction_id: provider_transaction_id.clone(),
-                item_id: item_id.to_string(),
-                plaid_account_id: txn.account_id.clone(),
-                outcome: ImportedActivityKind::Sell,
-                lot_id: None,
-                sale_id: Some(sale_id.clone()),
-            };
-            append_import(store, user_id, &provider_transaction_id, move |tx| {
-                Ok(from_investment_step(
-                    build_sell_in_txn(tx, &sale_id, &cmd)?,
-                    clone_record(&record),
-                ))
-            })?;
-            report.sold += 1;
-        }
-        PostAs::Income(kind) => {
-            let security_id = match txn.security.as_ref() {
-                Some(security) => Some(resolve_security(
-                    store,
-                    user_id,
-                    security,
-                    &mut report.securities_created,
-                )?),
-                // Sweep interest belongs to the account and to no holding, which is
-                // why phase 1 made the security optional on income.
-                None => None,
-            };
-            // One lookup on the configuration rather than a match here, so that
-            // the rule about which account each kind of income posts to lives in
-            // one place — beside the fields it reads. The `None` is the capital
-            // gain distribution with no account configured, which is held rather
-            // than posted to a guess.
-            let Some(income_account_id) = taxable.income_account_for(kind).map(str::to_string)
-            else {
-                return Err(ImportError::Held {
-                    reason: HoldReason::NoIncomeAccount,
-                    detail: None,
-                });
-            };
-            let cmd = RecordInvestmentIncomeCommand {
-                kind,
-                security_id,
-                cash_account_id: taxable.cash_account_id.clone(),
-                income_account_id,
-                // Income arrives as a credit to cash, so the provider's amount is
-                // negative. The magnitude is the income.
-                amount_cents: amount_cents.abs(),
-                received_on: date,
-                memo: Some(memo),
-            };
-            let outcome = match kind {
-                InvestmentIncomeKind::Dividend => ImportedActivityKind::Dividend,
-                // Tax-exempt interest is recorded as interest in the import
-                // register: the importer never chooses it (Plaid has no subtype
-                // for it — see the field on `TaxableBrokerageAccounts`), and a
-                // caller that passes it anyway has posted interest to a different
-                // account, which is what the entry says.
-                InvestmentIncomeKind::Interest | InvestmentIncomeKind::TaxExemptInterest => {
-                    ImportedActivityKind::Interest
-                }
-                InvestmentIncomeKind::CapitalGainDistribution => {
-                    ImportedActivityKind::CapitalGainDistribution
-                }
-            };
-            let record = ImportRecord {
-                provider_transaction_id: provider_transaction_id.clone(),
-                item_id: item_id.to_string(),
-                plaid_account_id: txn.account_id.clone(),
-                outcome,
-                lot_id: None,
-                sale_id: None,
-            };
-            append_import(store, user_id, &provider_transaction_id, move |tx| {
-                Ok(from_investment_step(
-                    build_income_in_txn(tx, &cmd)?,
-                    clone_record(&record),
-                ))
-            })?;
-            match kind {
-                InvestmentIncomeKind::Dividend => report.dividends += 1,
-                InvestmentIncomeKind::Interest | InvestmentIncomeKind::TaxExemptInterest => {
-                    report.interest += 1
-                }
-                InvestmentIncomeKind::CapitalGainDistribution => {
-                    report.capital_gain_distributions += 1
-                }
-            }
-        }
-        PostAs::Fee => {
-            let security_id = match txn.security.as_ref() {
-                Some(security) => Some(resolve_security(
-                    store,
-                    user_id,
-                    security,
-                    &mut report.securities_created,
-                )?),
-                None => None,
-            };
-            let cmd = ChargeInvestmentFeeCommand {
-                cash_account_id: taxable.cash_account_id.clone(),
-                expense_account_id: taxable.fee_expense_account_id.clone(),
-                amount_cents: amount_cents.abs(),
-                charged_on: date,
-                security_id,
-                memo: Some(memo),
-            };
-            let record = ImportRecord {
-                provider_transaction_id: provider_transaction_id.clone(),
-                item_id: item_id.to_string(),
-                plaid_account_id: txn.account_id.clone(),
-                outcome: ImportedActivityKind::Fee,
-                lot_id: None,
-                sale_id: None,
-            };
-            append_import(store, user_id, &provider_transaction_id, move |tx| {
-                Ok(from_investment_step(
-                    build_fee_in_txn(tx, &cmd)?,
-                    clone_record(&record),
-                ))
-            })?;
-            report.fees += 1;
-        }
-        PostAs::Cash => {
-            let Some(clearing) = taxable.transfer_clearing_account_id.clone() else {
-                return Err(ImportError::Held {
-                    reason: HoldReason::NoClearingAccount,
-                    detail: None,
-                });
-            };
-            // A transfer, so the sign is the provider's own: positive amount means
-            // cash left the brokerage, negative means it arrived. One signed
-            // construction rather than two branches, because the sign is the whole
-            // content of this entry and two branches is two places to get it wrong.
-            let into_brokerage = -amount_cents;
-            let record = ImportRecord {
-                provider_transaction_id: provider_transaction_id.clone(),
-                item_id: item_id.to_string(),
-                plaid_account_id: txn.account_id.clone(),
-                outcome: ImportedActivityKind::Cash,
-                lot_id: None,
-                sale_id: None,
-            };
-            let cash_account_id = taxable.cash_account_id.clone();
-            let memo_for_entry = memo.clone();
-            append_import(store, user_id, &provider_transaction_id, move |tx| {
-                if into_brokerage == 0 {
-                    return Ok(ImportStep::Reject(ImportError::Refused(
-                        "a cash movement of nothing moves no money".to_string(),
-                    )));
-                }
-                let currency = base_currency_in_txn(tx)?;
-                let lines = vec![
-                    (cash_account_id.clone(), into_brokerage, "Brokerage cash"),
-                    (clearing.clone(), -into_brokerage, "Cash in transit"),
-                ];
-                match investment_commands::entry_or_reject(
-                    tx,
-                    date,
-                    memo_for_entry.clone(),
-                    None,
-                    &lines,
-                    &currency,
-                )? {
-                    Ok(entry) => Ok(from_investment_step(
-                        InvestmentStep::Append(vec![entry]),
-                        clone_record(&record),
-                    )),
-                    Err(e) => Ok(ImportStep::Reject(ImportError::Refused(e.to_string()))),
-                }
-            })?;
-            report.cash_movements += 1;
-        }
-    }
-    Ok(())
-}
-
-/// Which securities subaccount one security's holdings are carried in.
-///
-/// Read off **our** security master rather than the provider's payload, and that is
-/// deliberate: a security matched to an existing master by CUSIP is carried where
-/// that master says it is, so a purchase, a later sale and the holdings report all
-/// agree about which account the position lives in. Taking it from the payload
-/// would let a provider that changed its mind about a security's type split one
-/// holding across two accounts, and the sale of it would then find no lots.
-///
-/// A security the master has never heard of cannot reach here —
-/// [`resolve_security`] has just created or found it — and if one somehow did, an
-/// empty kind falls to the `Other` slot, which is where an unrecognised kind goes
-/// anyway.
-fn securities_account_for(
-    conn: &Connection,
-    taxable: &TaxableBrokerageAccounts,
-    security_id: &str,
-) -> String {
-    let kind = investment_commands::get_security(conn, security_id)
-        .map(|s| s.kind)
-        .unwrap_or_default();
-    taxable.securities_account_for_kind(&kind).to_string()
-}
-
-fn clone_record(record: &ImportRecord) -> ImportRecord {
-    ImportRecord {
-        provider_transaction_id: record.provider_transaction_id.clone(),
-        item_id: record.item_id.clone(),
-        plaid_account_id: record.plaid_account_id.clone(),
-        outcome: record.outcome,
-        lot_id: record.lot_id.clone(),
-        sale_id: record.sale_id.clone(),
-    }
-}
-
-/// Append one import's batch, with the dedup check inside the same transaction.
-///
-/// The check is repeated here although the caller already made it, and the
-/// repetition is the point: the caller's read happened outside the write lock, and
-/// two imports of the same payload running at once would both pass it. Under the
-/// lock, the second one is refused.
-fn append_import(
-    store: &mut EventStore,
-    user_id: &str,
-    provider_transaction_id: &str,
-    build: impl Fn(&rusqlite::Transaction<'_>) -> Result<ImportStep, EventStoreError>,
-) -> Result<(), ImportError> {
-    let id = provider_transaction_id.to_string();
-    run(store, user_id, move |tx| {
-        if already_imported_in_txn(tx, &id)? {
-            return Ok(ImportStep::Reject(ImportError::Refused(format!(
-                "{id} has already been imported"
-            ))));
-        }
-        build(tx)
-    })?;
-    Ok(())
 }
 
 fn base_currency_in_txn(tx: &rusqlite::Transaction<'_>) -> Result<String, EventStoreError> {
@@ -2491,22 +2997,27 @@ pub struct HoldingsReport {
     pub securities_created: u32,
 }
 
-/// Record what the broker said, and — for a sheltered account — set its value from
-/// it.
+/// What one account's holdings import will write.
+pub(crate) struct PlannedHoldings {
+    plaid_account_id: String,
+    snapshot: HoldingsSnapshotData,
+    /// The ledger account carried at value, when this is a sheltered account, and
+    /// `None` for a taxable one — which posts nothing from a snapshot at all
+    /// (spec §3 and §5).
+    sheltered_account_id: Option<String>,
+}
+
+/// Group a holdings payload by account and decide what each account's snapshot is.
 ///
-/// Posts nothing for a taxable account (spec §3 and §5): the snapshot is the input
-/// to the reconciliation and to the market-value report, and market value is never
-/// posted.
-pub fn import_holdings(
-    store: &mut EventStore,
-    user_id: &str,
+/// Writes nothing, so it runs the same on a local book and on a replica of a group's.
+fn plan_holdings(
+    conn: &Connection,
     item_id: &str,
     as_of: NaiveDate,
     holdings: &[ProviderHolding],
     accounts: &[ProviderAccount],
-) -> Result<HoldingsReport, ImportError> {
-    let mut report = HoldingsReport::default();
-
+    ids: &mut impl SecurityIds,
+) -> Result<(Vec<String>, Vec<PlannedHoldings>), ImportError> {
     // Group by account, keeping the payload's order inside each group so a snapshot
     // reads the way the broker sent it.
     let mut by_account: BTreeMap<&str, Vec<&ProviderHolding>> = BTreeMap::new();
@@ -2523,11 +3034,15 @@ pub fn import_holdings(
             .push(holding);
     }
 
+    let mut skipped = Vec::new();
+    let mut planned = Vec::new();
     for (plaid_account_id, account_holdings) in by_account {
-        let Some(config) = get_config(store.connection(), item_id, plaid_account_id) else {
-            report
-                .skipped_unconfigured
-                .push(plaid_account_id.to_string());
+        let Some(config) = get_config(conn, item_id, plaid_account_id) else {
+            // Skipped rather than held, and the difference from a transaction is that
+            // a holdings read is not destructive: the same snapshot can simply be
+            // taken again once the account is configured, whereas a transaction the
+            // provider has handed over once is not offered again.
+            skipped.push(plaid_account_id.to_string());
             continue;
         };
 
@@ -2538,12 +3053,9 @@ pub fn import_holdings(
             // a 401(k) has ever held would be a list nothing reads and nothing keeps
             // honest.
             let security_id = match (config.treatment(), holding.security.as_ref()) {
-                (InvestmentTreatment::Taxable, Some(security)) => Some(resolve_security(
-                    store,
-                    user_id,
-                    security,
-                    &mut report.securities_created,
-                )?),
+                (InvestmentTreatment::Taxable, Some(security)) => {
+                    Some(ids.resolve(security).security_id)
+                }
                 _ => None,
             };
             lines.push(SnapshotHoldingData {
@@ -2564,30 +3076,109 @@ pub fn import_holdings(
                 currency: holding.iso_currency_code.clone(),
             });
         }
-        let holdings_data = lines;
 
-        let snapshot = HoldingsSnapshotData {
-            snapshot_id: Uuid::new_v4().to_string(),
-            item_id: item_id.to_string(),
+        planned.push(PlannedHoldings {
             plaid_account_id: plaid_account_id.to_string(),
-            as_of,
-            holdings: holdings_data,
-        };
+            snapshot: HoldingsSnapshotData {
+                snapshot_id: Uuid::new_v4().to_string(),
+                item_id: item_id.to_string(),
+                plaid_account_id: plaid_account_id.to_string(),
+                as_of,
+                holdings: lines,
+            },
+            sheltered_account_id: config.sheltered().map(str::to_string),
+        });
+    }
+    Ok((skipped, planned))
+}
 
-        if snapshot_unchanged(store.connection(), &snapshot) {
-            report.unchanged += 1;
-        } else {
-            let to_append = snapshot.clone();
-            run(store, user_id, move |_tx| {
-                Ok(ImportStep::Append(vec![Event::HoldingsSnapshotRecorded(
-                    Box::new(to_append.clone()),
-                )]))
-            })?;
+/// The securities a holdings payload will ask for, in the order it asks.
+fn demanded_holdings_securities(
+    conn: &Connection,
+    item_id: &str,
+    as_of: NaiveDate,
+    holdings: &[ProviderHolding],
+    accounts: &[ProviderAccount],
+) -> Result<Vec<ProviderSecurity>, ImportError> {
+    let mut demand = Demand::default();
+    plan_holdings(conn, item_id, as_of, holdings, accounts, &mut demand)?;
+    Ok(demand.wanted)
+}
+
+/// Record what the broker said, if it is not already on file.
+///
+/// The comparison is inside the transaction rather than before it, so re-importing
+/// the same payload appends literally nothing on either path — and so two members
+/// reading the same holdings at the same moment cannot both record them. An unchanged
+/// snapshot appends no events at all, which is how a caller tells the two apart.
+pub(crate) fn build_snapshot_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    snapshot: &HoldingsSnapshotData,
+) -> Result<ImportStep, EventStoreError> {
+    if snapshot_unchanged(tx, snapshot) {
+        return Ok(ImportStep::Append(Vec::new()));
+    }
+    Ok(ImportStep::Append(vec![Event::HoldingsSnapshotRecorded(
+        Box::new(snapshot.clone()),
+    )]))
+}
+
+/// Record what the broker said, and — for a sheltered account — set its value from
+/// it.
+///
+/// Posts nothing for a taxable account (spec §3 and §5): the snapshot is the input
+/// to the reconciliation and to the market-value report, and market value is never
+/// posted.
+pub fn import_holdings(
+    store: &mut EventStore,
+    user_id: &str,
+    item_id: &str,
+    as_of: NaiveDate,
+    holdings: &[ProviderHolding],
+    accounts: &[ProviderAccount],
+) -> Result<HoldingsReport, ImportError> {
+    let mut report = HoldingsReport::default();
+
+    let mut known = BTreeMap::new();
+    for security in
+        demanded_holdings_securities(store.connection(), item_id, as_of, holdings, accounts)?
+    {
+        let master = match mapped_security(store.connection(), &security.security_id) {
+            Some(master) => master,
+            None => resolve_security_locally(
+                store,
+                user_id,
+                &security,
+                &mut report.securities_created,
+            )?,
+        };
+        known.insert(security.security_id.clone(), master);
+    }
+
+    let (skipped, planned) = plan_holdings(
+        store.connection(),
+        item_id,
+        as_of,
+        holdings,
+        accounts,
+        &mut Known(&known),
+    )?;
+    report.skipped_unconfigured = skipped;
+
+    for plan in planned {
+        let snapshot = plan.snapshot.clone();
+        let recorded = !run(store, user_id, move |tx| {
+            build_snapshot_in_txn(tx, &snapshot)
+        })?
+        .is_empty();
+        if recorded {
             report.recorded += 1;
+        } else {
+            report.unchanged += 1;
         }
 
-        match config.sheltered() {
-            Some(account_id) => match snapshot.total_value_cents() {
+        match &plan.sheltered_account_id {
+            Some(account_id) => match plan.snapshot.total_value_cents() {
                 // The register already holds this statement, with this value, for
                 // this date. Phase 2's `set_value` would post no entry — it measures
                 // the difference against the books and would find zero — but it does
@@ -2621,17 +3212,116 @@ pub fn import_holdings(
                     .map_err(|e| ImportError::Refused(e.to_string()))?;
                     report
                         .values_set
-                        .push((plaid_account_id.to_string(), value));
+                        .push((plan.plaid_account_id.clone(), value));
                 }
-                None => report.incomplete_values.push(plaid_account_id.to_string()),
+                // A total missing one holding is not a total, and setting a sheltered
+                // account's value from one would post a fictional loss.
+                None => report.incomplete_values.push(plan.plaid_account_id.clone()),
             },
             None => {
                 if let Some(reconciliation) =
-                    reconcile(store.connection(), item_id, plaid_account_id)
+                    reconcile(store.connection(), item_id, &plan.plaid_account_id)
                 {
                     report.reconciliations.push(reconciliation);
                 }
             }
+        }
+    }
+
+    Ok(report)
+}
+
+/// The same holdings import, into a group's books.
+///
+/// The snapshot goes through the server for the reason the trades do: the
+/// reconciliation (spec §7) and the market-value report both read it, and on a
+/// group's books every member has to be looking at the same statement. A snapshot
+/// appended locally would fork the replica's log, and a snapshot only this machine
+/// held would make one member's reconciliation disagree with another's about what the
+/// broker said.
+///
+/// # What this does not do
+///
+/// It computes **no reconciliations**. Both halves of that comparison — the lots the
+/// books hold and the snapshot the broker sent — have just been written to the
+/// group's log and are not in this copy until the next pull, so a reconciliation run
+/// here would report every position the import just posted as missing from the books.
+/// The caller runs [`reconcile`] once the replica has caught up, which is the same
+/// place every other hosted figure comes from.
+pub async fn import_holdings_hosted(
+    store: &EventStore,
+    client: &mut crate::sync::SyncClient,
+    item_id: &str,
+    as_of: NaiveDate,
+    holdings: &[ProviderHolding],
+    accounts: &[ProviderAccount],
+) -> Result<HoldingsReport, ImportError> {
+    let conn = store.connection();
+    let mut report = HoldingsReport::default();
+
+    let mut known = BTreeMap::new();
+    for security in demanded_holdings_securities(conn, item_id, as_of, holdings, accounts)? {
+        let master = match mapped_security(conn, &security.security_id) {
+            Some(master) => master,
+            None => {
+                let resolved = client
+                    .resolve_plaid_security(
+                        &security.security_id,
+                        &provider_security_as_new(&security),
+                    )
+                    .await
+                    .map_err(from_sync_error)?;
+                if resolved.created {
+                    report.securities_created += 1;
+                }
+                resolved.master
+            }
+        };
+        known.insert(security.security_id.clone(), master);
+    }
+
+    let (skipped, planned) =
+        plan_holdings(conn, item_id, as_of, holdings, accounts, &mut Known(&known))?;
+    report.skipped_unconfigured = skipped;
+
+    for plan in planned {
+        let recorded = client
+            .record_holdings_snapshot(&plan.snapshot)
+            .await
+            .map_err(from_sync_error)?
+            .recorded;
+        if recorded {
+            report.recorded += 1;
+        } else {
+            report.unchanged += 1;
+        }
+
+        let Some(account_id) = plan.sheltered_account_id.as_deref() else {
+            continue;
+        };
+        match plan.snapshot.total_value_cents() {
+            Some(value_cents) if statement_already_recorded(conn, account_id, as_of, value_cents) => {
+            }
+            Some(value_cents) => {
+                let set = client
+                    .set_retirement_value(&SetRetirementValueCommand {
+                        account_id: account_id.to_string(),
+                        as_of,
+                        value_cents,
+                        memo: None,
+                    })
+                    .await
+                    .map_err(from_sync_error)?;
+                report.values_set.push((
+                    plan.plaid_account_id.clone(),
+                    ValueSet {
+                        book_value_cents: set.book_value_cents,
+                        change_cents: set.change_cents,
+                        entry_id: set.entry_id,
+                    },
+                ));
+            }
+            None => report.incomplete_values.push(plan.plaid_account_id.clone()),
         }
     }
 

@@ -408,7 +408,11 @@ pub fn consumed_lots(conn: &rusqlite::Connection, sale_id: &str) -> Vec<Consumed
 // ---------------------------------------------------------------------------
 
 /// A security to put on the master. `security_id` is minted by the command.
-#[derive(Debug, Clone)]
+///
+/// Serializable for the reason [`LotSelection`] is: the importer's hosted path
+/// sends this very struct to `/sync/commands/resolve-plaid-security`, so the
+/// security a group's master gets is described by the same type a local one is.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewSecurity {
     pub ticker: String,
     pub name: String,
@@ -421,7 +425,7 @@ pub struct NewSecurity {
     pub currency: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BuySecurityCommand {
     pub security_id: String,
     pub securities_account_id: String,
@@ -457,7 +461,7 @@ pub enum LotSelection {
     Specific(Vec<(String, i64)>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SellSecurityCommand {
     pub security_id: String,
     pub securities_account_id: String,
@@ -477,7 +481,7 @@ pub struct SellSecurityCommand {
     pub memo: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecordInvestmentIncomeCommand {
     pub kind: InvestmentIncomeKind,
     /// `None` for sweep interest, which belongs to the account and not to any
@@ -494,7 +498,7 @@ pub struct RecordInvestmentIncomeCommand {
     pub memo: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChargeInvestmentFeeCommand {
     pub cash_account_id: String,
     pub expense_account_id: String,
