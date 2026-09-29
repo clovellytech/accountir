@@ -403,6 +403,268 @@ pub struct RetirementDistributionData {
     pub on: NaiveDate,
 }
 
+// --- the investments importer (migration 050) ---
+//
+// INVESTMENTS-SPEC.md phase 4. What these four events have in common is that they
+// are *decisions about the provider's data*, not the money movements themselves:
+// which model an account is imported under, which of our securities the provider's
+// security is, what a provider transaction was turned into, and what the broker
+// said the account held. The money movements are still the phase 1 and phase 2
+// events, appended in the same batch — see `investment_import`.
+
+/// Which of spec §2's two models a Plaid investment account is imported under.
+///
+/// A **closed** set, and closed by the tax code rather than by a broker's
+/// vocabulary: either what happens inside the account is taxable, in which case
+/// every lot has to be tracked, or it is not, in which case none of them does.
+/// There is no third answer and there cannot be one.
+///
+/// Note this is *not* Plaid's `account.subtype`. The subtype is evidence, recorded
+/// beside the decision on [`InvestmentAccountConfigData`]; the decision is a
+/// bookkeeping rule that belongs to the ledger, which is also why the proxy passes
+/// the subtype through without forming an opinion about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvestmentTreatment {
+    /// Spec §2a: securities at cost, lots, realized gains, dividends and interest.
+    Taxable,
+    /// Spec §2b: one ledger account carried at value, and nothing inside it
+    /// recorded at all.
+    Sheltered,
+}
+
+impl InvestmentTreatment {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InvestmentTreatment::Taxable => "taxable",
+            InvestmentTreatment::Sheltered => "sheltered",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "taxable" => Some(InvestmentTreatment::Taxable),
+            "sheltered" => Some(InvestmentTreatment::Sheltered),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            InvestmentTreatment::Taxable => "Taxable (lots and gains)",
+            InvestmentTreatment::Sheltered => "Sheltered (carried at value)",
+        }
+    }
+}
+
+/// The six ledger accounts a taxable brokerage's activity posts to, and the
+/// optional seventh.
+///
+/// All six are required together, which is why they are a struct behind an enum
+/// variant rather than six nullable fields on the configuration. A taxable account
+/// configured with everything but a dividend account is not a partly-configured
+/// account; it is an account that imports a dividend into nowhere, and the type
+/// system is a better place to prevent that than a validation somebody has to
+/// remember to write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxableBrokerageAccounts {
+    /// `Assets:Brokerage:<…>:Securities` — holdings AT COST (spec §3).
+    pub securities_account_id: String,
+    /// `Assets:Brokerage:<…>:Cash` — the sweep balance.
+    pub cash_account_id: String,
+    /// `Income:Investments:Dividends`. Every dividend lands here as ordinary
+    /// income during the year; the qualified split comes off the 1099-DIV at year
+    /// end, because Plaid does not say which is which (spec §7).
+    pub dividend_income_account_id: String,
+    /// `Income:Investments:Interest`.
+    pub interest_income_account_id: String,
+    /// `Income:Investments:Realized gain` — one account for both directions, as
+    /// phase 1's sale command requires.
+    pub realized_gain_account_id: String,
+    /// `Expenses:Investments:Fees`, for a fee that is not part of a trade. A fee
+    /// *on* a trade is not an expense: it capitalises into a purchase's basis and
+    /// reduces a sale's proceeds, because that is how a 1099-B reports them.
+    pub fee_expense_account_id: String,
+    /// Where the other leg of a cash deposit or withdrawal goes.
+    ///
+    /// Optional, and its absence is a *policy* rather than an omission: a
+    /// brokerage says money arrived and does not say which bank account it came
+    /// from. With a clearing account configured, the movement posts against it and
+    /// the bank feed's own side of the transfer clears it later. Without one, the
+    /// movement is held for review, which is the honest answer when there is
+    /// nowhere truthful to put the other leg.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_clearing_account_id: Option<String>,
+}
+
+/// Which accounts an investment account's activity posts to — by treatment, so
+/// that the wrong set cannot be supplied for the wrong kind of account.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "treatment", rename_all = "snake_case")]
+pub enum InvestmentPostingAccounts {
+    Taxable(Box<TaxableBrokerageAccounts>),
+    /// The one ledger account carried at value, which must already be on the
+    /// `retirement_accounts` register (migration 048): whether a distribution out
+    /// of it is taxable depends on what kind of account it is, and only that
+    /// register records it.
+    Sheltered {
+        retirement_account_id: String,
+    },
+}
+
+impl InvestmentPostingAccounts {
+    pub fn treatment(&self) -> InvestmentTreatment {
+        match self {
+            InvestmentPostingAccounts::Taxable(_) => InvestmentTreatment::Taxable,
+            InvestmentPostingAccounts::Sheltered { .. } => InvestmentTreatment::Sheltered,
+        }
+    }
+}
+
+/// How one Plaid investment account is imported. Boxed on the event for the reason
+/// [`SecuritySoldData`] is: seven account ids inline would widen every `Event` the
+/// system moves.
+///
+/// # Why this is an event rather than a local setting
+///
+/// Because which ledger account a brokerage's dividends post to is a fact the
+/// whole book depends on, exactly as which account is a 401(k) is (phase 2). Two
+/// machines with different answers post the same dividend to two different
+/// accounts, and the divergence appears as a tax return that does not match a
+/// colleague's copy of the same books.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvestmentAccountConfigData {
+    pub item_id: String,
+    pub plaid_account_id: String,
+    pub accounts: InvestmentPostingAccounts,
+    /// What Plaid called the account when this was configured — `brokerage`,
+    /// `ira`, `401k`. Recorded rather than re-read, so that a flag raised because
+    /// the subtype was unrecognised can still say what it was that nobody
+    /// recognised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plaid_subtype: Option<String>,
+    /// Whether that subtype is one spec §2 lists. `false` means the treatment
+    /// above was **assumed** — taxable, because under-reporting tax is the worse
+    /// failure — and wants confirming.
+    pub subtype_recognised: bool,
+}
+
+/// One provider security, tied to one of ours.
+///
+/// Separate from [`SecurityDefinedData`] rather than a field on it, because the
+/// link is also made when an existing master is *matched* — a security already on
+/// the master by CUSIP or by ticker, from a purchase entered by hand — and then
+/// there is no definition to carry it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaidSecurityLinkData {
+    pub plaid_security_id: String,
+    pub security_id: String,
+}
+
+/// What an imported provider transaction was turned into.
+///
+/// The decision, not Plaid's own vocabulary: Plaid's `type` and `subtype` stay in
+/// the payload, and this says what rule was applied to them. The distinction
+/// matters when a rule changes — the log then shows which trades were imported
+/// under the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportedActivityKind {
+    Buy,
+    Sell,
+    Dividend,
+    Interest,
+    Fee,
+    /// Cash into or out of a taxable account, posted against the configured
+    /// clearing account.
+    Cash,
+}
+
+impl ImportedActivityKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImportedActivityKind::Buy => "buy",
+            ImportedActivityKind::Sell => "sell",
+            ImportedActivityKind::Dividend => "dividend",
+            ImportedActivityKind::Interest => "interest",
+            ImportedActivityKind::Fee => "fee",
+            ImportedActivityKind::Cash => "cash",
+        }
+    }
+}
+
+/// One provider transaction, imported. The dedup fence, in the log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvestmentActivityImportedData {
+    /// Plaid's `investment_transaction_id` — the only identifier that survives the
+    /// rolling re-fetch, and therefore the only thing worth deduplicating on.
+    pub provider_transaction_id: String,
+    pub item_id: String,
+    pub plaid_account_id: String,
+    pub outcome: ImportedActivityKind,
+    /// The entry posted in the same append batch as this event. Recorded so that a
+    /// trade can be traced from the broker's id to the books in one step.
+    pub entry_id: String,
+    /// The lot a purchase created; absent for everything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lot_id: Option<String>,
+    /// The sale a disposal recorded; absent for everything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sale_id: Option<String>,
+}
+
+/// One line of a holdings snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotHoldingData {
+    pub plaid_security_id: String,
+    /// Ours, when we have one. Absent is ordinary rather than an error: a
+    /// sheltered account's holdings never reach the security master, because
+    /// nothing inside one is recorded (spec §2b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticker: Option<String>,
+    /// Micro-shares, converted from the provider's float once, at the boundary.
+    pub quantity: i64,
+    /// The broker's own basis for the whole holding, when it has one. **Never
+    /// posted**: our basis comes from the buys we imported, and this is only the
+    /// cross-check (spec §7 and §8 — the broker's figures are what get filed, and
+    /// ours are what catch the broker being wrong).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_basis_cents: Option<i64>,
+    /// Market value. Also never posted — spec §3: marking to market changes no tax
+    /// outcome and churns the books daily.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+}
+
+/// What the broker said an account held, on a date.
+///
+/// Posts nothing for a taxable account (spec §5). For a sheltered one the total
+/// value drives `retirement_commands::set_value`, which is the whole of how a
+/// sheltered account is kept true.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoldingsSnapshotData {
+    pub snapshot_id: String,
+    pub item_id: String,
+    pub plaid_account_id: String,
+    pub as_of: NaiveDate,
+    pub holdings: Vec<SnapshotHoldingData>,
+}
+
+impl HoldingsSnapshotData {
+    /// What the account is worth, when every holding came with a value. `None` if
+    /// any did not — a total missing one holding is not a total, and a sheltered
+    /// account's value must not be set from one.
+    pub fn total_value_cents(&self) -> Option<i64> {
+        self.holdings
+            .iter()
+            .try_fold(0i64, |acc, h| Some(acc + h.value_cents?))
+    }
+}
+
 /// Source of a journal entry
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1009,6 +1271,32 @@ pub enum Event {
     /// which explains at length why this posts no income.
     RetirementDistributionRecorded(Box<RetirementDistributionData>),
 
+    // --- the investments importer (migration 050) ---
+    //
+    // INVESTMENTS-SPEC.md phase 4. These four record *decisions about the
+    // provider's data*; the money movements they cause are the phase 1 and phase 2
+    // events, appended in the same batch. That batching is the point: an imported
+    // buy whose import record never landed would be re-imported on the next pull,
+    // with a fresh lot id, past the reference fence, and deducted twice on a Form
+    // 8949.
+    /// How one Plaid investment account is imported: taxable or sheltered, and
+    /// into which ledger accounts. See [`InvestmentAccountConfigData`] for why
+    /// this is replicated rather than a local setting.
+    ///
+    /// Re-configuring the same account is allowed and replaces the configuration:
+    /// an account mapped to the wrong dividend account has to be correctable, and
+    /// entries already posted are not rewritten by it — they are what the books
+    /// say happened.
+    InvestmentAccountConfigured(Box<InvestmentAccountConfigData>),
+    /// Which of our securities a provider's security is. See
+    /// [`PlaidSecurityLinkData`].
+    PlaidSecurityLinked(Box<PlaidSecurityLinkData>),
+    /// One provider transaction, imported — the dedup fence in the log.
+    InvestmentActivityImported(Box<InvestmentActivityImportedData>),
+    /// What the broker said an account held on a date. Posts nothing for a taxable
+    /// account; for a sheltered one it is what a value update is computed from.
+    HoldingsSnapshotRecorded(Box<HoldingsSnapshotData>),
+
     UserAdded {
         user_id: String,
         username: String,
@@ -1339,6 +1627,10 @@ impl Event {
             Event::RetirementValueSet { .. } => "retirement_value_set",
             Event::RetirementContributionRecorded { .. } => "retirement_contribution_recorded",
             Event::RetirementDistributionRecorded(_) => "retirement_distribution_recorded",
+            Event::InvestmentAccountConfigured(_) => "investment_account_configured",
+            Event::PlaidSecurityLinked(_) => "plaid_security_linked",
+            Event::InvestmentActivityImported(_) => "investment_activity_imported",
+            Event::HoldingsSnapshotRecorded(_) => "holdings_snapshot_recorded",
             Event::BusinessTypeSet { .. } => "business_type_set",
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
             Event::ScheduleCAnswerSet { .. } => "schedule_c_answer_set",
@@ -1437,6 +1729,15 @@ impl Event {
             Event::RetirementValueSet { account_id, .. } => Some(account_id),
             Event::RetirementContributionRecorded { account_id, .. } => Some(account_id),
             Event::RetirementDistributionRecorded(d) => Some(&d.account_id),
+            // The Plaid account is the aggregate for the two that are about an
+            // account, and the provider's own transaction id for the import record
+            // — that id is what somebody holding a brokerage statement looks up,
+            // and the entry it posted is a field on the event rather than its
+            // identity.
+            Event::InvestmentAccountConfigured(d) => Some(&d.plaid_account_id),
+            Event::PlaidSecurityLinked(d) => Some(&d.security_id),
+            Event::InvestmentActivityImported(d) => Some(&d.provider_transaction_id),
+            Event::HoldingsSnapshotRecorded(d) => Some(&d.plaid_account_id),
             // One business per book, so no id names the thing changed — the same
             // answer `BusinessProfileSet` gives.
             Event::BusinessTypeSet { .. } => None,

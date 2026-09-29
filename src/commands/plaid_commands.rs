@@ -969,12 +969,21 @@ pub struct StagedOutcome {
     /// Not yet settled at the bank. Skipped because the amount can still change;
     /// they arrive again, as themselves, once they post.
     pub still_pending: u32,
+    /// Rows for an account configured as an investment account (INVESTMENTS-SPEC.md
+    /// §6). Skipped here on purpose, and it is the one case where skipping does not
+    /// lose anything: `/transactions/sync` reports only the **cash leg** of a
+    /// brokerage account, so a $1,000 purchase arrives here as $1,000 spent and a
+    /// sale arrives as income. Every fact in one of these rows arrives better, and
+    /// with the security attached, from the investments endpoints — see
+    /// `investment_import`. Staging them as well would put a confusing duplicate of
+    /// every trade in the review list.
+    pub investment_accounts: u32,
 }
 
 impl StagedOutcome {
     /// Everything that did not become a row.
     pub fn skipped(&self) -> u32 {
-        self.duplicates + self.still_pending
+        self.duplicates + self.still_pending + self.investment_accounts
     }
 }
 
@@ -1009,10 +1018,28 @@ pub fn stage_transactions_in_conn(
         .filter_map(|r| r.ok())
         .collect();
 
+    // Which of this connection's accounts are investment accounts. Read once: the
+    // list is short, and asking per transaction would be a query per row.
+    let investment_accounts: HashSet<String> = conn
+        .prepare("SELECT plaid_account_id FROM investment_account_config WHERE item_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_map([item_id], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
     let mut outcome = StagedOutcome::default();
     for txn in transactions {
         if txn.pending {
             outcome.still_pending += 1;
+            continue;
+        }
+
+        // INVESTMENTS-SPEC.md §6: investment accounts stop flowing through the
+        // transactions feed. See `StagedOutcome::investment_accounts` for why this
+        // is the one skip that loses nothing.
+        if investment_accounts.contains(&txn.account_id) {
+            outcome.investment_accounts += 1;
             continue;
         }
 

@@ -1,4 +1,6 @@
-use crate::events::types::{Event, JournalLineData};
+use crate::events::types::{
+    Event, ImportedActivityKind, InvestmentPostingAccounts, JournalLineData,
+};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -523,6 +525,110 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                     "a taxable amount of {} cents does not fit inside a distribution of {} cents",
                     d.taxable_cents, d.gross_cents
                 )));
+            }
+        }
+        // --- the investments importer (migration 050) ---
+        //
+        // Shape only, as everywhere in this function. Whether the dividend account
+        // is really an income account, and whether the retirement account is on the
+        // register, are questions about ledger state and are answered under the
+        // write lock in `investment_import`.
+        Event::InvestmentAccountConfigured(d) => {
+            validate_non_empty(&d.item_id, "item_id")?;
+            validate_non_empty(&d.plaid_account_id, "plaid_account_id")?;
+            match &d.accounts {
+                InvestmentPostingAccounts::Taxable(a) => {
+                    validate_non_empty(&a.securities_account_id, "securities_account_id")?;
+                    validate_non_empty(&a.cash_account_id, "cash_account_id")?;
+                    validate_non_empty(
+                        &a.dividend_income_account_id,
+                        "dividend_income_account_id",
+                    )?;
+                    validate_non_empty(
+                        &a.interest_income_account_id,
+                        "interest_income_account_id",
+                    )?;
+                    validate_non_empty(&a.realized_gain_account_id, "realized_gain_account_id")?;
+                    validate_non_empty(&a.fee_expense_account_id, "fee_expense_account_id")?;
+                    if let Some(clearing) = &a.transfer_clearing_account_id {
+                        validate_non_empty(clearing, "transfer_clearing_account_id")?;
+                    }
+                    // Securities at cost and the sweep cash being one account would
+                    // make every purchase an entry to itself: a debit and an equal
+                    // credit to one account, which balances, posts nothing, and
+                    // leaves the balance sheet silently missing the whole holding.
+                    // The same mistake phase 2 refuses for a retirement account and
+                    // its value-change account.
+                    if a.securities_account_id == a.cash_account_id {
+                        return Err(ValidationError::InvalidValue(
+                            "the securities account and the cash account cannot be the same \
+                             account: every purchase would post to itself and change nothing"
+                                .to_string(),
+                        ));
+                    }
+                }
+                InvestmentPostingAccounts::Sheltered {
+                    retirement_account_id,
+                } => {
+                    validate_non_empty(retirement_account_id, "retirement_account_id")?;
+                }
+            }
+        }
+        Event::PlaidSecurityLinked(d) => {
+            validate_non_empty(&d.plaid_security_id, "plaid_security_id")?;
+            validate_non_empty(&d.security_id, "security_id")?;
+        }
+        Event::InvestmentActivityImported(d) => {
+            validate_non_empty(&d.provider_transaction_id, "provider_transaction_id")?;
+            validate_non_empty(&d.item_id, "item_id")?;
+            validate_non_empty(&d.plaid_account_id, "plaid_account_id")?;
+            // Every outcome recorded here posted an entry. The things that post
+            // nothing — a sheltered account's trades, anything held for review —
+            // are deliberately absent from this register, so an import record with
+            // no entry would mean the two had fallen out of step.
+            validate_non_empty(&d.entry_id, "entry_id")?;
+            match d.outcome {
+                ImportedActivityKind::Buy if d.lot_id.is_none() => {
+                    return Err(ValidationError::InvalidValue(
+                        "an imported purchase without a lot id: the lot is where its basis \
+                         lives, and a purchase that created none relieved nothing when sold"
+                            .to_string(),
+                    ))
+                }
+                ImportedActivityKind::Sell if d.sale_id.is_none() => {
+                    return Err(ValidationError::InvalidValue(
+                        "an imported sale without a sale id: the sale is what carries the lots \
+                         it consumed, which is what a Form 8949 row is built from"
+                            .to_string(),
+                    ))
+                }
+                _ => {}
+            }
+        }
+        Event::HoldingsSnapshotRecorded(d) => {
+            validate_non_empty(&d.snapshot_id, "snapshot_id")?;
+            validate_non_empty(&d.item_id, "item_id")?;
+            validate_non_empty(&d.plaid_account_id, "plaid_account_id")?;
+            let mut seen = std::collections::HashSet::new();
+            for holding in &d.holdings {
+                validate_non_empty(&holding.plaid_security_id, "plaid_security_id")?;
+                // One security twice in one snapshot would double a position in the
+                // reconciliation, and the reconciliation is the safeguard the whole
+                // phase rests on (spec §7).
+                if !seen.insert(holding.plaid_security_id.as_str()) {
+                    return Err(ValidationError::DuplicateId(
+                        holding.plaid_security_id.clone(),
+                    ));
+                }
+                // A negative quantity is a short position, which is out of scope for
+                // v1 (spec §10), and reads as a negative holding everywhere it is
+                // summed. Zero is ordinary: brokers report closed positions.
+                if holding.quantity < 0 {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "a holding of {} micro-shares: a short position is out of scope",
+                        holding.quantity
+                    )));
+                }
             }
         }
         // --- sole proprietorships (migration 031) ---
