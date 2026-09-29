@@ -846,7 +846,7 @@ pub fn configure_account(
         .ok_or_else(|| ImportError::Store("the configuration did not land".to_string()))
 }
 
-fn build_configure_in_txn(
+pub(crate) fn build_configure_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &ConfigureInvestmentAccountCommand,
     subtype_recognised: bool,
@@ -2247,24 +2247,84 @@ pub struct ResolveAsDistributionCommand {
     pub note: String,
 }
 
+/// What a resolution has to know before it posts anything.
+///
+/// The read-only half of [`resolve_as_contribution`] and [`resolve_as_distribution`],
+/// split out so the **hosted** path can take it without taking the posting with it.
+/// On a group's books the entry is appended by the server and the row's status is
+/// flipped here, and the caller needs the account and the reference before it can
+/// build the command it sends. Nothing in here is a guess: the account comes from
+/// the provider account's configuration, exactly as the local path takes it, so a
+/// hosted contribution cannot land in a different retirement account than a local
+/// one would.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShelteredResolution {
+    /// The ledger account carried at value, from the provider account's config.
+    pub retirement_account_id: String,
+    /// The idempotency key the posted entry must carry. See
+    /// [`resolution_reference`] for why it is what makes the two-step shape safe.
+    pub reference: String,
+}
+
+/// Read what a sheltered-cash resolution needs, and refuse a row that is not one.
+///
+/// Runs the same three checks the local path runs — the row exists, it is still
+/// pending, and it is held because cash moved in or out of a sheltered account —
+/// and resolves the retirement account from the configuration rather than from a
+/// caller's argument, for the reason [`ResolveAsContributionCommand`] gives.
+pub fn prepare_sheltered_resolution(
+    conn: &Connection,
+    staged_id: &str,
+) -> Result<ShelteredResolution, ImportError> {
+    let row = pending_sheltered_row(conn, staged_id)?;
+    let retirement_account_id = sheltered_account_for(conn, &row)?;
+    Ok(ShelteredResolution {
+        retirement_account_id,
+        reference: resolution_reference(&row.provider_transaction_id),
+    })
+}
+
+/// Move a row off `pending` for a resolution whose entry has **already** been
+/// posted somewhere this function cannot see.
+///
+/// The second half of a hosted resolution: the group server appended the entry, and
+/// the status transition is machine-local bookkeeping in a table no replica mirrors
+/// (migration 050). Exposed rather than inlined at the call site so the guarded
+/// `UPDATE` in [`settle`] — status-checked, so two presses cannot both take effect —
+/// is the only thing that ever writes that column.
+///
+/// **Order matters, and this is the second step.** See [`resolution_reference`]:
+/// posting first and settling second means a crash in between leaves the row
+/// pending with the entry already in the books, and pressing the button again is
+/// refused by the reference. Settling first would leave a resolved row with nothing
+/// posted, which nothing can detect and the provider will never offer again.
+pub fn settle_resolution(
+    conn: &Connection,
+    staged_id: &str,
+    resolution: Resolution,
+    note: &str,
+    entry_id: Option<&str>,
+) -> Result<(), ImportError> {
+    settle(conn, staged_id, resolution, note, entry_id)
+}
+
 /// Record a held sheltered-cash row as a contribution. Returns the entry posted.
 pub fn resolve_as_contribution(
     store: &mut EventStore,
     user_id: &str,
     cmd: &ResolveAsContributionCommand,
 ) -> Result<String, ImportError> {
-    let row = pending_sheltered_row(store.connection(), &cmd.staged_id)?;
-    let account_id = sheltered_account_for(store.connection(), &row)?;
+    let prepared = prepare_sheltered_resolution(store.connection(), &cmd.staged_id)?;
     let entry_id = retirement_commands::record_contribution(
         store,
         user_id,
         &retirement_commands::RetirementContributionCommand {
-            account_id,
+            account_id: prepared.retirement_account_id,
             funding_account_id: cmd.funding_account_id.clone(),
             amount_cents: cmd.amount_cents,
             on: cmd.on,
             memo: cmd.memo.clone(),
-            reference: Some(resolution_reference(&row.provider_transaction_id)),
+            reference: Some(prepared.reference),
         },
     )
     .map_err(|e| ImportError::Refused(e.to_string()))?;
@@ -2285,13 +2345,12 @@ pub fn resolve_as_distribution(
     user_id: &str,
     cmd: &ResolveAsDistributionCommand,
 ) -> Result<retirement_commands::Distributed, ImportError> {
-    let row = pending_sheltered_row(store.connection(), &cmd.staged_id)?;
-    let account_id = sheltered_account_for(store.connection(), &row)?;
+    let prepared = prepare_sheltered_resolution(store.connection(), &cmd.staged_id)?;
     let distributed = retirement_commands::record_distribution(
         store,
         user_id,
         &retirement_commands::RetirementDistributionCommand {
-            account_id,
+            account_id: prepared.retirement_account_id,
             receiving_account_id: cmd.receiving_account_id.clone(),
             gross_cents: cmd.gross_cents,
             withheld_cents: cmd.withheld_cents,
@@ -2303,7 +2362,7 @@ pub fn resolve_as_distribution(
             taxable_cents: cmd.taxable_cents,
             on: cmd.on,
             memo: cmd.memo.clone(),
-            reference: Some(resolution_reference(&row.provider_transaction_id)),
+            reference: Some(prepared.reference),
         },
     )
     .map_err(|e| ImportError::Refused(e.to_string()))?;

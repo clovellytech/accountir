@@ -17,6 +17,14 @@ use super::commands::entry_ops::{
     LineAssignment, ReassignLinesRequest, ReassignLinesResponse, UnvoidEntryRequest,
     VoidEntriesRequest, VoidEntriesResponse, VoidEntryRequest,
 };
+use super::commands::investments::{
+    BuySecurityRequest, BuySecurityResponse, ChargeInvestmentFeeRequest,
+    ConfigureInvestmentAccountRequest, DefineSecurityRequest, DefineSecurityResponse,
+    PostedEntryResponse, RecordInvestmentIncomeRequest, RecordRetirementContributionRequest,
+    RecordRetirementDistributionRequest, RecordRetirementDistributionResponse,
+    RegisterRetirementAccountRequest, SellSecurityRequest, SellSecurityResponse,
+    SetRetirementValueRequest, SetRetirementValueResponse,
+};
 use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
     RemoveEventServiceRequest, SetServiceReportingRequest, SetServiceReportingResponse,
@@ -36,7 +44,16 @@ use super::commands::reconciliation::{
     StartReconciliationRequest, UnclearTransactionRequest,
 };
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
+use crate::commands::investment_commands::{
+    BuySecurityCommand, ChargeInvestmentFeeCommand, NewSecurity, RecordInvestmentIncomeCommand,
+    SellSecurityCommand,
+};
+use crate::commands::investment_import::ConfigureInvestmentAccountCommand;
 use crate::commands::partnership_commands::UpdatePartner;
+use crate::commands::retirement_commands::{
+    RegisterRetirementAccountCommand, RetirementContributionCommand,
+    RetirementDistributionCommand, SetRetirementValueCommand,
+};
 use crate::domain::{
     AccountType, Address, BusinessProfile, PartnerType, PaymentTerms, Residency, Shares,
 };
@@ -2153,7 +2170,341 @@ impl SyncClient {
         })
         .await
     }
+
+    // -----------------------------------------------------------------------
+    // Investments and retirement (INVESTMENTS-SPEC.md phases 1, 2 and 4)
+    // -----------------------------------------------------------------------
+
+    /// The stale-head retry loop for a command whose **answer** matters, written
+    /// once.
+    ///
+    /// [`submit_retrying`] hands back a head, which is all most commands produce.
+    /// An investment command produces a fact the caller cannot recompute: the lot a
+    /// purchase opened, the realized gain and consumed lots of a sale, the id of a
+    /// security just minted. Those come back in the response body, and a caller
+    /// that re-read the log for them would be racing its own replica pull — our
+    /// write returns through the same pull path as everybody else's, so for up to a
+    /// tick the replica does not contain it.
+    ///
+    /// Same soundness condition as [`submit_retrying`]: only for self-contained
+    /// commands. Every one below carries explicit amounts and explicit ids, and the
+    /// server re-runs every invariant inside each attempt's append transaction — so
+    /// a retry after somebody else wrote first is re-decided against the state that
+    /// now exists, which for a sale means FIFO re-picks against the lots that are
+    /// actually left.
+    ///
+    /// [`submit_retrying`]: SyncClient::submit_retrying
+    async fn submit_retrying_for<B, R>(
+        &mut self,
+        path: &str,
+        what: &str,
+        build: impl Fn(i64) -> B,
+    ) -> Result<R, SyncClientError>
+    where
+        B: serde::Serialize,
+        R: serde::de::DeserializeOwned + HasHead,
+    {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = build(self.head);
+            let resp = self
+                .http
+                .post(self.url(path))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let answer: R = resp.json().await?;
+                    self.head = answer.head();
+                    return Ok(answer);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                    let v: serde_json::Value = resp.json().await?;
+                    return Err(SyncClientError::Rejected(
+                        v["error"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+                // Named in the caller's words, not ours: the person is being told
+                // which action their server cannot do, and "/sync/commands/…" is
+                // our plumbing.
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld(what.to_string()))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Put a security on the group's master, and hand back its new id.
+    ///
+    /// Takes the same [`NewSecurity`] the local `define_security` takes, so a
+    /// caller that branches on `is_replica()` builds one value and sends it either
+    /// way. A `422` here means the ticker is already on the master — the message
+    /// names the security that has it.
+    pub async fn define_security(
+        &mut self,
+        security: &NewSecurity,
+    ) -> Result<DefineSecurityResponse, SyncClientError> {
+        self.submit_retrying_for("/sync/commands/define-security", "adding a security", |head| {
+            DefineSecurityRequest {
+                expected_head_seq: head,
+                ticker: security.ticker.clone(),
+                name: security.name.clone(),
+                kind: security.kind.clone(),
+                cusip: security.cusip.clone(),
+                currency: Some(security.currency.clone()),
+            }
+        })
+        .await
+    }
+
+    /// Buy shares on the group's books. Returns the lot the purchase opened.
+    pub async fn buy_security(
+        &mut self,
+        cmd: &BuySecurityCommand,
+    ) -> Result<BuySecurityResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/buy-security",
+            "recording a purchase",
+            |head| BuySecurityRequest {
+                expected_head_seq: head,
+                security_id: cmd.security_id.clone(),
+                securities_account_id: cmd.securities_account_id.clone(),
+                cash_account_id: cmd.cash_account_id.clone(),
+                quantity: cmd.quantity,
+                total_cost_cents: cmd.total_cost_cents,
+                trade_date: cmd.trade_date,
+                memo: cmd.memo.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Sell shares on the group's books. Returns the realized gain with the lots it
+    /// came out of.
+    ///
+    /// The command's [`LotSelection`] goes on the wire as it stands, so a hosted
+    /// specific-lot sale consumes exactly the lots the person named. Retrying on a
+    /// `409` is safe for a `Specific` selection because the lots are named by id and
+    /// re-checked against their remaining quantity inside the retry's own
+    /// transaction — a lot somebody else sold in the meantime comes back as a
+    /// terminal `422`, not as a different lot silently substituted. It is safe for
+    /// `Fifo` because the server re-picks: the retry sells the oldest lots that are
+    /// still there, which is what FIFO means.
+    pub async fn sell_security(
+        &mut self,
+        cmd: &SellSecurityCommand,
+    ) -> Result<SellSecurityResponse, SyncClientError> {
+        self.submit_retrying_for("/sync/commands/sell-security", "recording a sale", |head| {
+            SellSecurityRequest {
+                expected_head_seq: head,
+                security_id: cmd.security_id.clone(),
+                securities_account_id: cmd.securities_account_id.clone(),
+                cash_account_id: cmd.cash_account_id.clone(),
+                realized_gain_account_id: cmd.realized_gain_account_id.clone(),
+                quantity: cmd.quantity,
+                proceeds_cents: cmd.proceeds_cents,
+                fee_cents: cmd.fee_cents,
+                trade_date: cmd.trade_date,
+                selection: cmd.selection.clone(),
+                memo: cmd.memo.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record a dividend or interest payment on the group's books.
+    pub async fn record_investment_income(
+        &mut self,
+        cmd: &RecordInvestmentIncomeCommand,
+    ) -> Result<PostedEntryResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/record-investment-income",
+            "recording investment income",
+            |head| RecordInvestmentIncomeRequest {
+                expected_head_seq: head,
+                kind: cmd.kind,
+                security_id: cmd.security_id.clone(),
+                cash_account_id: cmd.cash_account_id.clone(),
+                income_account_id: cmd.income_account_id.clone(),
+                amount_cents: cmd.amount_cents,
+                received_on: cmd.received_on,
+                memo: cmd.memo.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Charge an account fee on the group's books.
+    pub async fn charge_investment_fee(
+        &mut self,
+        cmd: &ChargeInvestmentFeeCommand,
+    ) -> Result<PostedEntryResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/charge-investment-fee",
+            "charging an investment fee",
+            |head| ChargeInvestmentFeeRequest {
+                expected_head_seq: head,
+                cash_account_id: cmd.cash_account_id.clone(),
+                expense_account_id: cmd.expense_account_id.clone(),
+                amount_cents: cmd.amount_cents,
+                charged_on: cmd.charged_on,
+                security_id: cmd.security_id.clone(),
+                memo: cmd.memo.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Say how a provider investment account is imported into the group's books.
+    ///
+    /// `plaid_subtype` is forwarded, not interpreted: the server derives the
+    /// "recognised" flag from it, so a client cannot claim an assumption was
+    /// corroborated when it was not.
+    pub async fn configure_investment_account(
+        &mut self,
+        cmd: &ConfigureInvestmentAccountCommand,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/configure-investment-account", |head| {
+            ConfigureInvestmentAccountRequest {
+                expected_head_seq: head,
+                item_id: cmd.item_id.clone(),
+                plaid_account_id: cmd.plaid_account_id.clone(),
+                accounts: cmd.accounts.clone(),
+                plaid_subtype: cmd.plaid_subtype.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Put a ledger account on the group's retirement register.
+    pub async fn register_retirement_account(
+        &mut self,
+        cmd: &RegisterRetirementAccountCommand,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/register-retirement-account", |head| {
+            RegisterRetirementAccountRequest {
+                expected_head_seq: head,
+                account_id: cmd.account_id.clone(),
+                institution: cmd.institution.clone(),
+                kind: cmd.kind,
+                value_change_account_id: cmd.value_change_account_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record what a statement says a sheltered account is worth, and post the
+    /// difference. Returns what the update came to, including zero.
+    pub async fn set_retirement_value(
+        &mut self,
+        cmd: &SetRetirementValueCommand,
+    ) -> Result<SetRetirementValueResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/set-retirement-value",
+            "recording a retirement statement value",
+            |head| SetRetirementValueRequest {
+                expected_head_seq: head,
+                account_id: cmd.account_id.clone(),
+                as_of: cmd.as_of,
+                value_cents: cmd.value_cents,
+                memo: cmd.memo.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Record money into a sheltered account on the group's books.
+    pub async fn record_retirement_contribution(
+        &mut self,
+        cmd: &RetirementContributionCommand,
+    ) -> Result<PostedEntryResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/record-retirement-contribution",
+            "recording a retirement contribution",
+            |head| RecordRetirementContributionRequest {
+                expected_head_seq: head,
+                account_id: cmd.account_id.clone(),
+                funding_account_id: cmd.funding_account_id.clone(),
+                amount_cents: cmd.amount_cents,
+                on: cmd.on,
+                memo: cmd.memo.clone(),
+                reference: cmd.reference.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Record money out of a sheltered account on the group's books. Returns box
+    /// 2a, which is what a 1099-R will report.
+    pub async fn record_retirement_distribution(
+        &mut self,
+        cmd: &RetirementDistributionCommand,
+    ) -> Result<RecordRetirementDistributionResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/record-retirement-distribution",
+            "recording a retirement distribution",
+            |head| RecordRetirementDistributionRequest {
+                expected_head_seq: head,
+                account_id: cmd.account_id.clone(),
+                receiving_account_id: cmd.receiving_account_id.clone(),
+                gross_cents: cmd.gross_cents,
+                withheld_cents: cmd.withheld_cents,
+                withheld_account_id: cmd.withheld_account_id.clone(),
+                // Forwarded rather than dropped, so the refusal the command type
+                // documents is reachable over the wire too: a caller who named an
+                // income account is told why that is wrong instead of having the
+                // field silently ignored.
+                taxable_income_account_id: cmd.taxable_income_account_id.clone(),
+                taxable_cents: cmd.taxable_cents,
+                on: cmd.on,
+                memo: cmd.memo.clone(),
+                reference: cmd.reference.clone(),
+            },
+        )
+        .await
+    }
 }
+
+/// A command response that carries the new log head.
+///
+/// The one thing [`SyncClient::submit_retrying_for`] needs of every answer it
+/// deserializes: the head to cache, so the next write does not arrive with a
+/// `expected_head_seq` this client already knows to be stale.
+trait HasHead {
+    fn head(&self) -> i64;
+}
+
+macro_rules! has_head {
+    ($($t:ty),+ $(,)?) => {
+        $(impl HasHead for $t {
+            fn head(&self) -> i64 {
+                self.head
+            }
+        })+
+    };
+}
+
+has_head!(
+    DefineSecurityResponse,
+    BuySecurityResponse,
+    SellSecurityResponse,
+    PostedEntryResponse,
+    SetRetirementValueResponse,
+    RecordRetirementDistributionResponse,
+);
 
 /// The outcome of one command POST, before the retry loop decides what to do.
 enum Submitted {

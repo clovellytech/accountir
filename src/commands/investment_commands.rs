@@ -443,7 +443,13 @@ pub struct BuySecurityCommand {
 /// it is the reason the consumed lots are recorded on the event: the choice made
 /// on the day is the choice that was filed, and it must not be recomputed later
 /// from whatever the default has become.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Serializable, and deliberately the **same type** the sync transport puts on the
+/// wire (`sync::commands::investments::SellSecurityRequest`) rather than a wire
+/// twin of it. A hosted sale has to pick exactly the lots a local one would, and
+/// two types that have to agree about that are two types that can stop agreeing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LotSelection {
     #[default]
     Fifo,
