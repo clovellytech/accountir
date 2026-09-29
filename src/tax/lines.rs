@@ -1243,7 +1243,32 @@ pub fn split_deductible(balance: i64, pct: u8) -> (i64, i64) {
 /// actually made. This is what a *return* wants: the line every account ends up
 /// on once those choices are inherited.
 pub fn load_effective_mapping(conn: &Connection, year: i32) -> BTreeMap<String, String> {
-    inherit_through_tree(&load_mapping(conn, year), &load_parents(conn))
+    let mut mapping = inherit_through_tree(&load_mapping(conn, year), &load_parents(conn));
+    // The non-taxable fence, applied here and not left to the mapping table
+    // (INVESTMENTS-SPEC.md §8, phase 2).
+    //
+    // Growth inside a sheltered account is not income to anybody, ever. It
+    // reaching a tax line is not a cosmetic bug — it is a filed error, tax paid
+    // on money the statute exempts, on a return somebody signed. So the exclusion
+    // is enforced where every return reads the mapping, rather than trusted to the
+    // three things that could each let one through on their own:
+    //
+    //   * **inheritance**, which is the sneaky one. Nobody need map the
+    //     value-change account at all: mapping its parent `Income:Investments` to
+    //     line 7 is enough, and the child inherits it silently. That is why this
+    //     runs *after* `inherit_through_tree` and not before.
+    //   * **a mapping that predates the register**, written while the account was
+    //     an ordinary income account and still sitting in the table afterwards.
+    //   * **a row that arrived some other way** — over the sync transport from a
+    //     machine running older code, or out of a hand-edited database.
+    //
+    // `OFF_RETURN` rather than removal, because removal means "nobody has ruled on
+    // this yet" and makes `compute` warn about an account carrying a balance,
+    // every year, forever. Somebody did rule on it: the statute did.
+    for account_id in crate::commands::retirement_commands::value_change_account_ids(conn) {
+        mapping.insert(account_id, OFF_RETURN.to_string());
+    }
+    mapping
 }
 
 /// Every saved mapping as account id → line key, exactly as stored.

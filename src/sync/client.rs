@@ -84,6 +84,15 @@ pub struct AdoptOutcome {
     pub head_hash: Option<String>,
 }
 
+/// The account a path names on the group's ledger, after ensuring it exists.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct EnsuredAccountPath {
+    pub head: i64,
+    pub account_id: String,
+    /// How many accounts had to be created. Zero means the path was already there.
+    pub created: usize,
+}
+
 /// What a chunked import did, including when it did not finish.
 ///
 /// A large import is several appends, so "it failed" and "nothing happened" are
@@ -291,6 +300,70 @@ impl SyncClient {
             match self.submit("/sync/commands/create-account", &body).await? {
                 Submitted::Head(head) => return Ok(head),
                 Submitted::Retry => continue,
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Ensure a whole account path exists on the group's ledger, creating any
+    /// missing ancestors, and return the id of the account it names.
+    ///
+    /// The one command that cannot be expressed as a loop over
+    /// [`create_account`](SyncClient::create_account): `Expenses:Software:SaaS` may
+    /// be three new accounts, and creating them one at a time leaves a half-built
+    /// path behind when the second one is refused. The server appends the lot as one
+    /// batch, so this either returns an account or changes nothing.
+    ///
+    /// Retried on a stale head like the other commands, and for the same reason: the
+    /// path is re-walked inside each attempt's transaction, so a retry after somebody
+    /// else created part of it creates only the rest.
+    pub async fn ensure_account_path(
+        &mut self,
+        path: impl Into<String>,
+        account_type: AccountType,
+    ) -> Result<EnsuredAccountPath, SyncClientError> {
+        let path = path.into();
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = serde_json::json!({
+                "expected_head_seq": self.head,
+                "path": path,
+                "account_type": account_type,
+            });
+            let resp = self
+                .http
+                .post(self.url("/sync/commands/ensure-account-path"))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let ensured: EnsuredAccountPath = resp.json().await?;
+                    self.head = ensured.head;
+                    return Ok(ensured);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                    let v: serde_json::Value = resp.json().await?;
+                    return Err(SyncClientError::Rejected(
+                        v["error"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld(
+                        "creating an account path".into(),
+                    ))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
             }
         }
         Err(SyncClientError::ConflictExhausted(MAX_RETRIES))

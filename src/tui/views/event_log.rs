@@ -225,6 +225,19 @@ fn number_for(tax_year: i32, key: &str) -> String {
     }
 }
 
+/// Micro-shares as a human reads them: six places, trailing zeroes trimmed, so a
+/// round holding prints as "10" and a reinvested fraction still prints in full.
+fn shares(micro: i64) -> String {
+    let mut s = format!("{:.6}", micro as f64 / 1_000_000.0);
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
+}
+
 fn format_event_summary(event: &crate::events::types::Event) -> String {
     use crate::events::types::Event;
 
@@ -356,6 +369,100 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::DepreciationBasisAdjustmentRemoved { asset_id, .. } => {
             format!("Asset {asset_id}: a basis adjustment removed")
         }
+        // The brokerage register. Quantities are micro-shares in the log, so they
+        // are divided back to shares for a human to read; six places trimmed of
+        // trailing zeroes, because "10 shares" should not print as "10.000000".
+        Event::SecurityDefined(d) => {
+            format!("Security {} — {} ({})", d.ticker, d.name, d.kind)
+        }
+        Event::SecurityBought {
+            security_id,
+            quantity,
+            total_cost_cents,
+            trade_date,
+            ..
+        } => format!(
+            "Bought {} of {} for ${:.2} on {trade_date}",
+            shares(*quantity),
+            widgets::truncate(security_id, 8),
+            *total_cost_cents as f64 / 100.0
+        ),
+        Event::SecuritySold(d) => format!(
+            "Sold {} of {} for ${:.2} on {} — {} of ${:.2} across {} lot(s)",
+            shares(d.quantity),
+            widgets::truncate(&d.security_id, 8),
+            (d.proceeds_cents - d.fee_cents) as f64 / 100.0,
+            d.trade_date,
+            if d.realized_gain_cents < 0 {
+                "loss"
+            } else {
+                "gain"
+            },
+            d.realized_gain_cents.abs() as f64 / 100.0,
+            d.lots.len()
+        ),
+        Event::InvestmentIncomeReceived {
+            kind,
+            amount_cents,
+            received_on,
+            ..
+        } => format!(
+            "{} of ${:.2} received on {received_on}",
+            match kind {
+                crate::events::types::InvestmentIncomeKind::Dividend => "Dividend",
+                crate::events::types::InvestmentIncomeKind::Interest => "Interest",
+            },
+            *amount_cents as f64 / 100.0
+        ),
+        Event::InvestmentFeeCharged {
+            amount_cents,
+            charged_on,
+            ..
+        } => format!(
+            "Investment fee of ${:.2} charged on {charged_on}",
+            *amount_cents as f64 / 100.0
+        ),
+        // The sheltered-account register. No quantities here, because nothing
+        // inside a sheltered account is recorded — see `retirement_commands`.
+        Event::RetirementAccountRegistered {
+            account_id,
+            institution,
+            kind,
+            ..
+        } => format!(
+            "Retirement account {} — {institution}, {}",
+            widgets::truncate(account_id, 8),
+            kind.label()
+        ),
+        Event::RetirementValueSet {
+            account_id,
+            as_of,
+            value_cents,
+        } => format!(
+            "Retirement account {} worth ${:.2} as of {as_of}",
+            widgets::truncate(account_id, 8),
+            *value_cents as f64 / 100.0
+        ),
+        Event::RetirementContributionRecorded {
+            account_id,
+            amount_cents,
+            on,
+            ..
+        } => format!(
+            "Contributed ${:.2} to retirement account {} on {on}",
+            *amount_cents as f64 / 100.0,
+            widgets::truncate(account_id, 8)
+        ),
+        // The taxable amount is named because it is the one figure here that no
+        // journal entry holds, and the one a 1099-R is filed on.
+        Event::RetirementDistributionRecorded(d) => format!(
+            "Distributed ${:.2} from retirement account {} on {} — ${:.2} taxable, ${:.2} withheld",
+            d.gross_cents as f64 / 100.0,
+            widgets::truncate(&d.account_id, 8),
+            d.on,
+            d.taxable_cents as f64 / 100.0,
+            d.withheld_cents as f64 / 100.0
+        ),
         Event::BusinessTypeSet { business_type } => {
             let t = crate::domain::BusinessType::parse(business_type)
                 .map(|t| t.label())

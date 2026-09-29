@@ -44,11 +44,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+pub mod adopt;
 pub mod binding;
 pub mod client;
 pub mod commands;
 pub mod reads;
 pub mod replica;
+pub use adopt::{AdoptResponse, ADOPT_FORMAT_VERSION, ADOPT_MAX_BYTES};
 pub use binding::GroupBinding;
 pub use client::{SyncClient, SyncClientError};
 pub use replica::{AppliedRange, ReplicaError};
@@ -89,6 +91,10 @@ impl AuthBackend for StaticTokens {
 pub struct SyncState {
     pub store: Arc<Mutex<EventStore>>,
     pub auth: Arc<dyn AuthBackend>,
+    /// Which group this instance hosts, for the handful of answers that say so —
+    /// today [`adopt`]'s. `None` where nobody has said (the prototype and the
+    /// tests), reported as the empty string rather than invented.
+    group_id: Option<String>,
 }
 
 impl SyncState {
@@ -104,7 +110,21 @@ impl SyncState {
         Self {
             store: Arc::new(Mutex::new(store)),
             auth,
+            group_id: None,
         }
+    }
+
+    /// Name the group this instance hosts. A builder step rather than a parameter so
+    /// that adding it did not change `with_auth`'s signature, which `accountir-server`
+    /// and every test call.
+    pub fn with_group(mut self, group_id: impl Into<String>) -> Self {
+        self.group_id = Some(group_id.into());
+        self
+    }
+
+    /// The hosted group's id, or `""` when the caller never named one.
+    pub fn group_id(&self) -> &str {
+        self.group_id.as_deref().unwrap_or_default()
     }
 }
 
@@ -115,7 +135,12 @@ pub fn router(state: SyncState) -> Router {
         .route("/sync/events", get(get_events))
         .route("/sync/commands/post-entry", post(submit_post_entry))
         .merge(commands::router())
-        .merge(reads::router());
+        .merge(reads::router())
+        // How a group takes over books that already exist. Not test-only, unlike
+        // `/sync/submit` below: it keeps the ids and hashes it is given, but only into
+        // a ledger with no events, so it cannot rewrite or interleave anything. See
+        // the module docs.
+        .merge(adopt::router());
     // The raw blind-append primitive bypasses every domain invariant, so it must
     // never be reachable in a real deployment — an authenticated member could
     // otherwise forge arbitrary events (unbalanced entries, privilege-shaped
