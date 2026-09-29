@@ -860,6 +860,57 @@ mod tests {
         assert!(d.warnings.is_empty(), "{:?}", d.warnings);
     }
 
+    /// A wash sale reported per transaction, with the category subtotal left alone.
+    ///
+    /// Brokers do not agree on this: some fold the adjustment into the category
+    /// total, some print it only against the transaction. If only the total is
+    /// consulted, the second kind of statement quietly aggregates an adjusted
+    /// category onto line 1a — and the wash-sale disallowance vanishes from the
+    /// return, which overstates a loss. Covered here because the totals path was
+    /// already pinned and this one was not.
+    #[test]
+    fn an_adjustment_on_a_row_alone_still_forces_form_8949() {
+        let s = statement(
+            "Broad Street Brokerage",
+            &[
+                ("a_proceeds", 500_000),
+                ("a_basis", 560_000),
+                // No `a_adjustments`: this broker prints it against the line only.
+                ("a_gain", -60_000),
+            ],
+        );
+        let lines = vec![
+            detail(&s.statement_id, "l1", Category::A, "50 sh. ACME", 200_000, 190_000, None),
+            detail(
+                &s.statement_id,
+                "l2",
+                Category::A,
+                "80 sh. ACME",
+                300_000,
+                370_000,
+                Some(("W", 20_000)),
+            ),
+        ];
+        let form = Brokerage1099B::from_statement(&s, lines).unwrap();
+        assert!(
+            form.needs_form8949(Category::A),
+            "an adjustment on one row is enough to require listing"
+        );
+
+        let d = from_parts(YEAR, &[form], &[s], LedgerContributions::default());
+        assert!(
+            !d.lines.contains_key("1a"),
+            "it must not be subtotalled onto 1a: {:?}",
+            d.lines.keys().collect::<Vec<_>>()
+        );
+        let part = d.parts.first().expect("a Form 8949 part");
+        assert_eq!(part.category, Category::A);
+        assert_eq!(part.rows.len(), 2);
+        assert_eq!(part.rows[1].adjustment_code.as_deref(), Some("W"));
+        // Column (h): 300,000 - 370,000 + 20,000 — the disallowed loss is back.
+        assert_eq!(part.rows[1].gain_cents, -50_000);
+    }
+
     /// Box E: the broker reported the sale but not the basis, so the transaction
     /// has to be listed even though nothing about it was adjusted.
     #[test]
