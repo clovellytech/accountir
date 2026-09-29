@@ -538,7 +538,7 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             validate_non_empty(&d.plaid_account_id, "plaid_account_id")?;
             match &d.accounts {
                 InvestmentPostingAccounts::Taxable(a) => {
-                    validate_non_empty(&a.securities_account_id, "securities_account_id")?;
+                    validate_non_empty(&a.stocks_account_id, "securities_account_id")?;
                     validate_non_empty(&a.cash_account_id, "cash_account_id")?;
                     validate_non_empty(
                         &a.dividend_income_account_id,
@@ -550,8 +550,32 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                     )?;
                     validate_non_empty(&a.realized_gain_account_id, "realized_gain_account_id")?;
                     validate_non_empty(&a.fee_expense_account_id, "fee_expense_account_id")?;
-                    if let Some(clearing) = &a.transfer_clearing_account_id {
-                        validate_non_empty(clearing, "transfer_clearing_account_id")?;
+                    // Every optional slot, by the name it is configured under. An
+                    // empty string in one of them is not "not configured": it would
+                    // reach a posting as an account id nothing matches, and the
+                    // entry would be refused somewhere far from the mistake.
+                    for (value, field) in [
+                        (&a.mutual_funds_account_id, "mutual_funds_account_id"),
+                        (
+                            &a.other_securities_account_id,
+                            "other_securities_account_id",
+                        ),
+                        (
+                            &a.tax_exempt_interest_account_id,
+                            "tax_exempt_interest_account_id",
+                        ),
+                        (
+                            &a.capital_gain_distribution_account_id,
+                            "capital_gain_distribution_account_id",
+                        ),
+                        (
+                            &a.transfer_clearing_account_id,
+                            "transfer_clearing_account_id",
+                        ),
+                    ] {
+                        if let Some(id) = value {
+                            validate_non_empty(id, field)?;
+                        }
                     }
                     // Securities at cost and the sweep cash being one account would
                     // make every purchase an entry to itself: a debit and an equal
@@ -559,12 +583,19 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                     // leaves the balance sheet silently missing the whole holding.
                     // The same mistake phase 2 refuses for a retirement account and
                     // its value-change account.
-                    if a.securities_account_id == a.cash_account_id {
-                        return Err(ValidationError::InvalidValue(
-                            "the securities account and the cash account cannot be the same \
-                             account: every purchase would post to itself and change nothing"
-                                .to_string(),
-                        ));
+                    //
+                    // Checked for all three securities slots, not just the stocks
+                    // one: the mistake is as available on a slot added later, and
+                    // the consequence is identical.
+                    for group in crate::events::types::SecurityKindGroup::ALL {
+                        if a.securities_account_of(group) == a.cash_account_id {
+                            return Err(ValidationError::InvalidValue(format!(
+                                "the {} securities account and the cash account cannot be the \
+                                 same account: every purchase would post to itself and change \
+                                 nothing",
+                                group.label().to_lowercase()
+                            )));
+                        }
                     }
                 }
                 InvestmentPostingAccounts::Sheltered {

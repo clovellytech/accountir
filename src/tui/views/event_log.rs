@@ -408,10 +408,7 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             ..
         } => format!(
             "{} of ${:.2} received on {received_on}",
-            match kind {
-                crate::events::types::InvestmentIncomeKind::Dividend => "Dividend",
-                crate::events::types::InvestmentIncomeKind::Interest => "Interest",
-            },
+            kind.label(),
             *amount_cents as f64 / 100.0
         ),
         Event::InvestmentFeeCharged {

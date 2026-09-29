@@ -877,47 +877,85 @@ impl<'a> Projector<'a> {
                 // projector — which surfaces as an internal error on a correction
                 // somebody had every right to make — if the old columns were left
                 // behind.
-                let (securities, cash, dividends, interest, gain, fees, clearing, retirement) =
-                    match &d.accounts {
-                        crate::events::types::InvestmentPostingAccounts::Taxable(a) => (
-                            Some(a.securities_account_id.as_str()),
-                            Some(a.cash_account_id.as_str()),
-                            Some(a.dividend_income_account_id.as_str()),
-                            Some(a.interest_income_account_id.as_str()),
-                            Some(a.realized_gain_account_id.as_str()),
-                            Some(a.fee_expense_account_id.as_str()),
-                            a.transfer_clearing_account_id.as_deref(),
-                            None,
-                        ),
-                        crate::events::types::InvestmentPostingAccounts::Sheltered {
-                            retirement_account_id,
-                        } => (
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            Some(retirement_account_id.as_str()),
-                        ),
-                    };
+                // Twelve columns rather than eight since phase 5 split the
+                // securities account by kind and gave tax-exempt interest and
+                // capital gain distributions accounts of their own. Named as a
+                // struct rather than a wider tuple: eight positional `None`s in a
+                // row is where a column ends up written into its neighbour.
+                struct ConfigColumns<'a> {
+                    stocks: Option<&'a str>,
+                    mutual_funds: Option<&'a str>,
+                    other_securities: Option<&'a str>,
+                    cash: Option<&'a str>,
+                    dividends: Option<&'a str>,
+                    interest: Option<&'a str>,
+                    tax_exempt_interest: Option<&'a str>,
+                    capital_gain_distributions: Option<&'a str>,
+                    gain: Option<&'a str>,
+                    fees: Option<&'a str>,
+                    clearing: Option<&'a str>,
+                    retirement: Option<&'a str>,
+                }
+                let columns = match &d.accounts {
+                    crate::events::types::InvestmentPostingAccounts::Taxable(a) => ConfigColumns {
+                        stocks: Some(a.stocks_account_id.as_str()),
+                        mutual_funds: a.mutual_funds_account_id.as_deref(),
+                        other_securities: a.other_securities_account_id.as_deref(),
+                        cash: Some(a.cash_account_id.as_str()),
+                        dividends: Some(a.dividend_income_account_id.as_str()),
+                        interest: Some(a.interest_income_account_id.as_str()),
+                        tax_exempt_interest: a.tax_exempt_interest_account_id.as_deref(),
+                        capital_gain_distributions: a
+                            .capital_gain_distribution_account_id
+                            .as_deref(),
+                        gain: Some(a.realized_gain_account_id.as_str()),
+                        fees: Some(a.fee_expense_account_id.as_str()),
+                        clearing: a.transfer_clearing_account_id.as_deref(),
+                        retirement: None,
+                    },
+                    crate::events::types::InvestmentPostingAccounts::Sheltered {
+                        retirement_account_id,
+                    } => ConfigColumns {
+                        stocks: None,
+                        mutual_funds: None,
+                        other_securities: None,
+                        cash: None,
+                        dividends: None,
+                        interest: None,
+                        tax_exempt_interest: None,
+                        capital_gain_distributions: None,
+                        gain: None,
+                        fees: None,
+                        clearing: None,
+                        retirement: Some(retirement_account_id.as_str()),
+                    },
+                };
                 self.conn.execute(
                     "INSERT INTO investment_account_config
                         (item_id, plaid_account_id, treatment, plaid_subtype, subtype_recognised,
-                         securities_account_id, cash_account_id, dividend_income_account_id,
-                         interest_income_account_id, realized_gain_account_id,
+                         securities_account_id, mutual_funds_account_id,
+                         other_securities_account_id, cash_account_id,
+                         dividend_income_account_id, interest_income_account_id,
+                         tax_exempt_interest_account_id,
+                         capital_gain_distribution_account_id, realized_gain_account_id,
                          fee_expense_account_id, transfer_clearing_account_id,
                          retirement_account_id, configured_at_event, updated_at_event)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                             ?16, ?17, ?18, ?18)
                      ON CONFLICT(item_id, plaid_account_id) DO UPDATE SET
                         treatment = excluded.treatment,
                         plaid_subtype = excluded.plaid_subtype,
                         subtype_recognised = excluded.subtype_recognised,
                         securities_account_id = excluded.securities_account_id,
+                        mutual_funds_account_id = excluded.mutual_funds_account_id,
+                        other_securities_account_id = excluded.other_securities_account_id,
                         cash_account_id = excluded.cash_account_id,
                         dividend_income_account_id = excluded.dividend_income_account_id,
                         interest_income_account_id = excluded.interest_income_account_id,
+                        tax_exempt_interest_account_id =
+                            excluded.tax_exempt_interest_account_id,
+                        capital_gain_distribution_account_id =
+                            excluded.capital_gain_distribution_account_id,
                         realized_gain_account_id = excluded.realized_gain_account_id,
                         fee_expense_account_id = excluded.fee_expense_account_id,
                         transfer_clearing_account_id = excluded.transfer_clearing_account_id,
@@ -929,14 +967,18 @@ impl<'a> Projector<'a> {
                         d.accounts.treatment().as_str(),
                         d.plaid_subtype,
                         d.subtype_recognised as i64,
-                        securities,
-                        cash,
-                        dividends,
-                        interest,
-                        gain,
-                        fees,
-                        clearing,
-                        retirement,
+                        columns.stocks,
+                        columns.mutual_funds,
+                        columns.other_securities,
+                        columns.cash,
+                        columns.dividends,
+                        columns.interest,
+                        columns.tax_exempt_interest,
+                        columns.capital_gain_distributions,
+                        columns.gain,
+                        columns.fees,
+                        columns.clearing,
+                        columns.retirement,
                         stored_event.id,
                     ],
                 )?;

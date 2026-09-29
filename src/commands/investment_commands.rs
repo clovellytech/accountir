@@ -275,6 +275,24 @@ pub fn lots_of(
     )
 }
 
+/// The lots of one security in one account that still have shares in them, oldest
+/// first.
+///
+/// What a lot picker offers. A fully consumed lot is deliberately excluded: it can
+/// no longer contribute to a sale, and offering it would be offering a choice that
+/// is refused under the write lock — while [`lots_of`] keeps them, because a Form
+/// 8949 row for a lot sold in March still has to name the date it was acquired.
+pub fn open_lots(
+    conn: &rusqlite::Connection,
+    security_id: &str,
+    securities_account_id: &str,
+) -> Vec<Lot> {
+    lots_of(conn, security_id, securities_account_id)
+        .into_iter()
+        .filter(|l| l.remaining_quantity > 0)
+        .collect()
+}
+
 /// Every lot in the register, oldest first.
 pub fn list_lots(conn: &rusqlite::Connection) -> Vec<Lot> {
     read_lots(
@@ -1083,10 +1101,10 @@ pub(crate) fn build_income_in_txn(
     }
 
     let currency = base_currency(tx)?;
-    let label = match cmd.kind {
-        InvestmentIncomeKind::Dividend => "Dividend",
-        InvestmentIncomeKind::Interest => "Interest",
-    };
+    // One label per kind, from the enum itself rather than from a match here: four
+    // kinds since phase 5, and a fifth copy of the list is a fifth place for one of
+    // them to be called something else.
+    let label = cmd.kind.label();
     let memo = cmd.memo.clone().unwrap_or_else(|| match &cmd.security_id {
         Some(id) => format!("{label} from {}", ticker_or_id(tx, id)),
         None => format!("{label} on the brokerage account"),
