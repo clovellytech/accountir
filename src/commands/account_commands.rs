@@ -263,6 +263,183 @@ pub(crate) fn build_seed_default_accounts_in_txn(
     Ok(AccountBatchStep::Append(events))
 }
 
+/// What ensuring an account path came to: the events to append (possibly none) and
+/// the id of the account the path names.
+///
+/// The leaf id is the answer the caller actually wanted — "give me the account for
+/// `Expenses:Software:SaaS`" — and it exists in both outcomes: when the path is
+/// already there in full, nothing is appended and the id is the one already stored.
+pub(crate) enum EnsurePathStep {
+    Ensured {
+        events: Vec<Event>,
+        leaf_id: String,
+    },
+    Reject(AccountCommandError),
+}
+
+/// Base numbers for a chart with no account of that type yet. Mirrors what the
+/// desktop suggests locally, so the same path typed on hosted books and on local
+/// books gets the same numbering rather than two conventions.
+fn type_base(t: AccountType) -> i64 {
+    match t {
+        AccountType::Asset => 1000,
+        AccountType::Liability => 2000,
+        AccountType::Equity => 3000,
+        AccountType::Revenue => 4000,
+        AccountType::Expense => 5000,
+    }
+}
+
+/// The next free account number under `parent_number` (or for the type, at the top
+/// level), given every number already taken — including the ones minted earlier in
+/// this same batch, which is why `used` is passed in rather than re-read.
+fn next_free_number(
+    used: &std::collections::HashSet<i64>,
+    parent_number: Option<i64>,
+    account_type: AccountType,
+) -> String {
+    let base = parent_number.unwrap_or_else(|| type_base(account_type));
+    let mut candidate = if parent_number.is_some() { base + 1 } else { base };
+    while used.contains(&candidate) {
+        candidate += 1;
+    }
+    candidate.to_string()
+}
+
+/// Create every missing account along a colon-separated path, as ONE batch.
+///
+/// The failure this exists to remove: the desktop's "create the account I just
+/// typed" modal builds a whole missing path (`Expenses:Software:SaaS` may be three
+/// new accounts), and on hosted books it could only be refused — the single-account
+/// command takes them one at a time, so a path half-created and half-refused was a
+/// real outcome, and worse than not starting. Here the whole path is one append:
+/// every account or none.
+///
+/// Ids are minted as the batch is built, so each segment's parent is known before
+/// the next one is created — the same trick [`build_seed_default_accounts_in_txn`]
+/// uses. Segments that already exist are matched by their full path, not their name:
+/// two accounts may both be called "Taxes" under different parents, and only the one
+/// under the path being walked is the same account.
+pub(crate) fn build_ensure_account_path_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    path: &str,
+    account_type: AccountType,
+) -> Result<EnsurePathStep, EventStoreError> {
+    let segments: Vec<&str> = path
+        .split(':')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return Ok(EnsurePathStep::Reject(AccountCommandError::InvalidData(
+            "an account path needs at least one name".to_string(),
+        )));
+    }
+
+    // Every account, by id, as (name, parent_id, number). Read once inside the
+    // transaction: the numbering and the path matching must both see the same
+    // ledger, and that ledger must be the one the append is about to extend.
+    let mut existing: Vec<(String, String, Option<String>, String)> = Vec::new();
+    {
+        let mut q = tx.prepare("SELECT id, name, parent_id, account_number FROM accounts")?;
+        let rows = q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            existing.push(row?);
+        }
+    }
+    let mut used: std::collections::HashSet<i64> = existing
+        .iter()
+        .filter_map(|(_, _, _, number)| number.trim().parse::<i64>().ok())
+        .collect();
+
+    // The full path of an existing account, walked up through its parents. Bounded
+    // by the number of accounts so a cycle in the data cannot hang the append. A
+    // free function rather than a closure: the table it reads grows as this batch
+    // mints accounts, and each new segment must be matchable by the next one.
+    fn path_of(rows: &[(String, String, Option<String>, String)], id: &str) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = Some(id.to_string());
+        for _ in 0..=rows.len() {
+            let Some(this) = cur.take() else { break };
+            let (_, name, parent, _) = rows.iter().find(|(i, _, _, _)| *i == this)?;
+            parts.push(name.clone());
+            cur = parent.clone();
+        }
+        parts.reverse();
+        Some(parts.join(":"))
+    }
+
+    let mut events: Vec<Event> = Vec::new();
+    let mut parent: Option<(String, Option<i64>)> = None; // (id, number)
+    let mut walked = String::new();
+    for segment in segments {
+        walked = if walked.is_empty() {
+            segment.to_string()
+        } else {
+            format!("{walked}:{segment}")
+        };
+        let found = existing
+            .iter()
+            .find(|(id, _, _, _)| path_of(&existing, id).as_deref() == Some(walked.as_str()))
+            .map(|(id, _, _, number)| (id.clone(), number.trim().parse::<i64>().ok()));
+        parent = Some(match found {
+            Some(hit) => hit,
+            None => {
+                let number = next_free_number(
+                    &used,
+                    parent.as_ref().and_then(|(_, n)| *n),
+                    account_type,
+                );
+                let cmd = CreateAccountCommand {
+                    account_type,
+                    account_number: number.clone(),
+                    name: segment.to_string(),
+                    parent_id: parent.as_ref().map(|(id, _)| id.clone()),
+                    currency: None,
+                    description: None,
+                };
+                // The same uniqueness fence every other creation passes, under the
+                // same write lock.
+                match build_create_account_in_txn(tx, &cmd)? {
+                    AccountStep::Append(event) => {
+                        let Event::AccountCreated { account_id, .. } = &event else {
+                            unreachable!("build_create_account_in_txn appends AccountCreated")
+                        };
+                        let id = account_id.clone();
+                        let parsed = number.parse::<i64>().ok();
+                        if let Some(n) = parsed {
+                            used.insert(n);
+                        }
+                        // Recorded so a later segment can match against it by path,
+                        // and so its number is taken for the rest of the batch.
+                        existing.push((
+                            id.clone(),
+                            segment.to_string(),
+                            cmd.parent_id.clone(),
+                            number,
+                        ));
+                        events.push(event);
+                        (id, parsed)
+                    }
+                    AccountStep::Reject(e) => return Ok(EnsurePathStep::Reject(e)),
+                }
+            }
+        });
+    }
+
+    let leaf_id = parent
+        .map(|(id, _)| id)
+        .expect("a non-empty path walks at least one segment");
+    Ok(EnsurePathStep::Ensured { events, leaf_id })
+}
+
 /// Run `create_account`'s state-dependent invariant inside the append
 /// transaction — the account-number uniqueness check — and, if it holds, build
 /// the `AccountCreated` event. Shared by [`AccountCommands::create_account`] and

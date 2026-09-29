@@ -18,9 +18,9 @@
 
 use crate::commands::account_commands::{
     build_create_account_in_txn, build_deactivate_account_in_txn, build_delete_account_in_txn,
-    build_seed_default_accounts_in_txn, build_update_account_in_txn, AccountBatchStep,
-    AccountCommandError, AccountStep, CreateAccountCommand, DeactivateAccountCommand,
-    UpdateAccountCommand,
+    build_ensure_account_path_in_txn, build_seed_default_accounts_in_txn,
+    build_update_account_in_txn, AccountBatchStep, AccountCommandError, AccountStep,
+    CreateAccountCommand, DeactivateAccountCommand, EnsurePathStep, UpdateAccountCommand,
 };
 use crate::domain::AccountType;
 use crate::store::event_store::Verdict;
@@ -43,6 +43,10 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/seed-default-accounts",
             post(submit_seed_default_accounts),
+        )
+        .route(
+            "/sync/commands/ensure-account-path",
+            post(submit_ensure_account_path),
         )
 }
 
@@ -305,6 +309,90 @@ async fn submit_seed_default_accounts(
         )
         .map_err(ApiError::store)?;
     outcome_to_response_many(outcome, expected, ApiError::domain::<AccountCommandError>)
+}
+
+/// Create the account a path names, and any ancestors it does not have yet.
+#[derive(Serialize, Deserialize)]
+pub struct EnsureAccountPathRequest {
+    pub expected_head_seq: i64,
+    /// Colon-separated, as typed: `Expenses:Software:SaaS`.
+    pub path: String,
+    /// Every account created along the way takes this type, the way the local
+    /// modal does it — children conventionally share their parent's type.
+    pub account_type: AccountType,
+}
+
+/// What the group's ledger holds for that path now.
+#[derive(Serialize, Deserialize)]
+pub struct EnsureAccountPathResponse {
+    pub head: i64,
+    /// The account the path names — newly created, or the one already there.
+    pub account_id: String,
+    /// How many accounts this call had to create. Zero when the path already
+    /// existed, which is a success: the caller wanted the account, not the work.
+    pub created: usize,
+}
+
+/// Ensure a whole account path exists, as one append.
+///
+/// The refusal this removes: the desktop's "create the account I just typed" modal
+/// may need several accounts (`Expenses:Software:SaaS` can be three), and the
+/// single-account command takes them one at a time with no all-or-nothing across
+/// them — so on hosted books the modal could only say no, and the person was sent
+/// to the Accounts page to build the path by hand, one level at a time.
+///
+/// Here the whole path is one `append_checked_many`: every missing account or none.
+/// A duplicate account number is a 422 and nothing is written; a stale head is a 409
+/// for the client to refetch and retry, exactly like every other command.
+async fn submit_ensure_account_path(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<EnsureAccountPathRequest>,
+) -> Result<Json<EnsureAccountPathResponse>, ApiError> {
+    let expected = req.expected_head_seq;
+    // Filled inside the append transaction, read after it: the leaf id is decided
+    // there (it may be an account this batch mints), and the response cannot be
+    // built without it.
+    let found: std::sync::Arc<std::sync::Mutex<Option<(String, usize)>>> = Default::default();
+    let sink = found.clone();
+    let path = req.path.clone();
+    let account_type = req.account_type;
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            expected,
+            move |tx| match build_ensure_account_path_in_txn(tx, &path, account_type)? {
+                EnsurePathStep::Ensured { events, leaf_id } => {
+                    if let Ok(mut slot) = sink.lock() {
+                        *slot = Some((leaf_id, events.len()));
+                    }
+                    Ok(Verdict::Append(
+                        events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                    ))
+                }
+                EnsurePathStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    let head = outcome_to_response_many(outcome, expected, ApiError::domain::<AccountCommandError>)?
+        .0
+        .head;
+    let (account_id, created) = found
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .ok_or_else(|| {
+            ApiError::store(crate::store::event_store::EventStoreError::Backend(
+                "the account path was appended without recording which account it named"
+                    .to_string(),
+            ))
+        })?;
+    Ok(Json(EnsureAccountPathResponse {
+        head,
+        account_id,
+        created,
+    }))
 }
 
 #[cfg(test)]
@@ -884,5 +972,194 @@ mod tests {
                 .unwrap(),
             head + 1
         );
+    }
+}
+
+#[cfg(test)]
+mod ensure_path_tests {
+    use super::*;
+    use crate::commands::account_commands::{AccountCommands, CreateAccountCommand};
+    use crate::domain::AccountType;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+    use crate::sync::router;
+    use std::collections::HashMap;
+
+    const TOKEN: &str = "tok-1";
+
+    async fn serve(store: EventStore) -> String {
+        let state =
+            SyncState::new(store, HashMap::from([(TOKEN.to_string(), "u1".to_string())]));
+        let app = router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn store() -> EventStore {
+        let mut s = EventStore::in_memory().unwrap();
+        init_schema(s.connection()).unwrap();
+        let _ = &mut s;
+        s
+    }
+
+    async fn ensure(base: &str, head: i64, path: &str) -> (u16, serde_json::Value) {
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/sync/commands/ensure-account-path"))
+            .bearer_auth(TOKEN)
+            .json(&serde_json::json!({
+                "expected_head_seq": head,
+                "path": path,
+                "account_type": "expense",
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap();
+        (
+            status,
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body)),
+        )
+    }
+
+    /// Every account this ledger holds, as (name, number, parent id), read from the
+    /// event stream rather than `/sync/accounts` — the chart DTO carries no parent,
+    /// and parentage is exactly what these tests are about. It is also what a replica
+    /// reads, so this is the view the desktop will build.
+    async fn accounts(base: &str) -> Vec<(String, String, Option<String>)> {
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/sync/events?since=0"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        let v: serde_json::Value = resp.json().await.unwrap();
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| {
+                // Internally tagged, snake_case: {"type":"account_created", ...}.
+                let created = &e["event"];
+                (created["type"] == "account_created").then(|| {
+                    (
+                        created["name"].as_str().unwrap_or_default().to_string(),
+                        created["account_number"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        created["parent_id"].as_str().map(|s| s.to_string()),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The whole point: a path of accounts none of which exist becomes one append,
+    /// parented correctly, and the caller is told which account it asked for.
+    #[tokio::test]
+    async fn a_missing_path_is_created_whole_and_names_its_leaf() {
+        let base = serve(store()).await;
+
+        let (status, body) = ensure(&base, 0, "Expenses:Software:SaaS").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["created"], 3, "{body}");
+        let leaf = body["account_id"].as_str().unwrap().to_string();
+        assert!(!leaf.is_empty());
+
+        let rows = accounts(&base).await;
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let names: Vec<&str> = rows.iter().map(|(n, _, _)| n.as_str()).collect();
+        for expected in ["Expenses", "Software", "SaaS"] {
+            assert!(names.contains(&expected), "{rows:?}");
+        }
+        // Parented as a path, not created flat: only the root has no parent.
+        assert_eq!(
+            rows.iter().filter(|(_, _, parent)| parent.is_none()).count(),
+            1,
+            "{rows:?}"
+        );
+    }
+
+    /// Asked again, it creates nothing and returns the same account. The caller
+    /// wanted the account, not the work.
+    #[tokio::test]
+    async fn an_existing_path_is_returned_without_appending_anything() {
+        let base = serve(store()).await;
+        let (_, first) = ensure(&base, 0, "Expenses:Software").await;
+        let head = first["head"].as_i64().unwrap();
+        let id = first["account_id"].as_str().unwrap().to_string();
+
+        let (status, again) = ensure(&base, head, "Expenses:Software").await;
+        assert_eq!(status, 200, "{again}");
+        assert_eq!(again["created"], 0, "{again}");
+        assert_eq!(again["account_id"].as_str().unwrap(), id);
+        assert_eq!(again["head"].as_i64().unwrap(), head, "nothing was appended");
+    }
+
+    /// Only the missing part is created when the path is half there — and the new
+    /// account hangs off the one that already existed.
+    #[tokio::test]
+    async fn only_the_missing_segments_are_created() {
+        let mut s = store();
+        let parent = AccountCommands::new(&mut s, "seed".to_string())
+            .create_account(CreateAccountCommand {
+                account_type: AccountType::Expense,
+                account_number: "5000".to_string(),
+                name: "Expenses".to_string(),
+                parent_id: None,
+                currency: None,
+                description: None,
+            })
+            .unwrap();
+        let parent_id = match &parent.event {
+            crate::events::types::Event::AccountCreated { account_id, .. } => account_id.clone(),
+            _ => unreachable!(),
+        };
+        let head = parent.id;
+        let base = serve(s).await;
+
+        let (status, body) = ensure(&base, head, "Expenses:Software").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["created"], 1, "{body}");
+
+        let rows = accounts(&base).await;
+        let created = rows.iter().find(|(n, _, _)| n == "Software").unwrap();
+        assert_eq!(
+            created.2.as_deref(),
+            Some(parent_id.as_str()),
+            "the new account hangs off the one that was already there: {rows:?}"
+        );
+        assert_ne!(created.1, "5000", "and took a free number: {rows:?}");
+    }
+
+    /// Two accounts may share a name under different parents, so matching is by the
+    /// whole path. Matching by name would hand back the wrong account — silently, and
+    /// with entries then posted against it.
+    #[tokio::test]
+    async fn a_name_that_exists_under_another_parent_is_not_the_same_account() {
+        let base = serve(store()).await;
+        let (_, a) = ensure(&base, 0, "Expenses:Taxes").await;
+        let head = a["head"].as_i64().unwrap();
+        let first = a["account_id"].as_str().unwrap().to_string();
+
+        let (status, b) = ensure(&base, head, "Expenses:Payroll:Taxes").await;
+        assert_eq!(status, 200, "{b}");
+        assert_eq!(b["created"], 2, "Payroll and its own Taxes: {b}");
+        assert_ne!(b["account_id"].as_str().unwrap(), first);
+    }
+
+    #[tokio::test]
+    async fn an_empty_path_is_refused_and_a_stale_head_is_a_conflict() {
+        let base = serve(store()).await;
+        let (status, body) = ensure(&base, 0, "   :  ").await;
+        assert_eq!(status, 422, "{body}");
+
+        let (_, made) = ensure(&base, 0, "Expenses").await;
+        let stale = made["head"].as_i64().unwrap() - 1;
+        let (status, body) = ensure(&base, stale, "Expenses:Other").await;
+        assert_eq!(status, 409, "{body}");
     }
 }
