@@ -687,6 +687,126 @@ impl<'a> Projector<'a> {
                     params![adjustment_id],
                 )?;
             }
+            // --- the taxable-brokerage register (migration 047) ---
+            Event::SecurityDefined(d) => {
+                self.conn.execute(
+                    "INSERT INTO securities
+                        (id, ticker, name, kind, cusip, currency, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7)
+                     ON CONFLICT(id) DO UPDATE SET
+                        ticker = excluded.ticker,
+                        name = excluded.name,
+                        kind = excluded.kind,
+                        cusip = excluded.cusip,
+                        currency = excluded.currency,
+                        updated_at = excluded.updated_at,
+                        updated_at_event = excluded.updated_at_event",
+                    params![
+                        d.security_id,
+                        d.ticker,
+                        d.name,
+                        d.kind,
+                        d.cusip,
+                        d.currency,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            // A new lot is whole: everything of it remains, and all of its cost is
+            // still its basis. The remainders are columns rather than a
+            // computation for the reason migration 047 gives — re-deriving a
+            // part-sold lot's basis re-rounds the same money and loses cents.
+            Event::SecurityBought {
+                lot_id,
+                security_id,
+                securities_account_id,
+                cash_account_id,
+                quantity,
+                total_cost_cents,
+                trade_date,
+            } => {
+                self.conn.execute(
+                    "INSERT INTO investment_lots
+                        (id, security_id, securities_account_id, cash_account_id, quantity,
+                         total_cost_cents, remaining_quantity, remaining_basis_cents, trade_date,
+                         added_at_event, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?5, ?6, ?7, ?8, ?8)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![
+                        lot_id,
+                        security_id,
+                        securities_account_id,
+                        cash_account_id,
+                        quantity,
+                        total_cost_cents,
+                        trade_date.to_string(),
+                        stored_event.id,
+                    ],
+                )?;
+            }
+            // A sale writes its own record and then draws down the lots it named.
+            // The draw-down is a subtraction of the figures **on the event**, not a
+            // recomputation from a rule: the event is what a filed gain will be
+            // checked against, and a projection that disagreed with it would be a
+            // second opinion about a number already on a return (spec §4).
+            Event::SecuritySold(d) => {
+                let basis_cents: i64 = d.lots.iter().map(|l| l.basis_cents).sum();
+                self.conn.execute(
+                    "INSERT INTO investment_sales
+                        (id, security_id, securities_account_id, cash_account_id, quantity,
+                         proceeds_cents, fee_cents, basis_cents, realized_gain_cents, trade_date,
+                         recorded_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                     ON CONFLICT(id) DO NOTHING",
+                    params![
+                        d.sale_id,
+                        d.security_id,
+                        d.securities_account_id,
+                        d.cash_account_id,
+                        d.quantity,
+                        d.proceeds_cents,
+                        d.fee_cents,
+                        basis_cents,
+                        d.realized_gain_cents,
+                        d.trade_date.to_string(),
+                        stored_event.id,
+                    ],
+                )?;
+                for lot in &d.lots {
+                    self.conn.execute(
+                        "INSERT INTO investment_sale_lots
+                            (sale_id, lot_id, quantity, basis_cents, term)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(sale_id, lot_id) DO NOTHING",
+                        params![
+                            d.sale_id,
+                            lot.lot_id,
+                            lot.quantity,
+                            lot.basis_cents,
+                            lot.term.as_str(),
+                        ],
+                    )?;
+                    self.conn.execute(
+                        "UPDATE investment_lots
+                            SET remaining_quantity = remaining_quantity - ?2,
+                                remaining_basis_cents = remaining_basis_cents - ?3,
+                                updated_at_event = ?4
+                          WHERE id = ?1",
+                        params![lot.lot_id, lot.quantity, lot.basis_cents, stored_event.id],
+                    )?;
+                }
+            }
+            // Deliberately no projection.
+            //
+            // "How much dividend income" is a question the ledger answers, from
+            // the income accounts the entry credited — spec §3's rule that a
+            // report is computed and never a second copy of a posted figure. What
+            // these events add is the `security_id`, which no journal entry can
+            // carry, and which the 1099-DIV split at year end needs (spec §7).
+            // That report is phase 6, and it will bring the projection it needs
+            // with it; a table added now would be one nothing reads and nothing
+            // keeps honest.
+            Event::InvestmentIncomeReceived { .. } | Event::InvestmentFeeCharged { .. } => {}
             Event::UserAdded {
                 user_id,
                 username,
@@ -1372,7 +1492,16 @@ impl<'a> Projector<'a> {
              -- local configuration, not derived from the log, and a replay must
              -- leave it alone.
              DELETE FROM sole_proprietor;
-             DELETE FROM schedule_c_answers;",
+             DELETE FROM schedule_c_answers;
+             -- The brokerage register (migration 047). Projections like the rest:
+             -- a lot no event justifies would keep relieving basis on somebody's
+             -- Form 8949 after a replay, and a sale whose lots survived a replay
+             -- that dropped the lots themselves would report a gain against
+             -- shares the log says were never bought.
+             DELETE FROM investment_sale_lots;
+             DELETE FROM investment_sales;
+             DELETE FROM investment_lots;
+             DELETE FROM securities;",
         )?;
 
         // Replay all events

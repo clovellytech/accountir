@@ -163,6 +163,139 @@ pub struct DepreciableAssetData {
     pub notes: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// The taxable-brokerage register (migration 047) — INVESTMENTS-SPEC.md phase 1.
+//
+// # Units, once, for everything below
+//
+// Money is `i64` cents, as it is everywhere else in this log. Quantity is `i64`
+// in **millionths of a share** ("micro-shares", 1e-6): fractional shares are
+// ordinary now, and six places is past every brokerage's own precision, so
+// nothing has to be rounded on the way in. A float could not hold 0.1, and a
+// holding has to reconcile against a broker's statement.
+// ---------------------------------------------------------------------------
+
+/// A security's master record, as one event's payload.
+///
+/// Boxed for the reason [`BusinessProfileData`] is: an enum is as wide as its
+/// largest variant, and six fields inline would widen every `Event` the system
+/// moves. The wire format is unaffected — serde's internally tagged
+/// representation flattens a newtype variant's struct into the same object a
+/// struct variant produces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityDefinedData {
+    pub security_id: String,
+    /// What the broker calls it today. The master exists precisely so this can
+    /// change without forking history — a lot identified by ticker would become a
+    /// lot of a different company when a ticker is reassigned.
+    pub ticker: String,
+    pub name: String,
+    /// "stock", "etf", "mutual fund", "bond"… free text rather than an enum,
+    /// because a broker's own vocabulary is what will fill it (spec §6 imports
+    /// Plaid's `security.type`) and a closed set in a permanent log means a type
+    /// nobody anticipated cannot be recorded at all. Nothing in phase 1 branches
+    /// on it.
+    pub kind: String,
+    /// The identifier that survives a ticker change; absent when the broker gives
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cusip: Option<String>,
+    /// Carried from the start although multi-currency is out of scope (spec §10),
+    /// so adding it later is not a migration of every lot and of every gain
+    /// already computed from one.
+    pub currency: String,
+}
+
+/// Short or long term, per the holding period.
+///
+/// A closed enum, unlike [`SecurityDefinedData::kind`], because the statute
+/// closes it: §1222 knows two answers and no third is possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldingTerm {
+    Short,
+    Long,
+}
+
+impl HoldingTerm {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HoldingTerm::Short => "short",
+            HoldingTerm::Long => "long",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "short" => Some(HoldingTerm::Short),
+            "long" => Some(HoldingTerm::Long),
+            _ => None,
+        }
+    }
+}
+
+/// One lot a sale consumed: how much of it, what that cost, and on what terms.
+///
+/// Recorded **on the sale event** rather than recomputed from a rule at report
+/// time (spec §4). A gain already filed must not be silently restated because the
+/// default lot-selection method changed afterwards, and a rule applied to
+/// today's register is exactly what would do that.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaleLotData {
+    pub lot_id: String,
+    /// Micro-shares taken out of that lot.
+    pub quantity: i64,
+    /// That share of the lot's cost, to the cent.
+    pub basis_cents: i64,
+    /// Computed per lot, so one sale can produce both terms.
+    pub term: HoldingTerm,
+}
+
+/// A sale, whole. Boxed like [`SecurityDefinedData`], and more obviously so: it
+/// carries a `Vec` as well as four ids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecuritySoldData {
+    /// Minted by the command, exactly as `SecurityBought` mints a `lot_id`: the
+    /// sale's per-lot detail needs a stable key, and the event's position in the
+    /// log is not one a report should be keyed on.
+    pub sale_id: String,
+    pub security_id: String,
+    pub securities_account_id: String,
+    pub cash_account_id: String,
+    /// Micro-shares sold. Equal to the sum of `lots[..].quantity`.
+    pub quantity: i64,
+    /// Gross, as a 1099-B reports it.
+    pub proceeds_cents: i64,
+    /// The fee taken out of the proceeds. It reduces proceeds rather than posting
+    /// as an expense, because that is how a 1099-B reports proceeds and
+    /// reconciling against that form is the point (spec §7). A standalone account
+    /// fee is a different thing — see
+    /// [`InvestmentFeeCharged`](Event::InvestmentFeeCharged).
+    pub fee_cents: i64,
+    pub trade_date: NaiveDate,
+    pub lots: Vec<SaleLotData>,
+    /// `(proceeds - fee) - basis of the lots sold`. Negative is a loss.
+    pub realized_gain_cents: i64,
+}
+
+/// Dividend or interest. Closed, because which of the two it is decides which
+/// line of a Schedule B it reaches, and there is no third line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvestmentIncomeKind {
+    Dividend,
+    Interest,
+}
+
+impl InvestmentIncomeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InvestmentIncomeKind::Dividend => "dividend",
+            InvestmentIncomeKind::Interest => "interest",
+        }
+    }
+}
+
 /// Source of a journal entry
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -637,6 +770,75 @@ pub enum Event {
         asset_id: String,
     },
 
+    // --- the taxable-brokerage register (migration 047) ---
+    //
+    // INVESTMENTS-SPEC.md phase 1. Event-sourced like the asset register above,
+    // and for the same reason: what the business holds and what it realized on
+    // selling it is a fact the whole business files on.
+    //
+    // Note what these events carry and what they do not. They carry the facts a
+    // journal entry cannot express — quantity, which lots, which term, which
+    // security — and they do **not** repeat the income or gain account the
+    // posting used, because the `JournalEntryPosted` that lands in the same
+    // append batch already names every account the money touched. Two records of
+    // one fact is how the two come to disagree.
+    /// A security joins the master.
+    SecurityDefined(Box<SecurityDefinedData>),
+    /// A purchase, which is one lot.
+    ///
+    /// `total_cost_cents` is the whole cost including commission — buy fees
+    /// capitalise into basis under the ordinary treatment of a purchase — and
+    /// there is deliberately no unit price. A price times a quantity has to be
+    /// rounded, and would be rounded again on every sale out of the lot, so the
+    /// basis relieved would drift from the basis debited. The total makes it exact
+    /// by construction.
+    SecurityBought {
+        /// Minted by the command; the lot's identity for the rest of its life.
+        lot_id: String,
+        security_id: String,
+        /// Which Securities account holds it — load-bearing, because a sale may
+        /// only consume lots sitting in the account it sells out of.
+        securities_account_id: String,
+        /// Where the money came from. Provenance; the entry is what posts it.
+        cash_account_id: String,
+        /// Micro-shares.
+        quantity: i64,
+        total_cost_cents: i64,
+        trade_date: NaiveDate,
+    },
+    /// A sale, with the lots it consumed recorded on it. See
+    /// [`SecuritySoldData`].
+    SecuritySold(Box<SecuritySoldData>),
+    /// A dividend or interest payment landing in the brokerage's cash.
+    ///
+    /// `security_id` is optional because sweep interest belongs to the account
+    /// rather than to any holding — and it is the reason this event exists at all
+    /// beside its journal entry: the entry knows the amount and the account, and
+    /// only this knows which security paid it, which is what splits ordinary from
+    /// qualified dividends against a 1099-DIV at year end (spec §7).
+    InvestmentIncomeReceived {
+        kind: InvestmentIncomeKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        security_id: Option<String>,
+        cash_account_id: String,
+        amount_cents: i64,
+        received_on: NaiveDate,
+    },
+    /// An account fee not tied to a trade — an advisory fee, an ADR fee.
+    ///
+    /// Distinct from the `fee_cents` on a sale, which reduces proceeds. This one
+    /// is an ordinary expense and posts to an expense account, because it is not
+    /// part of any 1099-B's proceeds figure and pretending otherwise would put it
+    /// on a form that does not report it.
+    InvestmentFeeCharged {
+        cash_account_id: String,
+        expense_account_id: String,
+        amount_cents: i64,
+        charged_on: NaiveDate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        security_id: Option<String>,
+    },
+
     UserAdded {
         user_id: String,
         username: String,
@@ -958,6 +1160,11 @@ impl Event {
             Event::DepreciationBasisAdjustmentRemoved { .. } => {
                 "depreciation_basis_adjustment_removed"
             }
+            Event::SecurityDefined(_) => "security_defined",
+            Event::SecurityBought { .. } => "security_bought",
+            Event::SecuritySold(_) => "security_sold",
+            Event::InvestmentIncomeReceived { .. } => "investment_income_received",
+            Event::InvestmentFeeCharged { .. } => "investment_fee_charged",
             Event::BusinessTypeSet { .. } => "business_type_set",
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
             Event::ScheduleCAnswerSet { .. } => "schedule_c_answer_set",
@@ -1040,6 +1247,15 @@ impl Event {
             Event::DepreciationOverrideCleared { asset_id, .. } => Some(asset_id),
             Event::DepreciationBasisAdjusted { asset_id, .. } => Some(asset_id),
             Event::DepreciationBasisAdjustmentRemoved { asset_id, .. } => Some(asset_id),
+            // The security is the aggregate here, not the lot or the sale — the
+            // same choice `DepreciationBasisAdjusted` makes in naming the asset
+            // rather than the adjustment. Income and a fee may belong to no
+            // security at all, and then there is nothing to name.
+            Event::SecurityDefined(d) => Some(&d.security_id),
+            Event::SecurityBought { security_id, .. } => Some(security_id),
+            Event::SecuritySold(d) => Some(&d.security_id),
+            Event::InvestmentIncomeReceived { security_id, .. } => security_id.as_deref(),
+            Event::InvestmentFeeCharged { security_id, .. } => security_id.as_deref(),
             // One business per book, so no id names the thing changed — the same
             // answer `BusinessProfileSet` gives.
             Event::BusinessTypeSet { .. } => None,

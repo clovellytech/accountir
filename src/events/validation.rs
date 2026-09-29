@@ -296,6 +296,137 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::DepreciationBasisAdjustmentRemoved { adjustment_id, .. } => {
             validate_non_empty(adjustment_id, "adjustment_id")?;
         }
+        // --- the taxable-brokerage register (migration 047) ---
+        //
+        // Shape only, here as everywhere in this function: whether a sale can
+        // consume a lot is a question about ledger state, and is answered under
+        // the write lock in `investment_commands`. What this catches is an event
+        // that is nonsense on its own terms — a holding of no shares, a cost of
+        // nothing — and would sit in the log forever if it landed.
+        Event::SecurityDefined(d) => {
+            validate_non_empty(&d.security_id, "security_id")?;
+            validate_non_empty(&d.ticker, "ticker")?;
+            validate_non_empty(&d.name, "name")?;
+            validate_non_empty(&d.kind, "kind")?;
+            validate_currency_code(&d.currency)?;
+        }
+        Event::SecurityBought {
+            lot_id,
+            security_id,
+            securities_account_id,
+            cash_account_id,
+            quantity,
+            total_cost_cents,
+            trade_date: _,
+        } => {
+            validate_non_empty(lot_id, "lot_id")?;
+            validate_non_empty(security_id, "security_id")?;
+            validate_non_empty(securities_account_id, "securities_account_id")?;
+            validate_non_empty(cash_account_id, "cash_account_id")?;
+            if *quantity <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "a purchase of no shares is not a purchase".to_string(),
+                ));
+            }
+            if *total_cost_cents <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "a lot costs something; a free lot comes from a corporate action, which is \
+                     out of scope"
+                        .to_string(),
+                ));
+            }
+        }
+        Event::SecuritySold(d) => {
+            validate_non_empty(&d.sale_id, "sale_id")?;
+            validate_non_empty(&d.security_id, "security_id")?;
+            validate_non_empty(&d.securities_account_id, "securities_account_id")?;
+            validate_non_empty(&d.cash_account_id, "cash_account_id")?;
+            if d.quantity <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "a sale of no shares is not a sale".to_string(),
+                ));
+            }
+            if d.proceeds_cents < 0 || d.fee_cents < 0 {
+                return Err(ValidationError::InvalidValue(
+                    "proceeds and fees are amounts, not directions".to_string(),
+                ));
+            }
+            if d.lots.is_empty() {
+                return Err(ValidationError::InvalidValue(
+                    "a sale with no lots behind it has no basis, and a gain computed against no \
+                     basis is the whole proceeds"
+                        .to_string(),
+                ));
+            }
+            // The event has to add up against itself, because it is what a filed
+            // gain will be checked against years from now and nothing else will
+            // be left to check it with.
+            let mut seen = std::collections::HashSet::new();
+            let mut quantity = 0i64;
+            let mut basis = 0i64;
+            for lot in &d.lots {
+                validate_non_empty(&lot.lot_id, "lot_id")?;
+                if !seen.insert(&lot.lot_id) {
+                    return Err(ValidationError::DuplicateId(lot.lot_id.clone()));
+                }
+                if lot.quantity <= 0 {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "lot {} contributes no shares to the sale",
+                        lot.lot_id
+                    )));
+                }
+                if lot.basis_cents < 0 {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "lot {} contributes a negative basis",
+                        lot.lot_id
+                    )));
+                }
+                quantity += lot.quantity;
+                basis += lot.basis_cents;
+            }
+            if quantity != d.quantity {
+                return Err(ValidationError::InvalidValue(format!(
+                    "the lots account for {quantity} micro-shares and the sale is of {}",
+                    d.quantity
+                )));
+            }
+            if d.realized_gain_cents != d.proceeds_cents - d.fee_cents - basis {
+                return Err(ValidationError::InvalidValue(format!(
+                    "a realized gain of {} does not follow from proceeds {} less fees {} less \
+                     basis {basis}",
+                    d.realized_gain_cents, d.proceeds_cents, d.fee_cents
+                )));
+            }
+        }
+        Event::InvestmentIncomeReceived {
+            kind: _,
+            security_id: _,
+            cash_account_id,
+            amount_cents,
+            received_on: _,
+        } => {
+            validate_non_empty(cash_account_id, "cash_account_id")?;
+            if *amount_cents <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "income of nothing is not income".to_string(),
+                ));
+            }
+        }
+        Event::InvestmentFeeCharged {
+            cash_account_id,
+            expense_account_id,
+            amount_cents,
+            charged_on: _,
+            security_id: _,
+        } => {
+            validate_non_empty(cash_account_id, "cash_account_id")?;
+            validate_non_empty(expense_account_id, "expense_account_id")?;
+            if *amount_cents <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "a fee of nothing is not a fee".to_string(),
+                ));
+            }
+        }
         // --- sole proprietorships (migration 031) ---
         Event::BusinessTypeSet { business_type } => {
             // Checked against the catalogue rather than for emptiness: an
