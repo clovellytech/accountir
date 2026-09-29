@@ -1360,6 +1360,22 @@ async fn plaid_sync(
             })
             .unwrap_or_default();
 
+        // And the accounts the provider itself types as investment accounts, whether or
+        // not anybody has configured them. Skipping only the configured ones left an
+        // unconfigured brokerage importing its cash legs — a purchase as money spent —
+        // which is a figure somebody may act on. Importing nothing until it is set up
+        // is the better failure, and the page says so.
+        let typed_as_investment: std::collections::HashSet<String> = conn
+            .prepare(
+                "SELECT plaid_account_id FROM plaid_local_accounts
+                  WHERE item_id = ?1 AND lower(account_type) IN ('investment', 'brokerage')",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([&req.item_id], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
         let mut staged = 0u32;
         let mut skipped = 0u32;
 
@@ -1369,7 +1385,9 @@ async fn plaid_sync(
                 continue;
             }
 
-            if investment_accounts.contains(&txn.account_id) {
+            if investment_accounts.contains(&txn.account_id)
+                || typed_as_investment.contains(&txn.account_id)
+            {
                 skipped += 1;
                 continue;
             }

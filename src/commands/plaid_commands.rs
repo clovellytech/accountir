@@ -978,6 +978,20 @@ pub struct StagedOutcome {
     /// `investment_import`. Staging them as well would put a confusing duplicate of
     /// every trade in the review list.
     pub investment_accounts: u32,
+    /// Rows for an account the provider types as an investment account that nobody
+    /// has configured yet.
+    ///
+    /// Skipped for the same reason as [`Self::investment_accounts`] — the cash leg is
+    /// a misleading account of what happened — but counted apart, because the two
+    /// need different sentences. A configured account's trades are arriving properly
+    /// somewhere else and there is nothing to do. An unconfigured one is importing
+    /// **nothing**, and the person has to set it up before it will.
+    ///
+    /// Skipping on the provider's own type rather than only on the configuration is
+    /// the difference between a brokerage that reads wrongly and one that reads as
+    /// empty until it is set up. Empty and said out loud is the better failure: a
+    /// purchase staged as money spent is a figure somebody may act on.
+    pub unconfigured_investment_accounts: u32,
 }
 
 impl StagedOutcome {
@@ -1028,6 +1042,21 @@ pub fn stage_transactions_in_conn(
         })
         .unwrap_or_default();
 
+    // And the ones the provider itself calls investment accounts, configured or not.
+    // `account_type` is the provider's `type`, which is `investment` for every
+    // brokerage, IRA and 401(k); the finer `subtype` that tells taxable from
+    // sheltered is only needed once an account is being configured.
+    let typed_as_investment: HashSet<String> = conn
+        .prepare(
+            "SELECT plaid_account_id FROM plaid_local_accounts
+              WHERE item_id = ?1 AND lower(account_type) IN ('investment', 'brokerage')",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([item_id], |row| row.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default();
+
     let mut outcome = StagedOutcome::default();
     for txn in transactions {
         if txn.pending {
@@ -1040,6 +1069,12 @@ pub fn stage_transactions_in_conn(
         // is the one skip that loses nothing.
         if investment_accounts.contains(&txn.account_id) {
             outcome.investment_accounts += 1;
+            continue;
+        }
+        // Typed as an investment account but not configured: skipped too, and counted
+        // apart so the caller can say the one thing that helps — set this account up.
+        if typed_as_investment.contains(&txn.account_id) {
+            outcome.unconfigured_investment_accounts += 1;
             continue;
         }
 

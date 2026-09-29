@@ -5726,6 +5726,74 @@ mod tests {
         );
     }
 
+    /// A brokerage nobody has configured yet imports **nothing** rather than its cash
+    /// legs — and says which account to go and set up.
+    ///
+    /// Skipping only *configured* accounts left the gap this closes: until somebody
+    /// configures a brokerage, `/transactions/sync` was still staging its cash legs,
+    /// so a $1,504.95 purchase sat in the review list as money spent. That is a figure
+    /// a person may act on, and it is wrong in a way the row cannot show. Importing
+    /// nothing until the account is set up is the better failure, provided it is
+    /// counted and said out loud — which is what the separate counter is for.
+    #[test]
+    fn an_unconfigured_investment_account_imports_nothing_and_is_counted_apart() {
+        use crate::commands::plaid_commands::{stage_transactions_in_conn, SyncedTransaction};
+
+        // No `configure_account` call anywhere in this test: that is the point.
+        let store = store();
+        // `store()` already registers the connection; only the accounts are new.
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_local_accounts
+                    (item_id, plaid_account_id, name, account_type, local_account_id)
+                 VALUES ('item1', ?1, 'Brokerage', 'investment', NULL),
+                        ('item1', 'plaid-checking', 'Checking', 'depository', ?2)",
+                rusqlite::params![BRK, CHECKING],
+            )
+            .unwrap();
+
+        let cash_leg = |id: &str, account: &str| SyncedTransaction {
+            transaction_id: id.to_string(),
+            account_id: account.to_string(),
+            amount: 1504.95,
+            date: "2026-03-02".to_string(),
+            name: "BUY AAPL".to_string(),
+            merchant_name: None,
+            pending: false,
+            iso_currency_code: Some("USD".to_string()),
+            currency: None,
+            payment_meta: None,
+        };
+        let outcome = stage_transactions_in_conn(
+            store.connection(),
+            ITEM,
+            &[
+                cash_leg("bank-1", BRK),
+                cash_leg("bank-2", "plaid-checking"),
+            ],
+        )
+        .expect("staged");
+
+        assert_eq!(
+            outcome.unconfigured_investment_accounts, 1,
+            "counted as needing configuration, not as an ordinary skip"
+        );
+        assert_eq!(
+            outcome.investment_accounts, 0,
+            "and not counted as one that is importing properly elsewhere"
+        );
+        assert_eq!(outcome.staged, 1, "only the bank account's row is staged");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM plaid_staged_transactions WHERE plaid_account_id = 'plaid-brokerage'"
+            ),
+            0,
+            "no cash leg reached the review list"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Phase 5: securities by kind, four income accounts, holdings and review
     // -----------------------------------------------------------------------
