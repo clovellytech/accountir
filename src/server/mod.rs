@@ -705,6 +705,7 @@ pub async fn start_server_task() -> Option<ServerDb> {
         .route("/plaid/refresh-accounts", post(plaid_refresh_accounts))
         .route("/plaid/disconnect", post(plaid_disconnect))
         .route("/plaid/sync", post(plaid_sync))
+        .route("/plaid/investments/sync", post(plaid_investments_sync))
         .route("/plaid/balances", post(plaid_balances))
         .route("/plaid/staged", get(plaid_staged_list))
         .route("/plaid/staged/import-transfer", post(plaid_import_transfer))
@@ -1344,11 +1345,31 @@ async fn plaid_sync(
         })
         .unwrap_or_default();
 
+        // INVESTMENTS-SPEC.md §6: an investment account's rows stop flowing through
+        // this feed. `/transactions/sync` reports only the cash leg, so a purchase
+        // arrives here as money spent and a sale as income; the same activity arrives
+        // with its security attached from `/plaid/investments/sync`, and staging both
+        // would put a confusing duplicate of every trade in the review list. The same
+        // skip lives in `plaid_commands::stage_transactions_in_conn`, which is the
+        // delegated path's copy of this loop.
+        let investment_accounts: std::collections::HashSet<String> = conn
+            .prepare("SELECT plaid_account_id FROM investment_account_config WHERE item_id = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_map([&req.item_id], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
         let mut staged = 0u32;
         let mut skipped = 0u32;
 
         for txn in &added_txns {
             if txn.pending {
+                skipped += 1;
+                continue;
+            }
+
+            if investment_accounts.contains(&txn.account_id) {
                 skipped += 1;
                 continue;
             }
@@ -1961,6 +1982,264 @@ async fn plaid_link_page() -> Html<&'static str> {
 struct PlaidProxyConfig {
     proxy_url: String,
     api_key: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Investments (INVESTMENTS-SPEC.md phase 4)
+// ---------------------------------------------------------------------------
+//
+// Why this is a separate route from `/plaid/sync` rather than part of it: spec §6.
+// `/transactions/sync` reports only the **cash leg** of a brokerage account, so a
+// $1,000 purchase arrives there as $1,000 spent. Every fact worth having about an
+// investment account comes from `/investments/*` instead, and mixing the two
+// endpoints into one handler would mean one request that half-succeeds when a
+// brokerage is behind a connection and a bank is not.
+//
+// The handler does the HTTP and nothing else. Every decision — what an account is
+// imported as, what a transaction becomes, what is held, what reconciles — is in
+// `commands::investment_import`, which is why that module can be tested against
+// payload structs without a proxy in the loop. That is the seam the bank feed's
+// staging already uses.
+
+#[derive(Deserialize)]
+struct PlaidInvestmentsSyncRequest {
+    item_id: String,
+}
+
+#[derive(Serialize)]
+struct PlaidInvestmentsSyncResponse {
+    /// The window actually asked for, so a caller can tell a first full-history
+    /// pull from a rolling one without guessing.
+    start_date: String,
+    end_date: String,
+    bought: u32,
+    sold: u32,
+    dividends: u32,
+    interest: u32,
+    fees: u32,
+    cash_movements: u32,
+    duplicates: u32,
+    held: u32,
+    ignored_sheltered: u32,
+    securities_created: u32,
+    snapshots_recorded: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    flags: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    values_set: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unconfigured: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reconciliation_findings: Vec<String>,
+}
+
+async fn plaid_investments_sync(
+    State(state): State<Arc<SharedState>>,
+    Json(req): Json<PlaidInvestmentsSyncRequest>,
+) -> Result<Json<PlaidInvestmentsSyncResponse>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::commands::investment_import as imp;
+
+    let plaid_cfg = get_plaid_config(&state)?;
+
+    // The proxy's handle for the connection, and the accounts behind it, read
+    // together so the window can be the widest any one of them needs.
+    let (proxy_item_id, plaid_account_ids, window) = {
+        let guard = state.db.lock().unwrap();
+        let active = guard.as_ref().ok_or(no_database())?;
+        let conn = active.store.connection();
+        let proxy_item_id: String = conn
+            .query_row(
+                "SELECT proxy_item_id FROM plaid_items WHERE id = ?1 AND status = 'active'",
+                [&req.item_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        success: false,
+                        error: "Item not found".to_string(),
+                    }),
+                )
+            })?;
+        let ids: Vec<String> = conn
+            .prepare("SELECT plaid_account_id FROM plaid_local_accounts WHERE item_id = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_map([&req.item_id], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+        let today = chrono::Local::now().date_naive();
+        let window = imp::window_for_item(conn, &req.item_id, &ids, today);
+        (proxy_item_id, ids, window)
+    };
+
+    let transactions_body: serde_json::Value = post_to_proxy(
+        &state,
+        &plaid_cfg,
+        "/plaid/investments/transactions",
+        serde_json::json!({
+            "item_id": proxy_item_id,
+            "start_date": window.0.to_string(),
+            "end_date": window.1.to_string(),
+        }),
+    )
+    .await?;
+    let holdings_body: serde_json::Value = post_to_proxy(
+        &state,
+        &plaid_cfg,
+        "/plaid/investments/holdings",
+        serde_json::json!({ "item_id": proxy_item_id }),
+    )
+    .await?;
+
+    // Anything that will not deserialise is dropped here rather than failing the
+    // run, the way `plaid_sync` treats its `added` list: one malformed row must not
+    // cost the other four hundred. It is visible as a count that does not add up
+    // against the proxy's own `total`.
+    let transactions: Vec<imp::ProviderInvestmentTransaction> =
+        serde_json::from_value(transactions_body["investment_transactions"].clone())
+            .unwrap_or_default();
+    let mut accounts: Vec<imp::ProviderAccount> =
+        serde_json::from_value(transactions_body["accounts"].clone()).unwrap_or_default();
+    if accounts.is_empty() {
+        accounts = serde_json::from_value(holdings_body["accounts"].clone()).unwrap_or_default();
+    }
+    let holdings: Vec<imp::ProviderHolding> =
+        serde_json::from_value(holdings_body["holdings"].clone()).unwrap_or_default();
+
+    let mut guard = state.db.lock().unwrap();
+    let active = guard.as_mut().ok_or(no_database())?;
+
+    let report = imp::import_transactions(
+        &mut active.store,
+        "plaid-investments",
+        &req.item_id,
+        &accounts,
+        &transactions,
+    )
+    .map_err(|e| import_failed(e.to_string()))?;
+
+    // The holdings snapshot is dated the day it was read, not by anything in the
+    // payload: `/investments/holdings/get` answers "now", and each holding's own
+    // price date is the price's date rather than the position's.
+    let holdings_report = imp::import_holdings(
+        &mut active.store,
+        "plaid-investments",
+        &req.item_id,
+        window.1,
+        &holdings,
+        &accounts,
+    )
+    .map_err(|e| import_failed(e.to_string()))?;
+
+    // Recorded only after both imports succeeded. A window marked fetched before the
+    // rows it contained were dealt with is a window that never comes round again.
+    for plaid_account_id in &plaid_account_ids {
+        let _ = imp::record_fetch(
+            active.store.connection(),
+            &req.item_id,
+            plaid_account_id,
+            window.1,
+        );
+    }
+
+    Ok(Json(PlaidInvestmentsSyncResponse {
+        start_date: window.0.to_string(),
+        end_date: window.1.to_string(),
+        bought: report.bought,
+        sold: report.sold,
+        dividends: report.dividends,
+        interest: report.interest,
+        fees: report.fees,
+        cash_movements: report.cash_movements,
+        duplicates: report.duplicates,
+        held: report.held,
+        ignored_sheltered: report.ignored_sheltered,
+        securities_created: report.securities_created + holdings_report.securities_created,
+        snapshots_recorded: holdings_report.recorded,
+        flags: report.flags.iter().map(|f| f.message()).collect(),
+        values_set: holdings_report
+            .values_set
+            .iter()
+            .map(|(account, set)| {
+                format!(
+                    "{account}: {}{:.2} of value change posted",
+                    if set.change_cents < 0 { "-$" } else { "$" },
+                    set.change_cents.abs() as f64 / 100.0
+                )
+            })
+            .collect(),
+        unconfigured: holdings_report.skipped_unconfigured.clone(),
+        reconciliation_findings: holdings_report
+            .reconciliations
+            .iter()
+            .flat_map(|r| {
+                r.disagreements().into_iter().map(move |line| {
+                    format!(
+                        "{} in {}: books hold {} micro-shares at {} cents, the broker says {} \
+                         micro-shares at {}",
+                        line.ticker.as_deref().unwrap_or("an unknown security"),
+                        r.plaid_account_id,
+                        line.book_quantity,
+                        line.book_cost_cents,
+                        line.broker_quantity,
+                        match line.broker_cost_cents {
+                            Some(cents) => format!("{cents} cents"),
+                            None => "no basis it will state".to_string(),
+                        }
+                    )
+                })
+            })
+            .collect(),
+    }))
+}
+
+/// One POST to the proxy, with the api key when there is one.
+async fn post_to_proxy(
+    state: &Arc<SharedState>,
+    plaid_cfg: &PlaidProxyConfig,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value, (StatusCode, Json<ErrorResponse>)> {
+    let mut builder = state
+        .http_client
+        .post(format!("{}{}", plaid_cfg.proxy_url, path));
+    if let Some(ref key) = plaid_cfg.api_key {
+        builder = builder.bearer_auth(key);
+    }
+    let resp = builder
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| proxy_error(format!("Failed to contact proxy at {path}: {e}")))?;
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(proxy_error(format!("Proxy error from {path}: {text}")));
+    }
+    resp.json()
+        .await
+        .map_err(|e| proxy_error(format!("Parse error from {path}: {e}")))
+}
+
+fn no_database() -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            success: false,
+            error: "No database open".to_string(),
+        }),
+    )
+}
+
+fn import_failed(message: String) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ErrorResponse {
+            success: false,
+            error: format!("The investments import could not finish: {message}"),
+        }),
+    )
 }
 
 fn get_plaid_config(

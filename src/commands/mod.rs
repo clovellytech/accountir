@@ -11,6 +11,7 @@ pub mod fiscal_year_commands;
 pub mod import_commands;
 pub mod ingest_commands;
 pub mod investment_commands;
+pub mod investment_import;
 pub mod invoice_commands;
 pub mod partnership_commands;
 pub mod plaid_commands;

@@ -947,6 +947,151 @@ impl<'a> Projector<'a> {
             // now would be one nothing reads and nothing keeps honest.
             Event::RetirementContributionRecorded { .. }
             | Event::RetirementDistributionRecorded(_) => {}
+            // --- the investments importer (migration 050) ---
+            Event::InvestmentAccountConfigured(d) => {
+                // Every column of both treatments is written on every upsert, the
+                // unused side as NULL. Not tidiness: the CHECK constraint in
+                // migration 050 refuses a row that has both sets, so an account
+                // re-configured from taxable to sheltered would be rejected by the
+                // projector — which surfaces as an internal error on a correction
+                // somebody had every right to make — if the old columns were left
+                // behind.
+                let (securities, cash, dividends, interest, gain, fees, clearing, retirement) =
+                    match &d.accounts {
+                        crate::events::types::InvestmentPostingAccounts::Taxable(a) => (
+                            Some(a.securities_account_id.as_str()),
+                            Some(a.cash_account_id.as_str()),
+                            Some(a.dividend_income_account_id.as_str()),
+                            Some(a.interest_income_account_id.as_str()),
+                            Some(a.realized_gain_account_id.as_str()),
+                            Some(a.fee_expense_account_id.as_str()),
+                            a.transfer_clearing_account_id.as_deref(),
+                            None,
+                        ),
+                        crate::events::types::InvestmentPostingAccounts::Sheltered {
+                            retirement_account_id,
+                        } => (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            Some(retirement_account_id.as_str()),
+                        ),
+                    };
+                self.conn.execute(
+                    "INSERT INTO investment_account_config
+                        (item_id, plaid_account_id, treatment, plaid_subtype, subtype_recognised,
+                         securities_account_id, cash_account_id, dividend_income_account_id,
+                         interest_income_account_id, realized_gain_account_id,
+                         fee_expense_account_id, transfer_clearing_account_id,
+                         retirement_account_id, configured_at_event, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+                     ON CONFLICT(item_id, plaid_account_id) DO UPDATE SET
+                        treatment = excluded.treatment,
+                        plaid_subtype = excluded.plaid_subtype,
+                        subtype_recognised = excluded.subtype_recognised,
+                        securities_account_id = excluded.securities_account_id,
+                        cash_account_id = excluded.cash_account_id,
+                        dividend_income_account_id = excluded.dividend_income_account_id,
+                        interest_income_account_id = excluded.interest_income_account_id,
+                        realized_gain_account_id = excluded.realized_gain_account_id,
+                        fee_expense_account_id = excluded.fee_expense_account_id,
+                        transfer_clearing_account_id = excluded.transfer_clearing_account_id,
+                        retirement_account_id = excluded.retirement_account_id,
+                        updated_at_event = excluded.updated_at_event",
+                    params![
+                        d.item_id,
+                        d.plaid_account_id,
+                        d.accounts.treatment().as_str(),
+                        d.plaid_subtype,
+                        d.subtype_recognised as i64,
+                        securities,
+                        cash,
+                        dividends,
+                        interest,
+                        gain,
+                        fees,
+                        clearing,
+                        retirement,
+                        stored_event.id,
+                    ],
+                )?;
+            }
+            Event::PlaidSecurityLinked(d) => {
+                self.conn.execute(
+                    "INSERT INTO plaid_securities (plaid_security_id, security_id, linked_at_event)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(plaid_security_id) DO UPDATE SET
+                        security_id = excluded.security_id,
+                        linked_at_event = excluded.linked_at_event",
+                    params![d.plaid_security_id, d.security_id, stored_event.id],
+                )?;
+            }
+            Event::InvestmentActivityImported(d) => {
+                self.conn.execute(
+                    "INSERT INTO investment_imports
+                        (provider_transaction_id, item_id, plaid_account_id, outcome, entry_id,
+                         lot_id, sale_id, imported_at, imported_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime(\'now\'), ?8)
+                     ON CONFLICT(provider_transaction_id) DO NOTHING",
+                    params![
+                        d.provider_transaction_id,
+                        d.item_id,
+                        d.plaid_account_id,
+                        d.outcome.as_str(),
+                        d.entry_id,
+                        d.lot_id,
+                        d.sale_id,
+                        stored_event.id,
+                    ],
+                )?;
+            }
+            // A snapshot for a day replaces the day's previous one, lines and all.
+            // Deleted and re-inserted rather than merged, because a holding that has
+            // gone to zero and disappeared from the payload must disappear from the
+            // snapshot too — a merge would leave it there for ever, and the
+            // reconciliation would report a position nobody holds.
+            Event::HoldingsSnapshotRecorded(d) => {
+                self.conn.execute(
+                    "DELETE FROM investment_holdings_snapshots
+                      WHERE item_id = ?1 AND plaid_account_id = ?2 AND as_of = ?3",
+                    params![d.item_id, d.plaid_account_id, d.as_of.to_string()],
+                )?;
+                self.conn.execute(
+                    "INSERT INTO investment_holdings_snapshots
+                        (snapshot_id, item_id, plaid_account_id, as_of, recorded_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        d.snapshot_id,
+                        d.item_id,
+                        d.plaid_account_id,
+                        d.as_of.to_string(),
+                        stored_event.id,
+                    ],
+                )?;
+                for holding in &d.holdings {
+                    self.conn.execute(
+                        "INSERT INTO investment_holdings_snapshot_lines
+                            (snapshot_id, plaid_security_id, security_id, ticker, quantity,
+                             cost_basis_cents, value_cents, currency)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                         ON CONFLICT(snapshot_id, plaid_security_id) DO NOTHING",
+                        params![
+                            d.snapshot_id,
+                            holding.plaid_security_id,
+                            holding.security_id,
+                            holding.ticker,
+                            holding.quantity,
+                            holding.cost_basis_cents,
+                            holding.value_cents,
+                            holding.currency,
+                        ],
+                    )?;
+                }
+            }
             Event::UserAdded {
                 user_id,
                 username,
@@ -1582,6 +1727,19 @@ impl<'a> Projector<'a> {
              DELETE FROM invoices;
              DELETE FROM event_services;
              DELETE FROM plaid_imported_transactions;
+             -- The investments importer's four projections (migration 050).
+             -- Truncated like any other, and the dedup register among them: it is
+             -- derived from `InvestmentActivityImported` and replaying rebuilds it
+             -- exactly, so a rebuild does not lose the fence. The two local tables
+             -- migration 050 also creates -- `investment_staged_activity` and
+             -- `investment_fetch_state` -- are deliberately absent: one holds rows
+             -- somebody is still reviewing and the other how far this machine has
+             -- fetched, and neither is derived from the log.
+             DELETE FROM investment_holdings_snapshot_lines;
+             DELETE FROM investment_holdings_snapshots;
+             DELETE FROM investment_imports;
+             DELETE FROM plaid_securities;
+             DELETE FROM investment_account_config;
              DELETE FROM plaid_local_accounts;
              DELETE FROM plaid_items;
              DELETE FROM cleared_transactions;

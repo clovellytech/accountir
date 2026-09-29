@@ -508,7 +508,16 @@ pub struct Sold {
 /// rather than envelopes, because the local path stamps the operator and a future
 /// server path would stamp the authenticated actor, and shared code must not pick
 /// one.
-enum InvestmentStep {
+///
+/// `pub(crate)` along with the `build_*_in_txn` functions below, so that phase 4's
+/// importer (`investment_import`) appends a trade, its journal entry **and** its
+/// import record as one batch. That is not a convenience: an imported purchase
+/// whose import record did not land is re-imported on the next rolling fetch, with
+/// a freshly minted lot id that sails past the entry-reference fence, and the same
+/// purchase is then deducted twice on a Form 8949. Re-running these builders from
+/// the importer also means the importer cannot grow a second opinion about FIFO,
+/// about whether a lot can be consumed twice, or about a closed year.
+pub(crate) enum InvestmentStep {
     Append(Vec<Event>),
     Reject(InvestmentError),
 }
@@ -671,7 +680,7 @@ fn entry_id_of(events: &[StoredEvent]) -> Result<String, InvestmentError> {
 // Validation and event building, all of it inside the append transaction
 // ---------------------------------------------------------------------------
 
-fn build_define_security_in_txn(
+pub(crate) fn build_define_security_in_txn(
     tx: &rusqlite::Transaction<'_>,
     security_id: &str,
     security: &NewSecurity,
@@ -717,7 +726,7 @@ fn build_define_security_in_txn(
     )]))
 }
 
-fn build_buy_in_txn(
+pub(crate) fn build_buy_in_txn(
     tx: &rusqlite::Transaction<'_>,
     lot_id: &str,
     cmd: &BuySecurityCommand,
@@ -937,7 +946,7 @@ fn allocate_basis(remaining_basis_cents: i64, remaining_quantity: i64, quantity:
     (product / remaining_quantity as i128) as i64
 }
 
-fn build_sell_in_txn(
+pub(crate) fn build_sell_in_txn(
     tx: &rusqlite::Transaction<'_>,
     sale_id: &str,
     cmd: &SellSecurityCommand,
@@ -1056,7 +1065,7 @@ fn build_sell_in_txn(
     ]))
 }
 
-fn build_income_in_txn(
+pub(crate) fn build_income_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &RecordInvestmentIncomeCommand,
 ) -> Result<InvestmentStep, EventStoreError> {
@@ -1108,7 +1117,7 @@ fn build_income_in_txn(
     ]))
 }
 
-fn build_fee_in_txn(
+pub(crate) fn build_fee_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &ChargeInvestmentFeeCommand,
 ) -> Result<InvestmentStep, EventStoreError> {

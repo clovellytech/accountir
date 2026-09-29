@@ -20,14 +20,25 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
         [],
     )?;
 
-    // Get current version
-    let current_version: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    // WHICH versions have been applied — not how high they go.
+    //
+    // This used to gate on `MAX(version)`, and that is a silent data loss as soon as
+    // two branches number migrations independently. Concretely: `main` carried 047,
+    // 048 and 050 while `feature-personal-tax` carried 049. A database migrated on
+    // `main` is stamped 50, so when 049 arrived in the merge the old gate said
+    // "50 > 49, nothing to do" — and the documents and tax-statement tables were
+    // never created, with no error, on a database that looked fully migrated.
+    //
+    // A set closes that: a version is applied because it is recorded as applied. A
+    // database with no rows at all (one built by `init_schema`, or migrated by a
+    // runner that predates this table) is treated exactly as before — every version
+    // is attempted, and the "already exists" tolerance below absorbs the ones whose
+    // schema is already there.
+    let applied: std::collections::HashSet<i64> = {
+        let mut stmt = conn.prepare("SELECT version FROM schema_migrations")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.filter_map(Result::ok).collect()
+    };
 
     // Run migrations
     let migrations: Vec<(i64, &str)> = vec![
@@ -178,17 +189,19 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             include_str!("../../migrations/048_retirement_accounts.sql"),
         ),
         // Renumbered from 047 when this branch merged main, which had already
-        // claimed 047 and 048. It has to be 049 and not a later number with a gap:
-        // the runner gates on MAX(version), so a database that applied 050 would
-        // skip a 049 arriving in a later merge, permanently and silently.
+        // claimed 047 and 048.
         (
             49,
             include_str!("../../migrations/049_documents_and_tax_statements.sql"),
         ),
+        (
+            50,
+            include_str!("../../migrations/050_investment_imports.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
-        if version > current_version {
+        if !applied.contains(&version) {
             match conn.execute_batch(sql) {
                 Ok(()) => {}
                 Err(e) => {
@@ -903,7 +916,7 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             ON retirement_accounts(value_change_account_id);
 
         -- Attached documents (metadata only — the bytes are in the blob store),
-        -- recorded tax statements, and K-1 links (migration 047).
+        -- recorded tax statements, and K-1 links (migration 049).
         CREATE TABLE IF NOT EXISTS documents (
             document_id TEXT PRIMARY KEY,
             sha256 TEXT NOT NULL,
@@ -937,6 +950,119 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             partner_name TEXT NOT NULL,
             linked_at_event INTEGER REFERENCES events(id)
         );
+        -- The investments importer's registers (migration 050). Kept in step with
+        -- the migration for the reason the two blocks above are; see
+        -- 050_investment_imports.sql for which of these are projections of events
+        -- and which are machine-local, and why the split falls where it does.
+        CREATE TABLE IF NOT EXISTS investment_account_config (
+            item_id TEXT NOT NULL,
+            plaid_account_id TEXT NOT NULL,
+            treatment TEXT NOT NULL,
+            plaid_subtype TEXT,
+            subtype_recognised INTEGER NOT NULL DEFAULT 1,
+            securities_account_id TEXT,
+            cash_account_id TEXT,
+            dividend_income_account_id TEXT,
+            interest_income_account_id TEXT,
+            realized_gain_account_id TEXT,
+            fee_expense_account_id TEXT,
+            transfer_clearing_account_id TEXT,
+            retirement_account_id TEXT,
+            configured_at_event INTEGER REFERENCES events(id),
+            updated_at_event INTEGER REFERENCES events(id),
+            PRIMARY KEY (item_id, plaid_account_id),
+            CHECK (treatment IN ('taxable', 'sheltered')),
+            CHECK (
+                (treatment = 'taxable'
+                 AND securities_account_id IS NOT NULL
+                 AND cash_account_id IS NOT NULL
+                 AND dividend_income_account_id IS NOT NULL
+                 AND interest_income_account_id IS NOT NULL
+                 AND realized_gain_account_id IS NOT NULL
+                 AND fee_expense_account_id IS NOT NULL
+                 AND retirement_account_id IS NULL)
+                OR
+                (treatment = 'sheltered'
+                 AND retirement_account_id IS NOT NULL
+                 AND securities_account_id IS NULL
+                 AND cash_account_id IS NULL)
+            )
+        );
+
+        CREATE TABLE IF NOT EXISTS plaid_securities (
+            plaid_security_id TEXT PRIMARY KEY,
+            security_id TEXT NOT NULL,
+            linked_at_event INTEGER REFERENCES events(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_plaid_securities_security
+            ON plaid_securities(security_id);
+
+        CREATE TABLE IF NOT EXISTS investment_imports (
+            provider_transaction_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            plaid_account_id TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            entry_id TEXT NOT NULL,
+            lot_id TEXT,
+            sale_id TEXT,
+            imported_at TEXT NOT NULL DEFAULT (datetime('now')),
+            imported_at_event INTEGER REFERENCES events(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_investment_imports_account
+            ON investment_imports(item_id, plaid_account_id);
+
+        CREATE TABLE IF NOT EXISTS investment_holdings_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            plaid_account_id TEXT NOT NULL,
+            as_of TEXT NOT NULL,
+            recorded_at_event INTEGER REFERENCES events(id),
+            UNIQUE (item_id, plaid_account_id, as_of)
+        );
+
+        CREATE TABLE IF NOT EXISTS investment_holdings_snapshot_lines (
+            snapshot_id TEXT NOT NULL REFERENCES investment_holdings_snapshots(snapshot_id)
+                ON DELETE CASCADE,
+            plaid_security_id TEXT NOT NULL,
+            security_id TEXT,
+            ticker TEXT,
+            quantity INTEGER NOT NULL,
+            cost_basis_cents INTEGER,
+            value_cents INTEGER,
+            currency TEXT,
+            PRIMARY KEY (snapshot_id, plaid_security_id)
+        );
+
+        -- Machine-local: what this machine is still reviewing, and how far it has
+        -- fetched. Neither is derived from the log, and neither is truncated by a
+        -- rebuild.
+        CREATE TABLE IF NOT EXISTS investment_staged_activity (
+            id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            plaid_account_id TEXT NOT NULL,
+            provider_transaction_id TEXT NOT NULL UNIQUE,
+            reason TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            provider_type TEXT NOT NULL,
+            provider_subtype TEXT NOT NULL,
+            date TEXT NOT NULL,
+            name TEXT NOT NULL,
+            amount_cents INTEGER,
+            raw_payload TEXT NOT NULL,
+            staged_at TEXT NOT NULL DEFAULT (datetime('now')),
+            status TEXT NOT NULL DEFAULT 'pending'
+        );
+        CREATE INDEX IF NOT EXISTS idx_investment_staged_status
+            ON investment_staged_activity(status, date);
+
+        CREATE TABLE IF NOT EXISTS investment_fetch_state (
+            item_id TEXT NOT NULL,
+            plaid_account_id TEXT NOT NULL,
+            last_fetched_through TEXT NOT NULL,
+            last_fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (item_id, plaid_account_id)
+        );
+
         -- Local only, never replicated — see migration 023.
         -- No foreign key to `partners`, deliberately — see migration 025. This
         -- config outlives the projection it points at, and `rebuild` truncates
@@ -1400,6 +1526,252 @@ mod tests {
         run_migrations(&conn).unwrap();
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM retirement_accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "a re-run must not recreate the table empty");
+    }
+
+    /// The importer's registers (migration 050). Four projections and two
+    /// machine-local tables; see `050_investment_imports.sql` for which is which and
+    /// why.
+    const IMPORT_TABLES: [&str; 6] = [
+        "investment_account_config",
+        "plaid_securities",
+        "investment_imports",
+        "investment_holdings_snapshots",
+        "investment_holdings_snapshot_lines",
+        "investment_staged_activity",
+    ];
+
+    #[test]
+    fn init_schema_has_the_investment_import_registers() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        for table in IMPORT_TABLES {
+            assert!(has_table(&conn, table), "{table} is missing");
+        }
+        assert!(has_table(&conn, "investment_fetch_state"));
+
+        // A taxable configuration is all six accounts or it is not a configuration:
+        // one with no dividend account would import a dividend into nowhere, and the
+        // CHECK constraint is what stops a row like that existing at all.
+        let half = conn.execute(
+            "INSERT INTO investment_account_config
+               (item_id, plaid_account_id, treatment, securities_account_id, cash_account_id)
+             VALUES ('i1','pa1','taxable','1110','1100')",
+            [],
+        );
+        assert!(
+            half.is_err(),
+            "a half-configured taxable account must be refused"
+        );
+
+        conn.execute(
+            "INSERT INTO investment_account_config
+               (item_id, plaid_account_id, treatment, securities_account_id, cash_account_id,
+                dividend_income_account_id, interest_income_account_id,
+                realized_gain_account_id, fee_expense_account_id)
+             VALUES ('i1','pa1','taxable','1110','1100','4100','4110','4120','6000')",
+            [],
+        )
+        .expect("a fully configured taxable account is accepted");
+
+        // And the two kinds cannot be mixed: a row with both sets would mean two
+        // answers to whether anything in the account is taxable.
+        let both = conn.execute(
+            "INSERT INTO investment_account_config
+               (item_id, plaid_account_id, treatment, securities_account_id, cash_account_id,
+                dividend_income_account_id, interest_income_account_id,
+                realized_gain_account_id, fee_expense_account_id, retirement_account_id)
+             VALUES ('i1','pa2','taxable','1110','1100','4100','4110','4120','6000','1500')",
+            [],
+        );
+        assert!(
+            both.is_err(),
+            "a taxable row naming a retirement account must be refused"
+        );
+
+        conn.execute(
+            "INSERT INTO investment_account_config
+               (item_id, plaid_account_id, treatment, retirement_account_id)
+             VALUES ('i1','pa3','sheltered','1500')",
+            [],
+        )
+        .expect("a sheltered account is one ledger account and nothing else");
+
+        // One provider transaction is dealt with once, whichever table it landed in.
+        conn.execute(
+            "INSERT INTO investment_imports
+               (provider_transaction_id, item_id, plaid_account_id, outcome, entry_id)
+             VALUES ('tx1','i1','pa1','buy','e1')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO investment_imports
+               (provider_transaction_id, item_id, plaid_account_id, outcome, entry_id)
+             VALUES ('tx1','i1','pa1','buy','e2')",
+            [],
+        );
+        assert!(dup.is_err(), "one provider transaction is imported once");
+
+        conn.execute(
+            "INSERT INTO investment_staged_activity
+               (id, item_id, plaid_account_id, provider_transaction_id, reason, detail,
+                provider_type, provider_subtype, date, name, raw_payload)
+             VALUES ('s1','i1','pa1','tx2','corporate_action','split','transfer','split',
+                     '2026-05-20','SPLIT','{}')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO investment_staged_activity
+               (id, item_id, plaid_account_id, provider_transaction_id, reason, detail,
+                provider_type, provider_subtype, date, name, raw_payload)
+             VALUES ('s2','i1','pa1','tx2','corporate_action','split','transfer','split',
+                     '2026-05-20','SPLIT','{}')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "the rolling re-fetch must not grow the review list by a copy of itself"
+        );
+
+        // One snapshot per account per day: the later read of the same day is the
+        // better one, and two would double every position in the reconciliation.
+        conn.execute(
+            "INSERT INTO investment_holdings_snapshots
+               (snapshot_id, item_id, plaid_account_id, as_of)
+             VALUES ('sn1','i1','pa1','2026-03-31')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO investment_holdings_snapshots
+               (snapshot_id, item_id, plaid_account_id, as_of)
+             VALUES ('sn2','i1','pa1','2026-03-31')",
+            [],
+        );
+        assert!(
+            dup.is_err(),
+            "two snapshots for one account on one day must be refused"
+        );
+    }
+
+    /// And a database that predates it gets it too, by the route the others here use:
+    /// the pre-050 shape, stamped at version 49, then migrated.
+    #[test]
+    /// A version below the high-water mark still gets applied.
+    ///
+    /// The failure this pins is the one that actually happened: `main` numbered
+    /// 047, 048 and 050 while another branch numbered 049, so a database migrated on
+    /// `main` was stamped 50, and the old `MAX(version)` gate then skipped 049
+    /// forever — silently, on a database that reported itself fully migrated. Any
+    /// two branches numbering migrations independently reproduce it.
+    #[test]
+    fn a_migration_below_the_high_water_mark_is_still_applied() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        // A database that has been through the runner, then had one migration's
+        // tables removed and its stamp erased — exactly the shape a merge produces.
+        conn.execute_batch(
+            "DROP TABLE investment_lots;
+             DROP TABLE investment_sale_lots;
+             DROP TABLE investment_sales;
+             DROP TABLE securities;
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             DELETE FROM schema_migrations;",
+        )
+        .unwrap();
+        // Everything except 47 is recorded, including numbers ABOVE it.
+        for v in 1..=50 {
+            if v != 47 {
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                    [v],
+                )
+                .unwrap();
+            }
+        }
+
+        run_migrations(&conn).unwrap();
+
+        for table in [
+            "securities",
+            "investment_lots",
+            "investment_sales",
+            "investment_sale_lots",
+        ] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table} was skipped because 50 > 47");
+        }
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 47",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1, "and it is recorded as applied afterwards");
+    }
+
+    fn migration_050_adds_the_investment_import_registers_to_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE investment_holdings_snapshot_lines;
+             DROP TABLE investment_holdings_snapshots;
+             DROP TABLE investment_imports;
+             DROP TABLE plaid_securities;
+             DROP TABLE investment_account_config;
+             DROP TABLE investment_staged_activity;
+             DROP TABLE investment_fetch_state;
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO schema_migrations (version) VALUES (49);",
+        )
+        .unwrap();
+        for table in IMPORT_TABLES {
+            assert!(!has_table(&conn, table), "the fixture still has {table}");
+        }
+
+        run_migrations(&conn).unwrap();
+        for table in IMPORT_TABLES {
+            assert!(has_table(&conn, table), "{table} was not created");
+        }
+        assert!(has_table(&conn, "investment_fetch_state"));
+
+        conn.execute(
+            "INSERT INTO investment_fetch_state
+               (item_id, plaid_account_id, last_fetched_through)
+             VALUES ('i1','pa1','2026-09-20')",
+            [],
+        )
+        .expect("the fetch state records how far this machine has got");
+        conn.execute(
+            "INSERT INTO plaid_securities (plaid_security_id, security_id)
+             VALUES ('sec-aapl','s1')",
+            [],
+        )
+        .expect("the security mapping is what stops a ticker change forking a holding");
+
+        // And running it again changes nothing — the production path is init_schema
+        // then run_migrations, repeatedly.
+        run_migrations(&conn).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM investment_fetch_state", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(rows, 1, "a re-run must not recreate the table empty");
     }

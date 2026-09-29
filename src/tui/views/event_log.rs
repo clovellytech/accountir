@@ -463,6 +463,44 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             d.taxable_cents as f64 / 100.0,
             d.withheld_cents as f64 / 100.0
         ),
+        // The investments importer. What each of these says is a *decision*, so
+        // each names the thing decided and what was decided about it — a log entry
+        // reading "imported" without saying what it became is one nobody can check.
+        Event::InvestmentAccountConfigured(d) => format!(
+            "Brokerage account {} imports as {}{}",
+            widgets::truncate(&d.plaid_account_id, 8),
+            d.accounts.treatment().label(),
+            if d.subtype_recognised {
+                String::new()
+            } else {
+                format!(
+                    " — assumed, Plaid calls it {:?} and needs confirming",
+                    d.plaid_subtype.as_deref().unwrap_or("nothing")
+                )
+            }
+        ),
+        Event::PlaidSecurityLinked(d) => format!(
+            "Plaid security {} is security {}",
+            widgets::truncate(&d.plaid_security_id, 10),
+            widgets::truncate(&d.security_id, 8)
+        ),
+        Event::InvestmentActivityImported(d) => format!(
+            "Imported {} from {} as a {}, entry {}",
+            widgets::truncate(&d.provider_transaction_id, 12),
+            widgets::truncate(&d.plaid_account_id, 8),
+            d.outcome.as_str(),
+            widgets::truncate(&d.entry_id, 8)
+        ),
+        Event::HoldingsSnapshotRecorded(d) => format!(
+            "Holdings of {} as of {}: {} position(s){}",
+            widgets::truncate(&d.plaid_account_id, 8),
+            d.as_of,
+            d.holdings.len(),
+            match d.total_value_cents() {
+                Some(total) => format!(", worth ${:.2}", total as f64 / 100.0),
+                None => String::new(),
+            }
+        ),
         Event::BusinessTypeSet { business_type } => {
             let t = crate::domain::BusinessType::parse(business_type)
                 .map(|t| t.label())
