@@ -196,6 +196,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             50,
             include_str!("../../migrations/050_investment_imports.sql"),
         ),
+        (
+            51,
+            include_str!("../../migrations/051_investment_subaccounts_and_review.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -923,10 +927,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             treatment TEXT NOT NULL,
             plaid_subtype TEXT,
             subtype_recognised INTEGER NOT NULL DEFAULT 1,
+            -- The stocks slot, under the name every configuration before
+            -- migration 051 wrote it under; see that migration for why it is not
+            -- renamed.
             securities_account_id TEXT,
+            mutual_funds_account_id TEXT,
+            other_securities_account_id TEXT,
             cash_account_id TEXT,
             dividend_income_account_id TEXT,
             interest_income_account_id TEXT,
+            tax_exempt_interest_account_id TEXT,
+            capital_gain_distribution_account_id TEXT,
             realized_gain_account_id TEXT,
             fee_expense_account_id TEXT,
             transfer_clearing_account_id TEXT,
@@ -1013,7 +1024,15 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             amount_cents INTEGER,
             raw_payload TEXT NOT NULL,
             staged_at TEXT NOT NULL DEFAULT (datetime('now')),
-            status TEXT NOT NULL DEFAULT 'pending'
+            -- 'pending', 'resolved' or 'dismissed' (migration 051). A dismissal
+            -- is its own status rather than a kind of resolution, because
+            -- "nothing is missing from these books" is the question this list
+            -- answers and the two answers are opposite.
+            status TEXT NOT NULL DEFAULT 'pending',
+            resolution TEXT,
+            resolution_note TEXT,
+            resolution_entry_id TEXT,
+            resolved_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_investment_staged_status
             ON investment_staged_activity(status, date);
@@ -1620,9 +1639,6 @@ mod tests {
         );
     }
 
-    /// And a database that predates it gets it too, by the route the others here use:
-    /// the pre-050 shape, stamped at version 49, then migrated.
-    #[test]
     /// A version below the high-water mark still gets applied.
     ///
     /// The failure this pins is the one that actually happened: `main` numbered
@@ -1686,6 +1702,9 @@ mod tests {
         assert_eq!(stamped, 1, "and it is recorded as applied afterwards");
     }
 
+    /// And a database that predates it gets it too, by the route the others here use:
+    /// the pre-050 shape, stamped at version 49, then migrated.
+    #[test]
     fn migration_050_adds_the_investment_import_registers_to_an_existing_database() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
