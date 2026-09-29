@@ -807,6 +807,67 @@ impl<'a> Projector<'a> {
             // with it; a table added now would be one nothing reads and nothing
             // keeps honest.
             Event::InvestmentIncomeReceived { .. } | Event::InvestmentFeeCharged { .. } => {}
+            // --- the sheltered-account register (migration 048) ---
+            Event::RetirementAccountRegistered {
+                account_id,
+                institution,
+                kind,
+                value_change_account_id,
+            } => {
+                // `DO UPDATE` rather than `DO NOTHING`, so a re-registration that
+                // the command allowed (a corrected institution, a kind entered
+                // wrong) lands. The last value is left alone by name: it belongs
+                // to `RetirementValueSet`, and a registration must not silently
+                // erase the statement history.
+                self.conn.execute(
+                    "INSERT INTO retirement_accounts
+                        (account_id, institution, kind, value_change_account_id,
+                         registered_at_event, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                     ON CONFLICT(account_id) DO UPDATE SET
+                        institution = excluded.institution,
+                        kind = excluded.kind,
+                        value_change_account_id = excluded.value_change_account_id,
+                        updated_at_event = excluded.updated_at_event",
+                    params![
+                        account_id,
+                        institution,
+                        kind.as_str(),
+                        value_change_account_id,
+                        stored_event.id,
+                    ],
+                )?;
+            }
+            // The register records what the statement said; the entry appended
+            // beside this event is what moved the books. Taken from the event in
+            // log order without comparing dates: the command refuses a value
+            // dated before the last one, so the log is already in order, and a
+            // projection that second-guessed it would disagree with the entries
+            // that were actually posted.
+            Event::RetirementValueSet {
+                account_id,
+                as_of,
+                value_cents,
+            } => {
+                self.conn.execute(
+                    "UPDATE retirement_accounts
+                        SET last_value_cents = ?2,
+                            last_value_as_of = ?3,
+                            updated_at_event = ?4
+                      WHERE account_id = ?1",
+                    params![account_id, value_cents, as_of.to_string(), stored_event.id],
+                )?;
+            }
+            // Deliberately no projection, for the reason the investment income
+            // events give above: what moved is in the ledger, from the entry in
+            // the same append batch, and a second copy is how the two come to
+            // disagree. The one fact the ledger cannot hold is a distribution's
+            // taxable amount, and that is on the event —
+            // `retirement_commands::list_distributions` reads it back out of the
+            // log, which is what a 1099-R will be built from in phase 6. A table
+            // now would be one nothing reads and nothing keeps honest.
+            Event::RetirementContributionRecorded { .. }
+            | Event::RetirementDistributionRecorded(_) => {}
             Event::UserAdded {
                 user_id,
                 username,
@@ -1501,7 +1562,14 @@ impl<'a> Projector<'a> {
              DELETE FROM investment_sale_lots;
              DELETE FROM investment_sales;
              DELETE FROM investment_lots;
-             DELETE FROM securities;",
+             DELETE FROM securities;
+             -- The sheltered-account register (migration 048). A projection like
+             -- the rest, and the stakes are specific: this table is what decides
+             -- that the value-change account is off every tax line, so a row that
+             -- survived a replay the log does not justify would be an exclusion
+             -- nobody can account for — and, worse, a row the log *does* justify
+             -- that failed to come back would put a non-taxable gain on a return.
+             DELETE FROM retirement_accounts;",
         )?;
 
         // Replay all events

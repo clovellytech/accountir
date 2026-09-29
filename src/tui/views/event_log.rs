@@ -422,6 +422,47 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             "Investment fee of ${:.2} charged on {charged_on}",
             *amount_cents as f64 / 100.0
         ),
+        // The sheltered-account register. No quantities here, because nothing
+        // inside a sheltered account is recorded — see `retirement_commands`.
+        Event::RetirementAccountRegistered {
+            account_id,
+            institution,
+            kind,
+            ..
+        } => format!(
+            "Retirement account {} — {institution}, {}",
+            widgets::truncate(account_id, 8),
+            kind.label()
+        ),
+        Event::RetirementValueSet {
+            account_id,
+            as_of,
+            value_cents,
+        } => format!(
+            "Retirement account {} worth ${:.2} as of {as_of}",
+            widgets::truncate(account_id, 8),
+            *value_cents as f64 / 100.0
+        ),
+        Event::RetirementContributionRecorded {
+            account_id,
+            amount_cents,
+            on,
+            ..
+        } => format!(
+            "Contributed ${:.2} to retirement account {} on {on}",
+            *amount_cents as f64 / 100.0,
+            widgets::truncate(account_id, 8)
+        ),
+        // The taxable amount is named because it is the one figure here that no
+        // journal entry holds, and the one a 1099-R is filed on.
+        Event::RetirementDistributionRecorded(d) => format!(
+            "Distributed ${:.2} from retirement account {} on {} — ${:.2} taxable, ${:.2} withheld",
+            d.gross_cents as f64 / 100.0,
+            widgets::truncate(&d.account_id, 8),
+            d.on,
+            d.taxable_cents as f64 / 100.0,
+            d.withheld_cents as f64 / 100.0
+        ),
         Event::BusinessTypeSet { business_type } => {
             let t = crate::domain::BusinessType::parse(business_type)
                 .map(|t| t.label())

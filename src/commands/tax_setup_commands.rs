@@ -39,6 +39,15 @@ pub use crate::commands::partnership_commands::PartnershipError as TaxSetupError
 /// been filed on the old assignment. Making the caller name the year means the
 /// question "which years does this change?" is answered where the change is
 /// made rather than discovered afterwards.
+///
+/// # What it refuses
+///
+/// A retirement value-change account, for any line but
+/// [`crate::tax::lines::OFF_RETURN`]. Growth inside a sheltered account is not
+/// income to anybody (INVESTMENTS-SPEC.md §8), so putting it on a line is tax paid
+/// on exempt money, on a signed return. Refused here so the person who tried gets
+/// told why, at the moment they tried — `load_effective_mapping` is the fence that
+/// actually holds, and it holds silently, which is the wrong way to learn this.
 pub fn set_account_line(
     store: &mut EventStore,
     user_id: &str,
@@ -46,6 +55,19 @@ pub fn set_account_line(
     line_key: &str,
     effective_from: i32,
 ) -> Result<StoredEvent, TaxSetupError> {
+    if line_key != crate::tax::lines::OFF_RETURN
+        && crate::commands::retirement_commands::is_value_change_account(
+            store.connection(),
+            account_id,
+        )
+    {
+        return Err(TaxSetupError::InvalidData(format!(
+            "account {account_id} is where a sheltered account's value change is recorded, and \
+             nothing in a sheltered account is taxable — it cannot report on {line_key}. Growth \
+             in a 401(k) or an IRA is not income to anybody, and a return that reported it would \
+             pay tax on money the statute exempts."
+        )));
+    }
     append(
         store,
         user_id,

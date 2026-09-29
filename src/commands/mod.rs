@@ -15,6 +15,7 @@ pub mod partnership_commands;
 pub mod plaid_commands;
 pub mod reconciliation_commands;
 pub mod recurring_transfers;
+pub mod retirement_commands;
 pub mod revert_commands;
 pub mod sawyer_commands;
 pub mod share_period_commands;

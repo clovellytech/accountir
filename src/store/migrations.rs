@@ -173,6 +173,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             include_str!("../../migrations/046_illinois_tax_addbacks.sql"),
         ),
         (47, include_str!("../../migrations/047_investments.sql")),
+        (
+            48,
+            include_str!("../../migrations/048_retirement_accounts.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -872,6 +876,24 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             PRIMARY KEY (sale_id, lot_id)
         );
 
+        -- The sheltered-account register (migration 048). Kept in step with the
+        -- migration for the same reason the brokerage tables above are; see
+        -- 048_retirement_accounts.sql for why there are no lots in here, why
+        -- `kind` is closed where `securities.kind` is not, and why the last value
+        -- is nullable rather than zero.
+        CREATE TABLE IF NOT EXISTS retirement_accounts (
+            account_id TEXT PRIMARY KEY,
+            institution TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            value_change_account_id TEXT NOT NULL,
+            last_value_cents INTEGER,
+            last_value_as_of TEXT,
+            registered_at_event INTEGER REFERENCES events(id),
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_retirement_accounts_value_change
+            ON retirement_accounts(value_change_account_id);
+
         -- Local only, never replicated — see migration 023.
         -- No foreign key to `partners`, deliberately — see migration 025. This
         -- config outlives the projection it points at, and `rebuild` truncates
@@ -1245,6 +1267,98 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM investment_lots", [], |r| r.get(0))
             .unwrap();
         assert_eq!(lots, 1, "a re-run must not recreate the table empty");
+    }
+
+    /// A database built from scratch has the sheltered-account register
+    /// (migration 048), for the reason the 047 test above gives: `init_schema` and
+    /// the migration drifting apart is how a fresh ledger ends up missing a table
+    /// the code writes to.
+    #[test]
+    fn init_schema_has_the_retirement_register() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(has_table(&conn, "retirement_accounts"));
+
+        // One ledger account is one retirement account, enforced by the schema
+        // and not only by the command that checks it: two rows would mean two
+        // kinds, and a distribution would be taxable or not depending on which
+        // was read.
+        conn.execute(
+            "INSERT INTO retirement_accounts
+               (account_id, institution, kind, value_change_account_id)
+             VALUES ('1500','Fidelity ••5678','traditional','4130')",
+            [],
+        )
+        .unwrap();
+        let dup = conn.execute(
+            "INSERT INTO retirement_accounts
+               (account_id, institution, kind, value_change_account_id)
+             VALUES ('1500','Fidelity ••5678','roth','4130')",
+            [],
+        );
+        assert!(dup.is_err(), "a second row for one account must be refused");
+
+        // Sharing one value-change account is normal, not an error: spec §2b's
+        // chart has one for the whole book.
+        conn.execute(
+            "INSERT INTO retirement_accounts
+               (account_id, institution, kind, value_change_account_id)
+             VALUES ('1510','Vanguard ••9012','roth','4130')",
+            [],
+        )
+        .expect("two sheltered accounts may share one value-change account");
+
+        // And a freshly registered account has no last value, which is distinct
+        // from a last value of zero.
+        let unset: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM retirement_accounts
+                  WHERE last_value_cents IS NULL AND last_value_as_of IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unset, 2);
+    }
+
+    /// And a database that predates it gets it too, by the route the others here
+    /// use: the pre-048 shape, stamped at version 47, then migrated.
+    #[test]
+    fn migration_048_adds_the_retirement_register_to_an_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE retirement_accounts;
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO schema_migrations (version) VALUES (47);",
+        )
+        .unwrap();
+        assert!(
+            !has_table(&conn, "retirement_accounts"),
+            "the fixture still has the table"
+        );
+
+        run_migrations(&conn).unwrap();
+        assert!(has_table(&conn, "retirement_accounts"));
+        conn.execute(
+            "INSERT INTO retirement_accounts
+               (account_id, institution, kind, value_change_account_id,
+                last_value_cents, last_value_as_of)
+             VALUES ('1500','Fidelity ••5678','traditional','4130',10000000,'2026-01-31')",
+            [],
+        )
+        .expect("the register accepts an account with a statement value");
+
+        // And running it again changes nothing — the production path is
+        // init_schema then run_migrations, repeatedly.
+        run_migrations(&conn).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM retirement_accounts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "a re-run must not recreate the table empty");
     }
 }
 #[cfg(test)]

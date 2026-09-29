@@ -427,6 +427,104 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                 ));
             }
         }
+        // --- the sheltered-account register (migration 048) ---
+        //
+        // Shape only, as everywhere in this function. Whether the value series
+        // runs forwards and whether the account is on the register are questions
+        // about ledger state, answered under the write lock in
+        // `retirement_commands`.
+        Event::RetirementAccountRegistered {
+            account_id,
+            institution,
+            kind: _,
+            value_change_account_id,
+        } => {
+            validate_non_empty(account_id, "account_id")?;
+            validate_non_empty(institution, "institution")?;
+            validate_non_empty(value_change_account_id, "value_change_account_id")?;
+            // The retirement account and the value-change account being the same
+            // account would make every value update a posting to itself: an entry
+            // of a debit and an equal credit to one account, which balances, posts
+            // nothing, and leaves the balance sheet silently short of the whole
+            // account's growth.
+            if account_id == value_change_account_id {
+                return Err(ValidationError::InvalidValue(
+                    "the retirement account and its value-change account cannot be the same \
+                     account: every value update would post to itself and change nothing"
+                        .to_string(),
+                ));
+            }
+        }
+        Event::RetirementValueSet {
+            account_id,
+            as_of: _,
+            value_cents,
+        } => {
+            validate_non_empty(account_id, "account_id")?;
+            // Zero is allowed — an account really can be emptied — but negative is
+            // not: nothing is worth less than nothing, and a negative value here
+            // posts a loss that never happened.
+            if *value_cents < 0 {
+                return Err(ValidationError::InvalidValue(format!(
+                    "a retirement account cannot be worth {value_cents} cents"
+                )));
+            }
+        }
+        Event::RetirementContributionRecorded {
+            account_id,
+            funding_account_id,
+            amount_cents,
+            on: _,
+        } => {
+            validate_non_empty(account_id, "account_id")?;
+            validate_non_empty(funding_account_id, "funding_account_id")?;
+            if *amount_cents <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "a contribution of nothing is not a contribution; money coming back out is a \
+                     distribution"
+                        .to_string(),
+                ));
+            }
+            if account_id == funding_account_id {
+                return Err(ValidationError::InvalidValue(
+                    "a contribution from an account to itself moves no money".to_string(),
+                ));
+            }
+        }
+        Event::RetirementDistributionRecorded(d) => {
+            validate_non_empty(&d.account_id, "account_id")?;
+            validate_non_empty(&d.receiving_account_id, "receiving_account_id")?;
+            validate_non_empty(&d.withheld_account_id, "withheld_account_id")?;
+            if d.gross_cents <= 0 {
+                return Err(ValidationError::InvalidValue(
+                    "a distribution of nothing is not a distribution".to_string(),
+                ));
+            }
+            if d.withheld_cents < 0 {
+                return Err(ValidationError::InvalidValue(
+                    "withholding is an amount, not a direction".to_string(),
+                ));
+            }
+            // Withholding comes out of the distribution, so it cannot exceed it.
+            // Equal is legitimate — a distribution taken entirely to cover tax,
+            // which happens with a Roth conversion — and leaves the receiving
+            // account with a zero line, which is why the entry is built from
+            // signed lines rather than from a net that might be zero.
+            if d.withheld_cents > d.gross_cents {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{} cents withheld out of a distribution of {} cents",
+                    d.withheld_cents, d.gross_cents
+                )));
+            }
+            // Box 2a is a part of box 1. More than the gross would be income the
+            // owner never received; less is ordinary (a Roth, or after-tax basis).
+            if d.taxable_cents < 0 || d.taxable_cents > d.gross_cents {
+                return Err(ValidationError::InvalidValue(format!(
+                    "a taxable amount of {} cents does not fit inside a distribution of {} cents",
+                    d.taxable_cents, d.gross_cents
+                )));
+            }
+        }
         // --- sole proprietorships (migration 031) ---
         Event::BusinessTypeSet { business_type } => {
             // Checked against the catalogue rather than for emptiness: an
@@ -487,7 +585,20 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             // replay onto every member's machine.
             // Both catalogues, because one mapping table serves both returns
             // — see `tax::any_line_def`.
-            if crate::tax::any_line_def(line_key).is_none() {
+            //
+            // `OFF_RETURN` is the exception, and it belongs here rather than in
+            // either catalogue: it is not a line, it is the statement that this
+            // account is deliberately on none. Every reader already honours it
+            // (`sum_by_line`, `schedule_l`, `il1065`) and until now nothing could
+            // write it, so "deliberately off the return" was a state the code
+            // could read and no command could reach. Phase 2 of
+            // INVESTMENTS-SPEC.md is the first writer: registering a sheltered
+            // account puts its value-change account off the return explicitly,
+            // which is louder than an absence and — unlike an absence — draws no
+            // "this account has a balance and no line" warning every year.
+            if line_key != crate::tax::lines::OFF_RETURN
+                && crate::tax::any_line_def(line_key).is_none()
+            {
                 return Err(ValidationError::InvalidValue(format!(
                     "no Form 1065 or Schedule C line has key {line_key:?}"
                 )));

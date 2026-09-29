@@ -1165,7 +1165,12 @@ fn build_fee_in_txn(
 /// above computes its credit side from figures it derived, and an entry that does
 /// not balance means one of those derivations is wrong. Refusing it is how that
 /// never reaches the books.
-fn entry_or_reject(
+///
+/// `pub(crate)` so `retirement_commands` (phase 2) uses this very function rather
+/// than its own copy. There is exactly one set of fences an investment posting has
+/// to clear, and a second implementation of them is a second place for the
+/// closed-year check to be left out.
+pub(crate) fn entry_or_reject(
     tx: &rusqlite::Transaction<'_>,
     date: NaiveDate,
     memo: String,

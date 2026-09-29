@@ -296,6 +296,113 @@ impl InvestmentIncomeKind {
     }
 }
 
+/// What kind of sheltered account this is, which is the one thing about it that
+/// changes what a distribution out of it reports.
+///
+/// A **closed** enum, unlike [`SecurityDefinedData::kind`], and the difference is
+/// where the vocabulary comes from. A security's type is whatever a broker calls
+/// it, and a closed set there means a type nobody anticipated cannot be recorded
+/// at all. How a distribution is taxed is decided by the statute instead, which
+/// knows pre-tax money, after-tax money, and the handful of purpose-built
+/// accounts that are neither — so the set is closed and a fourth answer is not
+/// possible.
+///
+/// The Plaid subtypes of spec §2b map onto it: `401k`, `403b`, `ira`, `sep ira`
+/// and `simple ira` are [`Traditional`](RetirementKind::Traditional); `roth` and
+/// `roth 401k` are [`Roth`](RetirementKind::Roth); `529` and `hsa` are
+/// [`Other`](RetirementKind::Other), because whether a distribution out of one of
+/// those is taxable turns on what the money was *spent on* — a fact no ledger
+/// holds — so the register declines to guess and makes the caller state the
+/// taxable amount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetirementKind {
+    /// Pre-tax money: the whole distribution is ordinary income unless the owner
+    /// has after-tax basis in it (Form 8606), which the caller states.
+    Traditional,
+    /// After-tax money: a qualified distribution is not income at all.
+    Roth,
+    /// A 529 or an HSA — sheltered, but taxed on what the money was used for.
+    Other,
+}
+
+impl RetirementKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RetirementKind::Traditional => "traditional",
+            RetirementKind::Roth => "roth",
+            RetirementKind::Other => "other",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "traditional" => Some(RetirementKind::Traditional),
+            "roth" => Some(RetirementKind::Roth),
+            "other" => Some(RetirementKind::Other),
+            _ => None,
+        }
+    }
+
+    /// What a person reads.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RetirementKind::Traditional => "Traditional (pre-tax)",
+            RetirementKind::Roth => "Roth (after-tax)",
+            RetirementKind::Other => "Other sheltered (529, HSA)",
+        }
+    }
+}
+
+/// A distribution out of a sheltered account, whole. Boxed like
+/// [`SecuritySoldData`]: four account ids and three amounts inline would widen
+/// every `Event` the system moves.
+///
+/// # Why there is no income account on it
+///
+/// Because the distribution posts no income, and the reasoning is worth having
+/// written down where the next person to look will find it. The account is
+/// carried at **value** (spec §2b), so every dollar of growth in it was already
+/// recognised as `Income:Investments:Retirement value change` when the value was
+/// set, and every dollar of contribution was already recognised as the transfer
+/// it was. By the time the money comes out, the books have accounted for all of
+/// it. A distribution therefore only changes which asset holds it: out of the
+/// retirement account, into a bank account and into the prepaid tax the payer
+/// withheld. Crediting an income account as well would put the same dollar on the
+/// income statement twice.
+///
+/// That is exactly the opposite of a taxable sale, which *does* post income — and
+/// the difference is the carrying basis, not a difference of opinion. A taxable
+/// holding is carried at cost, so the part of the proceeds above cost has never
+/// been recognised and a realized gain is real income arriving. A sheltered
+/// account is carried at value, so there is nothing left to recognise.
+///
+/// The taxable figure a 1099-R reports is therefore not a posting; it is a fact
+/// about the distribution, and it is carried here — exactly as
+/// [`SecuritySoldData`] carries the lots a sale consumed — so that phase 6 can
+/// produce the form years later from the log rather than from a rule that may
+/// have changed since.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetirementDistributionData {
+    /// The sheltered account the money came out of.
+    pub account_id: String,
+    /// Where the net landed — a bank account, usually.
+    pub receiving_account_id: String,
+    /// Box 1 of the 1099-R: everything that left the retirement account.
+    pub gross_cents: i64,
+    /// Box 4: income tax the payer withheld and sent to the Treasury.
+    pub withheld_cents: i64,
+    /// A **prepaid-tax asset** account, not an expense. The money is paid toward
+    /// a tax bill that is not settled yet — it comes back as a refund or reduces
+    /// what is owed in April — and expensing it would both overstate expenses and
+    /// lose track of a payment already made.
+    pub withheld_account_id: String,
+    /// Box 2a: how much of the gross is taxable income to the owner. Recorded,
+    /// never posted — see the type docs. Zero for a qualified Roth distribution.
+    pub taxable_cents: i64,
+    pub on: NaiveDate,
+}
+
 /// Source of a journal entry
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -839,6 +946,69 @@ pub enum Event {
         security_id: Option<String>,
     },
 
+    // --- the sheltered-account register (migration 048) ---
+    //
+    // INVESTMENTS-SPEC.md phase 2. One ledger account per sheltered account,
+    // carried at value, and nothing inside it recorded at all — because nothing
+    // inside it is taxable, so lot accounting there answers no question (spec
+    // §2b).
+    //
+    // **Employer plans funded through payroll are out of scope.** A salary
+    // deferral reduces taxable wages and a match is not income, and payroll
+    // already owns both. These events are for money the owner moves and for what
+    // a statement says the account is worth; a deferral that arrived through
+    // payroll must not also arrive through here, or the contribution is counted
+    // twice.
+    /// A ledger account becomes a sheltered account on the register.
+    ///
+    /// Posts nothing — it says what an account *is*, and the money in it arrived
+    /// however it arrived. It does write one other thing, in the same append
+    /// batch: a `TaxLineMappingSet` putting the value-change account on
+    /// `tax::lines::OFF_RETURN`, so the account is excluded from the return from
+    /// the moment it exists rather than when somebody remembers.
+    RetirementAccountRegistered {
+        /// The ledger account carried at value. One account is one retirement
+        /// account; registering the same one twice is refused.
+        account_id: String,
+        /// "Fidelity ••5678" — a label, so the register reads beside the chart.
+        institution: String,
+        kind: RetirementKind,
+        /// `Income:Investments:Retirement value change`. Shared across accounts is
+        /// normal: spec §2b's chart has one for the whole book.
+        value_change_account_id: String,
+    },
+    /// What a statement says the account is worth, as of a date.
+    ///
+    /// The entry that follows posts the **difference** between this value and what
+    /// the books already say the account held on that date — not the value itself.
+    /// Posting the value would double the account every period. The difference is
+    /// the growth or the shrinkage, and it goes to the value-change account.
+    ///
+    /// A value equal to the book value posts no entry at all. A statement that
+    /// confirms nothing changed is not a journal entry, and an entry of zero is a
+    /// line in the register somebody has to read past forever.
+    RetirementValueSet {
+        account_id: String,
+        as_of: NaiveDate,
+        /// What it is worth. Never negative: an account cannot be worth less than
+        /// nothing, and a negative here would be a parse error upstream posting a
+        /// fictional loss.
+        value_cents: i64,
+    },
+    /// Money going in: a plain transfer from the funding account.
+    ///
+    /// Out of scope for payroll deferrals — see the note above this group.
+    RetirementContributionRecorded {
+        account_id: String,
+        /// The bank account the money came from.
+        funding_account_id: String,
+        amount_cents: i64,
+        on: NaiveDate,
+    },
+    /// Money coming out, with tax withheld. See [`RetirementDistributionData`],
+    /// which explains at length why this posts no income.
+    RetirementDistributionRecorded(Box<RetirementDistributionData>),
+
     UserAdded {
         user_id: String,
         username: String,
@@ -1165,6 +1335,10 @@ impl Event {
             Event::SecuritySold(_) => "security_sold",
             Event::InvestmentIncomeReceived { .. } => "investment_income_received",
             Event::InvestmentFeeCharged { .. } => "investment_fee_charged",
+            Event::RetirementAccountRegistered { .. } => "retirement_account_registered",
+            Event::RetirementValueSet { .. } => "retirement_value_set",
+            Event::RetirementContributionRecorded { .. } => "retirement_contribution_recorded",
+            Event::RetirementDistributionRecorded(_) => "retirement_distribution_recorded",
             Event::BusinessTypeSet { .. } => "business_type_set",
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
             Event::ScheduleCAnswerSet { .. } => "schedule_c_answer_set",
@@ -1256,6 +1430,13 @@ impl Event {
             Event::SecuritySold(d) => Some(&d.security_id),
             Event::InvestmentIncomeReceived { security_id, .. } => security_id.as_deref(),
             Event::InvestmentFeeCharged { security_id, .. } => security_id.as_deref(),
+            // The sheltered account itself is the aggregate: it is the ledger
+            // account, the register key and the thing every one of these events
+            // is about. No securities exist here to name instead.
+            Event::RetirementAccountRegistered { account_id, .. } => Some(account_id),
+            Event::RetirementValueSet { account_id, .. } => Some(account_id),
+            Event::RetirementContributionRecorded { account_id, .. } => Some(account_id),
+            Event::RetirementDistributionRecorded(d) => Some(&d.account_id),
             // One business per book, so no id names the thing changed — the same
             // answer `BusinessProfileSet` gives.
             Event::BusinessTypeSet { .. } => None,
