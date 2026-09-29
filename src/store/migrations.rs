@@ -20,14 +20,25 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
         [],
     )?;
 
-    // Get current version
-    let current_version: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    // WHICH versions have been applied — not how high they go.
+    //
+    // This used to gate on `MAX(version)`, and that is a silent data loss as soon as
+    // two branches number migrations independently. Concretely: `main` carried 047,
+    // 048 and 050 while `feature-personal-tax` carried 049. A database migrated on
+    // `main` is stamped 50, so when 049 arrived in the merge the old gate said
+    // "50 > 49, nothing to do" — and the documents and tax-statement tables were
+    // never created, with no error, on a database that looked fully migrated.
+    //
+    // A set closes that: a version is applied because it is recorded as applied. A
+    // database with no rows at all (one built by `init_schema`, or migrated by a
+    // runner that predates this table) is treated exactly as before — every version
+    // is attempted, and the "already exists" tolerance below absorbs the ones whose
+    // schema is already there.
+    let applied: std::collections::HashSet<i64> = {
+        let mut stmt = conn.prepare("SELECT version FROM schema_migrations")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.filter_map(Result::ok).collect()
+    };
 
     // Run migrations
     let migrations: Vec<(i64, &str)> = vec![
@@ -188,7 +199,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
     ];
 
     for (version, sql) in migrations {
-        if version > current_version {
+        if !applied.contains(&version) {
             match conn.execute_batch(sql) {
                 Ok(()) => {}
                 Err(e) => {
@@ -1612,6 +1623,69 @@ mod tests {
     /// And a database that predates it gets it too, by the route the others here use:
     /// the pre-050 shape, stamped at version 49, then migrated.
     #[test]
+    /// A version below the high-water mark still gets applied.
+    ///
+    /// The failure this pins is the one that actually happened: `main` numbered
+    /// 047, 048 and 050 while another branch numbered 049, so a database migrated on
+    /// `main` was stamped 50, and the old `MAX(version)` gate then skipped 049
+    /// forever — silently, on a database that reported itself fully migrated. Any
+    /// two branches numbering migrations independently reproduce it.
+    #[test]
+    fn a_migration_below_the_high_water_mark_is_still_applied() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        // A database that has been through the runner, then had one migration's
+        // tables removed and its stamp erased — exactly the shape a merge produces.
+        conn.execute_batch(
+            "DROP TABLE investment_lots;
+             DROP TABLE investment_sale_lots;
+             DROP TABLE investment_sales;
+             DROP TABLE securities;
+             CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             DELETE FROM schema_migrations;",
+        )
+        .unwrap();
+        // Everything except 47 is recorded, including numbers ABOVE it.
+        for v in 1..=50 {
+            if v != 47 {
+                conn.execute(
+                    "INSERT OR IGNORE INTO schema_migrations (version) VALUES (?1)",
+                    [v],
+                )
+                .unwrap();
+            }
+        }
+
+        run_migrations(&conn).unwrap();
+
+        for table in [
+            "securities",
+            "investment_lots",
+            "investment_sales",
+            "investment_sale_lots",
+        ] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "{table} was skipped because 50 > 47");
+        }
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 47",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1, "and it is recorded as applied afterwards");
+    }
+
     fn migration_050_adds_the_investment_import_registers_to_an_existing_database() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
