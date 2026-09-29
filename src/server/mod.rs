@@ -2034,6 +2034,11 @@ struct PlaidInvestmentsSyncResponse {
     sold: u32,
     dividends: u32,
     interest: u32,
+    /// A fund passing through a gain it realized. Reported apart from the dividends
+    /// because it reaches a different form — and reported at all because a caller
+    /// summing these into "how much was posted" would otherwise be short by exactly
+    /// this category, and short in a way nothing on screen could explain.
+    capital_gain_distributions: u32,
     fees: u32,
     cash_movements: u32,
     duplicates: u32,
@@ -2169,6 +2174,7 @@ async fn plaid_investments_sync(
         sold: report.sold,
         dividends: report.dividends,
         interest: report.interest,
+        capital_gain_distributions: report.capital_gain_distributions,
         fees: report.fees,
         cash_movements: report.cash_movements,
         duplicates: report.duplicates,
