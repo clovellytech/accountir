@@ -1012,6 +1012,45 @@ impl<'a> Projector<'a> {
                     ],
                 )?;
             }
+            Event::DocumentAttached(d) => {
+                // Replaces a row with the same id, so a document attached again after a
+                // removal comes back as it was attached the second time.
+                let (kind, id) = match &d.subject {
+                    Some(subject) => {
+                        let (kind, id) = subject.as_columns();
+                        (Some(kind.to_string()), Some(id.to_string()))
+                    }
+                    None => (None, None),
+                };
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO documents
+                       (document_id, sha256, size_bytes, media_type, filename, title,
+                        tax_year, form, subject_kind, subject_id, attached_at,
+                        attached_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        d.document_id,
+                        d.sha256,
+                        d.size_bytes as i64,
+                        d.media_type,
+                        d.filename,
+                        d.title,
+                        d.tax_year,
+                        d.form,
+                        kind,
+                        id,
+                        stored_event.timestamp.to_rfc3339(),
+                        stored_event.id
+                    ],
+                )?;
+            }
+            // The row goes; the bytes stay. See the event.
+            Event::DocumentRemoved { document_id } => {
+                self.conn.execute(
+                    "DELETE FROM documents WHERE document_id = ?1",
+                    [document_id],
+                )?;
+            }
             // The opposite of the arm above, and the only one in this file that takes
             // a register row away. Three steps, in this order, because each undoes
             // what the one before it relied on:
@@ -1755,6 +1794,7 @@ impl<'a> Projector<'a> {
              -- `investment_fetch_state` -- are deliberately absent: one holds rows
              -- somebody is still reviewing and the other how far this machine has
              -- fetched, and neither is derived from the log.
+             DELETE FROM documents;
              DELETE FROM investment_holdings_snapshot_lines;
              DELETE FROM investment_holdings_snapshots;
              DELETE FROM investment_imports;

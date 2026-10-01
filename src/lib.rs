@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod config;
+pub mod documents;
 pub mod domain;
 pub mod events;
 pub mod gnucash;

@@ -1,6 +1,7 @@
 pub mod account;
 pub mod ap_ar;
 pub mod depreciation;
+pub mod documents;
 pub mod fiscal_year;
 pub mod journal_entry;
 pub mod money;

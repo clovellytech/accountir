@@ -636,6 +636,59 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                 _ => {}
             }
         }
+        Event::DocumentAttached(d) => {
+            validate_non_empty(&d.document_id, "document_id")?;
+            // The digest is the key the bytes are fetched by and checked against, so one
+            // in any other shape names a file nobody can ever find.
+            if !crate::documents::is_sha256_hex(&d.sha256) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "sha256: {:?} is not a lowercase hex SHA-256 digest",
+                    d.sha256
+                )));
+            }
+            if d.size_bytes == 0 || d.size_bytes > crate::documents::MAX_DOCUMENT_BYTES {
+                return Err(ValidationError::InvalidValue(format!(
+                    "size_bytes: {} is not between 1 and {}",
+                    d.size_bytes,
+                    crate::documents::MAX_DOCUMENT_BYTES
+                )));
+            }
+            validate_non_empty(&d.media_type, "media_type")?;
+            validate_non_empty(&d.filename, "filename")?;
+            // A name, not a path. The stored file is named by its digest, so nothing
+            // here steers where anything is written — but a name with a separator in it
+            // reads as a path everywhere it is shown, and that is its own problem.
+            if d.filename.contains(['/', '\\']) {
+                return Err(ValidationError::InvalidValue(
+                    "filename: a document's name, not a path".to_string(),
+                ));
+            }
+            if let Some(year) = d.tax_year {
+                if !(1900..=2200).contains(&year) {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "{year} is not a tax year"
+                    )));
+                }
+            }
+            // Free text, kept short: the personal-tax work holds this to a form that
+            // version knows, and until it lands a code nothing recognises is a label
+            // rather than a figure anything computes from.
+            if let Some(form) = &d.form {
+                validate_non_empty(form, "form")?;
+                if form.chars().count() > 32 {
+                    return Err(ValidationError::InvalidValue(
+                        "form: a form's code, not a description".to_string(),
+                    ));
+                }
+            }
+            if let Some(subject) = &d.subject {
+                let (kind, id) = subject.as_columns();
+                validate_non_empty(id, kind)?;
+            }
+        }
+        Event::DocumentRemoved { document_id } => {
+            validate_non_empty(document_id, "document_id")?;
+        }
         Event::InvestmentImportsForgotten(d) => {
             validate_non_empty(&d.item_id, "item_id")?;
             validate_non_empty(&d.plaid_account_id, "plaid_account_id")?;
@@ -1553,5 +1606,69 @@ mod tests {
             description: None,
         };
         assert!(validate_event(&invalid_number).is_err());
+    }
+
+    const DIGEST: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn attached(sha: &str, size: u64, filename: &str) -> Event {
+        Event::DocumentAttached(Box::new(crate::events::types::DocumentAttachedData {
+            document_id: "d1".to_string(),
+            sha256: sha.to_string(),
+            size_bytes: size,
+            media_type: "application/pdf".to_string(),
+            filename: filename.to_string(),
+            title: None,
+            tax_year: None,
+            form: None,
+            subject: None,
+        }))
+    }
+
+    /// The digest is the key the bytes are fetched by and checked against, so the shape
+    /// is not cosmetic: a document whose digest is anything else names a file nobody can
+    /// ever find, and the event is the thing that is replicated for ever.
+    ///
+    /// Checked here rather than only at the route, because validation is what runs
+    /// whichever way an event arrives — a local command, a sync submit, a replay.
+    #[test]
+    fn a_document_whose_digest_is_not_a_digest_is_refused() {
+        assert!(validate_event(&attached(DIGEST, 10, "s.pdf")).is_ok());
+        assert!(validate_event(&attached("nope", 10, "s.pdf")).is_err());
+        assert!(
+            validate_event(&attached(&DIGEST.to_uppercase(), 10, "s.pdf")).is_err(),
+            "two spellings of one digest would be two keys for one file"
+        );
+        assert!(
+            validate_event(&attached(&DIGEST[..63], 10, "s.pdf")).is_err(),
+            "a digest of the wrong length"
+        );
+    }
+
+    /// The size bounds the blob store enforces, enforced on the event too: a record of a
+    /// file that could not have been stored is a document nobody can open.
+    #[test]
+    fn a_document_of_an_impossible_size_is_refused() {
+        assert!(validate_event(&attached(DIGEST, 0, "s.pdf")).is_err());
+        assert!(validate_event(&attached(
+            DIGEST,
+            crate::documents::MAX_DOCUMENT_BYTES + 1,
+            "s.pdf"
+        ))
+        .is_err());
+        assert!(validate_event(&attached(
+            DIGEST,
+            crate::documents::MAX_DOCUMENT_BYTES,
+            "s.pdf"
+        ))
+        .is_ok());
+    }
+
+    /// A name, not a path. The stored file is named by its digest so nothing is steered
+    /// by this, but a name with a separator reads as a path everywhere it is shown.
+    #[test]
+    fn a_documents_filename_is_a_name_and_not_a_path() {
+        assert!(validate_event(&attached(DIGEST, 10, "")).is_err());
+        assert!(validate_event(&attached(DIGEST, 10, "/etc/passwd")).is_err());
+        assert!(validate_event(&attached(DIGEST, 10, "..\\win.ini")).is_err());
     }
 }

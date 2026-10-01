@@ -881,6 +881,55 @@ pub struct InvestmentActivityImportedData {
     pub sale_id: Option<String>,
 }
 
+/// A file attached to the books. See `migrations/049_documents.sql` for why the bytes
+/// are not in the log, and [`crate::documents`] for where they are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentAttachedData {
+    pub document_id: String,
+    /// Lowercase hex SHA-256 of the file: the key its bytes are stored under, and what
+    /// any copy of them is checked against.
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+    /// The name it was attached under. Display only, and never a path.
+    pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tax_year: Option<i32>,
+    /// A form code where the document is a statement — `1099-B`, `W-2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
+    /// What it is about, where it is about one thing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<DocumentSubjectData>,
+}
+
+/// What a document is about, on the wire.
+///
+/// Tagged by `kind`, so a subject this version does not know still round-trips through
+/// a replica that has it and is simply not followed here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DocumentSubjectData {
+    Entry { entry_id: String },
+    Account { account_id: String },
+    Reconciliation { reconciliation_id: String },
+}
+
+impl DocumentSubjectData {
+    /// The pair the projection stores.
+    pub fn as_columns(&self) -> (&'static str, &str) {
+        match self {
+            DocumentSubjectData::Entry { entry_id } => ("entry", entry_id),
+            DocumentSubjectData::Account { account_id } => ("account", account_id),
+            DocumentSubjectData::Reconciliation { reconciliation_id } => {
+                ("reconciliation", reconciliation_id)
+            }
+        }
+    }
+}
+
 /// A provider account's imports, undone, so the broker can be read again.
 ///
 /// The provider hands over the same transaction for as long as it is in the window,
@@ -1599,6 +1648,16 @@ pub enum Event {
     /// One provider account's imports, undone, so the broker can be read again. See
     /// [`InvestmentImportsForgottenData`].
     InvestmentImportsForgotten(Box<InvestmentImportsForgottenData>),
+    /// A file is attached to the books. See [`DocumentAttachedData`].
+    DocumentAttached(Box<DocumentAttachedData>),
+    /// A document is taken off the books.
+    ///
+    /// Its bytes are left where they are. The log still names them, a removal can be a
+    /// mistake, and tax records have to be kept for years — deleting the file itself is
+    /// a separate, deliberate act.
+    DocumentRemoved {
+        document_id: String,
+    },
     /// What the broker said an account held on a date. Posts nothing for a taxable
     /// account; for a sheltered one it is what a value update is computed from.
     HoldingsSnapshotRecorded(Box<HoldingsSnapshotData>),
@@ -1937,6 +1996,8 @@ impl Event {
             Event::PlaidSecurityLinked(_) => "plaid_security_linked",
             Event::InvestmentActivityImported(_) => "investment_activity_imported",
             Event::InvestmentImportsForgotten(_) => "investment_imports_forgotten",
+            Event::DocumentAttached(_) => "document_attached",
+            Event::DocumentRemoved { .. } => "document_removed",
             Event::HoldingsSnapshotRecorded(_) => "holdings_snapshot_recorded",
             Event::BusinessTypeSet { .. } => "business_type_set",
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
@@ -2047,6 +2108,8 @@ impl Event {
             // The account, not the transactions: this is one act about one account,
             // and the transactions it names are its contents.
             Event::InvestmentImportsForgotten(d) => Some(&d.plaid_account_id),
+            Event::DocumentAttached(d) => Some(&d.document_id),
+            Event::DocumentRemoved { document_id } => Some(document_id),
             Event::HoldingsSnapshotRecorded(d) => Some(&d.plaid_account_id),
             // One business per book, so no id names the thing changed — the same
             // answer `BusinessProfileSet` gives.

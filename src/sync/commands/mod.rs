@@ -12,6 +12,7 @@ use axum::Router;
 pub mod account;
 pub mod bill;
 pub mod bill_ops;
+pub mod documents;
 pub mod entries;
 pub mod entry_ops;
 pub mod event_service;
@@ -29,6 +30,7 @@ pub fn router() -> Router<SyncState> {
         .merge(bill::router())
         .merge(bill_ops::router())
         .merge(entries::router())
+        .merge(documents::router())
         .merge(entry_ops::router())
         .merge(event_service::router())
         .merge(fiscal::router())

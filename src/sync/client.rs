@@ -12,6 +12,7 @@ use super::commands::bill::{IssueInvoiceRequest, ReceiveBillRequest};
 use super::commands::bill_ops::{
     ApplyBillPaymentRequest, ReceiveInvoicePaymentRequest, VoidBillRequest, VoidInvoiceRequest,
 };
+use super::commands::documents::{AttachDocumentRequest, RemoveDocumentRequest};
 use super::commands::entries::{BatchEntry, PostEntriesRequest, PostEntriesResponse};
 use super::commands::entry_ops::{
     LineAssignment, ReassignLinesRequest, ReassignLinesResponse, UnvoidEntryRequest,
@@ -2391,6 +2392,43 @@ impl SyncClient {
                 plaid_account_id: cmd.plaid_account_id.clone(),
                 accounts: cmd.accounts.clone(),
                 plaid_subtype: cmd.plaid_subtype.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record that a file has been attached to the group's books.
+    ///
+    /// The bytes are not sent: they stay in the blob store on the machine that attached
+    /// them, and the digest in this request is what makes a copy fetched from anywhere
+    /// else checkable. See `sync::commands::documents`.
+    pub async fn attach_document(
+        &mut self,
+        doc: AttachDocumentRequest,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/attach-document", |head| {
+            AttachDocumentRequest {
+                expected_head_seq: head,
+                document_id: doc.document_id.clone(),
+                sha256: doc.sha256.clone(),
+                size_bytes: doc.size_bytes,
+                media_type: doc.media_type.clone(),
+                filename: doc.filename.clone(),
+                title: doc.title.clone(),
+                tax_year: doc.tax_year,
+                form: doc.form.clone(),
+                subject: doc.subject.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Take a document off the group's books. Its bytes stay where they are.
+    pub async fn remove_document(&mut self, document_id: String) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/remove-document", |head| {
+            RemoveDocumentRequest {
+                expected_head_seq: head,
+                document_id: document_id.clone(),
             }
         })
         .await

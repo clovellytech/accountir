@@ -488,6 +488,21 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             d.outcome.as_str(),
             widgets::truncate(&d.entry_id, 8)
         ),
+        Event::DocumentAttached(d) => format!(
+            "Attached {} ({}){}",
+            widgets::truncate(&d.filename, 24),
+            d.media_type,
+            match &d.subject {
+                Some(subject) => {
+                    let (kind, id) = subject.as_columns();
+                    format!(" to {kind} {}", widgets::truncate(id, 8))
+                }
+                None => String::new(),
+            }
+        ),
+        Event::DocumentRemoved { document_id } => {
+            format!("Removed document {}", widgets::truncate(document_id, 8))
+        }
         Event::InvestmentImportsForgotten(d) => format!(
             "Forgot {} import(s) from {}: {}",
             d.provider_transaction_ids.len(),

@@ -188,10 +188,13 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             48,
             include_str!("../../migrations/048_retirement_accounts.sql"),
         ),
-        // 49 belongs to the personal-tax work's documents and received statements;
-        // this is 50 so the two branches do not both claim one number, which
-        // `run_migrations` cannot resolve afterwards -- it gates on
-        // `MAX(version)`, so a database stamped at 50 would never apply 49.
+        // 49 arrived after 50 and 51, which the runner now handles: it applies every
+        // version it has no record of rather than everything above `MAX(version)`, so a
+        // database already stamped at 51 picks this one up on its next open. The
+        // personal-tax work reserved this number for its documents and statements; only
+        // the documents half is here, because schema nothing reads is schema nobody
+        // maintains. See the file.
+        (49, include_str!("../../migrations/049_documents.sql")),
         (
             50,
             include_str!("../../migrations/050_investment_imports.sql"),
@@ -1036,6 +1039,28 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         );
         CREATE INDEX IF NOT EXISTS idx_investment_staged_status
             ON investment_staged_activity(status, date);
+
+        -- Files attached to the books (migration 049). Kept in step with that file
+        -- for the reason the blocks above are; see it for why the bytes are not here
+        -- and why the subject is two columns.
+        CREATE TABLE IF NOT EXISTS documents (
+            document_id       TEXT PRIMARY KEY,
+            sha256            TEXT NOT NULL,
+            size_bytes        INTEGER NOT NULL,
+            media_type        TEXT NOT NULL,
+            filename          TEXT NOT NULL,
+            title             TEXT,
+            tax_year          INTEGER,
+            form              TEXT,
+            subject_kind      TEXT,
+            subject_id        TEXT,
+            attached_at       TEXT NOT NULL,
+            attached_at_event INTEGER REFERENCES events(id),
+            CHECK ((subject_kind IS NULL) = (subject_id IS NULL))
+        );
+        CREATE INDEX IF NOT EXISTS idx_documents_subject
+            ON documents(subject_kind, subject_id);
+        CREATE INDEX IF NOT EXISTS idx_documents_tax_year ON documents(tax_year);
 
         CREATE TABLE IF NOT EXISTS investment_fetch_state (
             item_id TEXT NOT NULL,

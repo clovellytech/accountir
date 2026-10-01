@@ -4,6 +4,7 @@ pub mod amazon_reconcile;
 pub mod bill_commands;
 pub mod closing_commands;
 pub mod depreciation_commands;
+pub mod document_commands;
 pub mod entry_commands;
 pub mod event_service_commands;
 pub mod fiscal_year_commands;
