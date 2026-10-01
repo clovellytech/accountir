@@ -1,5 +1,6 @@
 pub mod account_queries;
 pub mod attention;
+pub mod cross_feed;
 pub mod ap_ar_queries;
 pub mod mirrored_feeds;
 pub mod reports;
