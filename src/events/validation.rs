@@ -636,6 +636,31 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                 _ => {}
             }
         }
+        Event::InvestmentImportsForgotten(d) => {
+            validate_non_empty(&d.item_id, "item_id")?;
+            validate_non_empty(&d.plaid_account_id, "plaid_account_id")?;
+            // A reason, because this is the one operation that takes imported
+            // activity out of the books wholesale, and the log is the only place
+            // anybody will ever read why.
+            validate_non_empty(&d.reason, "reason")?;
+            // Forgetting nothing is not a thing that happened. An event that names
+            // no transaction lifts no fence, and in the log it reads as if an import
+            // had been undone.
+            if d.provider_transaction_ids.is_empty() {
+                return Err(ValidationError::InvalidValue(
+                    "forgetting no transactions at all: the event names what its fence is \
+                     lifted for, and an empty list lifts nothing"
+                        .to_string(),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for id in &d.provider_transaction_ids {
+                validate_non_empty(id, "provider_transaction_id")?;
+                if !seen.insert(id.as_str()) {
+                    return Err(ValidationError::DuplicateId(id.clone()));
+                }
+            }
+        }
         Event::HoldingsSnapshotRecorded(d) => {
             validate_non_empty(&d.snapshot_id, "snapshot_id")?;
             validate_non_empty(&d.item_id, "item_id")?;

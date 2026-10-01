@@ -488,6 +488,12 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             d.outcome.as_str(),
             widgets::truncate(&d.entry_id, 8)
         ),
+        Event::InvestmentImportsForgotten(d) => format!(
+            "Forgot {} import(s) from {}: {}",
+            d.provider_transaction_ids.len(),
+            widgets::truncate(&d.plaid_account_id, 8),
+            d.reason
+        ),
         Event::HoldingsSnapshotRecorded(d) => format!(
             "Holdings of {} as of {}: {} position(s){}",
             widgets::truncate(&d.plaid_account_id, 8),

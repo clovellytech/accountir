@@ -20,8 +20,9 @@ use super::commands::entry_ops::{
 use super::commands::investments::{
     BuySecurityRequest, BuySecurityResponse, ChargeInvestmentFeeRequest,
     ConfigureInvestmentAccountRequest, DefineSecurityRequest, DefineSecurityResponse,
-    ImportInvestmentActivityRequest, ImportInvestmentActivityResponse, PostedEntryResponse,
-    RecordHoldingsSnapshotRequest, RecordHoldingsSnapshotResponse, RecordInvestmentIncomeRequest,
+    ForgetInvestmentImportsRequest, ImportInvestmentActivityRequest,
+    ImportInvestmentActivityResponse, PostedEntryResponse, RecordHoldingsSnapshotRequest,
+    RecordHoldingsSnapshotResponse, RecordInvestmentIncomeRequest,
     RecordRetirementContributionRequest, RecordRetirementDistributionRequest,
     RecordRetirementDistributionResponse, RegisterRetirementAccountRequest,
     ResolvePlaidSecurityRequest, ResolvePlaidSecurityResponse, SellSecurityRequest,
@@ -51,7 +52,7 @@ use crate::commands::investment_commands::{
     SellSecurityCommand,
 };
 use crate::commands::investment_import::{
-    ConfigureInvestmentAccountCommand, ImportRecord, PlannedWrite,
+    ConfigureInvestmentAccountCommand, ForgetImportsCommand, ImportRecord, PlannedWrite,
 };
 use crate::commands::partnership_commands::UpdatePartner;
 use crate::commands::retirement_commands::{
@@ -2388,6 +2389,29 @@ impl SyncClient {
                 plaid_account_id: cmd.plaid_account_id.clone(),
                 accounts: cmd.accounts.clone(),
                 plaid_subtype: cmd.plaid_subtype.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Lift the dedup fence for one provider account, so the broker can be read
+    /// again.
+    ///
+    /// The server voids what is still live and removes the lots and sales the imports
+    /// created. What it does *not* touch is this machine's review list and fetch
+    /// cursor — those are local in both modes (migration 050), so the caller clears
+    /// them here with
+    /// [`forget_local_state`](crate::commands::investment_import::forget_local_state).
+    pub async fn forget_investment_imports(
+        &mut self,
+        cmd: &ForgetImportsCommand,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/forget-investment-imports", |head| {
+            ForgetInvestmentImportsRequest {
+                expected_head_seq: head,
+                item_id: cmd.item_id.clone(),
+                plaid_account_id: cmd.plaid_account_id.clone(),
+                reason: cmd.reason.clone(),
             }
         })
         .await

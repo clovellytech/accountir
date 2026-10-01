@@ -100,7 +100,7 @@
 use chrono::{Days, Months, NaiveDate};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -112,9 +112,9 @@ use crate::commands::investment_commands::{
 use crate::commands::retirement_commands::{self, SetRetirementValueCommand, ValueSet};
 use crate::events::types::{
     Event, EventEnvelope, HoldingsSnapshotData, ImportedActivityKind, InvestmentAccountConfigData,
-    InvestmentActivityImportedData, InvestmentIncomeKind, InvestmentPostingAccounts,
-    InvestmentTreatment, PlaidSecurityLinkData, SecurityKindGroup, SnapshotHoldingData,
-    StoredEvent, TaxableBrokerageAccounts,
+    InvestmentActivityImportedData, InvestmentImportsForgottenData, InvestmentIncomeKind,
+    InvestmentPostingAccounts, InvestmentTreatment, PlaidSecurityLinkData, SecurityKindGroup,
+    SnapshotHoldingData, StoredEvent, TaxableBrokerageAccounts,
 };
 use crate::store::event_store::{CheckedOutcome, EventStore, EventStoreError, Verdict};
 use crate::store::projections::Projector;
@@ -192,6 +192,17 @@ pub enum ImportError {
          reopening it would invite the same transaction being posted a second time."
     )]
     NotDismissed { status: String },
+    #[error(
+        "Nothing has been imported for account {plaid_account_id}, so there is nothing to \
+         forget. A pull that found nothing leaves no import record behind."
+    )]
+    NothingToForget { plaid_account_id: String },
+    #[error(
+        "Lot {lot_id} was created by an import and sale {sale_id} has since sold out of it. \
+         Forgetting the lot would leave that sale's basis pointing at nothing — its Form 8949 \
+         row would lose the lot it came out of. Void or forget that sale first."
+    )]
+    LotAlreadySold { lot_id: String, sale_id: String },
     #[error("Invalid configuration: {0}")]
     Invalid(String),
     #[error("{0}")]
@@ -4065,10 +4076,368 @@ pub fn record_fetch(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Forgetting an account's imports
+// ---------------------------------------------------------------------------
+//
+// # Why this exists, and why it is not "void and re-pull"
+//
+// The provider offers the same transaction for as long as it stays in the window,
+// and the dedup fence is what stops it arriving twice (`already_seen`). That makes
+// the fence the thing standing between a bad import and a good one: void every entry
+// the import posted and the activity is still *imported*, so it is never offered
+// again, and the account cannot be read a second time at all.
+//
+// Void cannot be given that second meaning. "Void" means "this entry does not count"
+// — it is how a mistake is taken out of the books, and the entry stays visible and
+// reversible. Making it also mean "fetch this again" would make the two inseparable:
+// every correction of a single trade would re-open the whole account to re-import,
+// and an account deliberately left with voided imports could never stay that way.
+//
+// So forgetting is its own operation, and says so: it lifts the fence for one
+// provider account, voids whatever of its imports is still live, and gives back the
+// lots and sales its imports created. After it, the next pull reads the account's
+// whole history as if it had never been read.
+
+/// What forgetting an account's imports would do, counted before it is done.
+///
+/// Read before the act rather than reported after it, because two of these numbers
+/// are losses — a review row somebody had already resolved is a note that will not
+/// survive — and a confirmation that cannot say what it costs is not a confirmation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForgetPreview {
+    /// Imports whose fence would be lifted.
+    pub imports: usize,
+    /// Of those, the entries still live, which would be voided.
+    pub live_entries: usize,
+    /// Of those, the entries already voided, which are left alone.
+    pub void_entries: usize,
+    pub lots: usize,
+    pub sales: usize,
+    /// Review rows waiting for somebody, which would go.
+    pub held_pending: usize,
+    /// Review rows already resolved or dismissed, which would go as well — and with
+    /// them the note saying why, which nothing else records.
+    pub held_settled: usize,
+    /// Lots that an import created and a sale that is *not* being forgotten has
+    /// since consumed. Any of these refuses the whole operation: see
+    /// [`build_forget_imports_in_txn`].
+    pub sold_lots: Vec<String>,
+}
+
+impl ForgetPreview {
+    /// Nothing imported, nothing held: there is nothing to forget.
+    pub fn is_empty(&self) -> bool {
+        self.imports == 0 && self.held_pending == 0 && self.held_settled == 0
+    }
+}
+
+/// What forgetting an account's imports did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forgotten {
+    pub forgotten: usize,
+    pub voided: usize,
+    pub already_void: usize,
+    pub lots_removed: usize,
+    pub sales_removed: usize,
+    pub held_cleared: usize,
+    /// Whether the fetch cursor was put back, so the next pull asks for the whole
+    /// history again rather than the rolling window.
+    pub window_reset: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForgetImportsCommand {
+    pub item_id: String,
+    pub plaid_account_id: String,
+    pub reason: String,
+}
+
+/// One import, as the forget path needs it.
+struct ImportRow {
+    provider_transaction_id: String,
+    entry_id: String,
+    lot_id: Option<String>,
+    sale_id: Option<String>,
+}
+
+fn imports_of_account(
+    conn: &Connection,
+    item_id: &str,
+    plaid_account_id: &str,
+) -> Result<Vec<ImportRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT provider_transaction_id, entry_id, lot_id, sale_id FROM investment_imports
+          WHERE item_id = ?1 AND plaid_account_id = ?2
+          ORDER BY imported_at_event",
+    )?;
+    let rows = stmt.query_map([item_id, plaid_account_id], |row| {
+        Ok(ImportRow {
+            provider_transaction_id: row.get(0)?,
+            entry_id: row.get(1)?,
+            lot_id: row.get(2)?,
+            sale_id: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// The sales, other than these, that have taken quantity out of this lot.
+fn other_sales_of_lot(
+    conn: &Connection,
+    lot_id: &str,
+    forgetting: &HashSet<String>,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT sale_id FROM investment_sale_lots WHERE lot_id = ?1")?;
+    let sales: Vec<String> = stmt
+        .query_map([lot_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(sales
+        .into_iter()
+        .filter(|sale_id| !forgetting.contains(sale_id))
+        .collect())
+}
+
+/// What forgetting this account's imports would do.
+pub fn preview_forget(
+    conn: &Connection,
+    item_id: &str,
+    plaid_account_id: &str,
+) -> Result<ForgetPreview, ImportError> {
+    let imports = imports_of_account(conn, item_id, plaid_account_id)?;
+    let sales: HashSet<String> = imports.iter().filter_map(|r| r.sale_id.clone()).collect();
+    let mut preview = ForgetPreview {
+        imports: imports.len(),
+        lots: imports.iter().filter(|r| r.lot_id.is_some()).count(),
+        sales: sales.len(),
+        ..ForgetPreview::default()
+    };
+    for entry_id in entries_in_order(&imports) {
+        match entry_is_void(conn, &entry_id)? {
+            // An import whose entry the projection has never seen counts as neither:
+            // there is nothing to void and nothing already voided.
+            None => {}
+            Some(true) => preview.void_entries += 1,
+            Some(false) => preview.live_entries += 1,
+        }
+    }
+    for row in &imports {
+        if let Some(lot_id) = &row.lot_id {
+            if !other_sales_of_lot(conn, lot_id, &sales)?.is_empty() {
+                preview.sold_lots.push(lot_id.clone());
+            }
+        }
+    }
+    let (held_pending, held_settled) = held_counts(conn, item_id, plaid_account_id)?;
+    preview.held_pending = held_pending;
+    preview.held_settled = held_settled;
+    Ok(preview)
+}
+
+/// Review rows for this account: how many are waiting, and how many have been
+/// answered.
+fn held_counts(
+    conn: &Connection,
+    item_id: &str,
+    plaid_account_id: &str,
+) -> Result<(usize, usize), rusqlite::Error> {
+    conn.query_row(
+        "SELECT
+            COALESCE(SUM(CASE WHEN status = ?3 THEN 1 ELSE 0 END), 0),
+            COALESCE(SUM(CASE WHEN status <> ?3 THEN 1 ELSE 0 END), 0)
+           FROM investment_staged_activity
+          WHERE item_id = ?1 AND plaid_account_id = ?2",
+        rusqlite::params![item_id, plaid_account_id, PENDING],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+            ))
+        },
+    )
+}
+
+/// The entries these imports posted, once each, in the order they were imported.
+fn entries_in_order(imports: &[ImportRow]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    imports
+        .iter()
+        .filter(|r| seen.insert(r.entry_id.clone()))
+        .map(|r| r.entry_id.clone())
+        .collect()
+}
+
+/// Whether an entry is void, or `None` when the projection has no such entry.
+fn entry_is_void(conn: &Connection, entry_id: &str) -> Result<Option<bool>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT is_void FROM journal_entries WHERE id = ?1",
+        [entry_id],
+        |row| row.get::<_, i64>(0).map(|v| v != 0),
+    )
+    .optional()
+}
+
+/// Forget one provider account's imports: the ledger half.
+///
+/// Appends a `JournalEntryVoided` for every import entry still live, and one
+/// `InvestmentImportsForgotten` naming everything whose fence is lifted. The review
+/// list and the fetch cursor are **not** part of this — they are machine-local
+/// (migration 050), so they are cleared by [`forget_local_state`] on whichever
+/// machine asked, which on hosted books is not the machine that holds the log.
+pub(crate) fn build_forget_imports_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &ForgetImportsCommand,
+) -> Result<ImportStep, EventStoreError> {
+    if cmd.reason.trim().is_empty() {
+        return Ok(ImportStep::Reject(ImportError::Invalid(
+            "forgetting an account's imports needs a reason: it is the only record of why \
+             activity that really happened is no longer in these books"
+                .to_string(),
+        )));
+    }
+    let imports = imports_of_account(tx, &cmd.item_id, &cmd.plaid_account_id)?;
+    if imports.is_empty() {
+        return Ok(ImportStep::Reject(ImportError::NothingToForget {
+            plaid_account_id: cmd.plaid_account_id.clone(),
+        }));
+    }
+
+    let sale_ids: Vec<String> = {
+        let mut seen = HashSet::new();
+        imports
+            .iter()
+            .filter_map(|r| r.sale_id.clone())
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
+    };
+    let forgetting: HashSet<String> = sale_ids.iter().cloned().collect();
+    let lot_ids: Vec<String> = {
+        let mut seen = HashSet::new();
+        imports
+            .iter()
+            .filter_map(|r| r.lot_id.clone())
+            .filter(|id| seen.insert(id.clone()))
+            .collect()
+    };
+
+    // A lot this import created, which a sale that is staying has taken shares out
+    // of. Deleting it would leave that sale's basis pointing at nothing: its Form
+    // 8949 row would lose the lot it came out of, and the holding it relieved would
+    // come back. Refused whole rather than in part — a half-forgotten account is
+    // worse than one that says what is in the way.
+    for lot_id in &lot_ids {
+        let blocking = other_sales_of_lot(tx, lot_id, &forgetting)?;
+        if let Some(sale_id) = blocking.first() {
+            return Ok(ImportStep::Reject(ImportError::LotAlreadySold {
+                lot_id: lot_id.clone(),
+                sale_id: sale_id.clone(),
+            }));
+        }
+    }
+
+    let mut events = Vec::new();
+    for entry_id in entries_in_order(&imports) {
+        // Already void is ordinary, not an error: somebody voiding the entries by
+        // hand and then finding the account will not re-import is the very case this
+        // command was written for.
+        if entry_is_void(tx, &entry_id)? == Some(false) {
+            events.push(Event::JournalEntryVoided {
+                entry_id,
+                reason: format!("Imports forgotten: {}", cmd.reason.trim()),
+            });
+        }
+    }
+    events.push(Event::InvestmentImportsForgotten(Box::new(
+        InvestmentImportsForgottenData {
+            item_id: cmd.item_id.clone(),
+            plaid_account_id: cmd.plaid_account_id.clone(),
+            provider_transaction_ids: imports
+                .iter()
+                .map(|r| r.provider_transaction_id.clone())
+                .collect(),
+            lot_ids,
+            sale_ids,
+            reason: cmd.reason.trim().to_string(),
+        },
+    )));
+    Ok(ImportStep::Append(events))
+}
+
+/// Clear what this machine holds about an account's imports: the review list and the
+/// fetch cursor.
+///
+/// Both are machine-local (migration 050) and neither is in the log, so this runs on
+/// whichever machine asked — including a replica, where it is the only part of
+/// forgetting that happens here at all.
+///
+/// The review rows go rather than being marked: a held row gates re-import exactly as
+/// a posted one does (`already_seen` reads both tables), so a row left behind would
+/// keep its transaction out of the next pull, which is the opposite of the point. The
+/// cursor goes with them, so the next pull asks for the whole history instead of the
+/// rolling window — forgetting and then re-reading the last few weeks would leave the
+/// account emptier than before.
+pub fn forget_local_state(
+    conn: &Connection,
+    item_id: &str,
+    plaid_account_id: &str,
+) -> Result<(usize, bool), ImportError> {
+    let held = conn.execute(
+        "DELETE FROM investment_staged_activity WHERE item_id = ?1 AND plaid_account_id = ?2",
+        [item_id, plaid_account_id],
+    )?;
+    let window = conn.execute(
+        "DELETE FROM investment_fetch_state WHERE item_id = ?1 AND plaid_account_id = ?2",
+        [item_id, plaid_account_id],
+    )?;
+    Ok((held, window > 0))
+}
+
+/// Forget one provider account's imports, on books this machine owns.
+pub fn forget_imports(
+    store: &mut EventStore,
+    user_id: &str,
+    cmd: &ForgetImportsCommand,
+) -> Result<Forgotten, ImportError> {
+    let before = preview_forget(store.connection(), &cmd.item_id, &cmd.plaid_account_id)?;
+    let events = run(store, user_id, |tx| build_forget_imports_in_txn(tx, cmd))?;
+    let voided = events
+        .iter()
+        .filter(|e| matches!(e.event, Event::JournalEntryVoided { .. }))
+        .count();
+    let forgotten = events
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::InvestmentImportsForgotten(d) => Some(d),
+            _ => None,
+        })
+        .next()
+        .ok_or_else(|| ImportError::Store("the forget did not land".to_string()))?;
+    let summary = Forgotten {
+        forgotten: forgotten.provider_transaction_ids.len(),
+        voided,
+        already_void: before.void_entries,
+        lots_removed: forgotten.lot_ids.len(),
+        sales_removed: forgotten.sale_ids.len(),
+        ..Forgotten::default()
+    };
+    // After the append, not before: the review list is this machine's record of what
+    // the log does not hold, and clearing it ahead of a refusal would throw it away
+    // for nothing.
+    let (held_cleared, window_reset) =
+        forget_local_state(store.connection(), &cmd.item_id, &cmd.plaid_account_id)?;
+    Ok(Forgotten {
+        held_cleared,
+        window_reset,
+        ..summary
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::investment_commands::{holding_of, list_securities, MICRO_SHARE};
+    use crate::commands::investment_commands::{
+        buy_security, define_security, holding_of, list_securities, sell_security, MICRO_SHARE,
+    };
     use crate::commands::retirement_commands::{
         register_account, RegisterRetirementAccountCommand,
     };
@@ -6465,5 +6834,513 @@ mod tests {
         let resolved = get_activity(store.connection(), &row.id).expect("still there");
         assert_eq!(resolved.resolution.as_deref(), Some("distribution"));
         assert_eq!(resolved.status, RESOLVED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Forgetting an account's imports
+    // -----------------------------------------------------------------------
+
+    fn forget(store: &mut EventStore, account: &str) -> Result<Forgotten, ImportError> {
+        forget_imports(
+            store,
+            "u",
+            &ForgetImportsCommand {
+                item_id: ITEM.into(),
+                plaid_account_id: account.into(),
+                reason: "the account was configured wrong".into(),
+            },
+        )
+    }
+
+    fn is_void(store: &EventStore, provider_transaction_id: &str) -> Option<bool> {
+        let entry_id: String = store
+            .connection()
+            .query_row(
+                "SELECT entry_id FROM investment_imports WHERE provider_transaction_id = ?1",
+                [provider_transaction_id],
+                |r| r.get(0),
+            )
+            .ok()?;
+        entry_is_void(store.connection(), &entry_id).ok().flatten()
+    }
+
+    /// The whole point: after forgetting, the provider's own transaction arrives
+    /// again. Before this existed the dedup fence was permanent, and an account
+    /// imported against the wrong configuration could never be imported against the
+    /// right one.
+    #[test]
+    fn forgetting_lets_the_same_trade_arrive_again() {
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_lots"), 1);
+
+        let done = forget(&mut store, BRK).expect("forgotten");
+        assert_eq!(done.forgotten, 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_imports"), 0);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM investment_lots"),
+            0,
+            "the lot the purchase created goes with it: left behind it would hold a position \
+             nobody owns, and the re-import would add a second one"
+        );
+
+        let again = import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        assert_eq!(again.bought, 1, "offered again, and taken");
+        assert_eq!(again.duplicates, 0);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM investment_lots"),
+            1,
+            "one lot, not two"
+        );
+    }
+
+    /// The entries are voided, not deleted: a voided entry is what this book already
+    /// means by "this did not happen", and the history stays readable.
+    #[test]
+    fn forgetting_voids_the_entries_the_imports_posted() {
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        assert_eq!(is_void(&store, "tx-buy"), Some(false));
+        let entry_id: String = store
+            .connection()
+            .query_row(
+                "SELECT entry_id FROM investment_imports WHERE provider_transaction_id = 'tx-buy'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the import's entry");
+
+        let done = forget(&mut store, BRK).expect("forgotten");
+        assert_eq!(done.voided, 1);
+        assert_eq!(done.already_void, 0);
+        assert_eq!(
+            entry_is_void(store.connection(), &entry_id),
+            Ok(Some(true)),
+            "voided, and still there to read"
+        );
+    }
+
+    /// The case this was written for. Somebody voids the entries by hand, finds the
+    /// account will not import again, and asks why — because voiding says nothing
+    /// about the fence. Forgetting has to work from there, with nothing left to void.
+    #[test]
+    fn forgetting_works_when_the_entries_are_already_void() {
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        let entry_id: String = store
+            .connection()
+            .query_row(
+                "SELECT entry_id FROM investment_imports WHERE provider_transaction_id = 'tx-buy'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the import's entry");
+        crate::commands::entry_commands::EntryCommands::new(&mut store, "u".into())
+            .void_entry(crate::commands::entry_commands::VoidEntryCommand {
+                entry_id: entry_id.clone(),
+                reason: "by hand".into(),
+            })
+            .expect("voided by hand");
+
+        let done = forget(&mut store, BRK).expect("forgotten");
+        assert_eq!(done.voided, 0, "nothing left to void");
+        assert_eq!(done.already_void, 1);
+        assert_eq!(done.forgotten, 1);
+
+        let again = import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        assert_eq!(again.bought, 1);
+    }
+
+    /// A sale gives back what it took. Both of this sale's lots were imported, so
+    /// both go — but the quantities are restored first, which is what makes the
+    /// mixed case below work at all.
+    #[test]
+    fn forgetting_removes_the_sales_the_imports_recorded() {
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple(), sell_apple()],
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_sales"), 1);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM investment_sale_lots"),
+            1
+        );
+
+        let done = forget(&mut store, BRK).expect("forgotten");
+        assert_eq!(done.forgotten, 2);
+        assert_eq!(done.lots_removed, 1);
+        assert_eq!(done.sales_removed, 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_sales"), 0);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM investment_sale_lots"),
+            0,
+            "the lot links go with the sale: a link to a lot that no longer exists is what a \
+             Form 8949 row would be built out of"
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_lots"), 0);
+    }
+
+    /// A lot entered by hand, sold by an import. Forgetting the sale must give the
+    /// shares back to that lot — it is staying, and it is six shares short.
+    #[test]
+    fn forgetting_an_imported_sale_gives_a_hand_entered_lot_its_shares_back() {
+        let mut store = configured(None);
+        let (security, _) = define_security(
+            &mut store,
+            "u",
+            &NewSecurity {
+                ticker: "AAPL".into(),
+                name: "Apple Inc".into(),
+                kind: "stock".into(),
+                cusip: Some("037833100".into()),
+                currency: "USD".into(),
+            },
+        )
+        .expect("defined");
+        let bought = buy_security(
+            &mut store,
+            "u",
+            &BuySecurityCommand {
+                security_id: security.clone(),
+                securities_account_id: SECURITIES.into(),
+                cash_account_id: BROKER_CASH.into(),
+                quantity: 10 * MICRO_SHARE,
+                total_cost_cents: 150_495,
+                trade_date: day(2026, 3, 2),
+                memo: None,
+            },
+        )
+        .expect("bought by hand");
+        // The provider's security has to resolve to the one just defined, or the sale
+        // is held rather than posted.
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[sell_apple()],
+        );
+        let remaining: i64 = store
+            .connection()
+            .query_row(
+                "SELECT remaining_quantity FROM investment_lots WHERE id = ?1",
+                [&bought.lot_id],
+                |r| r.get(0),
+            )
+            .expect("the lot");
+        assert_eq!(remaining, 6 * MICRO_SHARE, "four sold out of ten");
+
+        let done = forget(&mut store, BRK).expect("forgotten");
+        assert_eq!(done.sales_removed, 1);
+        assert_eq!(done.lots_removed, 0, "the lot was not an import's");
+        let (quantity, basis): (i64, i64) = store
+            .connection()
+            .query_row(
+                "SELECT remaining_quantity, remaining_basis_cents FROM investment_lots
+                  WHERE id = ?1",
+                [&bought.lot_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("still there");
+        assert_eq!(
+            (quantity, basis),
+            (10 * MICRO_SHARE, 150_495),
+            "whole again: the sale gave back exactly the quantity and basis it took"
+        );
+    }
+
+    /// The other way round, and the one case that is refused. An import's lot that a
+    /// sale which is *staying* has sold out of cannot be removed: that sale's basis
+    /// would point at nothing, and the position it relieved would come back.
+    #[test]
+    fn a_lot_a_remaining_sale_has_sold_out_of_cannot_be_forgotten() {
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        let security = list_securities(store.connection())
+            .into_iter()
+            .next()
+            .expect("the import defined one");
+        sell_security(
+            &mut store,
+            "u",
+            &SellSecurityCommand {
+                security_id: security.security_id,
+                securities_account_id: SECURITIES.into(),
+                cash_account_id: BROKER_CASH.into(),
+                realized_gain_account_id: REALIZED_GAIN.into(),
+                quantity: 4 * MICRO_SHARE,
+                proceeds_cents: 80_000,
+                fee_cents: 125,
+                trade_date: day(2026, 6, 10),
+                selection: LotSelection::Fifo,
+                memo: None,
+            },
+        )
+        .expect("sold by hand");
+
+        let refused = forget(&mut store, BRK).expect_err("refused");
+        assert!(
+            matches!(refused, ImportError::LotAlreadySold { .. }),
+            "{refused:?}"
+        );
+        let said = refused.to_string();
+        assert!(said.contains("Void or forget that sale first"), "{said}");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM investment_imports"),
+            1,
+            "refused whole: a half-forgotten account is worse than one that says what is in \
+             the way"
+        );
+    }
+
+    #[test]
+    fn forgetting_an_account_with_nothing_imported_is_refused() {
+        let mut store = configured(None);
+        let refused = forget(&mut store, BRK).expect_err("refused");
+        assert!(
+            matches!(refused, ImportError::NothingToForget { .. }),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn forgetting_needs_a_reason() {
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        let refused = forget_imports(
+            &mut store,
+            "u",
+            &ForgetImportsCommand {
+                item_id: ITEM.into(),
+                plaid_account_id: BRK.into(),
+                reason: "   ".into(),
+            },
+        )
+        .expect_err("refused");
+        assert!(matches!(refused, ImportError::Invalid(_)), "{refused:?}");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_imports"), 1);
+    }
+
+    /// Both machine-local tables go, and for the same reason: either one left behind
+    /// would keep the next pull from reading what it is there to read.
+    #[test]
+    fn forgetting_clears_the_review_list_and_the_fetch_window() {
+        let mut store = configured(None);
+        // An unconfigured account's activity is held rather than posted, which is the
+        // cheapest way to get a review row for a configured one: a corporate action.
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[
+                buy_apple(),
+                txn(
+                    "tx-split",
+                    BRK,
+                    "transfer",
+                    "stock distribution",
+                    day(2026, 4, 1),
+                    0.0,
+                ),
+            ],
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM investment_staged_activity WHERE plaid_account_id \
+                 = 'plaid-brokerage'"
+            ),
+            1
+        );
+        record_fetch(store.connection(), ITEM, BRK, day(2026, 9, 30)).expect("cursor");
+
+        let done = forget(&mut store, BRK).expect("forgotten");
+        assert_eq!(done.held_cleared, 1);
+        assert!(done.window_reset);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM investment_staged_activity"),
+            0,
+            "a held row gates re-import exactly as a posted one does, so leaving it would keep \
+             its transaction out of the next pull"
+        );
+        assert_eq!(
+            last_fetched_through(store.connection(), ITEM, BRK),
+            None,
+            "the next pull asks for the whole history, not the rolling window"
+        );
+    }
+
+    /// One account, not the connection. Two brokerages behind one login is ordinary,
+    /// and forgetting the one that was set up wrong must not re-open the other.
+    #[test]
+    fn forgetting_one_account_leaves_the_others_alone() {
+        let mut store = configured(None);
+        with_sheltered(&mut store);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[
+                buy_apple(),
+                txn(
+                    "tx-ira",
+                    IRA_PLAID,
+                    "cash",
+                    "deposit",
+                    day(2026, 5, 1),
+                    -500.0,
+                ),
+            ],
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_imports"), 1);
+        let held_elsewhere = count(
+            &store,
+            "SELECT COUNT(*) FROM investment_staged_activity WHERE plaid_account_id = 'plaid-ira'",
+        );
+
+        forget(&mut store, BRK).expect("forgotten");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM investment_staged_activity WHERE plaid_account_id \
+                 = 'plaid-ira'"
+            ),
+            held_elsewhere,
+            "the other account's review rows are not this account's to clear"
+        );
+    }
+
+    /// What the confirmation reads from. The two "held" figures are apart because one
+    /// of them is a loss: a row somebody resolved carries a note nothing else records.
+    #[test]
+    fn the_preview_counts_what_would_go() {
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[
+                buy_apple(),
+                sell_apple(),
+                txn(
+                    "tx-split",
+                    BRK,
+                    "transfer",
+                    "stock distribution",
+                    day(2026, 4, 1),
+                    0.0,
+                ),
+            ],
+        );
+        let held = activity_with_status(store.connection(), PENDING)
+            .into_iter()
+            .next()
+            .expect("the corporate action was held");
+        resolve_by_hand(store.connection(), &held.id, "entered by hand", None).expect("resolved");
+
+        let preview = preview_forget(store.connection(), ITEM, BRK).expect("previewed");
+        assert_eq!(preview.imports, 2);
+        assert_eq!(preview.live_entries, 2);
+        assert_eq!(preview.void_entries, 0);
+        assert_eq!(preview.lots, 1);
+        assert_eq!(preview.sales, 1);
+        assert_eq!(preview.held_pending, 0);
+        assert_eq!(
+            preview.held_settled, 1,
+            "the resolved row is counted apart, because its note is what gets lost"
+        );
+        assert!(preview.sold_lots.is_empty());
+        assert!(!preview.is_empty());
+    }
+
+    /// A replay has to reach the same place. The forget event carries the ids it
+    /// decided on rather than re-reading the register, exactly so that this holds:
+    /// replaying the log inserts the imports and then takes them away again.
+    #[test]
+    fn a_rebuild_from_the_log_forgets_them_again() {
+        use crate::store::projections::ProjectionStore;
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple(), sell_apple()],
+        );
+        forget(&mut store, BRK).expect("forgotten");
+        let again = import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        assert_eq!(again.bought, 1);
+
+        let events = store.get_all().expect("the log");
+        store.rebuild_projections(&events).expect("rebuilt");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM investment_imports"),
+            1,
+            "the two forgotten imports are gone and the re-imported one is there — the same \
+             state the appends left, reached by replay alone"
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_lots"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM investment_sales"), 0);
+    }
+
+    /// The refusal is visible before the button is pressed, not only after.
+    #[test]
+    fn the_preview_names_a_lot_that_cannot_be_forgotten() {
+        let mut store = configured(None);
+        import(
+            &mut store,
+            &[brokerage_account("brokerage")],
+            &[buy_apple()],
+        );
+        let security = list_securities(store.connection())
+            .into_iter()
+            .next()
+            .expect("defined by the import");
+        sell_security(
+            &mut store,
+            "u",
+            &SellSecurityCommand {
+                security_id: security.security_id,
+                securities_account_id: SECURITIES.into(),
+                cash_account_id: BROKER_CASH.into(),
+                realized_gain_account_id: REALIZED_GAIN.into(),
+                quantity: 4 * MICRO_SHARE,
+                proceeds_cents: 80_000,
+                fee_cents: 125,
+                trade_date: day(2026, 6, 10),
+                selection: LotSelection::Fifo,
+                memo: None,
+            },
+        )
+        .expect("sold by hand");
+        let preview = preview_forget(store.connection(), ITEM, BRK).expect("previewed");
+        assert_eq!(preview.sold_lots.len(), 1);
     }
 }

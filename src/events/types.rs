@@ -881,6 +881,41 @@ pub struct InvestmentActivityImportedData {
     pub sale_id: Option<String>,
 }
 
+/// A provider account's imports, undone, so the broker can be read again.
+///
+/// The provider hands over the same transaction for as long as it is in the window,
+/// and the dedup fence is what stops it arriving twice. That fence is therefore also
+/// what stops a bad import being replaced by a good one: the activity exists, so it
+/// is never offered again. This event lifts the fence for one account, naming
+/// exactly what it lifts it for.
+///
+/// It does not undo the bookkeeping on its own. The entries are voided by
+/// `JournalEntryVoided` events in the same append, because a voided entry is what
+/// this book already means by "this did not happen", and there is no second way to
+/// say it. What this event does carry is the part void cannot say: the lots and
+/// sales the imports created, which are registers rather than entries and would
+/// otherwise still be holding positions nobody owns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvestmentImportsForgottenData {
+    pub item_id: String,
+    pub plaid_account_id: String,
+    /// The provider transactions whose fence is lifted. Listed rather than implied
+    /// by the account, so that a replay deletes what this event decided and not
+    /// whatever the register happens to hold when it runs.
+    pub provider_transaction_ids: Vec<String>,
+    /// Lots created by those imports, to be removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lot_ids: Vec<String>,
+    /// Sales recorded by those imports. Removing one gives back what it consumed:
+    /// its lots get their quantity and basis returned, which is why the sales have
+    /// to be named as well as the lots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sale_ids: Vec<String>,
+    /// Why, in the words of whoever did it. Required: this is the one operation on
+    /// this page that takes activity out of the books wholesale.
+    pub reason: String,
+}
+
 /// One line of a holdings snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotHoldingData {
@@ -1561,6 +1596,9 @@ pub enum Event {
     PlaidSecurityLinked(Box<PlaidSecurityLinkData>),
     /// One provider transaction, imported — the dedup fence in the log.
     InvestmentActivityImported(Box<InvestmentActivityImportedData>),
+    /// One provider account's imports, undone, so the broker can be read again. See
+    /// [`InvestmentImportsForgottenData`].
+    InvestmentImportsForgotten(Box<InvestmentImportsForgottenData>),
     /// What the broker said an account held on a date. Posts nothing for a taxable
     /// account; for a sheltered one it is what a value update is computed from.
     HoldingsSnapshotRecorded(Box<HoldingsSnapshotData>),
@@ -1898,6 +1936,7 @@ impl Event {
             Event::InvestmentAccountConfigured(_) => "investment_account_configured",
             Event::PlaidSecurityLinked(_) => "plaid_security_linked",
             Event::InvestmentActivityImported(_) => "investment_activity_imported",
+            Event::InvestmentImportsForgotten(_) => "investment_imports_forgotten",
             Event::HoldingsSnapshotRecorded(_) => "holdings_snapshot_recorded",
             Event::BusinessTypeSet { .. } => "business_type_set",
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
@@ -2005,6 +2044,9 @@ impl Event {
             Event::InvestmentAccountConfigured(d) => Some(&d.plaid_account_id),
             Event::PlaidSecurityLinked(d) => Some(&d.security_id),
             Event::InvestmentActivityImported(d) => Some(&d.provider_transaction_id),
+            // The account, not the transactions: this is one act about one account,
+            // and the transactions it names are its contents.
+            Event::InvestmentImportsForgotten(d) => Some(&d.plaid_account_id),
             Event::HoldingsSnapshotRecorded(d) => Some(&d.plaid_account_id),
             // One business per book, so no id names the thing changed — the same
             // answer `BusinessProfileSet` gives.

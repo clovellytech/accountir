@@ -44,9 +44,10 @@ use crate::commands::investment_commands::{
     InvestmentStep, LotSelection, NewSecurity, RecordInvestmentIncomeCommand, SellSecurityCommand,
 };
 use crate::commands::investment_import::{
-    build_configure_in_txn, build_import_in_txn, build_resolve_security_in_txn,
-    build_snapshot_in_txn, classify_subtype, ConfigureInvestmentAccountCommand, ImportError,
-    ImportRecord, ImportStep, MasterSecurity, PlannedWrite,
+    build_configure_in_txn, build_forget_imports_in_txn, build_import_in_txn,
+    build_resolve_security_in_txn, build_snapshot_in_txn, classify_subtype,
+    ConfigureInvestmentAccountCommand, ForgetImportsCommand, ImportError, ImportRecord, ImportStep,
+    MasterSecurity, PlannedWrite,
 };
 use crate::commands::retirement_commands::{
     build_contribution_in_txn, build_distribution_in_txn, build_registration_in_txn,
@@ -114,6 +115,12 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/record-holdings-snapshot",
             post(submit_record_holdings_snapshot),
+        )
+        // The one that takes imports away again. Here rather than local-only because
+        // it voids entries and removes lots, which are the group's books.
+        .route(
+            "/sync/commands/forget-investment-imports",
+            post(submit_forget_imports),
         )
 }
 
@@ -619,6 +626,53 @@ async fn submit_configure_account(
         .append_checked_many(
             expected,
             move |tx| match build_configure_in_txn(tx, &cmd, recognised)? {
+                ImportStep::Append(events) => Ok(Verdict::Append(
+                    events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                )),
+                ImportStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response_many(outcome, expected, ApiError::domain::<ImportError>)
+}
+
+// ---------------------------------------------------------------------------
+// forget-investment-imports
+// ---------------------------------------------------------------------------
+
+/// Lift the dedup fence for one provider account in the group's books.
+#[derive(Serialize, Deserialize)]
+pub struct ForgetInvestmentImportsRequest {
+    pub expected_head_seq: i64,
+    pub item_id: String,
+    pub plaid_account_id: String,
+    pub reason: String,
+}
+
+/// Forget an account's imports, validated server-side: which transactions were
+/// imported, which of their entries are still live, and whether a lot one of them
+/// created has been sold by a sale that is staying.
+///
+/// The client is told nothing but the head. What it needs afterwards — the review
+/// list and the fetch cursor — is on the client's own machine and nowhere near this
+/// server (migration 050), so the client clears it there itself.
+async fn submit_forget_imports(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<ForgetInvestmentImportsRequest>,
+) -> Result<Json<SubmitResponse>, ApiError> {
+    let expected = req.expected_head_seq;
+    let cmd = ForgetImportsCommand {
+        item_id: req.item_id,
+        plaid_account_id: req.plaid_account_id,
+        reason: req.reason,
+    };
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            expected,
+            move |tx| match build_forget_imports_in_txn(tx, &cmd)? {
                 ImportStep::Append(events) => Ok(Verdict::Append(
                     events.into_iter().map(|e| stamp(e, &actor)).collect(),
                 )),

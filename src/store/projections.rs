@@ -1012,6 +1012,63 @@ impl<'a> Projector<'a> {
                     ],
                 )?;
             }
+            // The opposite of the arm above, and the only one in this file that takes
+            // a register row away. Three steps, in this order, because each undoes
+            // what the one before it relied on:
+            //
+            // 1. every sale gives back what it consumed. `investment_sale_lots` is
+            //    the record of which lots a sale took quantity out of, so the lots
+            //    can be put back exactly as they were — including a lot that was
+            //    entered by hand and is not being forgotten, which is why this runs
+            //    whether or not the lot is in `lot_ids`.
+            // 2. the sales go, and their lot links with them.
+            // 3. the lots the imports created go. By now nothing points at them: the
+            //    command refused the whole operation if a sale that is staying had
+            //    consumed one (see `build_forget_imports_in_txn`).
+            //
+            // The entries are not touched here. They are voided by
+            // `JournalEntryVoided` events in the same append, which is what this book
+            // already means by "this did not happen".
+            Event::InvestmentImportsForgotten(d) => {
+                for sale_id in &d.sale_ids {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT lot_id, quantity, basis_cents FROM investment_sale_lots
+                          WHERE sale_id = ?1",
+                    )?;
+                    let consumed: Vec<(String, i64, i64)> = stmt
+                        .query_map([sale_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                        .collect::<Result<_, _>>()?;
+                    drop(stmt);
+                    for (lot_id, quantity, basis_cents) in consumed {
+                        self.conn.execute(
+                            "UPDATE investment_lots
+                                SET remaining_quantity = remaining_quantity + ?2,
+                                    remaining_basis_cents = remaining_basis_cents + ?3,
+                                    updated_at_event = ?4
+                              WHERE id = ?1",
+                            params![lot_id, quantity, basis_cents, stored_event.id],
+                        )?;
+                    }
+                    self.conn.execute(
+                        "DELETE FROM investment_sale_lots WHERE sale_id = ?1",
+                        params![sale_id],
+                    )?;
+                    self.conn.execute(
+                        "DELETE FROM investment_sales WHERE id = ?1",
+                        params![sale_id],
+                    )?;
+                }
+                for lot_id in &d.lot_ids {
+                    self.conn
+                        .execute("DELETE FROM investment_lots WHERE id = ?1", params![lot_id])?;
+                }
+                for provider_transaction_id in &d.provider_transaction_ids {
+                    self.conn.execute(
+                        "DELETE FROM investment_imports WHERE provider_transaction_id = ?1",
+                        params![provider_transaction_id],
+                    )?;
+                }
+            }
             // A snapshot for a day replaces the day's previous one, lines and all.
             // Deleted and re-inserted rather than merged, because a holding that has
             // gone to zero and disappeared from the payload must disappear from the
