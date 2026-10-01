@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::domain::AccountType;
 use crate::queries::account_queries::AccountQueries;
@@ -14,6 +14,12 @@ pub enum ReportError {
     QueryError(#[from] crate::queries::account_queries::AccountQueryError),
     #[error("Unbalanced trial balance: debits {0}, credits {1}")]
     UnbalancedTrialBalance(i64, i64),
+    #[error(
+        "the cash accounts moved by {movement} and the statement attributes {attributed}: the \
+         two are read from the same entries, so a difference is a fault in the report rather \
+         than a fact about the books"
+    )]
+    CashFlowDoesNotTie { movement: i64, attributed: i64 },
 }
 
 /// A line in the trial balance
@@ -94,6 +100,108 @@ pub struct IncomeStatement {
     pub revenue: IncomeStatementSection,
     pub expenses: IncomeStatementSection,
     pub net_income: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Cash flow
+// ---------------------------------------------------------------------------
+
+/// One account money came from or went to, over the period.
+#[derive(Debug, Clone)]
+pub struct CashFlowLine {
+    pub account_id: String,
+    pub account_number: String,
+    pub account_name: String,
+    pub parent_id: Option<String>,
+    /// Signed as cash moved: positive is cash **in**.
+    pub amount: i64,
+}
+
+/// One of the accounts the statement treats as cash.
+#[derive(Debug, Clone)]
+pub struct CashAccountMovement {
+    pub account_id: String,
+    pub account_number: String,
+    pub account_name: String,
+    pub opening: i64,
+    pub closing: i64,
+}
+
+impl CashAccountMovement {
+    pub fn net(&self) -> i64 {
+        self.closing - self.opening
+    }
+}
+
+/// Refuse a statement whose two halves disagree.
+///
+/// The identity that makes the report worth reading: the cash accounts' own movement,
+/// read from their balances, and the movement the statement attributes to named
+/// accounts, read from the entries. They hold by construction — the non-cash lines of
+/// a balanced entry sum to the negative of its cash movement — so a difference means
+/// the balances and the attribution were read under different filters, which is a
+/// fault here and not a fact about the books. Shown figures would be wrong in a way
+/// nobody could see, so they are not shown.
+fn check_cash_flow_ties(flow: &CashFlow) -> Result<(), ReportError> {
+    let movement: i64 = flow.cash_accounts.iter().map(|a| a.net()).sum();
+    if movement != flow.net_change() {
+        return Err(ReportError::CashFlowDoesNotTie {
+            movement,
+            attributed: flow.net_change(),
+        });
+    }
+    Ok(())
+}
+
+/// Where cash came from and where it went, over a period.
+///
+/// # Direct method, and exact rather than apportioned
+///
+/// An entry is balanced, so its lines sum to zero. For any entry that touches a
+/// cash account, the lines that are *not* on a cash account therefore sum to
+/// exactly the negative of the cash movement — which means every dollar of cash
+/// movement can be attributed to a named account with no apportioning and no
+/// residual. That is what makes this report additive: `opening + in - out` is
+/// `closing`, and [`Reports::cash_flow`] refuses to return a statement where it is
+/// not.
+///
+/// The indirect method — net income plus non-cash adjustments — is not what this
+/// is. It answers "why does profit differ from cash", which needs a working-capital
+/// classification this chart does not carry. This answers "where did the money go",
+/// which is the question somebody looking at a bank balance is asking.
+///
+/// # What a transfer between two cash accounts does
+///
+/// Nothing, correctly. Such an entry has no non-cash lines, so it contributes no
+/// attribution, and the two cash movements cancel in the opening/closing figures.
+/// A statement that showed it would report money both earned and spent.
+#[derive(Debug, Clone)]
+pub struct CashFlow {
+    pub start_date: NaiveDate,
+    pub end_date: NaiveDate,
+    /// The accounts treated as cash, with what they held at each end.
+    pub cash_accounts: Vec<CashAccountMovement>,
+    /// Accounts cash came from, largest first.
+    pub inflows: Vec<CashFlowLine>,
+    /// Accounts cash went to, largest first.
+    pub outflows: Vec<CashFlowLine>,
+    pub total_in: i64,
+    pub total_out: i64,
+}
+
+impl CashFlow {
+    pub fn opening_cash(&self) -> i64 {
+        self.cash_accounts.iter().map(|a| a.opening).sum()
+    }
+
+    pub fn closing_cash(&self) -> i64 {
+        self.cash_accounts.iter().map(|a| a.closing).sum()
+    }
+
+    /// The movement the attribution accounts for.
+    pub fn net_change(&self) -> i64 {
+        self.total_in - self.total_out
+    }
 }
 
 /// Report generator
@@ -458,6 +566,152 @@ impl<'a> Reports<'a> {
     }
 
     /// Get account activity summary
+    /// The accounts a cash flow statement covers unless somebody says otherwise.
+    ///
+    /// Asset accounts the bank feed maps to an account the provider itself calls
+    /// `depository` — a chequing or savings account. Derived from what the provider
+    /// said rather than guessed from a name, because "Cash" in an account's name is
+    /// not evidence and a chart is free to call a bank account anything.
+    ///
+    /// Credit cards are deliberately absent. Paying one is cash leaving; what was
+    /// bought with it left cash when the card was paid, not when it was swiped, and
+    /// a statement that counted both would double every card purchase.
+    pub fn default_cash_accounts(&self) -> Result<Vec<String>, ReportError> {
+        // A book old enough to predate the bank feed has no such table, and the
+        // report still has to open — with no default, which reads as "choose the
+        // accounts" rather than as an error.
+        let has_links: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'plaid_local_accounts'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !has_links {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT a.id
+               FROM plaid_local_accounts pa
+               JOIN accounts a ON a.id = pa.local_account_id
+              WHERE lower(pa.account_type) = 'depository'
+                AND a.account_type = 'asset'
+              ORDER BY a.account_number",
+        )?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    /// Where cash came from and where it went, between two dates inclusive.
+    ///
+    /// See [`CashFlow`] for why the attribution is exact rather than apportioned,
+    /// and why a transfer between two cash accounts contributes nothing.
+    pub fn cash_flow(
+        &self,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+        cash_account_ids: &[String],
+    ) -> Result<CashFlow, ReportError> {
+        let queries = AccountQueries::new(self.conn);
+        let cash: HashSet<&str> = cash_account_ids.iter().map(|s| s.as_str()).collect();
+
+        let mut cash_accounts = Vec::new();
+        for id in cash_account_ids {
+            let account = queries.get_account(id)?;
+            // The day before the period starts: an opening balance is what was there
+            // before anything in the window happened.
+            let before = start_date.pred_opt().unwrap_or(start_date);
+            cash_accounts.push(CashAccountMovement {
+                account_id: account.id.clone(),
+                account_number: account.account_number.clone(),
+                account_name: account.name.clone(),
+                opening: queries.get_account_balance(id, Some(before))?.balance,
+                closing: queries.get_account_balance(id, Some(end_date))?.balance,
+            });
+        }
+
+        // Every line of every live entry that touches a cash account, cash lines
+        // included — they are filtered here rather than in SQL so the attribution and
+        // the movement are read from one result set and cannot disagree.
+        let mut by_account: BTreeMap<String, i64> = BTreeMap::new();
+        if !cash.is_empty() {
+            // Every index is written out. A bare `?` takes one more than the largest
+            // index seen so far, so mixing the two forms made the account list bind
+            // *after* the dates and the statement ask for a parameter nobody passed.
+            let placeholders = (3..3 + cash_account_ids.len())
+                .map(|n| format!("?{n}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT jl.account_id, jl.amount
+                   FROM journal_lines jl
+                   JOIN journal_entries je ON je.id = jl.entry_id
+                  WHERE je.is_void = 0
+                    AND je.date >= ?1 AND je.date <= ?2
+                    AND jl.entry_id IN (
+                        SELECT entry_id FROM journal_lines WHERE account_id IN ({placeholders})
+                    )"
+            );
+            let mut params: Vec<String> = vec![start_date.to_string(), end_date.to_string()];
+            params.extend(cash_account_ids.iter().cloned());
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (account_id, amount) = row?;
+                if cash.contains(account_id.as_str()) {
+                    continue;
+                }
+                // Negated: a line crediting Income by 100 is 100 of cash coming in.
+                *by_account.entry(account_id).or_insert(0) -= amount;
+            }
+        }
+
+        let mut inflows = Vec::new();
+        let mut outflows = Vec::new();
+        for (account_id, amount) in by_account {
+            if amount == 0 {
+                continue;
+            }
+            let account = queries.get_account(&account_id)?;
+            let line = CashFlowLine {
+                account_id,
+                account_number: account.account_number,
+                account_name: account.name,
+                parent_id: account.parent_id,
+                amount,
+            };
+            if amount > 0 {
+                inflows.push(line);
+            } else {
+                outflows.push(line);
+            }
+        }
+        // Largest first on both sides: the biggest thing is why anybody opened this.
+        inflows.sort_by_key(|l| -l.amount);
+        outflows.sort_by_key(|l| l.amount);
+
+        let total_in: i64 = inflows.iter().map(|l| l.amount).sum();
+        let total_out: i64 = outflows.iter().map(|l| -l.amount).sum();
+
+        let flow = CashFlow {
+            start_date,
+            end_date,
+            cash_accounts,
+            inflows,
+            outflows,
+            total_in,
+            total_out,
+        };
+        check_cash_flow_ties(&flow)?;
+        Ok(flow)
+    }
+
     pub fn account_activity_summary(
         &self,
         account_id: &str,
@@ -554,7 +808,7 @@ mod tests {
         stored
     }
 
-    fn create_accounts_and_entries(store: &mut EventStore) {
+    pub(crate) fn create_accounts_and_entries(store: &mut EventStore) {
         // Create accounts
         let accounts = vec![
             ("cash", EventAccountType::Asset, "1000", "Cash"),
@@ -1289,6 +1543,376 @@ mod deactivated_account_tests {
         assert!(
             matches!(err, ClosingError::InactiveAccountHoldsBalance { .. }),
             "got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cash_flow_tests {
+    use super::*;
+    use crate::events::types::{
+        Event, EventAccountType, EventEnvelope, JournalLineData, StoredEvent,
+    };
+    use crate::queries::reports::tests::create_accounts_and_entries;
+    use crate::store::event_store::EventStore;
+    use crate::store::migrations::init_schema;
+    use crate::store::projections::ProjectionStore;
+
+    fn setup() -> EventStore {
+        let store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        store
+    }
+
+    fn append_and_project(store: &mut EventStore, event: Event, user_id: &str) -> StoredEvent {
+        let stored = store
+            .append(EventEnvelope::new(event, user_id.to_string()))
+            .unwrap();
+        store.apply_projection(&stored).unwrap();
+        stored
+    }
+
+    // -----------------------------------------------------------------------
+    // Cash flow
+    // -----------------------------------------------------------------------
+
+    fn entry(id: &str, date: NaiveDate, lines: &[(&str, i64)]) -> Event {
+        Event::JournalEntryPosted {
+            entry_id: id.to_string(),
+            date,
+            memo: id.to_string(),
+            lines: lines
+                .iter()
+                .enumerate()
+                .map(|(i, (account, amount))| JournalLineData {
+                    line_id: format!("{id}-{i}"),
+                    account_id: account.to_string(),
+                    amount: *amount,
+                    currency: "USD".to_string(),
+                    exchange_rate: None,
+                    memo: None,
+                })
+                .collect(),
+            reference: None,
+            source: None,
+        }
+    }
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    /// Cash in from revenue, cash out to an expense, and the receivable sale left
+    /// out: it moved no cash, which is the whole difference between this report and
+    /// the income statement.
+    #[test]
+    fn the_cash_flow_names_where_the_money_came_from_and_went() {
+        let mut store = setup();
+        create_accounts_and_entries(&mut store);
+        let reports = Reports::new(store.connection());
+        let flow = reports
+            .cash_flow(day(2024, 1, 1), day(2024, 1, 31), &["cash".to_string()])
+            .expect("ties");
+
+        assert_eq!(flow.opening_cash(), 0);
+        assert_eq!(flow.closing_cash(), 80_000);
+        assert_eq!(flow.total_in, 100_000, "the owner's investment");
+        assert_eq!(flow.total_out, 20_000, "the supplies");
+        assert_eq!(flow.net_change(), 80_000);
+        assert_eq!(
+            flow.inflows
+                .iter()
+                .map(|l| l.account_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["equity"]
+        );
+        assert_eq!(
+            flow.outflows
+                .iter()
+                .map(|l| l.account_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["expense"]
+        );
+        assert!(
+            flow.inflows.iter().all(|l| l.account_id != "revenue"),
+            "the sale was on credit: it earned $500 and moved no cash"
+        );
+    }
+
+    /// A transfer between two cash accounts is not income and not spending. The
+    /// report has to say nothing about it at all — anything else reports the same
+    /// money as both.
+    #[test]
+    fn a_transfer_between_two_cash_accounts_is_not_a_flow() {
+        let mut store = setup();
+        create_accounts_and_entries(&mut store);
+        append_and_project(
+            &mut store,
+            Event::AccountCreated {
+                account_id: "savings".to_string(),
+                account_type: EventAccountType::Asset,
+                account_number: "1001".to_string(),
+                name: "Savings".to_string(),
+                parent_id: None,
+                currency: Some("USD".to_string()),
+                description: None,
+            },
+            "user",
+        );
+        append_and_project(
+            &mut store,
+            entry(
+                "transfer",
+                day(2024, 1, 25),
+                &[("savings", 30_000), ("cash", -30_000)],
+            ),
+            "user",
+        );
+        let reports = Reports::new(store.connection());
+        let flow = reports
+            .cash_flow(
+                day(2024, 1, 1),
+                day(2024, 1, 31),
+                &["cash".to_string(), "savings".to_string()],
+            )
+            .expect("ties");
+
+        assert_eq!(flow.total_in, 100_000);
+        assert_eq!(flow.total_out, 20_000);
+        assert!(
+            flow.inflows
+                .iter()
+                .chain(&flow.outflows)
+                .all(|l| { l.account_id != "cash" && l.account_id != "savings" }),
+            "a cash account is never a line of its own statement"
+        );
+        assert_eq!(
+            flow.closing_cash(),
+            80_000,
+            "the transfer moved no cash out"
+        );
+    }
+
+    /// With only one of the two in the cash set, the same transfer *is* a flow — the
+    /// statement is about the accounts it was asked about, and money leaving them for
+    /// an account it was not asked about has left.
+    #[test]
+    fn a_transfer_out_of_the_cash_set_is_a_flow() {
+        let mut store = setup();
+        create_accounts_and_entries(&mut store);
+        append_and_project(
+            &mut store,
+            Event::AccountCreated {
+                account_id: "savings".to_string(),
+                account_type: EventAccountType::Asset,
+                account_number: "1001".to_string(),
+                name: "Savings".to_string(),
+                parent_id: None,
+                currency: Some("USD".to_string()),
+                description: None,
+            },
+            "user",
+        );
+        append_and_project(
+            &mut store,
+            entry(
+                "transfer",
+                day(2024, 1, 25),
+                &[("savings", 30_000), ("cash", -30_000)],
+            ),
+            "user",
+        );
+        let reports = Reports::new(store.connection());
+        let flow = reports
+            .cash_flow(day(2024, 1, 1), day(2024, 1, 31), &["cash".to_string()])
+            .expect("ties");
+        assert_eq!(flow.total_out, 50_000, "supplies and the transfer out");
+        assert!(flow.outflows.iter().any(|l| l.account_id == "savings"));
+        assert_eq!(flow.closing_cash(), 50_000);
+    }
+
+    /// A three-line entry: one cash line and two counter lines. Every dollar is
+    /// attributed and nothing is apportioned, because a balanced entry's non-cash
+    /// lines already sum to its cash movement.
+    #[test]
+    fn a_split_entry_attributes_every_dollar_to_a_named_account() {
+        let mut store = setup();
+        create_accounts_and_entries(&mut store);
+        append_and_project(
+            &mut store,
+            entry(
+                "split",
+                day(2024, 1, 28),
+                &[("expense", 7_000), ("ap", 3_000), ("cash", -10_000)],
+            ),
+            "user",
+        );
+        let reports = Reports::new(store.connection());
+        let flow = reports
+            .cash_flow(day(2024, 1, 1), day(2024, 1, 31), &["cash".to_string()])
+            .expect("ties");
+        let out = |id: &str| {
+            flow.outflows
+                .iter()
+                .find(|l| l.account_id == id)
+                .map(|l| -l.amount)
+                .unwrap_or(0)
+        };
+        assert_eq!(out("expense"), 27_000, "20,000 earlier plus 7,000 here");
+        assert_eq!(out("ap"), 3_000);
+        assert_eq!(flow.total_out, 30_000);
+        assert_eq!(flow.net_change(), 70_000);
+    }
+
+    /// The window is the window. An entry outside it is not in the attribution, and
+    /// the opening balance is what the account held the day before it starts.
+    #[test]
+    fn the_period_bounds_the_attribution_and_sets_the_opening_balance() {
+        let mut store = setup();
+        create_accounts_and_entries(&mut store);
+        let reports = Reports::new(store.connection());
+        let flow = reports
+            .cash_flow(day(2024, 1, 16), day(2024, 1, 31), &["cash".to_string()])
+            .expect("ties");
+        assert_eq!(
+            flow.opening_cash(),
+            100_000,
+            "the investment landed on the 1st, before this window"
+        );
+        assert_eq!(flow.total_in, 0);
+        assert_eq!(flow.total_out, 20_000);
+        assert_eq!(flow.closing_cash(), 80_000);
+    }
+
+    /// A void entry moved no money, and the balances it is checked against exclude
+    /// it. Counting it would break the identity the report refuses to publish
+    /// without.
+    #[test]
+    fn a_voided_entry_is_not_a_cash_flow() {
+        let mut store = setup();
+        create_accounts_and_entries(&mut store);
+        append_and_project(
+            &mut store,
+            entry(
+                "mistake",
+                day(2024, 1, 29),
+                &[("expense", 99_000), ("cash", -99_000)],
+            ),
+            "user",
+        );
+        append_and_project(
+            &mut store,
+            Event::JournalEntryVoided {
+                entry_id: "mistake".to_string(),
+                reason: "not ours".to_string(),
+            },
+            "user",
+        );
+        let reports = Reports::new(store.connection());
+        let flow = reports
+            .cash_flow(day(2024, 1, 1), day(2024, 1, 31), &["cash".to_string()])
+            .expect("ties");
+        assert_eq!(flow.total_out, 20_000);
+        assert_eq!(flow.closing_cash(), 80_000);
+    }
+
+    /// No cash accounts is not an error: it is a statement with nothing in it, which
+    /// is what a book whose bank accounts nobody has named should show.
+    #[test]
+    fn a_statement_over_no_accounts_is_empty_and_ties() {
+        let mut store = setup();
+        create_accounts_and_entries(&mut store);
+        let reports = Reports::new(store.connection());
+        let flow = reports
+            .cash_flow(day(2024, 1, 1), day(2024, 1, 31), &[])
+            .expect("ties");
+        assert_eq!(flow.opening_cash(), 0);
+        assert_eq!(flow.closing_cash(), 0);
+        assert_eq!(flow.net_change(), 0);
+        assert!(flow.inflows.is_empty() && flow.outflows.is_empty());
+    }
+
+    /// The guard that stops a statement whose halves disagree being published. It
+    /// cannot fire while the balances and the attribution are read under the same
+    /// filters, which is the point — but an unreachable check whose arithmetic was
+    /// never run is a check that will be wrong on the day it is reached.
+    #[test]
+    fn a_statement_whose_halves_disagree_is_refused() {
+        let mut flow = CashFlow {
+            start_date: day(2024, 1, 1),
+            end_date: day(2024, 1, 31),
+            cash_accounts: vec![CashAccountMovement {
+                account_id: "cash".to_string(),
+                account_number: "1000".to_string(),
+                account_name: "Cash".to_string(),
+                opening: 0,
+                closing: 80_000,
+            }],
+            inflows: Vec::new(),
+            outflows: Vec::new(),
+            total_in: 100_000,
+            total_out: 20_000,
+        };
+        assert!(
+            super::check_cash_flow_ties(&flow).is_ok(),
+            "80,000 either way"
+        );
+
+        flow.total_out = 30_000;
+        let refused = super::check_cash_flow_ties(&flow).expect_err("refused");
+        let said = refused.to_string();
+        assert!(said.contains("80000"), "{said}");
+        assert!(said.contains("70000"), "{said}");
+        assert!(
+            said.contains("fault in the report"),
+            "it says whose fault it is: {said}"
+        );
+    }
+
+    /// The default set is what the provider called a chequing account, not what the
+    /// chart calls one — and never a credit card, because paying one is the cash
+    /// movement and the purchase was not.
+    #[test]
+    fn the_default_cash_set_is_the_banks_own_depository_accounts() {
+        let mut store = setup();
+        create_accounts_and_entries(&mut store);
+        append_and_project(
+            &mut store,
+            Event::AccountCreated {
+                account_id: "card".to_string(),
+                account_type: EventAccountType::Liability,
+                account_number: "2100".to_string(),
+                name: "Visa".to_string(),
+                parent_id: None,
+                currency: Some("USD".to_string()),
+                description: None,
+            },
+            "user",
+        );
+        let conn = store.connection();
+        conn.execute(
+            "INSERT INTO plaid_items (id, proxy_item_id, institution_name, status)
+             VALUES ('item1', 'p1', 'Bank', 'active')",
+            [],
+        )
+        .unwrap();
+        for (pa, kind, local) in [
+            ("pa1", "depository", "cash"),
+            ("pa2", "credit", "card"),
+            ("pa3", "investment", "ar"),
+        ] {
+            conn.execute(
+                "INSERT INTO plaid_local_accounts
+                    (item_id, plaid_account_id, name, account_type, local_account_id)
+                 VALUES ('item1', ?1, ?1, ?2, ?3)",
+                rusqlite::params![pa, kind, local],
+            )
+            .unwrap();
+        }
+        let reports = Reports::new(conn);
+        assert_eq!(
+            reports.default_cash_accounts().expect("read"),
+            vec!["cash".to_string()]
         );
     }
 }
