@@ -57,6 +57,13 @@ pub enum PlaidCommandError {
     InvalidTransfer(String),
     #[error("Transaction already imported: {0}")]
     AlreadyImported(String),
+    #[error(
+        "Account {plaid_account_id} is an investment account, so this feed does not post its \
+         transactions: a purchase arrives here as money spent and a sale as income. Its activity \
+         comes from the Investments page, with the securities attached. This row was staged \
+         before that was true and can be left where it is."
+    )]
+    InvestmentAccount { plaid_account_id: String },
     #[error("Database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
     #[error("Account error: {0}")]
@@ -677,6 +684,25 @@ impl<'a> PlaidCommands<'a> {
             .clone()
             .ok_or_else(|| PlaidCommandError::AccountNotMapped(to_txn.plaid_account_id.clone()))?;
 
+        // Either leg being an investment account's is enough. A transfer between a
+        // brokerage and a bank is real, but its brokerage leg belongs to the
+        // Investments page — a contribution there is a cash movement with a
+        // configured clearing account, not a line in this feed. New candidates
+        // cannot be built from such rows any more, because staging skips them; one
+        // paired before that was true still can be.
+        for leg in [&from_txn, &to_txn] {
+            let on_investments = handled_by_investments(
+                self.store.connection(),
+                &leg.item_id,
+                &leg.plaid_account_id,
+            )?;
+            if on_investments {
+                return Err(PlaidCommandError::InvestmentAccount {
+                    plaid_account_id: leg.plaid_account_id.clone(),
+                });
+            }
+        }
+
         let from_currency = from_txn.currency.clone();
         let to_currency = to_txn.currency.clone();
         let from_ref = from_txn.plaid_transaction_id.clone();
@@ -793,6 +819,7 @@ impl<'a> PlaidCommands<'a> {
             .clone()
             .unwrap_or_else(|| uncategorized_id.clone());
 
+        let plaid_account_id = txn.plaid_account_id.clone();
         let date = NaiveDate::parse_from_str(&txn.date, "%Y-%m-%d")
             .unwrap_or_else(|_| Utc::now().date_naive());
         let memo = plaid_memo(&txn.name, txn.merchant_name.as_deref());
@@ -833,6 +860,17 @@ impl<'a> PlaidCommands<'a> {
                         return Ok(Verdict::Reject(PlaidCommandError::AlreadyImported(
                             txn_ref.clone(),
                         )));
+                    }
+                    // INVESTMENTS-SPEC.md §6, at import time as well as at staging
+                    // time. Staging skips an investment account, but rows staged
+                    // before the account was configured — or before that skip
+                    // existed — are still in the review list, and importing one
+                    // posts a trade's cash leg as spending. Refused in-txn, so a
+                    // configuration that lands while this is in flight is honoured.
+                    if handled_by_investments(tx, &item, &plaid_account_id)? {
+                        return Ok(Verdict::Reject(PlaidCommandError::InvestmentAccount {
+                            plaid_account_id: plaid_account_id.clone(),
+                        }));
                     }
                     if let Some(e) = check_entry_invariants_in_txn(
                         tx,
@@ -915,20 +953,44 @@ impl<'a> PlaidCommands<'a> {
 
         let mut transfers = 0u32;
         for cid in &candidate_ids {
-            self.import_transfer(cid)?;
-            transfers += 1;
+            match self.import_transfer(cid) {
+                Ok(_) => transfers += 1,
+                // A candidate with an investment leg is left where it is, for the
+                // reason the pending rows below are filtered: one of them must not
+                // stop the rest of the run.
+                Err(PlaidCommandError::InvestmentAccount { .. }) => {}
+                Err(e) => return Err(e),
+            }
         }
 
-        // Collect remaining pending staged transaction IDs
+        // Collect remaining pending staged transaction IDs.
+        //
+        // An investment account's rows are left out here rather than refused one by
+        // one: `import_single_staged` rejects them, and a rejection from this loop
+        // would abort the whole run — one brokerage staged before it was configured
+        // would stop every other account's transactions importing.
         let pending_ids: Vec<String> = {
             let conn = self.store.connection();
-            let mut stmt =
-                conn.prepare("SELECT id FROM plaid_staged_transactions WHERE status = 'pending'")?;
-            let ids: Vec<String> = stmt
-                .query_map([], |row| row.get(0))?
+            let mut stmt = conn.prepare(
+                "SELECT id, item_id, plaid_account_id FROM plaid_staged_transactions
+                  WHERE status = 'pending'",
+            )?;
+            let rows: Vec<(String, String, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .filter_map(|r| r.ok())
                 .collect();
-            ids
+            drop(stmt);
+            let conn = self.store.connection();
+            rows.into_iter()
+                .filter_map(|(id, item_id, plaid_account_id)| {
+                    match handled_by_investments(conn, &item_id, &plaid_account_id) {
+                        Ok(true) => None,
+                        // A read that failed is not evidence the row should be
+                        // skipped; the in-txn fence is what actually stops it.
+                        _ => Some(id),
+                    }
+                })
+                .collect()
         };
 
         let mut unmatched = 0u32;
@@ -948,6 +1010,44 @@ impl<'a> PlaidCommands<'a> {
     ) -> Result<StoredEvent, PlaidCommandError> {
         self.append_step(|tx| build_disconnect_item_in_txn(tx, item_id, reason))
     }
+}
+
+/// Whether the transactions feed leaves this provider account to the Investments
+/// page.
+///
+/// The same two-part test staging applies (see `stage_transactions_in_conn`):
+/// configured as an investment account, or typed as one by the provider. Read again
+/// at import time because staging and importing are separate acts, and rows staged
+/// before an account was configured are still sitting in the review list — a
+/// brokerage that reported as a chequing account for years has hundreds of them, and
+/// importing one posts a trade's cash leg as spending.
+pub(crate) fn handled_by_investments(
+    conn: &rusqlite::Connection,
+    item_id: &str,
+    plaid_account_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let configured: bool = conn
+        .query_row(
+            "SELECT 1 FROM investment_account_config
+              WHERE item_id = ?1 AND plaid_account_id = ?2",
+            [item_id, plaid_account_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if configured {
+        return Ok(true);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM plaid_local_accounts
+              WHERE item_id = ?1 AND plaid_account_id = ?2
+                AND lower(account_type) IN ('investment', 'brokerage')",
+            [item_id, plaid_account_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// What one staging run did with the transactions it was handed.
@@ -2078,6 +2178,197 @@ mod tests {
             1,
             "no double-post"
         );
+    }
+
+    /// Staging a brokerage's rows is skipped, but rows staged *before* the account
+    /// became an investment account are already in the review list — hundreds of them
+    /// where a bank reported a brokerage as a chequing account. Importing one posts a
+    /// trade's cash leg as spending, so the same test runs again at import time.
+    #[test]
+    fn a_staged_row_for_an_investment_account_is_not_imported() {
+        let (mut store, local) = setup();
+        // Staged while the account was still an ordinary depository account, which
+        // is the only way such a row can exist.
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions("item1", &[txn("t1", "2026-03-04", 4.50)])
+            .expect("staged");
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM plaid_staged_transactions"),
+            1
+        );
+        // Now it is configured as a brokerage.
+        store
+            .connection()
+            .execute(
+                "INSERT INTO investment_account_config
+                    (item_id, plaid_account_id, treatment, securities_account_id, cash_account_id,
+                     dividend_income_account_id, interest_income_account_id,
+                     realized_gain_account_id, fee_expense_account_id)
+                 VALUES ('item1','pa1','taxable',?1,?1,?1,?1,?1,?1)",
+                [&local],
+            )
+            .expect("configured");
+        let staged_id: String = store
+            .connection()
+            .query_row("SELECT id FROM plaid_staged_transactions", [], |r| r.get(0))
+            .expect("the staged row");
+
+        let refused = PlaidCommands::new(&mut store, "u".to_string())
+            .import_single_staged(&staged_id)
+            .expect_err("refused");
+        assert!(
+            matches!(refused, PlaidCommandError::InvestmentAccount { .. }),
+            "{refused:?}"
+        );
+        assert!(
+            refused.to_string().contains("Investments page"),
+            "the refusal says where the activity does come from: {refused}"
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM journal_entries"), 0);
+    }
+
+    /// And "Import all" leaves it where it is instead of stopping: one brokerage
+    /// staged before it was configured must not keep every other account's
+    /// transactions out of the books.
+    #[test]
+    fn importing_everything_staged_passes_over_an_investment_account() {
+        let (mut store, local) = setup();
+        let other = mk_account(&mut store, "1010", "Savings", AccountType::Asset);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_local_accounts
+                    (item_id, plaid_account_id, name, account_type, local_account_id)
+                 VALUES ('item1','pa2','Savings','depository',?1)",
+                [&other],
+            )
+            .expect("second account");
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions("item1", &[txn("t1", "2026-03-04", 4.50)])
+            .expect("staged the brokerage row");
+        store
+            .connection()
+            .execute(
+                "UPDATE plaid_staged_transactions SET plaid_account_id = 'pa1' WHERE
+                 plaid_transaction_id = 't1'",
+                [],
+            )
+            .expect("on the brokerage");
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions("item1", &[txn("t2", "2026-03-05", 9.00)])
+            .expect("staged");
+        store
+            .connection()
+            .execute(
+                "UPDATE plaid_staged_transactions
+                    SET plaid_account_id = 'pa2', local_account_id = ?1
+                  WHERE plaid_transaction_id = 't2'",
+                [&other],
+            )
+            .expect("on the savings account");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO investment_account_config
+                    (item_id, plaid_account_id, treatment, securities_account_id, cash_account_id,
+                     dividend_income_account_id, interest_income_account_id,
+                     realized_gain_account_id, fee_expense_account_id)
+                 VALUES ('item1','pa1','taxable',?1,?1,?1,?1,?1,?1)",
+                [&local],
+            )
+            .expect("configured");
+
+        let (_, imported) = PlaidCommands::new(&mut store, "u".to_string())
+            .import_all_staged()
+            .expect("the run completes");
+        assert_eq!(imported, 1, "the savings row, and only it");
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM journal_entries WHERE reference = 't2'"
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM journal_entries WHERE reference = 't1'"
+            ),
+            0,
+            "the brokerage row is still waiting, not posted as spending"
+        );
+    }
+
+    /// A transfer between a brokerage and a bank is real, but its brokerage leg
+    /// belongs to the Investments page — a contribution there posts against the
+    /// configured clearing account. A pair made before the account was configured is
+    /// the only way one can still be sitting here.
+    #[test]
+    fn a_transfer_with_an_investment_leg_is_not_imported() {
+        let (mut store, local) = setup();
+        let other = mk_account(&mut store, "1010", "Savings", AccountType::Asset);
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_local_accounts
+                    (item_id, plaid_account_id, name, account_type, local_account_id)
+                 VALUES ('item1','pa2','Savings','depository',?1)",
+                [&other],
+            )
+            .expect("second account");
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions("item1", &[txn("t1", "2026-03-04", 50.0)])
+            .expect("staged");
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions("item1", &[txn("t2", "2026-03-04", -50.0)])
+            .expect("staged");
+        store
+            .connection()
+            .execute(
+                "UPDATE plaid_staged_transactions
+                    SET plaid_account_id = 'pa2', local_account_id = ?1
+                  WHERE plaid_transaction_id = 't2'",
+                [&other],
+            )
+            .expect("the other leg");
+        let ids: Vec<String> = {
+            let conn = store.connection();
+            let mut stmt = conn
+                .prepare("SELECT id FROM plaid_staged_transactions ORDER BY plaid_transaction_id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        let candidate =
+            create_manual_transfer(store.connection(), &ids[0], &ids[1]).expect("paired");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO investment_account_config
+                    (item_id, plaid_account_id, treatment, securities_account_id, cash_account_id,
+                     dividend_income_account_id, interest_income_account_id,
+                     realized_gain_account_id, fee_expense_account_id)
+                 VALUES ('item1','pa1','taxable',?1,?1,?1,?1,?1,?1)",
+                [&local],
+            )
+            .expect("configured");
+
+        let refused = PlaidCommands::new(&mut store, "u".to_string())
+            .import_transfer(&candidate)
+            .expect_err("refused");
+        assert!(
+            matches!(refused, PlaidCommandError::InvestmentAccount { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM journal_entries"), 0);
+
+        // And the whole run still completes, leaving the pair where it is.
+        PlaidCommands::new(&mut store, "u".to_string())
+            .import_all_staged()
+            .expect("the run completes");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM journal_entries"), 0);
     }
 
     #[test]
