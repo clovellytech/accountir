@@ -110,6 +110,7 @@ use crate::commands::investment_commands::{
     InvestmentStep, LotSelection, NewSecurity, RecordInvestmentIncomeCommand, SellSecurityCommand,
 };
 use crate::commands::retirement_commands::{self, SetRetirementValueCommand, ValueSet};
+use crate::domain::AccountType;
 use crate::events::types::{
     Event, EventEnvelope, HoldingsSnapshotData, ImportedActivityKind, InvestmentAccountConfigData,
     InvestmentActivityImportedData, InvestmentImportsForgottenData, InvestmentIncomeKind,
@@ -4077,6 +4078,354 @@ pub fn record_fetch(
 }
 
 // ---------------------------------------------------------------------------
+// The standard chart for one brokerage
+// ---------------------------------------------------------------------------
+//
+// Configuring a brokerage by hand means naming ten ledger accounts, and the ten are
+// not a free choice: the securities slots have to be separate from each other because
+// a broker may use average cost for a fund and not for a stock, the cash slot has to
+// be separate from the securities or a purchase posts to itself, tax-exempt interest
+// has to be its own account because it is reported and not taxed, and a capital gain
+// distribution has to be its own because it belongs on Schedule D rather than
+// Schedule B. Ten pickers is how one of them ends up pointing at the wrong account,
+// which balances perfectly and comes out wrong on the return.
+//
+// So the chart is laid down the way a new set of books is seeded: one action, one
+// definition, every account or none.
+//
+// # The shape
+//
+// ```text
+// Assets:…:<the account>          the ledger account the bank feed already maps
+//   Cash                          the sweep balance
+//   Stocks                        equities and ETFs, at cost
+//   Mutual funds                  kept apart: average cost is permitted here
+//   Other securities              bonds, cash equivalents, unrecognised kinds
+// Income:Investment income:<account>
+//   Dividends
+//   Interest
+//   Tax-exempt interest
+//   Capital gain distributions
+//   Realized gains
+// Expenses:Investment expenses:<account>
+// ```
+//
+// # Why the income accounts are per account and not shared
+//
+// Because the figures are checked against a document per account. A 1099-DIV is
+// issued for one account, and "do the books agree with it" is only answerable if the
+// books can be summed for that account alone. The same reason the securities are
+// carried under the account rather than in one securities pool.
+//
+// # Fees, and what is deliberately not here
+//
+// There is one expense account per brokerage and no subdivision under it, because
+// most of what looks like an investment expense never reaches it:
+//
+// - **A fee on a trade is not an expense.** A purchase's commission capitalises into
+//   the lot's basis and a sale's fee comes out of the proceeds, because that is how a
+//   1099-B reports them and therefore how a gain has to be computed. Only a charge
+//   that is not part of a trade — advisory and management fees, account maintenance,
+//   wire and transfer fees — lands in the expense account.
+// - **Margin interest is not a fee.** It is investment interest expense, limited on
+//   the investor's own return (Form 4952), so it belongs in its own account and not
+//   lumped with advisory fees. Nothing sorts it automatically: a provider that
+//   reports one as a fee posts it here, and it has to be reclassified by hand.
+// - **No tax line is set.** On an individual's return an advisory fee is not
+//   deductible at all, and in an entity's books the same charge may be; which of
+//   those applies is not something the chart can know, so the account is created with
+//   no mapping and whoever files decides.
+
+/// One slot of a taxable brokerage's configuration, and the account that fills it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvestmentSlot {
+    Cash,
+    Stocks,
+    MutualFunds,
+    OtherSecurities,
+    Dividends,
+    Interest,
+    TaxExemptInterest,
+    CapitalGainDistributions,
+    RealizedGains,
+    Fees,
+}
+
+impl InvestmentSlot {
+    /// Every slot the standard chart fills, in the order the paths are built.
+    pub const ALL: [InvestmentSlot; 10] = [
+        InvestmentSlot::Cash,
+        InvestmentSlot::Stocks,
+        InvestmentSlot::MutualFunds,
+        InvestmentSlot::OtherSecurities,
+        InvestmentSlot::Dividends,
+        InvestmentSlot::Interest,
+        InvestmentSlot::TaxExemptInterest,
+        InvestmentSlot::CapitalGainDistributions,
+        InvestmentSlot::RealizedGains,
+        InvestmentSlot::Fees,
+    ];
+
+    fn account_type(self) -> AccountType {
+        match self {
+            InvestmentSlot::Cash
+            | InvestmentSlot::Stocks
+            | InvestmentSlot::MutualFunds
+            | InvestmentSlot::OtherSecurities => AccountType::Asset,
+            InvestmentSlot::Dividends
+            | InvestmentSlot::Interest
+            | InvestmentSlot::TaxExemptInterest
+            | InvestmentSlot::CapitalGainDistributions
+            | InvestmentSlot::RealizedGains => AccountType::Revenue,
+            InvestmentSlot::Fees => AccountType::Expense,
+        }
+    }
+
+    fn leaf(self) -> &'static str {
+        match self {
+            InvestmentSlot::Cash => "Cash",
+            InvestmentSlot::Stocks => "Stocks",
+            InvestmentSlot::MutualFunds => "Mutual funds",
+            InvestmentSlot::OtherSecurities => "Other securities",
+            InvestmentSlot::Dividends => "Dividends",
+            InvestmentSlot::Interest => "Interest",
+            InvestmentSlot::TaxExemptInterest => "Tax-exempt interest",
+            InvestmentSlot::CapitalGainDistributions => "Capital gain distributions",
+            InvestmentSlot::RealizedGains => "Realized gains",
+            // Its own leaf would be an only child. The per-account node *is* the
+            // expense account, and a book that later wants advisory and maintenance
+            // apart can add children under it.
+            InvestmentSlot::Fees => "",
+        }
+    }
+}
+
+/// The top of the two trees the per-account nodes hang under. Named rather than
+/// spelled at each use, because a typo here makes a second chart that looks like the
+/// first.
+const INCOME_ROOT: &str = "Income:Investment income";
+const EXPENSE_ROOT: &str = "Expenses:Investment expenses";
+
+/// A name as a path segment: colons become spaces, because colons separate
+/// segments, and runs of whitespace collapse. May come back empty.
+fn clean(name: &str) -> String {
+    name.replace(':', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What this book calls one provider account, as a path segment.
+///
+/// The institution and the mask as well as the name, because "Trust" at two brokers
+/// is two accounts and a chart that merges them reports one 1099 against the other's
+/// figures.
+///
+/// Each part is dropped when it is empty rather than replaced by a placeholder: a
+/// provider that sends no institution should give "Trust ••8S78", not "Unnamed
+/// Trust ••8S78". The placeholder is only for the case where nothing at all is left,
+/// which would otherwise be an account path with an empty segment in it.
+pub fn account_segment(institution: &str, name: &str, mask: Option<&str>) -> String {
+    let mut parts: Vec<String> = [institution, name]
+        .into_iter()
+        .map(clean)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if let Some(mask) = mask.map(clean).filter(|m| !m.is_empty()) {
+        parts.push(format!("\u{2022}\u{2022}{mask}"));
+    }
+    if parts.is_empty() {
+        "Unnamed account".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Every path the standard chart lays down, with the slot it fills.
+///
+/// `asset_root` is the account the securities and cash hang under — the one the bank
+/// feed is already mapped to, so the brokerage's own subaccounts appear where
+/// somebody already looks for that account.
+pub fn standard_chart(asset_root: &str, account: &str) -> Vec<(InvestmentSlot, String)> {
+    InvestmentSlot::ALL
+        .into_iter()
+        .map(|slot| {
+            let root = match slot.account_type() {
+                AccountType::Asset => asset_root.to_string(),
+                AccountType::Revenue => format!("{INCOME_ROOT}:{account}"),
+                _ => format!("{EXPENSE_ROOT}:{account}"),
+            };
+            let path = match slot.leaf() {
+                "" => root,
+                leaf => format!("{root}:{leaf}"),
+            };
+            (slot, path)
+        })
+        .collect()
+}
+
+/// Lay down the standard chart for one provider account.
+#[derive(Debug, Clone)]
+pub struct SeedInvestmentAccountsCommand {
+    pub item_id: String,
+    pub plaid_account_id: String,
+}
+
+/// What seeding came to: the configuration it fills, and the chart it laid down.
+#[derive(Debug, Clone)]
+pub struct SeededAccounts {
+    pub accounts: Box<TaxableBrokerageAccounts>,
+    /// Every path, in slot order, so the answer can say what it made.
+    pub paths: Vec<String>,
+    /// How many of them were created. Zero means the chart was already there, which
+    /// is an ordinary answer: seeding twice changes nothing.
+    pub created: usize,
+}
+
+pub(crate) enum SeedAccountsStep {
+    Append {
+        events: Vec<Event>,
+        seeded: Box<SeededAccounts>,
+    },
+    Reject(ImportError),
+}
+
+/// Build the standard chart for one provider account inside the append transaction.
+///
+/// The client names the provider account and nothing else. The *layout* is decided
+/// here, from the bank-link projection — which institution, which account, which
+/// ledger account it is already mapped to — so a replica cannot ask for a chart of
+/// its own shape and two machines cannot lay down two different ones.
+pub(crate) fn build_seed_accounts_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    cmd: &SeedInvestmentAccountsCommand,
+) -> Result<SeedAccountsStep, EventStoreError> {
+    let row: Option<(String, String, Option<String>, Option<String>)> = tx
+        .query_row(
+            "SELECT i.institution_name, pa.name, pa.mask, pa.local_account_id
+               FROM plaid_local_accounts pa
+               JOIN plaid_items i ON i.id = pa.item_id
+              WHERE pa.item_id = ?1 AND pa.plaid_account_id = ?2",
+            [&cmd.item_id, &cmd.plaid_account_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((institution, name, mask, local_account_id)) = row else {
+        return Ok(SeedAccountsStep::Reject(ImportError::NoSuchAccount(
+            cmd.plaid_account_id.clone(),
+        )));
+    };
+
+    let account = account_segment(&institution, &name, mask.as_deref());
+    // Under the account the bank feed already maps, when there is one: that is the
+    // account somebody already named and already looks at. Only when there is none
+    // does the chart invent a place to put it.
+    let asset_root = local_account_id
+        .as_deref()
+        .and_then(|id| crate::commands::account_commands::path_of_account(tx, id))
+        .unwrap_or_else(|| format!("Assets:{}", account));
+
+    let chart = standard_chart(&asset_root, &account);
+    let paths: Vec<String> = chart.iter().map(|(_, path)| path.clone()).collect();
+    let requested: Vec<(String, AccountType)> = chart
+        .iter()
+        .map(|(slot, path)| (path.clone(), slot.account_type()))
+        .collect();
+
+    use crate::commands::account_commands::{build_ensure_account_paths_in_txn, EnsurePathsStep};
+    let (events, ids) = match build_ensure_account_paths_in_txn(tx, &requested)? {
+        EnsurePathsStep::Ensured { events, leaf_ids } => (events, leaf_ids),
+        EnsurePathsStep::Reject(e) => {
+            return Ok(SeedAccountsStep::Reject(ImportError::Invalid(e.to_string())))
+        }
+    };
+    let by_slot = |slot: InvestmentSlot| -> String {
+        let at = InvestmentSlot::ALL
+            .iter()
+            .position(|s| *s == slot)
+            .expect("every slot is in ALL");
+        ids[at].clone()
+    };
+    let created = events.len();
+    Ok(SeedAccountsStep::Append {
+        events,
+        seeded: Box::new(SeededAccounts {
+            accounts: Box::new(TaxableBrokerageAccounts {
+                stocks_account_id: by_slot(InvestmentSlot::Stocks),
+                mutual_funds_account_id: Some(by_slot(InvestmentSlot::MutualFunds)),
+                other_securities_account_id: Some(by_slot(InvestmentSlot::OtherSecurities)),
+                cash_account_id: by_slot(InvestmentSlot::Cash),
+                dividend_income_account_id: by_slot(InvestmentSlot::Dividends),
+                interest_income_account_id: by_slot(InvestmentSlot::Interest),
+                tax_exempt_interest_account_id: Some(by_slot(InvestmentSlot::TaxExemptInterest)),
+                capital_gain_distribution_account_id: Some(by_slot(
+                    InvestmentSlot::CapitalGainDistributions,
+                )),
+                realized_gain_account_id: by_slot(InvestmentSlot::RealizedGains),
+                fee_expense_account_id: by_slot(InvestmentSlot::Fees),
+                // Deliberately empty. A clearing account turns every deposit and
+                // withdrawal into a posting against cash-in-transit that somebody
+                // has to clear against the bank's own side; without one they are
+                // held for review, which is the honest answer when the brokerage
+                // has not said which bank account the money came from. Choosing
+                // that trade-off is not the chart's business.
+                transfer_clearing_account_id: None,
+            }),
+            paths,
+            created,
+        }),
+    })
+}
+
+/// Lay down the standard chart on books this machine owns.
+pub fn seed_investment_accounts(
+    store: &mut EventStore,
+    user_id: &str,
+    cmd: &SeedInvestmentAccountsCommand,
+) -> Result<SeededAccounts, ImportError> {
+    // The payload the transaction decided, read back after it commits. The closure
+    // may run more than once — a head move retries it — so the last write wins,
+    // which is the run that was committed.
+    let sink: std::sync::Arc<std::sync::Mutex<Option<Box<SeededAccounts>>>> = Default::default();
+    loop {
+        let head = store.latest_id()?.unwrap_or(0);
+        let kept = sink.clone();
+        let outcome = store.append_checked_many(
+            head,
+            |tx| match build_seed_accounts_in_txn(tx, cmd)? {
+                SeedAccountsStep::Append { events, seeded } => {
+                    *kept.lock().unwrap() = Some(seeded);
+                    Ok(Verdict::Append(
+                        events
+                            .into_iter()
+                            .map(|e| EventEnvelope::new(e, user_id.to_string()))
+                            .collect(),
+                    ))
+                }
+                SeedAccountsStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            |tx, stored| {
+                Projector::new(tx)
+                    .apply(stored)
+                    .map_err(|e| EventStoreError::Projection(e.to_string()))
+            },
+        )?;
+        match outcome {
+            CheckedOutcome::Appended(_) => {
+                return sink
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .map(|b| *b)
+                    .ok_or_else(|| ImportError::Store("the chart did not land".to_string()))
+            }
+            CheckedOutcome::HeadMismatch { .. } => continue,
+            CheckedOutcome::Rejected(e) => return Err(e),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Forgetting an account's imports
 // ---------------------------------------------------------------------------
 //
@@ -7342,5 +7691,264 @@ mod tests {
         .expect("sold by hand");
         let preview = preview_forget(store.connection(), ITEM, BRK).expect("previewed");
         assert_eq!(preview.sold_lots.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Seeding a brokerage's standard chart
+    // -----------------------------------------------------------------------
+
+    /// The chart as paths, from the books, in slot order.
+    fn seeded_paths(store: &EventStore) -> Vec<String> {
+        let conn = store.connection();
+        let mut stmt = conn
+            .prepare("SELECT id FROM accounts ORDER BY account_number")
+            .expect("accounts");
+        let ids: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .expect("ids")
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut paths: Vec<String> = ids
+            .iter()
+            .filter_map(|id| crate::commands::account_commands::path_of_account(conn, id))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// A book with the bank link in place and nothing else: the brokerage is mapped to
+    /// a ledger account somebody has already named, which is where its subaccounts
+    /// belong.
+    fn linked() -> EventStore {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        crate::commands::partnership_commands::append_event_locally(
+            &mut store,
+            "u",
+            Event::CompanyCreated {
+                company_id: "c".into(),
+                name: "Books".into(),
+                base_currency: "USD".into(),
+                fiscal_year_start: 1,
+            },
+        )
+        .expect("company");
+        crate::commands::account_commands::create_default_accounts(&mut store)
+            .expect("the default chart");
+        let ml = crate::commands::account_commands::AccountCommands::new(&mut store, "u".into())
+            .create_account(crate::commands::account_commands::CreateAccountCommand {
+                account_type: AccountType::Asset,
+                account_number: "1100".into(),
+                name: "Trust Taxable".into(),
+                parent_id: None,
+                currency: Some("USD".into()),
+                description: None,
+            })
+            .expect("the brokerage's ledger account");
+        let ml_id = match &ml.event {
+            Event::AccountCreated { account_id, .. } => account_id.clone(),
+            _ => unreachable!(),
+        };
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_items (id, proxy_item_id, institution_name, status)
+                 VALUES ('item1', 'p1', 'Merrill', 'active')",
+                [],
+            )
+            .expect("item");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_local_accounts
+                    (item_id, plaid_account_id, name, account_type, mask, local_account_id)
+                 VALUES ('item1', 'pa1', 'Trust', 'depository', '8S78', ?1)",
+                [&ml_id],
+            )
+            .expect("account");
+        store
+    }
+
+    fn seed(store: &mut EventStore) -> Result<SeededAccounts, ImportError> {
+        seed_investment_accounts(
+            store,
+            "u",
+            &SeedInvestmentAccountsCommand {
+                item_id: ITEM.into(),
+                plaid_account_id: "pa1".into(),
+            },
+        )
+    }
+
+    /// The whole shape, in one assertion, because the shape *is* the decision: the
+    /// securities and cash under the account somebody already named, the income
+    /// accounts under a node per account, and one expense account.
+    #[test]
+    fn seeding_lays_down_the_standard_chart_under_the_account_already_mapped() {
+        let mut store = linked();
+        let seeded = seed(&mut store).expect("seeded");
+        // Ten slots and three parents — `Income:Investment income`, the node under it
+        // for this account, and `Expenses:Investment expenses`. Thirteen rather than
+        // fourteen because the expense slot *is* the per-account node, and the asset
+        // root was already there: that is the whole point of hanging the subaccounts
+        // under the account the bank feed maps.
+        assert_eq!(seeded.created, 13, "{:?}", seeded.paths);
+        assert_eq!(
+            seeded.paths,
+            vec![
+                "Trust Taxable:Cash",
+                "Trust Taxable:Stocks",
+                "Trust Taxable:Mutual funds",
+                "Trust Taxable:Other securities",
+                "Income:Investment income:Merrill Trust \u{2022}\u{2022}8S78:Dividends",
+                "Income:Investment income:Merrill Trust \u{2022}\u{2022}8S78:Interest",
+                "Income:Investment income:Merrill Trust \u{2022}\u{2022}8S78:Tax-exempt interest",
+                "Income:Investment income:Merrill Trust \u{2022}\u{2022}8S78:Capital gain \
+                 distributions",
+                "Income:Investment income:Merrill Trust \u{2022}\u{2022}8S78:Realized gains",
+                "Expenses:Investment expenses:Merrill Trust \u{2022}\u{2022}8S78",
+            ]
+        );
+    }
+
+    /// And the ids it hands back are a configuration that the configure command
+    /// accepts — which is the whole point of seeding rather than naming ten accounts
+    /// by hand. Every type check in `build_configure_in_txn` runs against them.
+    #[test]
+    fn the_seeded_chart_configures_the_account_without_a_single_picker() {
+        let mut store = linked();
+        let seeded = seed(&mut store).expect("seeded");
+        configure_account(
+            &mut store,
+            "u",
+            &ConfigureInvestmentAccountCommand {
+                item_id: ITEM.into(),
+                plaid_account_id: "pa1".into(),
+                accounts: InvestmentPostingAccounts::Taxable(seeded.accounts.clone()),
+                plaid_subtype: Some("brokerage".into()),
+            },
+        )
+        .expect("the seeded accounts are of the types every slot requires");
+        let config = get_config(store.connection(), ITEM, "pa1").expect("configured");
+        let taxable = config.taxable().expect("taxable");
+        assert_ne!(taxable.cash_account_id, taxable.stocks_account_id);
+        assert!(
+            taxable.capital_gain_distribution_account_id.is_some(),
+            "the slot with no fallback is filled, or every fund distribution is held"
+        );
+        assert!(
+            taxable.tax_exempt_interest_account_id.is_some(),
+            "reported and not taxed, so it cannot be folded into ordinary interest"
+        );
+        assert_eq!(
+            taxable.transfer_clearing_account_id, None,
+            "left to a person: with one, every deposit posts to transit; without one it \
+             is held for review"
+        );
+    }
+
+    /// Seeding twice is not an error and not a second chart. The seeder for a new book
+    /// refuses a chart that is already there; this one is run against an account that
+    /// may already be half set up, so it matches by path and reuses.
+    #[test]
+    fn seeding_twice_creates_nothing_the_second_time() {
+        let mut store = linked();
+        let first = seed(&mut store).expect("seeded");
+        let before = seeded_paths(&store);
+        let again = seed(&mut store).expect("seeded again");
+        assert_eq!(again.created, 0);
+        assert_eq!(
+            again.accounts.cash_account_id, first.accounts.cash_account_id,
+            "the same accounts, not a second set"
+        );
+        assert_eq!(
+            again.accounts.realized_gain_account_id,
+            first.accounts.realized_gain_account_id
+        );
+        assert_eq!(again.paths, first.paths);
+        assert_eq!(seeded_paths(&store), before);
+    }
+
+    /// Two brokerages at two institutions whose accounts have the same name. The
+    /// income nodes must not merge: a 1099 is issued per account, and a merged node
+    /// cannot be summed for one of them.
+    #[test]
+    fn two_accounts_of_the_same_name_get_their_own_income_nodes() {
+        let mut store = linked();
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_items (id, proxy_item_id, institution_name, status)
+                 VALUES ('item2', 'p2', 'Schwab', 'active')",
+                [],
+            )
+            .expect("second item");
+        store
+            .connection()
+            .execute(
+                "INSERT INTO plaid_local_accounts
+                    (item_id, plaid_account_id, name, account_type, mask)
+                 VALUES ('item2', 'pa2', 'Trust', 'investment', '1234')",
+                [],
+            )
+            .expect("second account");
+        seed(&mut store).expect("the first");
+        let second = seed_investment_accounts(
+            &mut store,
+            "u",
+            &SeedInvestmentAccountsCommand {
+                item_id: "item2".into(),
+                plaid_account_id: "pa2".into(),
+            },
+        )
+        .expect("the second");
+        assert!(
+            second.paths[4].contains("Schwab Trust \u{2022}\u{2022}1234"),
+            "{:?}",
+            second.paths
+        );
+        // Unmapped at the bank, so the chart had to invent somewhere for the assets.
+        assert_eq!(
+            second.paths[0], "Assets:Schwab Trust \u{2022}\u{2022}1234:Cash",
+            "{:?}",
+            second.paths
+        );
+    }
+
+    #[test]
+    fn seeding_an_account_this_book_does_not_know_is_refused() {
+        let mut store = linked();
+        let refused = seed_investment_accounts(
+            &mut store,
+            "u",
+            &SeedInvestmentAccountsCommand {
+                item_id: ITEM.into(),
+                plaid_account_id: "nope".into(),
+            },
+        )
+        .expect_err("refused");
+        assert!(
+            matches!(refused, ImportError::NoSuchAccount(_)),
+            "{refused:?}"
+        );
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM accounts WHERE name = 'Cash'"),
+            0
+        );
+    }
+
+    /// A colon in a provider's name would otherwise split into two accounts.
+    #[test]
+    fn a_colon_in_a_providers_name_is_not_a_path_separator() {
+        assert_eq!(
+            account_segment("Merrill: Lynch", "Trust", Some("8S78")),
+            "Merrill Lynch Trust \u{2022}\u{2022}8S78"
+        );
+        assert_eq!(account_segment("  ", "  ", None), "Unnamed account");
+        assert_eq!(
+            account_segment("", "Trust", Some("8S78")),
+            "Trust \u{2022}\u{2022}8S78",
+            "an empty part is dropped, not replaced by a placeholder"
+        );
     }
 }

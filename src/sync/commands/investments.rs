@@ -45,9 +45,10 @@ use crate::commands::investment_commands::{
 };
 use crate::commands::investment_import::{
     build_configure_in_txn, build_forget_imports_in_txn, build_import_in_txn,
-    build_resolve_security_in_txn, build_snapshot_in_txn, classify_subtype,
-    ConfigureInvestmentAccountCommand, ForgetImportsCommand, ImportError, ImportRecord, ImportStep,
-    MasterSecurity, PlannedWrite,
+    build_resolve_security_in_txn, build_seed_accounts_in_txn, build_snapshot_in_txn,
+    classify_subtype, ConfigureInvestmentAccountCommand, ForgetImportsCommand, ImportError,
+    ImportRecord, ImportStep, MasterSecurity, PlannedWrite, SeedAccountsStep,
+    SeedInvestmentAccountsCommand, SeededAccounts,
 };
 use crate::commands::retirement_commands::{
     build_contribution_in_txn, build_distribution_in_txn, build_registration_in_txn,
@@ -56,7 +57,7 @@ use crate::commands::retirement_commands::{
 };
 use crate::events::types::{
     Event, HoldingsSnapshotData, InvestmentIncomeKind, InvestmentPostingAccounts, RetirementKind,
-    SaleLotData,
+    SaleLotData, TaxableBrokerageAccounts,
 };
 use crate::store::event_store::{EventStoreError, Verdict};
 use crate::sync::{
@@ -121,6 +122,12 @@ pub fn router() -> Router<SyncState> {
         .route(
             "/sync/commands/forget-investment-imports",
             post(submit_forget_imports),
+        )
+        // Lays down a brokerage's standard chart, the way `seed-default-accounts`
+        // lays down a new book's.
+        .route(
+            "/sync/commands/seed-investment-accounts",
+            post(submit_seed_investment_accounts),
         )
 }
 
@@ -635,6 +642,83 @@ async fn submit_configure_account(
         )
         .map_err(ApiError::store)?;
     outcome_to_response_many(outcome, expected, ApiError::domain::<ImportError>)
+}
+
+// ---------------------------------------------------------------------------
+// seed-investment-accounts
+// ---------------------------------------------------------------------------
+
+/// Lay down the standard chart for one provider investment account.
+#[derive(Serialize, Deserialize)]
+pub struct SeedInvestmentAccountsRequest {
+    pub expected_head_seq: i64,
+    pub item_id: String,
+    pub plaid_account_id: String,
+}
+
+/// The chart, as it now stands in the group's books.
+#[derive(Serialize, Deserialize)]
+pub struct SeedInvestmentAccountsResponse {
+    pub head: i64,
+    /// The ids, ready to be sent straight back as a configuration.
+    pub accounts: TaxableBrokerageAccounts,
+    /// Every path in slot order, so the client can say what was laid down without
+    /// re-deriving it.
+    pub paths: Vec<String>,
+    /// How many accounts were created. Zero means the chart was already there.
+    pub created: usize,
+}
+
+/// Seed a brokerage's chart, with the **layout decided here**.
+///
+/// The client names a provider account and nothing else: which institution it is,
+/// what it is called, and which ledger account the bank feed already maps are all
+/// read from this ledger's own projection. A client that could send paths could send
+/// a chart of its own shape, and two machines would lay down two.
+///
+/// Appends as one batch, like `seed-default-accounts`: every account or none. Unlike
+/// it, seeding twice is harmless — accounts already there are matched by path and
+/// reused, and the answer says nothing was created.
+async fn submit_seed_investment_accounts(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SeedInvestmentAccountsRequest>,
+) -> Result<Json<SeedInvestmentAccountsResponse>, ApiError> {
+    let expected = req.expected_head_seq;
+    let cmd = SeedInvestmentAccountsCommand {
+        item_id: req.item_id,
+        plaid_account_id: req.plaid_account_id,
+    };
+    let seeded: Sink<Box<SeededAccounts>> = sink();
+    let recorder = seeded.clone();
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked_many(
+            expected,
+            move |tx| match build_seed_accounts_in_txn(tx, &cmd)? {
+                SeedAccountsStep::Append { events, seeded } => {
+                    if let Ok(mut slot) = recorder.lock() {
+                        *slot = Some(seeded);
+                    }
+                    Ok(Verdict::Append(
+                        events.into_iter().map(|e| stamp(e, &actor)).collect(),
+                    ))
+                }
+                SeedAccountsStep::Reject(e) => Ok(Verdict::Reject(e)),
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    let head = outcome_to_response_many(outcome, expected, ApiError::domain::<ImportError>)?
+        .0
+        .head;
+    let seeded = taken(&seeded, "the seeded chart")?;
+    Ok(Json(SeedInvestmentAccountsResponse {
+        head,
+        accounts: *seeded.accounts,
+        paths: seeded.paths,
+        created: seeded.created,
+    }))
 }
 
 // ---------------------------------------------------------------------------

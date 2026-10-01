@@ -263,6 +263,41 @@ pub(crate) fn build_seed_default_accounts_in_txn(
     Ok(AccountBatchStep::Append(events))
 }
 
+/// The colon-separated path of an existing account, walked up through its parents.
+///
+/// The read-only counterpart of [`build_ensure_account_paths_in_txn`]: that function
+/// turns a path into accounts, this turns an account back into its path, so a chart
+/// can be extended *under* an account somebody already chose — a brokerage's
+/// subaccounts hang under the account the bank feed is already mapped to.
+///
+/// Bounded by the number of accounts, so a cycle in the data cannot hang a read.
+pub fn path_of_account(conn: &rusqlite::Connection, account_id: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = Some(account_id.to_string());
+    let limit: i64 = conn
+        .query_row("SELECT COUNT(*) FROM accounts", [], |r| r.get(0))
+        .unwrap_or(0);
+    for _ in 0..=limit {
+        let Some(this) = cur.take() else { break };
+        let (name, parent): (String, Option<String>) = conn
+            .query_row(
+                "SELECT name, parent_id FROM accounts WHERE id = ?1",
+                [&this],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        parts.push(name);
+        cur = parent;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    Some(parts.join(":"))
+}
+
 /// What ensuring an account path came to: the events to append (possibly none) and
 /// the id of the account the path names.
 ///
@@ -270,9 +305,16 @@ pub(crate) fn build_seed_default_accounts_in_txn(
 /// `Expenses:Software:SaaS`" — and it exists in both outcomes: when the path is
 /// already there in full, nothing is appended and the id is the one already stored.
 pub(crate) enum EnsurePathStep {
+    Ensured { events: Vec<Event>, leaf_id: String },
+    Reject(AccountCommandError),
+}
+
+/// The same, for several paths at once: the events to append and one leaf id per
+/// path, in the order the paths were given.
+pub(crate) enum EnsurePathsStep {
     Ensured {
         events: Vec<Event>,
-        leaf_id: String,
+        leaf_ids: Vec<String>,
     },
     Reject(AccountCommandError),
 }
@@ -299,7 +341,11 @@ fn next_free_number(
     account_type: AccountType,
 ) -> String {
     let base = parent_number.unwrap_or_else(|| type_base(account_type));
-    let mut candidate = if parent_number.is_some() { base + 1 } else { base };
+    let mut candidate = if parent_number.is_some() {
+        base + 1
+    } else {
+        base
+    };
     while used.contains(&candidate) {
         candidate += 1;
     }
@@ -325,14 +371,35 @@ pub(crate) fn build_ensure_account_path_in_txn(
     path: &str,
     account_type: AccountType,
 ) -> Result<EnsurePathStep, EventStoreError> {
-    let segments: Vec<&str> = path
-        .split(':')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if segments.is_empty() {
-        return Ok(EnsurePathStep::Reject(AccountCommandError::InvalidData(
-            "an account path needs at least one name".to_string(),
+    Ok(
+        match build_ensure_account_paths_in_txn(tx, &[(path.to_string(), account_type)])? {
+            EnsurePathsStep::Ensured { events, leaf_ids } => EnsurePathStep::Ensured {
+                events,
+                leaf_id: leaf_ids
+                    .into_iter()
+                    .next()
+                    .expect("one path in, one leaf out"),
+            },
+            EnsurePathsStep::Reject(e) => EnsurePathStep::Reject(e),
+        },
+    )
+}
+
+/// Create every missing account along every one of these paths, as ONE batch.
+///
+/// Why several at once rather than a call each: the paths overlap. A brokerage's
+/// standard chart is ten accounts sharing four parents, and ten separate calls would
+/// each read the ledger as it was before any of them ran — so each would decide
+/// `Income:Investment income` was missing, and create it ten times. Walking them
+/// together means a parent minted for the first path is matched by the rest, and the
+/// whole set lands or none of it does.
+pub(crate) fn build_ensure_account_paths_in_txn(
+    tx: &rusqlite::Transaction<'_>,
+    paths: &[(String, AccountType)],
+) -> Result<EnsurePathsStep, EventStoreError> {
+    if paths.is_empty() {
+        return Ok(EnsurePathsStep::Reject(AccountCommandError::InvalidData(
+            "no account paths were given".to_string(),
         )));
     }
 
@@ -377,67 +444,83 @@ pub(crate) fn build_ensure_account_path_in_txn(
     }
 
     let mut events: Vec<Event> = Vec::new();
-    let mut parent: Option<(String, Option<i64>)> = None; // (id, number)
-    let mut walked = String::new();
-    for segment in segments {
-        walked = if walked.is_empty() {
-            segment.to_string()
-        } else {
-            format!("{walked}:{segment}")
-        };
-        let found = existing
-            .iter()
-            .find(|(id, _, _, _)| path_of(&existing, id).as_deref() == Some(walked.as_str()))
-            .map(|(id, _, _, number)| (id.clone(), number.trim().parse::<i64>().ok()));
-        parent = Some(match found {
-            Some(hit) => hit,
-            None => {
-                let number = next_free_number(
-                    &used,
-                    parent.as_ref().and_then(|(_, n)| *n),
-                    account_type,
-                );
-                let cmd = CreateAccountCommand {
-                    account_type,
-                    account_number: number.clone(),
-                    name: segment.to_string(),
-                    parent_id: parent.as_ref().map(|(id, _)| id.clone()),
-                    currency: None,
-                    description: None,
-                };
-                // The same uniqueness fence every other creation passes, under the
-                // same write lock.
-                match build_create_account_in_txn(tx, &cmd)? {
-                    AccountStep::Append(event) => {
-                        let Event::AccountCreated { account_id, .. } = &event else {
-                            unreachable!("build_create_account_in_txn appends AccountCreated")
-                        };
-                        let id = account_id.clone();
-                        let parsed = number.parse::<i64>().ok();
-                        if let Some(n) = parsed {
-                            used.insert(n);
+    let mut leaf_ids: Vec<String> = Vec::with_capacity(paths.len());
+    for (path, account_type) in paths {
+        let account_type = *account_type;
+        let segments: Vec<&str> = path
+            .split(':')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if segments.is_empty() {
+            return Ok(EnsurePathsStep::Reject(AccountCommandError::InvalidData(
+                "an account path needs at least one name".to_string(),
+            )));
+        }
+        let mut parent: Option<(String, Option<i64>)> = None; // (id, number)
+        let mut walked = String::new();
+        for segment in segments {
+            walked = if walked.is_empty() {
+                segment.to_string()
+            } else {
+                format!("{walked}:{segment}")
+            };
+            let found = existing
+                .iter()
+                .find(|(id, _, _, _)| path_of(&existing, id).as_deref() == Some(walked.as_str()))
+                .map(|(id, _, _, number)| (id.clone(), number.trim().parse::<i64>().ok()));
+            parent = Some(match found {
+                Some(hit) => hit,
+                None => {
+                    let number = next_free_number(
+                        &used,
+                        parent.as_ref().and_then(|(_, n)| *n),
+                        account_type,
+                    );
+                    let cmd = CreateAccountCommand {
+                        account_type,
+                        account_number: number.clone(),
+                        name: segment.to_string(),
+                        parent_id: parent.as_ref().map(|(id, _)| id.clone()),
+                        currency: None,
+                        description: None,
+                    };
+                    // The same uniqueness fence every other creation passes, under the
+                    // same write lock.
+                    match build_create_account_in_txn(tx, &cmd)? {
+                        AccountStep::Append(event) => {
+                            let Event::AccountCreated { account_id, .. } = &event else {
+                                unreachable!("build_create_account_in_txn appends AccountCreated")
+                            };
+                            let id = account_id.clone();
+                            let parsed = number.parse::<i64>().ok();
+                            if let Some(n) = parsed {
+                                used.insert(n);
+                            }
+                            // Recorded so a later segment can match against it by path,
+                            // and so its number is taken for the rest of the batch.
+                            existing.push((
+                                id.clone(),
+                                segment.to_string(),
+                                cmd.parent_id.clone(),
+                                number,
+                            ));
+                            events.push(event);
+                            (id, parsed)
                         }
-                        // Recorded so a later segment can match against it by path,
-                        // and so its number is taken for the rest of the batch.
-                        existing.push((
-                            id.clone(),
-                            segment.to_string(),
-                            cmd.parent_id.clone(),
-                            number,
-                        ));
-                        events.push(event);
-                        (id, parsed)
+                        AccountStep::Reject(e) => return Ok(EnsurePathsStep::Reject(e)),
                     }
-                    AccountStep::Reject(e) => return Ok(EnsurePathStep::Reject(e)),
                 }
-            }
-        });
-    }
+            });
+        }
 
-    let leaf_id = parent
-        .map(|(id, _)| id)
-        .expect("a non-empty path walks at least one segment");
-    Ok(EnsurePathStep::Ensured { events, leaf_id })
+        leaf_ids.push(
+            parent
+                .map(|(id, _)| id)
+                .expect("a non-empty path walks at least one segment"),
+        );
+    }
+    Ok(EnsurePathsStep::Ensured { events, leaf_ids })
 }
 
 /// Run `create_account`'s state-dependent invariant inside the append

@@ -25,8 +25,9 @@ use super::commands::investments::{
     RecordHoldingsSnapshotResponse, RecordInvestmentIncomeRequest,
     RecordRetirementContributionRequest, RecordRetirementDistributionRequest,
     RecordRetirementDistributionResponse, RegisterRetirementAccountRequest,
-    ResolvePlaidSecurityRequest, ResolvePlaidSecurityResponse, SellSecurityRequest,
-    SellSecurityResponse, SetRetirementValueRequest, SetRetirementValueResponse,
+    ResolvePlaidSecurityRequest, ResolvePlaidSecurityResponse, SeedInvestmentAccountsRequest,
+    SeedInvestmentAccountsResponse, SellSecurityRequest, SellSecurityResponse,
+    SetRetirementValueRequest, SetRetirementValueResponse,
 };
 use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
@@ -53,6 +54,7 @@ use crate::commands::investment_commands::{
 };
 use crate::commands::investment_import::{
     ConfigureInvestmentAccountCommand, ForgetImportsCommand, ImportRecord, PlannedWrite,
+    SeedInvestmentAccountsCommand,
 };
 use crate::commands::partnership_commands::UpdatePartner;
 use crate::commands::retirement_commands::{
@@ -2394,6 +2396,27 @@ impl SyncClient {
         .await
     }
 
+    /// Lay down the standard chart for one provider investment account.
+    ///
+    /// Sends the account and nothing else: the layout is the server's, so a replica
+    /// cannot ask for a chart of its own shape. The answer carries the ids, ready to
+    /// be sent straight back as a configuration.
+    pub async fn seed_investment_accounts(
+        &mut self,
+        cmd: &SeedInvestmentAccountsCommand,
+    ) -> Result<SeedInvestmentAccountsResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/seed-investment-accounts",
+            "seeding a brokerage's accounts",
+            |head| SeedInvestmentAccountsRequest {
+                expected_head_seq: head,
+                item_id: cmd.item_id.clone(),
+                plaid_account_id: cmd.plaid_account_id.clone(),
+            },
+        )
+        .await
+    }
+
     /// Lift the dedup fence for one provider account, so the broker can be read
     /// again.
     ///
@@ -2623,6 +2646,7 @@ has_head!(
     PostedEntryResponse,
     SetRetirementValueResponse,
     RecordRetirementDistributionResponse,
+    SeedInvestmentAccountsResponse,
 );
 
 /// The outcome of one command POST, before the retry loop decides what to do.
