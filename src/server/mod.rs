@@ -774,14 +774,44 @@ struct PlaidLinkTokenResponse {
     link_token: String,
 }
 
+/// Asks for a token that re-opens an existing connection instead of linking a new
+/// one. Absent for an ordinary link.
+#[derive(Deserialize)]
+struct PlaidLinkTokenRequest {
+    /// The proxy's id for the connection — not the ledger's. On hosted books the
+    /// ledger has no proxy id at all, so the desktop resolves it (from the grant
+    /// it filed) before opening the page.
+    proxy_item_id: String,
+}
+
 async fn plaid_link_token(
     State(state): State<Arc<SharedState>>,
+    update: Option<Json<PlaidLinkTokenRequest>>,
 ) -> Result<Json<PlaidLinkTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     let plaid_cfg = get_plaid_config(&state)?;
 
+    // Update mode: Link re-opens the connection to ask for investments consent and
+    // keeps its Item and account ids. Parsed as a UUID because it is spliced into
+    // the proxy's path, and anything else there is a different route.
+    let path = match update {
+        Some(Json(req)) => {
+            let id = uuid::Uuid::parse_str(req.proxy_item_id.trim()).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        success: false,
+                        error: "That is not a bank-sync connection id.".to_string(),
+                    }),
+                )
+            })?;
+            format!("/plaid/items/{id}/link-token")
+        }
+        None => "/plaid/create-link-token".to_string(),
+    };
+
     let mut req = state
         .http_client
-        .post(format!("{}/plaid/create-link-token", plaid_cfg.proxy_url));
+        .post(format!("{}{}", plaid_cfg.proxy_url, path));
     if let Some(ref key) = plaid_cfg.api_key {
         req = req.bearer_auth(key);
     }
