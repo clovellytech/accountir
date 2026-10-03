@@ -266,7 +266,7 @@ pub fn to_micro_shares(quantity: f64) -> Result<i64, ConversionError> {
     )
 }
 
-fn scale(value: f64, factor: f64, unit: &'static str) -> Result<i64, ConversionError> {
+pub(crate) fn scale(value: f64, factor: f64, unit: &'static str) -> Result<i64, ConversionError> {
     if !value.is_finite() {
         return Err(ConversionError::NotFinite { unit });
     }

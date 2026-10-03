@@ -203,6 +203,7 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             51,
             include_str!("../../migrations/051_investment_subaccounts_and_review.sql"),
         ),
+        (52, include_str!("../../migrations/052_portfolio.sql")),
     ];
 
     for (version, sql) in migrations {
@@ -1069,6 +1070,48 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             last_fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (item_id, plaid_account_id)
         );
+
+        -- The portfolio (migration 052): market value by day, machine-local and
+        -- never posted. Kept in step with the migration; see it for why none of
+        -- this is in the log.
+        CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            plaid_account_id TEXT NOT NULL,
+            as_of TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            account_name TEXT NOT NULL,
+            account_subtype TEXT,
+            mask TEXT,
+            balance_cents INTEGER,
+            currency TEXT,
+            UNIQUE (item_id, plaid_account_id, as_of)
+        );
+        CREATE TABLE IF NOT EXISTS portfolio_holdings (
+            snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshots(snapshot_id)
+                ON DELETE CASCADE,
+            plaid_security_id TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price_micros INTEGER,
+            price_as_of TEXT,
+            value_cents INTEGER,
+            cost_basis_cents INTEGER,
+            currency TEXT,
+            PRIMARY KEY (snapshot_id, plaid_security_id)
+        );
+        CREATE TABLE IF NOT EXISTS portfolio_securities (
+            plaid_security_id TEXT PRIMARY KEY,
+            name TEXT,
+            ticker TEXT,
+            security_type TEXT,
+            is_cash_equivalent INTEGER NOT NULL DEFAULT 0,
+            close_price_micros INTEGER,
+            close_price_as_of TEXT,
+            currency TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_account
+            ON portfolio_snapshots(item_id, plaid_account_id, as_of);
 
         -- Local only, never replicated — see migration 023.
         -- No foreign key to `partners`, deliberately — see migration 025. This
