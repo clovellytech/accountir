@@ -270,34 +270,6 @@ impl<'a> Projector<'a> {
                     params![account_id, effective_from, *added_back as i64, stored_event.id],
                 )?;
             }
-            Event::DocumentAttached(d) => {
-                // Replaces a row with the same id, so a document attached again
-                // after a removal comes back as it was attached the second time.
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO documents
-                       (document_id, sha256, size_bytes, media_type, filename, title,
-                        tax_year, form, attached_at, attached_at_event)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        d.document_id,
-                        d.sha256,
-                        d.size_bytes as i64,
-                        d.media_type,
-                        d.filename,
-                        d.title,
-                        d.tax_year,
-                        d.form,
-                        stored_event.timestamp.to_rfc3339(),
-                        stored_event.id
-                    ],
-                )?;
-            }
-            Event::DocumentRemoved { document_id } => {
-                self.conn.execute(
-                    "DELETE FROM documents WHERE document_id = ?1",
-                    [document_id],
-                )?;
-            }
             Event::TaxStatementRecorded(s) => {
                 // Replaces: a re-recorded statement is the same statement with new
                 // figures — see the event.
@@ -997,47 +969,85 @@ impl<'a> Projector<'a> {
                 // projector — which surfaces as an internal error on a correction
                 // somebody had every right to make — if the old columns were left
                 // behind.
-                let (securities, cash, dividends, interest, gain, fees, clearing, retirement) =
-                    match &d.accounts {
-                        crate::events::types::InvestmentPostingAccounts::Taxable(a) => (
-                            Some(a.securities_account_id.as_str()),
-                            Some(a.cash_account_id.as_str()),
-                            Some(a.dividend_income_account_id.as_str()),
-                            Some(a.interest_income_account_id.as_str()),
-                            Some(a.realized_gain_account_id.as_str()),
-                            Some(a.fee_expense_account_id.as_str()),
-                            a.transfer_clearing_account_id.as_deref(),
-                            None,
-                        ),
-                        crate::events::types::InvestmentPostingAccounts::Sheltered {
-                            retirement_account_id,
-                        } => (
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            Some(retirement_account_id.as_str()),
-                        ),
-                    };
+                // Twelve columns rather than eight since phase 5 split the
+                // securities account by kind and gave tax-exempt interest and
+                // capital gain distributions accounts of their own. Named as a
+                // struct rather than a wider tuple: eight positional `None`s in a
+                // row is where a column ends up written into its neighbour.
+                struct ConfigColumns<'a> {
+                    stocks: Option<&'a str>,
+                    mutual_funds: Option<&'a str>,
+                    other_securities: Option<&'a str>,
+                    cash: Option<&'a str>,
+                    dividends: Option<&'a str>,
+                    interest: Option<&'a str>,
+                    tax_exempt_interest: Option<&'a str>,
+                    capital_gain_distributions: Option<&'a str>,
+                    gain: Option<&'a str>,
+                    fees: Option<&'a str>,
+                    clearing: Option<&'a str>,
+                    retirement: Option<&'a str>,
+                }
+                let columns = match &d.accounts {
+                    crate::events::types::InvestmentPostingAccounts::Taxable(a) => ConfigColumns {
+                        stocks: Some(a.stocks_account_id.as_str()),
+                        mutual_funds: a.mutual_funds_account_id.as_deref(),
+                        other_securities: a.other_securities_account_id.as_deref(),
+                        cash: Some(a.cash_account_id.as_str()),
+                        dividends: Some(a.dividend_income_account_id.as_str()),
+                        interest: Some(a.interest_income_account_id.as_str()),
+                        tax_exempt_interest: a.tax_exempt_interest_account_id.as_deref(),
+                        capital_gain_distributions: a
+                            .capital_gain_distribution_account_id
+                            .as_deref(),
+                        gain: Some(a.realized_gain_account_id.as_str()),
+                        fees: Some(a.fee_expense_account_id.as_str()),
+                        clearing: a.transfer_clearing_account_id.as_deref(),
+                        retirement: None,
+                    },
+                    crate::events::types::InvestmentPostingAccounts::Sheltered {
+                        retirement_account_id,
+                    } => ConfigColumns {
+                        stocks: None,
+                        mutual_funds: None,
+                        other_securities: None,
+                        cash: None,
+                        dividends: None,
+                        interest: None,
+                        tax_exempt_interest: None,
+                        capital_gain_distributions: None,
+                        gain: None,
+                        fees: None,
+                        clearing: None,
+                        retirement: Some(retirement_account_id.as_str()),
+                    },
+                };
                 self.conn.execute(
                     "INSERT INTO investment_account_config
                         (item_id, plaid_account_id, treatment, plaid_subtype, subtype_recognised,
-                         securities_account_id, cash_account_id, dividend_income_account_id,
-                         interest_income_account_id, realized_gain_account_id,
+                         securities_account_id, mutual_funds_account_id,
+                         other_securities_account_id, cash_account_id,
+                         dividend_income_account_id, interest_income_account_id,
+                         tax_exempt_interest_account_id,
+                         capital_gain_distribution_account_id, realized_gain_account_id,
                          fee_expense_account_id, transfer_clearing_account_id,
                          retirement_account_id, configured_at_event, updated_at_event)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                             ?16, ?17, ?18, ?18)
                      ON CONFLICT(item_id, plaid_account_id) DO UPDATE SET
                         treatment = excluded.treatment,
                         plaid_subtype = excluded.plaid_subtype,
                         subtype_recognised = excluded.subtype_recognised,
                         securities_account_id = excluded.securities_account_id,
+                        mutual_funds_account_id = excluded.mutual_funds_account_id,
+                        other_securities_account_id = excluded.other_securities_account_id,
                         cash_account_id = excluded.cash_account_id,
                         dividend_income_account_id = excluded.dividend_income_account_id,
                         interest_income_account_id = excluded.interest_income_account_id,
+                        tax_exempt_interest_account_id =
+                            excluded.tax_exempt_interest_account_id,
+                        capital_gain_distribution_account_id =
+                            excluded.capital_gain_distribution_account_id,
                         realized_gain_account_id = excluded.realized_gain_account_id,
                         fee_expense_account_id = excluded.fee_expense_account_id,
                         transfer_clearing_account_id = excluded.transfer_clearing_account_id,
@@ -1049,14 +1059,18 @@ impl<'a> Projector<'a> {
                         d.accounts.treatment().as_str(),
                         d.plaid_subtype,
                         d.subtype_recognised as i64,
-                        securities,
-                        cash,
-                        dividends,
-                        interest,
-                        gain,
-                        fees,
-                        clearing,
-                        retirement,
+                        columns.stocks,
+                        columns.mutual_funds,
+                        columns.other_securities,
+                        columns.cash,
+                        columns.dividends,
+                        columns.interest,
+                        columns.tax_exempt_interest,
+                        columns.capital_gain_distributions,
+                        columns.gain,
+                        columns.fees,
+                        columns.clearing,
+                        columns.retirement,
                         stored_event.id,
                     ],
                 )?;
@@ -1089,6 +1103,102 @@ impl<'a> Projector<'a> {
                         stored_event.id,
                     ],
                 )?;
+            }
+            Event::DocumentAttached(d) => {
+                // Replaces a row with the same id, so a document attached again after a
+                // removal comes back as it was attached the second time.
+                let (kind, id) = match &d.subject {
+                    Some(subject) => {
+                        let (kind, id) = subject.as_columns();
+                        (Some(kind.to_string()), Some(id.to_string()))
+                    }
+                    None => (None, None),
+                };
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO documents
+                       (document_id, sha256, size_bytes, media_type, filename, title,
+                        tax_year, form, subject_kind, subject_id, attached_at,
+                        attached_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        d.document_id,
+                        d.sha256,
+                        d.size_bytes as i64,
+                        d.media_type,
+                        d.filename,
+                        d.title,
+                        d.tax_year,
+                        d.form,
+                        kind,
+                        id,
+                        stored_event.timestamp.to_rfc3339(),
+                        stored_event.id
+                    ],
+                )?;
+            }
+            // The row goes; the bytes stay. See the event.
+            Event::DocumentRemoved { document_id } => {
+                self.conn.execute(
+                    "DELETE FROM documents WHERE document_id = ?1",
+                    [document_id],
+                )?;
+            }
+            // The opposite of the arm above, and the only one in this file that takes
+            // a register row away. Three steps, in this order, because each undoes
+            // what the one before it relied on:
+            //
+            // 1. every sale gives back what it consumed. `investment_sale_lots` is
+            //    the record of which lots a sale took quantity out of, so the lots
+            //    can be put back exactly as they were — including a lot that was
+            //    entered by hand and is not being forgotten, which is why this runs
+            //    whether or not the lot is in `lot_ids`.
+            // 2. the sales go, and their lot links with them.
+            // 3. the lots the imports created go. By now nothing points at them: the
+            //    command refused the whole operation if a sale that is staying had
+            //    consumed one (see `build_forget_imports_in_txn`).
+            //
+            // The entries are not touched here. They are voided by
+            // `JournalEntryVoided` events in the same append, which is what this book
+            // already means by "this did not happen".
+            Event::InvestmentImportsForgotten(d) => {
+                for sale_id in &d.sale_ids {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT lot_id, quantity, basis_cents FROM investment_sale_lots
+                          WHERE sale_id = ?1",
+                    )?;
+                    let consumed: Vec<(String, i64, i64)> = stmt
+                        .query_map([sale_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                        .collect::<Result<_, _>>()?;
+                    drop(stmt);
+                    for (lot_id, quantity, basis_cents) in consumed {
+                        self.conn.execute(
+                            "UPDATE investment_lots
+                                SET remaining_quantity = remaining_quantity + ?2,
+                                    remaining_basis_cents = remaining_basis_cents + ?3,
+                                    updated_at_event = ?4
+                              WHERE id = ?1",
+                            params![lot_id, quantity, basis_cents, stored_event.id],
+                        )?;
+                    }
+                    self.conn.execute(
+                        "DELETE FROM investment_sale_lots WHERE sale_id = ?1",
+                        params![sale_id],
+                    )?;
+                    self.conn.execute(
+                        "DELETE FROM investment_sales WHERE id = ?1",
+                        params![sale_id],
+                    )?;
+                }
+                for lot_id in &d.lot_ids {
+                    self.conn
+                        .execute("DELETE FROM investment_lots WHERE id = ?1", params![lot_id])?;
+                }
+                for provider_transaction_id in &d.provider_transaction_ids {
+                    self.conn.execute(
+                        "DELETE FROM investment_imports WHERE provider_transaction_id = ?1",
+                        params![provider_transaction_id],
+                    )?;
+                }
             }
             // A snapshot for a day replaces the day's previous one, lines and all.
             // Deleted and re-inserted rather than merged, because a holding that has
@@ -1776,6 +1886,7 @@ impl<'a> Projector<'a> {
              -- `investment_fetch_state` -- are deliberately absent: one holds rows
              -- somebody is still reviewing and the other how far this machine has
              -- fetched, and neither is derived from the log.
+             DELETE FROM documents;
              DELETE FROM investment_holdings_snapshot_lines;
              DELETE FROM investment_holdings_snapshots;
              DELETE FROM investment_imports;

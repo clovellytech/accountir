@@ -774,14 +774,44 @@ struct PlaidLinkTokenResponse {
     link_token: String,
 }
 
+/// Asks for a token that re-opens an existing connection instead of linking a new
+/// one. Absent for an ordinary link.
+#[derive(Deserialize)]
+struct PlaidLinkTokenRequest {
+    /// The proxy's id for the connection — not the ledger's. On hosted books the
+    /// ledger has no proxy id at all, so the desktop resolves it (from the grant
+    /// it filed) before opening the page.
+    proxy_item_id: String,
+}
+
 async fn plaid_link_token(
     State(state): State<Arc<SharedState>>,
+    update: Option<Json<PlaidLinkTokenRequest>>,
 ) -> Result<Json<PlaidLinkTokenResponse>, (StatusCode, Json<ErrorResponse>)> {
     let plaid_cfg = get_plaid_config(&state)?;
 
+    // Update mode: Link re-opens the connection to ask for investments consent and
+    // keeps its Item and account ids. Parsed as a UUID because it is spliced into
+    // the proxy's path, and anything else there is a different route.
+    let path = match update {
+        Some(Json(req)) => {
+            let id = uuid::Uuid::parse_str(req.proxy_item_id.trim()).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        success: false,
+                        error: "That is not a bank-sync connection id.".to_string(),
+                    }),
+                )
+            })?;
+            format!("/plaid/items/{id}/link-token")
+        }
+        None => "/plaid/create-link-token".to_string(),
+    };
+
     let mut req = state
         .http_client
-        .post(format!("{}/plaid/create-link-token", plaid_cfg.proxy_url));
+        .post(format!("{}{}", plaid_cfg.proxy_url, path));
     if let Some(ref key) = plaid_cfg.api_key {
         req = req.bearer_auth(key);
     }
@@ -1360,6 +1390,22 @@ async fn plaid_sync(
             })
             .unwrap_or_default();
 
+        // And the accounts the provider itself types as investment accounts, whether or
+        // not anybody has configured them. Skipping only the configured ones left an
+        // unconfigured brokerage importing its cash legs — a purchase as money spent —
+        // which is a figure somebody may act on. Importing nothing until it is set up
+        // is the better failure, and the page says so.
+        let typed_as_investment: std::collections::HashSet<String> = conn
+            .prepare(
+                "SELECT plaid_account_id FROM plaid_local_accounts
+                  WHERE item_id = ?1 AND lower(account_type) IN ('investment', 'brokerage')",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([&req.item_id], |row| row.get::<_, String>(0))
+                    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+
         let mut staged = 0u32;
         let mut skipped = 0u32;
 
@@ -1369,7 +1415,9 @@ async fn plaid_sync(
                 continue;
             }
 
-            if investment_accounts.contains(&txn.account_id) {
+            if investment_accounts.contains(&txn.account_id)
+                || typed_as_investment.contains(&txn.account_id)
+            {
                 skipped += 1;
                 continue;
             }
@@ -2016,6 +2064,11 @@ struct PlaidInvestmentsSyncResponse {
     sold: u32,
     dividends: u32,
     interest: u32,
+    /// A fund passing through a gain it realized. Reported apart from the dividends
+    /// because it reaches a different form — and reported at all because a caller
+    /// summing these into "how much was posted" would otherwise be short by exactly
+    /// this category, and short in a way nothing on screen could explain.
+    capital_gain_distributions: u32,
     fees: u32,
     cash_movements: u32,
     duplicates: u32,
@@ -2151,6 +2204,7 @@ async fn plaid_investments_sync(
         sold: report.sold,
         dividends: report.dividends,
         interest: report.interest,
+        capital_gain_distributions: report.capital_gain_distributions,
         fees: report.fees,
         cash_movements: report.cash_movements,
         duplicates: report.duplicates,

@@ -188,19 +188,32 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             48,
             include_str!("../../migrations/048_retirement_accounts.sql"),
         ),
-        // Renumbered from 047 when this branch merged main, which had already
-        // claimed 047 and 048.
-        (
-            49,
-            include_str!("../../migrations/049_documents_and_tax_statements.sql"),
-        ),
+        // 49 arrived after 50 and 51, which the runner now handles: it applies every
+        // version it has no record of rather than everything above `MAX(version)`, so a
+        // database already stamped at 51 picks this one up on its next open. The
+        // personal-tax work reserved this number for its documents and statements; only
+        // the documents half is here, because schema nothing reads is schema nobody
+        // maintains. See the file.
+        (49, include_str!("../../migrations/049_documents.sql")),
         (
             50,
             include_str!("../../migrations/050_investment_imports.sql"),
         ),
         (
             51,
-            include_str!("../../migrations/051_tax_statement_lines.sql"),
+            include_str!("../../migrations/051_investment_subaccounts_and_review.sql"),
+        ),
+        (52, include_str!("../../migrations/052_portfolio.sql")),
+        // The personal-tax work's own two. They were 049 and 051 on their branch,
+        // and main took both numbers first — 049 for the documents half of the
+        // first, which is why 053 creates only the statements and the K-1 links.
+        (
+            53,
+            include_str!("../../migrations/053_tax_statements.sql"),
+        ),
+        (
+            54,
+            include_str!("../../migrations/054_tax_statement_lines.sql"),
         ),
     ];
 
@@ -919,21 +932,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         CREATE INDEX IF NOT EXISTS idx_retirement_accounts_value_change
             ON retirement_accounts(value_change_account_id);
 
-        -- Attached documents (metadata only — the bytes are in the blob store),
-        -- recorded tax statements, and K-1 links (migration 049).
-        CREATE TABLE IF NOT EXISTS documents (
-            document_id TEXT PRIMARY KEY,
-            sha256 TEXT NOT NULL,
-            size_bytes INTEGER NOT NULL,
-            media_type TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            title TEXT,
-            tax_year INTEGER,
-            form TEXT,
-            attached_at TEXT NOT NULL,
-            attached_at_event INTEGER REFERENCES events(id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_documents_tax_year ON documents(tax_year);
+        -- Recorded tax statements and K-1 links (migration 053). `documents`,
+        -- which they cite, is further down with migration 049.
         CREATE TABLE IF NOT EXISTS tax_statements (
             statement_id TEXT PRIMARY KEY,
             tax_year INTEGER NOT NULL,
@@ -947,8 +947,8 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         );
         CREATE INDEX IF NOT EXISTS idx_tax_statements_year ON tax_statements(tax_year, form);
         -- A statement's transaction-by-transaction detail: the Form 8949 rows a
-        -- 1099-B's category subtotals are not enough for (migration 051). See
-        -- 051_tax_statement_lines.sql for why a 1099-B needs a list where every
+        -- 1099-B's category subtotals are not enough for (migration 054). See
+        -- 054_tax_statement_lines.sql for why a 1099-B needs a list where every
         -- other statement needs only boxes, and why the covered categories
         -- usually leave this table empty.
         CREATE TABLE IF NOT EXISTS tax_statement_lines (
@@ -987,10 +987,17 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             treatment TEXT NOT NULL,
             plaid_subtype TEXT,
             subtype_recognised INTEGER NOT NULL DEFAULT 1,
+            -- The stocks slot, under the name every configuration before
+            -- migration 051 wrote it under; see that migration for why it is not
+            -- renamed.
             securities_account_id TEXT,
+            mutual_funds_account_id TEXT,
+            other_securities_account_id TEXT,
             cash_account_id TEXT,
             dividend_income_account_id TEXT,
             interest_income_account_id TEXT,
+            tax_exempt_interest_account_id TEXT,
+            capital_gain_distribution_account_id TEXT,
             realized_gain_account_id TEXT,
             fee_expense_account_id TEXT,
             transfer_clearing_account_id TEXT,
@@ -1077,10 +1084,40 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             amount_cents INTEGER,
             raw_payload TEXT NOT NULL,
             staged_at TEXT NOT NULL DEFAULT (datetime('now')),
-            status TEXT NOT NULL DEFAULT 'pending'
+            -- 'pending', 'resolved' or 'dismissed' (migration 051). A dismissal
+            -- is its own status rather than a kind of resolution, because
+            -- "nothing is missing from these books" is the question this list
+            -- answers and the two answers are opposite.
+            status TEXT NOT NULL DEFAULT 'pending',
+            resolution TEXT,
+            resolution_note TEXT,
+            resolution_entry_id TEXT,
+            resolved_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_investment_staged_status
             ON investment_staged_activity(status, date);
+
+        -- Files attached to the books (migration 049). Kept in step with that file
+        -- for the reason the blocks above are; see it for why the bytes are not here
+        -- and why the subject is two columns.
+        CREATE TABLE IF NOT EXISTS documents (
+            document_id       TEXT PRIMARY KEY,
+            sha256            TEXT NOT NULL,
+            size_bytes        INTEGER NOT NULL,
+            media_type        TEXT NOT NULL,
+            filename          TEXT NOT NULL,
+            title             TEXT,
+            tax_year          INTEGER,
+            form              TEXT,
+            subject_kind      TEXT,
+            subject_id        TEXT,
+            attached_at       TEXT NOT NULL,
+            attached_at_event INTEGER REFERENCES events(id),
+            CHECK ((subject_kind IS NULL) = (subject_id IS NULL))
+        );
+        CREATE INDEX IF NOT EXISTS idx_documents_subject
+            ON documents(subject_kind, subject_id);
+        CREATE INDEX IF NOT EXISTS idx_documents_tax_year ON documents(tax_year);
 
         CREATE TABLE IF NOT EXISTS investment_fetch_state (
             item_id TEXT NOT NULL,
@@ -1089,6 +1126,48 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             last_fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (item_id, plaid_account_id)
         );
+
+        -- The portfolio (migration 052): market value by day, machine-local and
+        -- never posted. Kept in step with the migration; see it for why none of
+        -- this is in the log.
+        CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL,
+            plaid_account_id TEXT NOT NULL,
+            as_of TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            account_name TEXT NOT NULL,
+            account_subtype TEXT,
+            mask TEXT,
+            balance_cents INTEGER,
+            currency TEXT,
+            UNIQUE (item_id, plaid_account_id, as_of)
+        );
+        CREATE TABLE IF NOT EXISTS portfolio_holdings (
+            snapshot_id TEXT NOT NULL REFERENCES portfolio_snapshots(snapshot_id)
+                ON DELETE CASCADE,
+            plaid_security_id TEXT NOT NULL,
+            quantity INTEGER NOT NULL,
+            price_micros INTEGER,
+            price_as_of TEXT,
+            value_cents INTEGER,
+            cost_basis_cents INTEGER,
+            currency TEXT,
+            PRIMARY KEY (snapshot_id, plaid_security_id)
+        );
+        CREATE TABLE IF NOT EXISTS portfolio_securities (
+            plaid_security_id TEXT PRIMARY KEY,
+            name TEXT,
+            ticker TEXT,
+            security_type TEXT,
+            is_cash_equivalent INTEGER NOT NULL DEFAULT 0,
+            close_price_micros INTEGER,
+            close_price_as_of TEXT,
+            currency TEXT,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_account
+            ON portfolio_snapshots(item_id, plaid_account_id, as_of);
 
         -- Local only, never replicated — see migration 023.
         -- No foreign key to `partners`, deliberately — see migration 025. This
@@ -1749,11 +1828,6 @@ mod tests {
 
     /// And a database that predates it gets it too, by the route the others here use:
     /// the pre-050 shape, stamped at version 49, then migrated.
-    ///
-    /// The `#[test]` was landed on the wrong function when this arrived on `main`,
-    /// between the test above's doc comment and its body, so this one never ran at
-    /// all. Restored here because a test nobody runs is worse than no test: it looks
-    /// like coverage.
     #[test]
     fn migration_050_adds_the_investment_import_registers_to_an_existing_database() {
         let conn = Connection::open_in_memory().unwrap();

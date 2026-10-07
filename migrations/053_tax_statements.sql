@@ -1,5 +1,9 @@
--- Documents attached to the books, the tax statements recorded from them, and the
+-- The tax statements recorded from documents attached to the books, and the
 -- partnerships whose K-1s these books receive.
+--
+-- Written as 049 on the personal-tax branch, together with `documents`. Main took
+-- 049 first for the documents half (`049_documents.sql`, which adds a subject),
+-- so this file keeps only the other two tables under the next free number.
 --
 -- # Why the file itself is not here
 --
@@ -20,23 +24,6 @@
 -- `commands::tax_statement_commands`.
 --
 -- All three are projections: truncated and replayed by `Projector::rebuild`.
-
-CREATE TABLE IF NOT EXISTS documents (
-    document_id       TEXT PRIMARY KEY,
-    -- Lowercase hex SHA-256 of the file's bytes: the blob store's key.
-    sha256            TEXT NOT NULL,
-    size_bytes        INTEGER NOT NULL,
-    media_type        TEXT NOT NULL,
-    -- The name it was attached under. Display only; never a path.
-    filename          TEXT NOT NULL,
-    title             TEXT,
-    tax_year          INTEGER,
-    -- A `tax::information_returns::FormKind` code, when the document is one.
-    form              TEXT,
-    attached_at       TEXT NOT NULL,
-    attached_at_event INTEGER REFERENCES events(id)
-);
-CREATE INDEX IF NOT EXISTS idx_documents_tax_year ON documents(tax_year);
 
 CREATE TABLE IF NOT EXISTS tax_statements (
     statement_id      TEXT PRIMARY KEY,

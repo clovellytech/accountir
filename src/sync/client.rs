@@ -12,10 +12,23 @@ use super::commands::bill::{IssueInvoiceRequest, ReceiveBillRequest};
 use super::commands::bill_ops::{
     ApplyBillPaymentRequest, ReceiveInvoicePaymentRequest, VoidBillRequest, VoidInvoiceRequest,
 };
+use super::commands::documents::{AttachDocumentRequest, RemoveDocumentRequest};
 use super::commands::entries::{BatchEntry, PostEntriesRequest, PostEntriesResponse};
 use super::commands::entry_ops::{
     LineAssignment, ReassignLinesRequest, ReassignLinesResponse, UnvoidEntryRequest,
     VoidEntriesRequest, VoidEntriesResponse, VoidEntryRequest,
+};
+use super::commands::investments::{
+    BuySecurityRequest, BuySecurityResponse, ChargeInvestmentFeeRequest,
+    ConfigureInvestmentAccountRequest, DefineSecurityRequest, DefineSecurityResponse,
+    ForgetInvestmentImportsRequest, ImportInvestmentActivityRequest,
+    ImportInvestmentActivityResponse, PostedEntryResponse, RecordHoldingsSnapshotRequest,
+    RecordHoldingsSnapshotResponse, RecordInvestmentIncomeRequest,
+    RecordRetirementContributionRequest, RecordRetirementDistributionRequest,
+    RecordRetirementDistributionResponse, RegisterRetirementAccountRequest,
+    ResolvePlaidSecurityRequest, ResolvePlaidSecurityResponse, SeedInvestmentAccountsRequest,
+    SeedInvestmentAccountsResponse, SellSecurityRequest, SellSecurityResponse,
+    SetRetirementValueRequest, SetRetirementValueResponse,
 };
 use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
@@ -36,7 +49,19 @@ use super::commands::reconciliation::{
     StartReconciliationRequest, UnclearTransactionRequest,
 };
 use super::{EventsResponse, HeadResponse, PostEntryLine, PostEntryRequest, SubmitResponse};
+use crate::commands::investment_commands::{
+    BuySecurityCommand, ChargeInvestmentFeeCommand, NewSecurity, RecordInvestmentIncomeCommand,
+    SellSecurityCommand,
+};
+use crate::commands::investment_import::{
+    ConfigureInvestmentAccountCommand, ForgetImportsCommand, ImportRecord, PlannedWrite,
+    SeedInvestmentAccountsCommand,
+};
 use crate::commands::partnership_commands::UpdatePartner;
+use crate::commands::retirement_commands::{
+    RegisterRetirementAccountCommand, RetirementContributionCommand,
+    RetirementDistributionCommand, SetRetirementValueCommand,
+};
 use crate::domain::{
     AccountType, Address, BusinessProfile, PartnerType, PaymentTerms, Residency, Shares,
 };
@@ -2153,7 +2178,514 @@ impl SyncClient {
         })
         .await
     }
+
+    // -----------------------------------------------------------------------
+    // Investments and retirement (INVESTMENTS-SPEC.md phases 1, 2 and 4)
+    // -----------------------------------------------------------------------
+
+    /// The stale-head retry loop for a command whose **answer** matters, written
+    /// once.
+    ///
+    /// [`submit_retrying`] hands back a head, which is all most commands produce.
+    /// An investment command produces a fact the caller cannot recompute: the lot a
+    /// purchase opened, the realized gain and consumed lots of a sale, the id of a
+    /// security just minted. Those come back in the response body, and a caller
+    /// that re-read the log for them would be racing its own replica pull — our
+    /// write returns through the same pull path as everybody else's, so for up to a
+    /// tick the replica does not contain it.
+    ///
+    /// Same soundness condition as [`submit_retrying`]: only for self-contained
+    /// commands. Every one below carries explicit amounts and explicit ids, and the
+    /// server re-runs every invariant inside each attempt's append transaction — so
+    /// a retry after somebody else wrote first is re-decided against the state that
+    /// now exists, which for a sale means FIFO re-picks against the lots that are
+    /// actually left.
+    ///
+    /// [`submit_retrying`]: SyncClient::submit_retrying
+    async fn submit_retrying_for<B, R>(
+        &mut self,
+        path: &str,
+        what: &str,
+        build: impl Fn(i64) -> B,
+    ) -> Result<R, SyncClientError>
+    where
+        B: serde::Serialize,
+        R: serde::de::DeserializeOwned + HasHead,
+    {
+        const MAX_RETRIES: u32 = 5;
+        for _ in 0..=MAX_RETRIES {
+            let body = build(self.head);
+            let resp = self
+                .http
+                .post(self.url(path))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await?;
+            match resp.status() {
+                reqwest::StatusCode::OK => {
+                    let answer: R = resp.json().await?;
+                    self.head = answer.head();
+                    return Ok(answer);
+                }
+                reqwest::StatusCode::CONFLICT => {
+                    let v: serde_json::Value = resp.json().await?;
+                    self.head = v["current_head"].as_i64().unwrap_or(self.head);
+                    continue;
+                }
+                reqwest::StatusCode::UNAUTHORIZED => return Err(SyncClientError::Unauthorized),
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+                    let v: serde_json::Value = resp.json().await?;
+                    return Err(SyncClientError::Rejected(
+                        v["error"].as_str().unwrap_or_default().to_string(),
+                    ));
+                }
+                // Named in the caller's words, not ours: the person is being told
+                // which action their server cannot do, and "/sync/commands/…" is
+                // our plumbing.
+                reqwest::StatusCode::NOT_FOUND => {
+                    return Err(SyncClientError::ServerTooOld(what.to_string()))
+                }
+                s => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(SyncClientError::Unexpected(s.as_u16(), body));
+                }
+            }
+        }
+        Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Put a security on the group's master, and hand back its new id.
+    ///
+    /// Takes the same [`NewSecurity`] the local `define_security` takes, so a
+    /// caller that branches on `is_replica()` builds one value and sends it either
+    /// way. A `422` here means the ticker is already on the master — the message
+    /// names the security that has it.
+    pub async fn define_security(
+        &mut self,
+        security: &NewSecurity,
+    ) -> Result<DefineSecurityResponse, SyncClientError> {
+        self.submit_retrying_for("/sync/commands/define-security", "adding a security", |head| {
+            DefineSecurityRequest {
+                expected_head_seq: head,
+                ticker: security.ticker.clone(),
+                name: security.name.clone(),
+                kind: security.kind.clone(),
+                cusip: security.cusip.clone(),
+                currency: Some(security.currency.clone()),
+            }
+        })
+        .await
+    }
+
+    /// Buy shares on the group's books. Returns the lot the purchase opened.
+    pub async fn buy_security(
+        &mut self,
+        cmd: &BuySecurityCommand,
+    ) -> Result<BuySecurityResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/buy-security",
+            "recording a purchase",
+            |head| BuySecurityRequest {
+                expected_head_seq: head,
+                security_id: cmd.security_id.clone(),
+                securities_account_id: cmd.securities_account_id.clone(),
+                cash_account_id: cmd.cash_account_id.clone(),
+                quantity: cmd.quantity,
+                total_cost_cents: cmd.total_cost_cents,
+                trade_date: cmd.trade_date,
+                memo: cmd.memo.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Sell shares on the group's books. Returns the realized gain with the lots it
+    /// came out of.
+    ///
+    /// The command's [`LotSelection`] goes on the wire as it stands, so a hosted
+    /// specific-lot sale consumes exactly the lots the person named. Retrying on a
+    /// `409` is safe for a `Specific` selection because the lots are named by id and
+    /// re-checked against their remaining quantity inside the retry's own
+    /// transaction — a lot somebody else sold in the meantime comes back as a
+    /// terminal `422`, not as a different lot silently substituted. It is safe for
+    /// `Fifo` because the server re-picks: the retry sells the oldest lots that are
+    /// still there, which is what FIFO means.
+    pub async fn sell_security(
+        &mut self,
+        cmd: &SellSecurityCommand,
+    ) -> Result<SellSecurityResponse, SyncClientError> {
+        self.submit_retrying_for("/sync/commands/sell-security", "recording a sale", |head| {
+            SellSecurityRequest {
+                expected_head_seq: head,
+                security_id: cmd.security_id.clone(),
+                securities_account_id: cmd.securities_account_id.clone(),
+                cash_account_id: cmd.cash_account_id.clone(),
+                realized_gain_account_id: cmd.realized_gain_account_id.clone(),
+                quantity: cmd.quantity,
+                proceeds_cents: cmd.proceeds_cents,
+                fee_cents: cmd.fee_cents,
+                trade_date: cmd.trade_date,
+                selection: cmd.selection.clone(),
+                memo: cmd.memo.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record a dividend or interest payment on the group's books.
+    pub async fn record_investment_income(
+        &mut self,
+        cmd: &RecordInvestmentIncomeCommand,
+    ) -> Result<PostedEntryResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/record-investment-income",
+            "recording investment income",
+            |head| RecordInvestmentIncomeRequest {
+                expected_head_seq: head,
+                kind: cmd.kind,
+                security_id: cmd.security_id.clone(),
+                cash_account_id: cmd.cash_account_id.clone(),
+                income_account_id: cmd.income_account_id.clone(),
+                amount_cents: cmd.amount_cents,
+                received_on: cmd.received_on,
+                memo: cmd.memo.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Charge an account fee on the group's books.
+    pub async fn charge_investment_fee(
+        &mut self,
+        cmd: &ChargeInvestmentFeeCommand,
+    ) -> Result<PostedEntryResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/charge-investment-fee",
+            "charging an investment fee",
+            |head| ChargeInvestmentFeeRequest {
+                expected_head_seq: head,
+                cash_account_id: cmd.cash_account_id.clone(),
+                expense_account_id: cmd.expense_account_id.clone(),
+                amount_cents: cmd.amount_cents,
+                charged_on: cmd.charged_on,
+                security_id: cmd.security_id.clone(),
+                memo: cmd.memo.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Say how a provider investment account is imported into the group's books.
+    ///
+    /// `plaid_subtype` is forwarded, not interpreted: the server derives the
+    /// "recognised" flag from it, so a client cannot claim an assumption was
+    /// corroborated when it was not.
+    pub async fn configure_investment_account(
+        &mut self,
+        cmd: &ConfigureInvestmentAccountCommand,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/configure-investment-account", |head| {
+            ConfigureInvestmentAccountRequest {
+                expected_head_seq: head,
+                item_id: cmd.item_id.clone(),
+                plaid_account_id: cmd.plaid_account_id.clone(),
+                accounts: cmd.accounts.clone(),
+                plaid_subtype: cmd.plaid_subtype.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record that a file has been attached to the group's books.
+    ///
+    /// The bytes are not sent: they stay in the blob store on the machine that attached
+    /// them, and the digest in this request is what makes a copy fetched from anywhere
+    /// else checkable. See `sync::commands::documents`.
+    pub async fn attach_document(
+        &mut self,
+        doc: AttachDocumentRequest,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/attach-document", |head| {
+            AttachDocumentRequest {
+                expected_head_seq: head,
+                document_id: doc.document_id.clone(),
+                sha256: doc.sha256.clone(),
+                size_bytes: doc.size_bytes,
+                media_type: doc.media_type.clone(),
+                filename: doc.filename.clone(),
+                title: doc.title.clone(),
+                tax_year: doc.tax_year,
+                form: doc.form.clone(),
+                subject: doc.subject.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Take a document off the group's books. Its bytes stay where they are.
+    pub async fn remove_document(&mut self, document_id: String) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/remove-document", |head| {
+            RemoveDocumentRequest {
+                expected_head_seq: head,
+                document_id: document_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Lay down the standard chart for one provider investment account.
+    ///
+    /// Sends the account and nothing else: the layout is the server's, so a replica
+    /// cannot ask for a chart of its own shape. The answer carries the ids, ready to
+    /// be sent straight back as a configuration.
+    pub async fn seed_investment_accounts(
+        &mut self,
+        cmd: &SeedInvestmentAccountsCommand,
+    ) -> Result<SeedInvestmentAccountsResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/seed-investment-accounts",
+            "seeding a brokerage's accounts",
+            |head| SeedInvestmentAccountsRequest {
+                expected_head_seq: head,
+                item_id: cmd.item_id.clone(),
+                plaid_account_id: cmd.plaid_account_id.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Lift the dedup fence for one provider account, so the broker can be read
+    /// again.
+    ///
+    /// The server voids what is still live and removes the lots and sales the imports
+    /// created. What it does *not* touch is this machine's review list and fetch
+    /// cursor — those are local in both modes (migration 050), so the caller clears
+    /// them here with
+    /// [`forget_local_state`](crate::commands::investment_import::forget_local_state).
+    pub async fn forget_investment_imports(
+        &mut self,
+        cmd: &ForgetImportsCommand,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/forget-investment-imports", |head| {
+            ForgetInvestmentImportsRequest {
+                expected_head_seq: head,
+                item_id: cmd.item_id.clone(),
+                plaid_account_id: cmd.plaid_account_id.clone(),
+                reason: cmd.reason.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Put a ledger account on the group's retirement register.
+    pub async fn register_retirement_account(
+        &mut self,
+        cmd: &RegisterRetirementAccountCommand,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/register-retirement-account", |head| {
+            RegisterRetirementAccountRequest {
+                expected_head_seq: head,
+                account_id: cmd.account_id.clone(),
+                institution: cmd.institution.clone(),
+                kind: cmd.kind,
+                value_change_account_id: cmd.value_change_account_id.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record what a statement says a sheltered account is worth, and post the
+    /// difference. Returns what the update came to, including zero.
+    pub async fn set_retirement_value(
+        &mut self,
+        cmd: &SetRetirementValueCommand,
+    ) -> Result<SetRetirementValueResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/set-retirement-value",
+            "recording a retirement statement value",
+            |head| SetRetirementValueRequest {
+                expected_head_seq: head,
+                account_id: cmd.account_id.clone(),
+                as_of: cmd.as_of,
+                value_cents: cmd.value_cents,
+                memo: cmd.memo.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Record money into a sheltered account on the group's books.
+    pub async fn record_retirement_contribution(
+        &mut self,
+        cmd: &RetirementContributionCommand,
+    ) -> Result<PostedEntryResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/record-retirement-contribution",
+            "recording a retirement contribution",
+            |head| RecordRetirementContributionRequest {
+                expected_head_seq: head,
+                account_id: cmd.account_id.clone(),
+                funding_account_id: cmd.funding_account_id.clone(),
+                amount_cents: cmd.amount_cents,
+                on: cmd.on,
+                memo: cmd.memo.clone(),
+                reference: cmd.reference.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Record money out of a sheltered account on the group's books. Returns box
+    /// 2a, which is what a 1099-R will report.
+    pub async fn record_retirement_distribution(
+        &mut self,
+        cmd: &RetirementDistributionCommand,
+    ) -> Result<RecordRetirementDistributionResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/record-retirement-distribution",
+            "recording a retirement distribution",
+            |head| RecordRetirementDistributionRequest {
+                expected_head_seq: head,
+                account_id: cmd.account_id.clone(),
+                receiving_account_id: cmd.receiving_account_id.clone(),
+                gross_cents: cmd.gross_cents,
+                withheld_cents: cmd.withheld_cents,
+                withheld_account_id: cmd.withheld_account_id.clone(),
+                // Forwarded rather than dropped, so the refusal the command type
+                // documents is reachable over the wire too: a caller who named an
+                // income account is told why that is wrong instead of having the
+                // field silently ignored.
+                taxable_income_account_id: cmd.taxable_income_account_id.clone(),
+                taxable_cents: cmd.taxable_cents,
+                on: cmd.on,
+                memo: cmd.memo.clone(),
+                reference: cmd.reference.clone(),
+            },
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // The importer's three (phase 4 over the transport)
+    // -----------------------------------------------------------------------
+
+    /// Find or mint the group's master for a provider security, and hand back the
+    /// id **the server chose**.
+    ///
+    /// The whole resolution — the mapping, the CUSIP, the ticker, then minting one —
+    /// happens on the server inside its append transaction, rather than here against
+    /// a replica that may not have pulled the last member's definition. A client that
+    /// decided for itself would mint a second master for a security the group already
+    /// has, and two masters for one holding neither add up on a balance sheet nor
+    /// reconcile against a 1099-B.
+    ///
+    /// The answer carries the kind the master holds as well as the id, because that is
+    /// what decides which securities subaccount a position is carried in and a replica
+    /// cannot read it back for a security that was just defined.
+    pub async fn resolve_plaid_security(
+        &mut self,
+        plaid_security_id: &str,
+        security: &NewSecurity,
+    ) -> Result<ResolvePlaidSecurityResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/resolve-plaid-security",
+            "adding a security from a brokerage feed",
+            |head| ResolvePlaidSecurityRequest {
+                expected_head_seq: head,
+                plaid_security_id: plaid_security_id.to_string(),
+                security: security.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Import one provider transaction into the group's books.
+    ///
+    /// Takes the same [`PlannedWrite`] the local importer hands to
+    /// `build_import_in_txn`, so the planning is done once and only the destination
+    /// differs. The server appends the posting, its register event and the import
+    /// record as one batch, which is why this is one command rather than a posting
+    /// followed by a note about it: a posting whose fence did not land is re-imported
+    /// on the next rolling fetch and deducted twice.
+    ///
+    /// A `422` here is the books refusing this transaction, and the caller holds the
+    /// row with the wording the server sent. One `422` is not a refusal to show
+    /// anybody — "already imported", which on a replica means the local register had
+    /// not pulled yet; [`import_transactions_hosted`] recognises it by the message
+    /// both sides build from one constructor.
+    ///
+    /// [`PlannedWrite`]: crate::commands::investment_import::PlannedWrite
+    /// [`import_transactions_hosted`]: crate::commands::investment_import::import_transactions_hosted
+    pub async fn import_investment_activity(
+        &mut self,
+        write: &PlannedWrite,
+        record: &ImportRecord,
+    ) -> Result<ImportInvestmentActivityResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/import-investment-activity",
+            "importing brokerage activity",
+            |head| ImportInvestmentActivityRequest {
+                expected_head_seq: head,
+                record: record.clone(),
+                write: write.clone(),
+            },
+        )
+        .await
+    }
+
+    /// Record what a broker said an account held, on the group's books.
+    ///
+    /// `recorded` is `false` when the group already held this exact snapshot for this
+    /// date, which is a success: it is what makes re-importing a holdings payload
+    /// append nothing.
+    pub async fn record_holdings_snapshot(
+        &mut self,
+        snapshot: &crate::events::types::HoldingsSnapshotData,
+    ) -> Result<RecordHoldingsSnapshotResponse, SyncClientError> {
+        self.submit_retrying_for(
+            "/sync/commands/record-holdings-snapshot",
+            "recording a brokerage holdings snapshot",
+            |head| RecordHoldingsSnapshotRequest {
+                expected_head_seq: head,
+                snapshot: snapshot.clone(),
+            },
+        )
+        .await
+    }
 }
+
+/// A command response that carries the new log head.
+///
+/// The one thing [`SyncClient::submit_retrying_for`] needs of every answer it
+/// deserializes: the head to cache, so the next write does not arrive with a
+/// `expected_head_seq` this client already knows to be stale.
+trait HasHead {
+    fn head(&self) -> i64;
+}
+
+macro_rules! has_head {
+    ($($t:ty),+ $(,)?) => {
+        $(impl HasHead for $t {
+            fn head(&self) -> i64 {
+                self.head
+            }
+        })+
+    };
+}
+
+has_head!(
+    DefineSecurityResponse,
+    ResolvePlaidSecurityResponse,
+    ImportInvestmentActivityResponse,
+    RecordHoldingsSnapshotResponse,
+    BuySecurityResponse,
+    SellSecurityResponse,
+    PostedEntryResponse,
+    SetRetirementValueResponse,
+    RecordRetirementDistributionResponse,
+    SeedInvestmentAccountsResponse,
+);
 
 /// The outcome of one command POST, before the retry loop decides what to do.
 enum Submitted {

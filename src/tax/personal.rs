@@ -231,7 +231,8 @@ mod tests {
                 filename: "w2.pdf",
                 title: None,
                 tax_year: Some(YEAR),
-                form: Some(FormKind::W2),
+                form: Some(FormKind::W2.as_str().to_string()),
+                subject: None,
             },
         )
         .unwrap();

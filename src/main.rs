@@ -2761,7 +2761,15 @@ fn handle_document_command(store: &mut EventStore, cmd: DocumentCliCommands) -> 
             form,
         } => {
             let form = form.as_deref().map(parse_form).transpose()?;
-            let doc = dc::attach_file(store, "cli-user", &file, title, year, form)?;
+            let doc = dc::attach_file(
+                store,
+                "cli-user",
+                &file,
+                title,
+                year,
+                form.map(|f| f.as_str().to_string()),
+                None,
+            )?;
             println!(
                 "Attached {} ({} bytes, {}) as {}",
                 doc.filename, doc.size_bytes, doc.media_type, doc.document_id
@@ -2793,7 +2801,13 @@ fn handle_document_command(store: &mut EventStore, cmd: DocumentCliCommands) -> 
                     d.size_bytes,
                     d.filename,
                     d.tax_year.map(|y| format!("  {y}")).unwrap_or_default(),
-                    d.form.map(|f| format!("  {}", f.label())).unwrap_or_default(),
+                    d.form
+                        .as_deref()
+                        .map(|code| match accountir::tax::information_returns::FormKind::parse(code) {
+                            Some(f) => format!("  {}", f.label()),
+                            None => format!("  {code}"),
+                        })
+                        .unwrap_or_default(),
                     if here { "" } else { "  (not on this machine)" }
                 );
                 if let Some(title) = &d.title {

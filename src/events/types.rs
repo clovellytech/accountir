@@ -281,13 +281,32 @@ pub struct SecuritySoldData {
     pub realized_gain_cents: i64,
 }
 
-/// Dividend or interest. Closed, because which of the two it is decides which
-/// line of a Schedule B it reaches, and there is no third line.
+/// What a brokerage paid into its cash. Closed, because each of the four reaches
+/// a different line of a return, and a fifth kind of investment income that a
+/// brokerage pays in cash does not exist.
+///
+/// The set was two — dividends and interest — until phase 5 configured four
+/// accounts for it, and the two additions are not refinements of the first two:
+///
+/// * **Tax-exempt interest** is reported (Form 1040 line 2a, Schedule B's own
+///   note) and not taxed. Adding it to ordinary interest overstates taxable
+///   income; leaving it out of the books entirely loses a figure the return
+///   still has to state.
+/// * **A capital gain distribution** is a fund passing through a gain it
+///   realized. It is Schedule D income, not Schedule B: calling one a dividend
+///   puts it on the wrong form at the wrong rate, which is why phase 4 held them
+///   for review rather than posting them to the dividend account.
+///
+/// Which of the four a payment is remains a **configuration** question at the
+/// posting site — the account is named by the caller, never derived from this
+/// enum (see [`TaxableBrokerageAccounts::income_account_for`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvestmentIncomeKind {
     Dividend,
     Interest,
+    TaxExemptInterest,
+    CapitalGainDistribution,
 }
 
 impl InvestmentIncomeKind {
@@ -295,8 +314,28 @@ impl InvestmentIncomeKind {
         match self {
             InvestmentIncomeKind::Dividend => "dividend",
             InvestmentIncomeKind::Interest => "interest",
+            InvestmentIncomeKind::TaxExemptInterest => "tax_exempt_interest",
+            InvestmentIncomeKind::CapitalGainDistribution => "capital_gain_distribution",
         }
     }
+
+    /// What to call it on screen and in an entry's memo.
+    pub fn label(&self) -> &'static str {
+        match self {
+            InvestmentIncomeKind::Dividend => "Dividend",
+            InvestmentIncomeKind::Interest => "Interest",
+            InvestmentIncomeKind::TaxExemptInterest => "Tax-exempt interest",
+            InvestmentIncomeKind::CapitalGainDistribution => "Capital gain distribution",
+        }
+    }
+
+    /// All four, in the order a configuration form asks for them.
+    pub const ALL: [InvestmentIncomeKind; 4] = [
+        InvestmentIncomeKind::Dividend,
+        InvestmentIncomeKind::Interest,
+        InvestmentIncomeKind::TaxExemptInterest,
+        InvestmentIncomeKind::CapitalGainDistribution,
+    ];
 }
 
 /// What kind of sheltered account this is, which is the one thing about it that
@@ -460,19 +499,129 @@ impl InvestmentTreatment {
     }
 }
 
-/// The six ledger accounts a taxable brokerage's activity posts to, and the
-/// optional seventh.
+/// Which securities subaccount a holding is carried in.
 ///
-/// All six are required together, which is why they are a struct behind an enum
-/// variant rather than six nullable fields on the configuration. A taxable account
-/// configured with everything but a dividend account is not a partly-configured
-/// account; it is an account that imports a dividend into nowhere, and the type
-/// system is a better place to prevent that than a validation somebody has to
-/// remember to write.
+/// Three slots, and the reason there are three rather than one is the
+/// reconciliation in spec §7. A broker may compute a **mutual fund's** basis by
+/// average cost, which the regulations permit for funds and do not permit for
+/// stocks (§1.1012-1(e)); so a difference between our basis and the broker's is a
+/// finding on a stock and quite possibly a method difference on a fund. A trial
+/// balance that keeps the two apart can say which kind of difference it is
+/// looking at, and one account holding both cannot.
+///
+/// A **closed** set, unlike [`SecurityDefinedData::kind`], which is whatever the
+/// broker calls it. The kinds are open-ended; the accounting treatments they fall
+/// into are not, and anything this cannot place goes to `Other` rather than to a
+/// fourth slot nobody configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityKindGroup {
+    /// Individual equities, and ETFs — which are legally funds but whose basis
+    /// every broker computes lot by lot, as for a stock.
+    Stocks,
+    /// Open-ended mutual funds: the ones average cost is available for.
+    MutualFunds,
+    /// Bonds, cash equivalents, and anything whose kind this does not recognise.
+    Other,
+}
+
+impl SecurityKindGroup {
+    /// Which slot a security of this kind belongs in.
+    ///
+    /// Matched against the broker's own vocabulary — Plaid's `security_type` is
+    /// what reaches [`SecurityDefinedData::kind`] — and **`Other` when it does not
+    /// recognise the word**, never `Stocks`. A bond filed with the stocks is a
+    /// basis difference reported as an error; a stock filed with "other" is a
+    /// holding in a slightly wrong column. Only one of those misleads a person
+    /// preparing a return.
+    pub fn of(kind: &str) -> Self {
+        let k = kind.trim().to_lowercase().replace(['_', '-'], " ");
+        match k.as_str() {
+            "equity" | "stock" | "stocks" | "etf" | "etp" | "share" | "shares" | "common stock" => {
+                SecurityKindGroup::Stocks
+            }
+            "mutual fund" | "mutualfund" | "fund" | "money market" | "money market fund" => {
+                SecurityKindGroup::MutualFunds
+            }
+            _ => SecurityKindGroup::Other,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SecurityKindGroup::Stocks => "stocks",
+            SecurityKindGroup::MutualFunds => "mutual_funds",
+            SecurityKindGroup::Other => "other",
+        }
+    }
+
+    /// What to call the slot on screen.
+    pub fn label(&self) -> &'static str {
+        match self {
+            SecurityKindGroup::Stocks => "Stocks",
+            SecurityKindGroup::MutualFunds => "Mutual funds",
+            SecurityKindGroup::Other => "Other",
+        }
+    }
+
+    /// All three, in the order a configuration form asks for them.
+    pub const ALL: [SecurityKindGroup; 3] = [
+        SecurityKindGroup::Stocks,
+        SecurityKindGroup::MutualFunds,
+        SecurityKindGroup::Other,
+    ];
+}
+
+/// The ledger accounts a taxable brokerage's activity posts to.
+///
+/// The required ones are required **together**, which is why they are a struct
+/// behind an enum variant rather than nullable fields on the configuration. A
+/// taxable account configured with everything but a dividend account is not a
+/// partly-configured account; it is an account that imports a dividend into
+/// nowhere, and the type system is a better place to prevent that than a
+/// validation somebody has to remember to write.
+///
+/// # Why some of them are `Option` anyway
+///
+/// Three of the fields below were added by phase 5, after the first
+/// configurations had already been appended to a log. An event is immutable, so a
+/// configuration written before they existed has to keep deserialising — and the
+/// honest reading of a slot nobody chose is *not* "the same account as the stocks
+/// slot" in general. So each one names, in its own documentation, what its absence
+/// falls back to and why that fallback is safe:
+///
+/// * a securities slot falls back to the stocks slot, which is where everything
+///   was carried before the split — so the balance sheet does not move under an
+///   old configuration, and nothing is restated;
+/// * the capital-gain-distribution account has **no fallback**: without one the
+///   activity is held for review, exactly as phase 4 held it, because posting a
+///   Schedule D item to the dividend account puts it on the wrong form.
+///
+/// `securities_account_id` keeps its serialised name although the field is now the
+/// stocks slot. Renaming it would change the JSON of an event appended by an older
+/// build, and the event hash is computed over that JSON — so a replica would see a
+/// re-serialised payload disagree with the hash the server sent and report
+/// divergence. See `events::payload::compute_event_hash`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaxableBrokerageAccounts {
-    /// `Assets:Brokerage:<…>:Securities` — holdings AT COST (spec §3).
-    pub securities_account_id: String,
+    /// `Assets:Brokerage:<…>:Stocks` — equities and ETFs, AT COST (spec §3).
+    ///
+    /// Also the fallback for the other two securities slots, and therefore the one
+    /// that is never optional.
+    #[serde(rename = "securities_account_id")]
+    pub stocks_account_id: String,
+    /// `Assets:Brokerage:<…>:Mutual funds`. Kept apart from the stocks slot
+    /// because a broker may use average cost for a fund — see
+    /// [`SecurityKindGroup`].
+    ///
+    /// `None` on a configuration written before the three-way split: the funds are
+    /// then carried in the stocks slot, where they already were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutual_funds_account_id: Option<String>,
+    /// `Assets:Brokerage:<…>:Other securities` — bonds, cash equivalents, and
+    /// anything whose kind is not recognised. `None` falls back to the stocks slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_securities_account_id: Option<String>,
     /// `Assets:Brokerage:<…>:Cash` — the sweep balance.
     pub cash_account_id: String,
     /// `Income:Investments:Dividends`. Every dividend lands here as ordinary
@@ -481,6 +630,31 @@ pub struct TaxableBrokerageAccounts {
     pub dividend_income_account_id: String,
     /// `Income:Investments:Interest`.
     pub interest_income_account_id: String,
+    /// `Income:Investments:Tax-exempt interest`.
+    ///
+    /// Its own account because the figure is *reported and not taxed*, so it can
+    /// neither be folded into ordinary interest nor left out of the books.
+    ///
+    /// The importer never chooses it: Plaid has no subtype that distinguishes
+    /// municipal interest from any other, so an import posts ordinary interest and
+    /// the split comes off the 1099-INT at year end — the same order §7 sets for
+    /// qualified dividends. It is here for a payment entered by hand and for that
+    /// year-end reclassification.
+    ///
+    /// `None` on a configuration written before phase 5; falls back to the
+    /// ordinary interest account, which is what such a configuration has been
+    /// doing all along.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tax_exempt_interest_account_id: Option<String>,
+    /// `Income:Investments:Capital gain distributions` — a fund passing through a
+    /// gain it realized. Schedule D, not Schedule B.
+    ///
+    /// **No fallback.** Without this account a capital gain distribution is held
+    /// for review, which is what phase 4 did with every one of them; posting it to
+    /// the dividend account would put it on the wrong form at the wrong rate, and
+    /// that is a worse answer than a row somebody has to look at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capital_gain_distribution_account_id: Option<String>,
     /// `Income:Investments:Realized gain` — one account for both directions, as
     /// phase 1's sale command requires.
     pub realized_gain_account_id: String,
@@ -498,6 +672,96 @@ pub struct TaxableBrokerageAccounts {
     /// nowhere truthful to put the other leg.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_clearing_account_id: Option<String>,
+}
+
+impl TaxableBrokerageAccounts {
+    /// The securities subaccount a slot posts to, with the fallback each field
+    /// documents.
+    pub fn securities_account_of(&self, group: SecurityKindGroup) -> &str {
+        match group {
+            SecurityKindGroup::Stocks => &self.stocks_account_id,
+            SecurityKindGroup::MutualFunds => self
+                .mutual_funds_account_id
+                .as_deref()
+                .unwrap_or(&self.stocks_account_id),
+            SecurityKindGroup::Other => self
+                .other_securities_account_id
+                .as_deref()
+                .unwrap_or(&self.stocks_account_id),
+        }
+    }
+
+    /// The securities subaccount a security of this kind is carried in.
+    ///
+    /// The importer and every report go through here, so a lot is bought into the
+    /// same account a sale later relieves it from — which is not a nicety: lots are
+    /// keyed by `(security, securities account)`, and a sale looking in the wrong
+    /// account finds no lots and cannot compute a gain.
+    pub fn securities_account_for_kind(&self, kind: &str) -> &str {
+        self.securities_account_of(SecurityKindGroup::of(kind))
+    }
+
+    /// Each distinct securities subaccount, with the slots it serves.
+    ///
+    /// Distinct, because a configuration may point two slots at one account —
+    /// every configuration written before the split points all three at one — and
+    /// a holdings report that listed that account twice would show the same
+    /// holding twice.
+    pub fn securities_accounts(&self) -> Vec<(String, Vec<SecurityKindGroup>)> {
+        let mut out: Vec<(String, Vec<SecurityKindGroup>)> = Vec::new();
+        for group in SecurityKindGroup::ALL {
+            let id = self.securities_account_of(group).to_string();
+            match out.iter_mut().find(|(existing, _)| *existing == id) {
+                Some((_, groups)) => groups.push(group),
+                None => out.push((id, vec![group])),
+            }
+        }
+        out
+    }
+
+    /// The account one kind of income posts to, or `None` when the configuration
+    /// names none and there is nothing safe to fall back to.
+    pub fn income_account_for(&self, kind: InvestmentIncomeKind) -> Option<&str> {
+        match kind {
+            InvestmentIncomeKind::Dividend => Some(&self.dividend_income_account_id),
+            InvestmentIncomeKind::Interest => Some(&self.interest_income_account_id),
+            InvestmentIncomeKind::TaxExemptInterest => Some(
+                self.tax_exempt_interest_account_id
+                    .as_deref()
+                    .unwrap_or(&self.interest_income_account_id),
+            ),
+            // The one with no fallback. See the field.
+            InvestmentIncomeKind::CapitalGainDistribution => {
+                self.capital_gain_distribution_account_id.as_deref()
+            }
+        }
+    }
+
+    /// Every account named, for a caller that has to check them all — the
+    /// configuration command checks each one's type, and a slot left out of this
+    /// list is a slot nothing validates.
+    pub fn all_named(&self) -> Vec<&str> {
+        let mut out = vec![
+            self.stocks_account_id.as_str(),
+            self.cash_account_id.as_str(),
+            self.dividend_income_account_id.as_str(),
+            self.interest_income_account_id.as_str(),
+            self.realized_gain_account_id.as_str(),
+            self.fee_expense_account_id.as_str(),
+        ];
+        for optional in [
+            &self.mutual_funds_account_id,
+            &self.other_securities_account_id,
+            &self.tax_exempt_interest_account_id,
+            &self.capital_gain_distribution_account_id,
+            &self.transfer_clearing_account_id,
+        ] {
+            if let Some(id) = optional.as_deref() {
+                out.push(id);
+            }
+        }
+        out
+    }
 }
 
 /// Which accounts an investment account's activity posts to — by treatment, so
@@ -577,6 +841,9 @@ pub enum ImportedActivityKind {
     Sell,
     Dividend,
     Interest,
+    /// A fund passing through a gain it realized — Schedule D, not Schedule B.
+    /// Held for review until phase 5 gave it an account of its own to post to.
+    CapitalGainDistribution,
     Fee,
     /// Cash into or out of a taxable account, posted against the configured
     /// clearing account.
@@ -590,6 +857,7 @@ impl ImportedActivityKind {
             ImportedActivityKind::Sell => "sell",
             ImportedActivityKind::Dividend => "dividend",
             ImportedActivityKind::Interest => "interest",
+            ImportedActivityKind::CapitalGainDistribution => "capital_gain_distribution",
             ImportedActivityKind::Fee => "fee",
             ImportedActivityKind::Cash => "cash",
         }
@@ -614,6 +882,90 @@ pub struct InvestmentActivityImportedData {
     /// The sale a disposal recorded; absent for everything else.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sale_id: Option<String>,
+}
+
+/// A file attached to the books. See `migrations/049_documents.sql` for why the bytes
+/// are not in the log, and [`crate::documents`] for where they are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentAttachedData {
+    pub document_id: String,
+    /// Lowercase hex SHA-256 of the file: the key its bytes are stored under, and what
+    /// any copy of them is checked against.
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub media_type: String,
+    /// The name it was attached under. Display only, and never a path.
+    pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tax_year: Option<i32>,
+    /// A form code where the document is a statement — `1099-B`, `W-2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
+    /// What it is about, where it is about one thing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<DocumentSubjectData>,
+}
+
+/// What a document is about, on the wire.
+///
+/// Tagged by `kind`, so a subject this version does not know still round-trips through
+/// a replica that has it and is simply not followed here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DocumentSubjectData {
+    Entry { entry_id: String },
+    Account { account_id: String },
+    Reconciliation { reconciliation_id: String },
+}
+
+impl DocumentSubjectData {
+    /// The pair the projection stores.
+    pub fn as_columns(&self) -> (&'static str, &str) {
+        match self {
+            DocumentSubjectData::Entry { entry_id } => ("entry", entry_id),
+            DocumentSubjectData::Account { account_id } => ("account", account_id),
+            DocumentSubjectData::Reconciliation { reconciliation_id } => {
+                ("reconciliation", reconciliation_id)
+            }
+        }
+    }
+}
+
+/// A provider account's imports, undone, so the broker can be read again.
+///
+/// The provider hands over the same transaction for as long as it is in the window,
+/// and the dedup fence is what stops it arriving twice. That fence is therefore also
+/// what stops a bad import being replaced by a good one: the activity exists, so it
+/// is never offered again. This event lifts the fence for one account, naming
+/// exactly what it lifts it for.
+///
+/// It does not undo the bookkeeping on its own. The entries are voided by
+/// `JournalEntryVoided` events in the same append, because a voided entry is what
+/// this book already means by "this did not happen", and there is no second way to
+/// say it. What this event does carry is the part void cannot say: the lots and
+/// sales the imports created, which are registers rather than entries and would
+/// otherwise still be holding positions nobody owns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvestmentImportsForgottenData {
+    pub item_id: String,
+    pub plaid_account_id: String,
+    /// The provider transactions whose fence is lifted. Listed rather than implied
+    /// by the account, so that a replay deletes what this event decided and not
+    /// whatever the register happens to hold when it runs.
+    pub provider_transaction_ids: Vec<String>,
+    /// Lots created by those imports, to be removed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lot_ids: Vec<String>,
+    /// Sales recorded by those imports. Removing one gives back what it consumed:
+    /// its lots get their quantity and basis returned, which is why the sales have
+    /// to be named as well as the lots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sale_ids: Vec<String>,
+    /// Why, in the words of whoever did it. Required: this is the one operation on
+    /// this page that takes activity out of the books wholesale.
+    pub reason: String,
 }
 
 /// One line of a holdings snapshot.
@@ -778,31 +1130,6 @@ pub const ANY_YEAR: i32 = 0;
 /// Whether a year is the undated sentinel, for `skip_serializing_if`.
 fn is_any_year(year: &i32) -> bool {
     *year == ANY_YEAR
-}
-
-/// A file attached to the books, as the log records it: what it is and the
-/// digest of its bytes, never the bytes. See [`crate::documents`] for why.
-///
-/// Boxed into its variant, as [`BusinessProfileSet`](Event::BusinessProfileSet)
-/// is, to keep [`Event`] small.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DocumentAttachedData {
-    pub document_id: String,
-    /// Lowercase hex SHA-256 of the file: the key its bytes are stored under,
-    /// and what any copy of them is checked against.
-    pub sha256: String,
-    pub size_bytes: u64,
-    pub media_type: String,
-    /// The name it was attached under. Display only, and never a path.
-    pub filename: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tax_year: Option<i32>,
-    /// A [`crate::tax::information_returns::FormKind`] code, when the document
-    /// is a statement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub form: Option<String>,
 }
 
 /// What a received statement says, box by box.
@@ -1118,15 +1445,6 @@ pub enum Event {
         /// The first tax year this applies to.
         effective_from: i32,
     },
-    /// A file is attached to the books. Metadata and digest only; the bytes go
-    /// to a [`crate::documents::BlobStore`] first.
-    DocumentAttached(Box<DocumentAttachedData>),
-    /// A document is taken off the books.
-    ///
-    /// Its bytes are left where they are. The log still names them, a removal
-    /// can be a mistake, and tax records have to be kept for years — deleting
-    /// the file itself is a separate, deliberate act.
-    DocumentRemoved { document_id: String },
     /// A received statement is recorded, or re-recorded under the same id.
     ///
     /// Re-recording replaces rather than adds: a corrected 1099 or a re-pulled
@@ -1480,6 +1798,19 @@ pub enum Event {
     PlaidSecurityLinked(Box<PlaidSecurityLinkData>),
     /// One provider transaction, imported — the dedup fence in the log.
     InvestmentActivityImported(Box<InvestmentActivityImportedData>),
+    /// One provider account's imports, undone, so the broker can be read again. See
+    /// [`InvestmentImportsForgottenData`].
+    InvestmentImportsForgotten(Box<InvestmentImportsForgottenData>),
+    /// A file is attached to the books. See [`DocumentAttachedData`].
+    DocumentAttached(Box<DocumentAttachedData>),
+    /// A document is taken off the books.
+    ///
+    /// Its bytes are left where they are. The log still names them, a removal can be a
+    /// mistake, and tax records have to be kept for years — deleting the file itself is
+    /// a separate, deliberate act.
+    DocumentRemoved {
+        document_id: String,
+    },
     /// What the broker said an account held on a date. Posts nothing for a taxable
     /// account; for a sheltered one it is what a value update is computed from.
     HoldingsSnapshotRecorded(Box<HoldingsSnapshotData>),
@@ -1824,6 +2155,7 @@ impl Event {
             Event::InvestmentAccountConfigured(_) => "investment_account_configured",
             Event::PlaidSecurityLinked(_) => "plaid_security_linked",
             Event::InvestmentActivityImported(_) => "investment_activity_imported",
+            Event::InvestmentImportsForgotten(_) => "investment_imports_forgotten",
             Event::HoldingsSnapshotRecorded(_) => "holdings_snapshot_recorded",
             Event::BusinessTypeSet { .. } => "business_type_set",
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
@@ -1938,6 +2270,9 @@ impl Event {
             Event::InvestmentAccountConfigured(d) => Some(&d.plaid_account_id),
             Event::PlaidSecurityLinked(d) => Some(&d.security_id),
             Event::InvestmentActivityImported(d) => Some(&d.provider_transaction_id),
+            // The account, not the transactions: this is one act about one account,
+            // and the transactions it names are its contents.
+            Event::InvestmentImportsForgotten(d) => Some(&d.plaid_account_id),
             Event::HoldingsSnapshotRecorded(d) => Some(&d.plaid_account_id),
             // One business per book, so no id names the thing changed — the same
             // answer `BusinessProfileSet` gives.
@@ -2384,6 +2719,7 @@ mod tests {
                 title: None,
                 tax_year: Some(2025),
                 form: Some("1099_int".to_string()),
+                subject: None,
             })),
             Event::DocumentRemoved {
                 document_id: "doc-1".to_string(),
@@ -2551,5 +2887,173 @@ mod partnership_event_shape {
         // And it survives the round trip the replica makes.
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+}
+
+#[cfg(test)]
+mod investment_account_shape {
+    use super::*;
+
+    /// A configuration with only the slots phase 4 had.
+    fn old_shape() -> TaxableBrokerageAccounts {
+        TaxableBrokerageAccounts {
+            stocks_account_id: "1110".into(),
+            mutual_funds_account_id: None,
+            other_securities_account_id: None,
+            cash_account_id: "1100".into(),
+            dividend_income_account_id: "4100".into(),
+            interest_income_account_id: "4110".into(),
+            tax_exempt_interest_account_id: None,
+            capital_gain_distribution_account_id: None,
+            realized_gain_account_id: "4120".into(),
+            fee_expense_account_id: "6000".into(),
+            transfer_clearing_account_id: None,
+        }
+    }
+
+    /// The classifier decides which securities account a holding is carried in, and
+    /// therefore which account a later sale looks for its lots in. An ETF goes with
+    /// the stocks because every broker computes its basis lot by lot; anything
+    /// unrecognised goes to `Other`, never to the stocks — a bond filed with the
+    /// stocks is a basis difference reported as an error, which is the misleading
+    /// direction.
+    #[test]
+    fn a_kind_the_broker_invented_lands_in_other_and_not_in_stocks() {
+        for kind in ["equity", "stock", "ETF", "Common Stock", "etp"] {
+            assert_eq!(
+                SecurityKindGroup::of(kind),
+                SecurityKindGroup::Stocks,
+                "{kind}"
+            );
+        }
+        for kind in ["mutual fund", "mutual_fund", "money market", "FUND"] {
+            assert_eq!(
+                SecurityKindGroup::of(kind),
+                SecurityKindGroup::MutualFunds,
+                "{kind}"
+            );
+        }
+        for kind in ["fixed income", "bond", "derivative", "unknown", "", "cash"] {
+            assert_eq!(
+                SecurityKindGroup::of(kind),
+                SecurityKindGroup::Other,
+                "{kind}"
+            );
+        }
+    }
+
+    /// A configuration written before the split carried everything in one account,
+    /// and must carry on carrying it there. Anything else would move a holding
+    /// between accounts on nothing but a software upgrade, which is a restated
+    /// balance sheet nobody asked for.
+    #[test]
+    fn an_unconfigured_securities_slot_stays_where_the_holding_already_is() {
+        let a = old_shape();
+        for group in SecurityKindGroup::ALL {
+            assert_eq!(a.securities_account_of(group), "1110");
+        }
+        assert_eq!(a.securities_account_for_kind("bond"), "1110");
+        // One account, listed once, serving all three slots — a holdings report that
+        // listed it three times would show the same holding three times.
+        let accounts = a.securities_accounts();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].0, "1110");
+        assert_eq!(accounts[0].1, SecurityKindGroup::ALL.to_vec());
+    }
+
+    #[test]
+    fn a_split_configuration_sends_each_kind_to_its_own_account() {
+        let a = TaxableBrokerageAccounts {
+            mutual_funds_account_id: Some("1111".into()),
+            other_securities_account_id: Some("1112".into()),
+            ..old_shape()
+        };
+        assert_eq!(a.securities_account_for_kind("equity"), "1110");
+        assert_eq!(a.securities_account_for_kind("mutual fund"), "1111");
+        assert_eq!(a.securities_account_for_kind("fixed income"), "1112");
+        assert_eq!(
+            a.securities_accounts()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>(),
+            vec!["1110", "1111", "1112"]
+        );
+    }
+
+    /// Tax-exempt interest is *interest* until somebody says otherwise, so an
+    /// unconfigured slot falls back to it. A capital gain distribution has no such
+    /// fallback: dividends are Schedule B and this is Schedule D, so with no account
+    /// there is nowhere for it to go and the activity has to be held.
+    #[test]
+    fn only_the_capital_gain_account_has_no_fallback() {
+        let a = old_shape();
+        assert_eq!(
+            a.income_account_for(InvestmentIncomeKind::TaxExemptInterest),
+            Some("4110")
+        );
+        assert_eq!(
+            a.income_account_for(InvestmentIncomeKind::CapitalGainDistribution),
+            None
+        );
+
+        let configured = TaxableBrokerageAccounts {
+            tax_exempt_interest_account_id: Some("4111".into()),
+            capital_gain_distribution_account_id: Some("4112".into()),
+            ..old_shape()
+        };
+        assert_eq!(
+            configured.income_account_for(InvestmentIncomeKind::TaxExemptInterest),
+            Some("4111")
+        );
+        assert_eq!(
+            configured.income_account_for(InvestmentIncomeKind::CapitalGainDistribution),
+            Some("4112")
+        );
+    }
+
+    /// The whole reason the stocks slot keeps its old serialised name.
+    ///
+    /// An event's hash is computed over the JSON its payload re-serialises to (see
+    /// `events::payload::compute_event_hash`), and a replica recomputes that hash
+    /// from its own build to check what the server sent it. Rename the field and a
+    /// configuration appended by an older build re-serialises to different bytes —
+    /// so the hashes disagree and the pull reports divergence, over a change that
+    /// meant nothing.
+    #[test]
+    fn an_old_configuration_round_trips_to_the_same_bytes() {
+        let json = r#"{"treatment":"taxable","securities_account_id":"1110","cash_account_id":"1100","dividend_income_account_id":"4100","interest_income_account_id":"4110","realized_gain_account_id":"4120","fee_expense_account_id":"6000"}"#;
+        let parsed: InvestmentPostingAccounts = serde_json::from_str(json).expect("old shape");
+        let InvestmentPostingAccounts::Taxable(accounts) = &parsed else {
+            panic!("a taxable configuration read back as something else");
+        };
+        assert_eq!(accounts.stocks_account_id, "1110");
+        assert_eq!(accounts.mutual_funds_account_id, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    /// Every named account reaches the list the configuration command type-checks
+    /// against. A slot missing from it is a slot nothing validates, and the failure
+    /// it produces — income posted to an asset account — balances perfectly and is
+    /// invisible until a return is prepared.
+    #[test]
+    fn every_slot_is_offered_for_checking() {
+        let a = TaxableBrokerageAccounts {
+            mutual_funds_account_id: Some("1111".into()),
+            other_securities_account_id: Some("1112".into()),
+            tax_exempt_interest_account_id: Some("4111".into()),
+            capital_gain_distribution_account_id: Some("4112".into()),
+            transfer_clearing_account_id: Some("1090".into()),
+            ..old_shape()
+        };
+        let mut named = a.all_named();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            vec![
+                "1090", "1100", "1110", "1111", "1112", "4100", "4110", "4111", "4112", "4120",
+                "6000"
+            ]
+        );
+        assert_eq!(old_shape().all_named().len(), 6);
     }
 }

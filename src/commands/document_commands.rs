@@ -25,10 +25,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::documents::{self, BlobError, BlobStore, LocalBlobStore};
-use crate::domain::documents::Document;
+use crate::domain::documents::{Document, DocumentSubject};
 use crate::events::types::{DocumentAttachedData, Event, StoredEvent};
 use crate::store::event_store::EventStore;
-use crate::tax::information_returns::FormKind;
 
 #[derive(Debug, Error)]
 pub enum DocumentError {
@@ -45,6 +44,8 @@ pub enum DocumentError {
     NoLedgerId,
     #[error("no document with id {0}")]
     NoSuchDocument(String),
+    #[error("the subject of a document has to name something: {0} is empty")]
+    EmptySubject(&'static str),
     #[error("document {document_id} is what {} was read from; remove or re-record that first", statements.join(", "))]
     InUse {
         document_id: String,
@@ -60,7 +61,9 @@ pub struct AttachDocument<'a> {
     pub filename: &'a str,
     pub title: Option<String>,
     pub tax_year: Option<i32>,
-    pub form: Option<FormKind>,
+    pub form: Option<String>,
+    /// What it is about, where it is about one thing.
+    pub subject: Option<DocumentSubject>,
 }
 
 /// The blob store these books' documents live in on this machine.
@@ -97,7 +100,11 @@ pub fn attach(
             filename,
             title,
             tax_year: doc.tax_year,
-            form: doc.form.map(|f| f.as_str().to_string()),
+            form: doc
+                .form
+                .map(|f| f.trim().to_string())
+                .filter(|f| !f.is_empty()),
+            subject: doc.subject.as_ref().map(wire_subject),
         })),
     )?;
     get(store.connection(), &document_id).ok_or_else(|| {
@@ -112,7 +119,8 @@ pub fn attach_file(
     path: &Path,
     title: Option<String>,
     tax_year: Option<i32>,
-    form: Option<FormKind>,
+    form: Option<String>,
+    subject: Option<DocumentSubject>,
 ) -> Result<Document, DocumentError> {
     let read_error = |source| DocumentError::Read {
         path: path.display().to_string(),
@@ -133,6 +141,7 @@ pub fn attach_file(
             title,
             tax_year,
             form,
+            subject,
         },
     )
 }
@@ -140,8 +149,10 @@ pub fn attach_file(
 /// Take a document off the books. Its bytes stay in storage — see
 /// [`Event::DocumentRemoved`].
 ///
-/// Refused while a recorded statement names it as its source, because removing
-/// it would leave figures on the return with nothing behind them.
+/// Nothing on `main` computes from a document, so nothing can be left pointing at a
+/// removed one. The personal-tax work adds the fence it needs: a statement that names a
+/// document as its source refuses the removal, because taking it away would leave
+/// figures on a return with nothing behind them.
 pub fn remove(
     store: &mut EventStore,
     user_id: &str,
@@ -169,7 +180,7 @@ pub fn remove(
 /// Documents on the books, newest first — all of them, or one tax year's.
 pub fn list(conn: &Connection, tax_year: Option<i32>) -> Vec<Document> {
     let sql = "SELECT document_id, sha256, size_bytes, media_type, filename, title, tax_year,
-                      form, attached_at
+                      form, subject_kind, subject_id, attached_at
                  FROM documents
                 WHERE ?1 IS NULL OR tax_year = ?1
                 ORDER BY attached_at DESC, document_id";
@@ -184,7 +195,7 @@ pub fn list(conn: &Connection, tax_year: Option<i32>) -> Vec<Document> {
 pub fn get(conn: &Connection, document_id: &str) -> Option<Document> {
     conn.query_row(
         "SELECT document_id, sha256, size_bytes, media_type, filename, title, tax_year,
-                form, attached_at
+                form, subject_kind, subject_id, attached_at
            FROM documents WHERE document_id = ?1",
         [document_id],
         row_to_document,
@@ -255,7 +266,9 @@ fn statements_citing(conn: &Connection, document_id: &str) -> Vec<String> {
 }
 
 fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
-    let attached_at: String = row.get(8)?;
+    let attached_at: String = row.get(10)?;
+    let kind: Option<String> = row.get(8)?;
+    let id: Option<String> = row.get(9)?;
     Ok(Document {
         document_id: row.get(0)?,
         sha256: row.get(1)?,
@@ -264,13 +277,88 @@ fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
         filename: row.get(4)?,
         title: row.get(5)?,
         tax_year: row.get(6)?,
-        form: row
-            .get::<_, Option<String>>(7)?
-            .and_then(|code| FormKind::parse(&code)),
+        form: row.get(7)?,
+        // A kind this version does not know reads as no subject: the document is still
+        // a document, and the link is simply one this build cannot follow.
+        subject: kind
+            .zip(id)
+            .and_then(|(kind, id)| DocumentSubject::from_columns(&kind, &id)),
         attached_at: DateTime::parse_from_rfc3339(&attached_at)
             .map(|t| t.with_timezone(&Utc))
             .unwrap_or_default(),
     })
+}
+
+/// The domain subject as the event carries it.
+fn wire_subject(subject: &DocumentSubject) -> crate::events::types::DocumentSubjectData {
+    use crate::events::types::DocumentSubjectData as Wire;
+    match subject {
+        DocumentSubject::Entry { entry_id } => Wire::Entry {
+            entry_id: entry_id.clone(),
+        },
+        DocumentSubject::Account { account_id } => Wire::Account {
+            account_id: account_id.clone(),
+        },
+        DocumentSubject::Reconciliation { reconciliation_id } => Wire::Reconciliation {
+            reconciliation_id: reconciliation_id.clone(),
+        },
+    }
+}
+
+/// The documents attached to one thing, oldest first.
+///
+/// Oldest first and not newest: attachments to one entry are usually a receipt and then
+/// a correction, and reading them in the order they arrived is reading the story.
+pub fn for_subject(conn: &Connection, subject: &DocumentSubject) -> Vec<Document> {
+    let (kind, id) = subject.as_columns();
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT document_id, sha256, size_bytes, media_type, filename, title, tax_year,
+                form, subject_kind, subject_id, attached_at
+           FROM documents
+          WHERE subject_kind = ?1 AND subject_id = ?2
+          ORDER BY attached_at, document_id",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map(params![kind, id], row_to_document)
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+/// How many documents are attached to each of these things.
+///
+/// One query for a list of rows rather than one per row: a register showing a paperclip
+/// on five hundred entries cannot ask five hundred times.
+pub fn counts_for_entries(
+    conn: &Connection,
+    entry_ids: &[String],
+) -> std::collections::HashMap<String, usize> {
+    let mut out = std::collections::HashMap::new();
+    if entry_ids.is_empty() {
+        return out;
+    }
+    let placeholders = (2..2 + entry_ids.len())
+        .map(|n| format!("?{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT subject_id, COUNT(*) FROM documents
+          WHERE subject_kind = ?1 AND subject_id IN ({placeholders})
+          GROUP BY subject_id"
+    );
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return out;
+    };
+    let mut params: Vec<String> = vec!["entry".to_string()];
+    params.extend(entry_ids.iter().cloned());
+    if let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    }) {
+        for row in rows.flatten() {
+            out.insert(row.0, row.1.max(0) as usize);
+        }
+    }
+    out
 }
 
 fn append(
@@ -316,7 +404,8 @@ mod tests {
                 filename: "/scans/2025/1099-INT.pdf",
                 title: Some("  Bank interest  ".to_string()),
                 tax_year: Some(2025),
-                form: Some(FormKind::F1099Int),
+                form: Some("1099-INT".to_string()),
+                subject: None,
             },
         )
         .unwrap()
@@ -331,7 +420,7 @@ mod tests {
         assert_eq!(doc.filename, "1099-INT.pdf", "the name, not the path");
         assert_eq!(doc.title.as_deref(), Some("Bank interest"));
         assert_eq!(doc.media_type, "application/pdf");
-        assert_eq!(doc.form, Some(FormKind::F1099Int));
+        assert_eq!(doc.form.as_deref(), Some("1099-INT"));
         assert_eq!(list(store.connection(), Some(2025)), vec![doc.clone()]);
         assert!(list(store.connection(), Some(2024)).is_empty());
         assert_eq!(
@@ -372,6 +461,54 @@ mod tests {
         ));
     }
 
+    /// The point of the subject: a receipt belongs to the entry it is a receipt for,
+    /// and "what is attached to this" has to be answerable without reading every row.
+    #[test]
+    fn a_document_attached_to_an_entry_is_found_by_that_entry() {
+        let mut store = books("personal");
+        let (blobs, _dir) = blobs();
+        let on_entry = attach(
+            &mut store,
+            &blobs,
+            "user",
+            AttachDocument {
+                bytes: b"%PDF-1.7 receipt",
+                filename: "receipt.pdf",
+                title: None,
+                tax_year: None,
+                form: None,
+                subject: Some(DocumentSubject::Entry {
+                    entry_id: "e1".to_string(),
+                }),
+            },
+        )
+        .unwrap();
+        let elsewhere = pdf(&mut store, &blobs, b"%PDF-1.7 interest");
+
+        let entry = DocumentSubject::Entry {
+            entry_id: "e1".to_string(),
+        };
+        assert_eq!(for_subject(store.connection(), &entry), vec![on_entry]);
+        assert!(
+            for_subject(
+                store.connection(),
+                &DocumentSubject::Entry {
+                    entry_id: "e2".to_string()
+                }
+            )
+            .is_empty(),
+            "another entry's attachments are not this entry's"
+        );
+        assert_eq!(
+            counts_for_entries(store.connection(), &["e1".to_string(), "e2".to_string()]),
+            std::collections::HashMap::from([("e1".to_string(), 1)]),
+            "a count for every entry that has one, and no row for the ones that do not"
+        );
+        // A document about the books at large has no subject and is not anybody's.
+        assert_eq!(elsewhere.subject, None);
+        assert_eq!(list(store.connection(), None).len(), 2);
+    }
+
     #[test]
     fn nothing_is_recorded_for_a_file_that_could_not_be_stored() {
         let mut store = books("personal");
@@ -386,6 +523,7 @@ mod tests {
                 title: None,
                 tax_year: None,
                 form: None,
+                subject: None,
             },
         );
         assert!(matches!(result, Err(DocumentError::Blob(BlobError::Empty))));

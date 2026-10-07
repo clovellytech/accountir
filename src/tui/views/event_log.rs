@@ -408,10 +408,7 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             ..
         } => format!(
             "{} of ${:.2} received on {received_on}",
-            match kind {
-                crate::events::types::InvestmentIncomeKind::Dividend => "Dividend",
-                crate::events::types::InvestmentIncomeKind::Interest => "Interest",
-            },
+            kind.label(),
             *amount_cents as f64 / 100.0
         ),
         Event::InvestmentFeeCharged {
@@ -490,6 +487,27 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             widgets::truncate(&d.plaid_account_id, 8),
             d.outcome.as_str(),
             widgets::truncate(&d.entry_id, 8)
+        ),
+        Event::DocumentAttached(d) => format!(
+            "Attached {} ({}){}",
+            widgets::truncate(&d.filename, 24),
+            d.media_type,
+            match &d.subject {
+                Some(subject) => {
+                    let (kind, id) = subject.as_columns();
+                    format!(" to {kind} {}", widgets::truncate(id, 8))
+                }
+                None => String::new(),
+            }
+        ),
+        Event::DocumentRemoved { document_id } => {
+            format!("Removed document {}", widgets::truncate(document_id, 8))
+        }
+        Event::InvestmentImportsForgotten(d) => format!(
+            "Forgot {} import(s) from {}: {}",
+            d.provider_transaction_ids.len(),
+            widgets::truncate(&d.plaid_account_id, 8),
+            d.reason
         ),
         Event::HoldingsSnapshotRecorded(d) => format!(
             "Holdings of {} as of {}: {} position(s){}",
@@ -664,14 +682,6 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
             widgets::truncate(account_id, 8),
             if *added_back { "is" } else { "is no longer" }
         ),
-        Event::DocumentAttached(d) => format!(
-            "Document attached: {}{}",
-            d.filename,
-            d.tax_year.map(|y| format!(" ({y})")).unwrap_or_default()
-        ),
-        Event::DocumentRemoved { document_id } => {
-            format!("Document {} removed", widgets::truncate(document_id, 8))
-        }
         Event::TaxStatementRecorded(s) => {
             let form = crate::tax::information_returns::FormKind::parse(&s.form)
                 .map(|f| f.label())

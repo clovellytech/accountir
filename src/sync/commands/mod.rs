@@ -12,10 +12,12 @@ use axum::Router;
 pub mod account;
 pub mod bill;
 pub mod bill_ops;
+pub mod documents;
 pub mod entries;
 pub mod entry_ops;
 pub mod event_service;
 pub mod fiscal;
+pub mod investments;
 pub mod partnership;
 pub mod plaid;
 pub mod reconciliation;
@@ -28,9 +30,11 @@ pub fn router() -> Router<SyncState> {
         .merge(bill::router())
         .merge(bill_ops::router())
         .merge(entries::router())
+        .merge(documents::router())
         .merge(entry_ops::router())
         .merge(event_service::router())
         .merge(fiscal::router())
+        .merge(investments::router())
         .merge(partnership::router())
         .merge(plaid::router())
         .merge(reconciliation::router())

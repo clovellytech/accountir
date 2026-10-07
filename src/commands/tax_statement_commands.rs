@@ -892,7 +892,8 @@ mod tests {
                 filename: "k1.pdf",
                 title: None,
                 tax_year: Some(YEAR),
-                form: Some(FormKind::K1Partnership),
+                form: Some(FormKind::K1Partnership.as_str().to_string()),
+                subject: None,
             },
         )
         .unwrap();

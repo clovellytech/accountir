@@ -542,7 +542,15 @@ pub fn record_distribution(
 /// The outcome of a retirement command's in-transaction validation: the events to
 /// append as one unit, or a domain rejection. The shape `InvestmentStep` has, for
 /// the reason it gives.
-enum RetirementStep {
+///
+/// `pub(crate)` along with the `build_*_in_txn` functions below, so the sync
+/// command endpoints in `sync::commands::investments` run these very builders
+/// inside the server's own append transaction. That is the whole point of the
+/// hosted path: a retirement account on a group's books must be fenced by the same
+/// out-of-order-statement refusal, the same account-type checks and the same
+/// closed-year fence as one in a local file, and a second implementation of them
+/// would be a second place for one to be left out.
+pub(crate) enum RetirementStep {
     Append(Vec<Event>),
     Reject(RetirementError),
 }
@@ -731,7 +739,7 @@ fn check_registration_in_txn(
     Ok(None)
 }
 
-fn build_registration_in_txn(
+pub(crate) fn build_registration_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &RegisterRetirementAccountCommand,
 ) -> Result<RetirementStep, EventStoreError> {
@@ -772,7 +780,7 @@ fn build_registration_in_txn(
     ]))
 }
 
-fn build_value_in_txn(
+pub(crate) fn build_value_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &SetRetirementValueCommand,
 ) -> Result<RetirementStep, EventStoreError> {
@@ -856,7 +864,7 @@ fn build_value_in_txn(
     Ok(RetirementStep::Append(vec![entry, register]))
 }
 
-fn build_contribution_in_txn(
+pub(crate) fn build_contribution_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &RetirementContributionCommand,
 ) -> Result<RetirementStep, EventStoreError> {
@@ -915,7 +923,7 @@ fn build_contribution_in_txn(
     ]))
 }
 
-fn build_distribution_in_txn(
+pub(crate) fn build_distribution_in_txn(
     tx: &rusqlite::Transaction<'_>,
     cmd: &RetirementDistributionCommand,
 ) -> Result<RetirementStep, EventStoreError> {

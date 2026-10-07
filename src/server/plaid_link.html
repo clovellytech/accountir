@@ -66,9 +66,20 @@
             statusEl.innerHTML = msg;
         }
 
+        // `?item=<proxy item id>` re-opens an existing connection in update mode to
+        // ask for investments consent. Nothing is exchanged afterwards: the
+        // connection, its access token and its account ids all stay as they were.
+        const updateItem = new URLSearchParams(window.location.search).get('item');
+
         async function init() {
             try {
-                const resp = await fetch('/plaid/link-token', { method: 'POST' });
+                const resp = await fetch('/plaid/link-token', updateItem
+                    ? {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ proxy_item_id: updateItem }),
+                    }
+                    : { method: 'POST' });
                 if (!resp.ok) {
                     const err = await resp.json().catch(() => ({ error: 'Unknown error' }));
                     showStatus('error', 'Failed to get link token: ' + (err.error || resp.statusText));
@@ -80,6 +91,11 @@
                 const handler = Plaid.create({
                     token: link_token,
                     onSuccess: async (publicToken, metadata) => {
+                        if (updateItem) {
+                            showStatus('success', 'Investments access added. Go back to Accountir and pull again.');
+                            closeNote.style.display = 'block';
+                            return;
+                        }
                         showStatus('loading', '<span class="spinner"></span> Connecting your bank...');
                         try {
                             const accounts = (metadata.accounts || []).map(a => ({

@@ -275,6 +275,24 @@ pub fn lots_of(
     )
 }
 
+/// The lots of one security in one account that still have shares in them, oldest
+/// first.
+///
+/// What a lot picker offers. A fully consumed lot is deliberately excluded: it can
+/// no longer contribute to a sale, and offering it would be offering a choice that
+/// is refused under the write lock — while [`lots_of`] keeps them, because a Form
+/// 8949 row for a lot sold in March still has to name the date it was acquired.
+pub fn open_lots(
+    conn: &rusqlite::Connection,
+    security_id: &str,
+    securities_account_id: &str,
+) -> Vec<Lot> {
+    lots_of(conn, security_id, securities_account_id)
+        .into_iter()
+        .filter(|l| l.remaining_quantity > 0)
+        .collect()
+}
+
 /// Every lot in the register, oldest first.
 pub fn list_lots(conn: &rusqlite::Connection) -> Vec<Lot> {
     read_lots(
@@ -539,7 +557,11 @@ pub fn realized_in_year(conn: &rusqlite::Connection, year: i32) -> Vec<RealizedP
 // ---------------------------------------------------------------------------
 
 /// A security to put on the master. `security_id` is minted by the command.
-#[derive(Debug, Clone)]
+///
+/// Serializable for the reason [`LotSelection`] is: the importer's hosted path
+/// sends this very struct to `/sync/commands/resolve-plaid-security`, so the
+/// security a group's master gets is described by the same type a local one is.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NewSecurity {
     pub ticker: String,
     pub name: String,
@@ -552,7 +574,7 @@ pub struct NewSecurity {
     pub currency: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BuySecurityCommand {
     pub security_id: String,
     pub securities_account_id: String,
@@ -574,7 +596,13 @@ pub struct BuySecurityCommand {
 /// it is the reason the consumed lots are recorded on the event: the choice made
 /// on the day is the choice that was filed, and it must not be recomputed later
 /// from whatever the default has become.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Serializable, and deliberately the **same type** the sync transport puts on the
+/// wire (`sync::commands::investments::SellSecurityRequest`) rather than a wire
+/// twin of it. A hosted sale has to pick exactly the lots a local one would, and
+/// two types that have to agree about that are two types that can stop agreeing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LotSelection {
     #[default]
     Fifo,
@@ -582,7 +610,7 @@ pub enum LotSelection {
     Specific(Vec<(String, i64)>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SellSecurityCommand {
     pub security_id: String,
     pub securities_account_id: String,
@@ -602,7 +630,7 @@ pub struct SellSecurityCommand {
     pub memo: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RecordInvestmentIncomeCommand {
     pub kind: InvestmentIncomeKind,
     /// `None` for sweep interest, which belongs to the account and not to any
@@ -619,7 +647,7 @@ pub struct RecordInvestmentIncomeCommand {
     pub memo: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChargeInvestmentFeeCommand {
     pub cash_account_id: String,
     pub expense_account_id: String,
@@ -1232,10 +1260,10 @@ pub(crate) fn build_income_in_txn(
     }
 
     let currency = base_currency(tx)?;
-    let label = match cmd.kind {
-        InvestmentIncomeKind::Dividend => "Dividend",
-        InvestmentIncomeKind::Interest => "Interest",
-    };
+    // One label per kind, from the enum itself rather than from a match here: four
+    // kinds since phase 5, and a fifth copy of the list is a fifth place for one of
+    // them to be called something else.
+    let label = cmd.kind.label();
     let memo = cmd.memo.clone().unwrap_or_else(|| match &cmd.security_id {
         Some(id) => format!("{label} from {}", ticker_or_id(tx, id)),
         None => format!("{label} on the brokerage account"),
