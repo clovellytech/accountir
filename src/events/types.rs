@@ -1272,6 +1272,13 @@ pub struct PersonalTaxProfileData {
     /// State estimated tax paid for the year, likewise.
     #[serde(default)]
     pub state_estimated_payments_cents: i64,
+    /// Capital losses carried in from last year's return (Schedule D lines 6 and
+    /// 14), as positive amounts. Last year's return says what they are; nothing in
+    /// this year's books does.
+    #[serde(default)]
+    pub short_term_loss_carryover_cents: i64,
+    #[serde(default)]
+    pub long_term_loss_carryover_cents: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rental_properties: Vec<RentalPropertyData>,
     /// Taxable-interest accounts Schedule B reads beyond the ones a brokerage's

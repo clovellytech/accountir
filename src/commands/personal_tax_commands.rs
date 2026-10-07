@@ -93,7 +93,7 @@ pub fn profile_years(conn: &Connection) -> Vec<i32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::events::types::{FilingStatus, RentalPropertyData};
     use crate::store::migrations::SchemaStore;
@@ -117,6 +117,8 @@ mod tests {
             state: Some("IL".to_string()),
             federal_estimated_payments_cents: 0,
             state_estimated_payments_cents: 0,
+            short_term_loss_carryover_cents: 0,
+            long_term_loss_carryover_cents: 0,
             rental_properties: Vec::new(),
             extra_interest_account_ids: Vec::new(),
             extra_dividend_account_ids: Vec::new(),

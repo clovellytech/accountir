@@ -560,6 +560,12 @@ enum TaxCliCommands {
         /// State estimated tax paid for the year, in dollars
         #[arg(long)]
         state_estimated: Option<String>,
+        /// Short-term capital loss carried in from last year, in dollars
+        #[arg(long)]
+        st_carryover: Option<String>,
+        /// Long-term capital loss carried in from last year, in dollars
+        #[arg(long)]
+        lt_carryover: Option<String>,
         /// A rental property: `NAME=INCOME_ACCOUNT[,...]:EXPENSE_ACCOUNT[,...]`,
         /// accounts by id or number. Repeat for each property
         #[arg(long = "rental")]
@@ -3376,6 +3382,8 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
             state,
             federal_estimated,
             state_estimated,
+            st_carryover,
+            lt_carryover,
             rentals,
             interest_accounts,
             dividend_accounts,
@@ -3423,6 +3431,8 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
                     state: state.map(|s| s.trim().to_ascii_uppercase()),
                     federal_estimated_payments_cents: dollars(federal_estimated)?,
                     state_estimated_payments_cents: dollars(state_estimated)?,
+                    short_term_loss_carryover_cents: dollars(st_carryover)?,
+                    long_term_loss_carryover_cents: dollars(lt_carryover)?,
                     rental_properties,
                     extra_interest_account_ids: interest_accounts
                         .iter()

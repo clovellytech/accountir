@@ -915,10 +915,18 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                     "state_estimated_payments_cents",
                     p.state_estimated_payments_cents,
                 ),
+                (
+                    "short_term_loss_carryover_cents",
+                    p.short_term_loss_carryover_cents,
+                ),
+                (
+                    "long_term_loss_carryover_cents",
+                    p.long_term_loss_carryover_cents,
+                ),
             ] {
                 if cents < 0 {
                     return Err(ValidationError::InvalidValue(format!(
-                        "{field}: a payment made cannot be negative"
+                        "{field}: cannot be negative"
                     )));
                 }
             }

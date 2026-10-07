@@ -20,6 +20,8 @@ pub mod attachments;
 pub mod capital;
 pub mod constructive;
 pub mod depreciation;
+pub mod federal_params;
+pub mod form1040;
 pub mod form1065;
 pub mod form1125a;
 pub mod form4562;
