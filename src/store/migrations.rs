@@ -215,6 +215,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             54,
             include_str!("../../migrations/054_tax_statement_lines.sql"),
         ),
+        (
+            55,
+            include_str!("../../migrations/055_personal_tax_profiles.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -969,6 +973,12 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         );
         CREATE INDEX IF NOT EXISTS idx_tax_statement_lines_order
             ON tax_statement_lines(statement_id, position);
+        -- One tax year's filing facts (migration 055).
+        CREATE TABLE IF NOT EXISTS personal_tax_profiles (
+            tax_year INTEGER PRIMARY KEY,
+            profile TEXT NOT NULL,
+            updated_at_event INTEGER REFERENCES events(id)
+        );
         CREATE TABLE IF NOT EXISTS k1_links (
             link_id TEXT PRIMARY KEY,
             ledger_id TEXT NOT NULL,

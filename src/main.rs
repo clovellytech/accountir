@@ -527,6 +527,51 @@ enum TaxCliCommands {
         elect_pte: Option<bool>,
     },
 
+    /// Show or set a tax year's filing facts for a personal return (Form 1040):
+    /// filing status, age and blindness, dependents, state, estimated payments.
+    /// With only --year, prints the year's profile. Setting replaces the whole
+    /// year, so give every flag that applies
+    Profile {
+        #[arg(long)]
+        year: i32,
+        /// single, mfj, mfs, hoh or qss
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        taxpayer_65: bool,
+        #[arg(long)]
+        taxpayer_blind: bool,
+        #[arg(long)]
+        spouse_65: bool,
+        #[arg(long)]
+        spouse_blind: bool,
+        /// Children who qualify for the child tax credit
+        #[arg(long, default_value_t = 0)]
+        children: u32,
+        /// Other dependents
+        #[arg(long, default_value_t = 0)]
+        other_dependents: u32,
+        /// Two-letter state of residence, e.g. IL. Omit for no state return
+        #[arg(long)]
+        state: Option<String>,
+        /// Federal estimated tax paid for the year, in dollars
+        #[arg(long)]
+        federal_estimated: Option<String>,
+        /// State estimated tax paid for the year, in dollars
+        #[arg(long)]
+        state_estimated: Option<String>,
+        /// A rental property: `NAME=INCOME_ACCOUNT[,...]:EXPENSE_ACCOUNT[,...]`,
+        /// accounts by id or number. Repeat for each property
+        #[arg(long = "rental")]
+        rentals: Vec<String>,
+        /// A taxable-interest account beyond the brokerages' configured ones. Repeat
+        #[arg(long = "interest-account")]
+        interest_accounts: Vec<String>,
+        /// An ordinary-dividend account beyond the brokerages' configured ones. Repeat
+        #[arg(long = "dividend-account")]
+        dividend_accounts: Vec<String>,
+    },
+
     /// Mark an account as Illinois income or replacement tax, so IL-1065 line 16
     /// adds back what the federal return deducts from it
     IlTaxAddback {
@@ -2683,6 +2728,21 @@ fn handle_partnership_command(store: &mut EventStore, cmd: PartnershipCliCommand
     Ok(())
 }
 
+/// Cents as dollars with separators: `$12,345.67`.
+fn cents_to_dollars(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let abs = cents.unsigned_abs();
+    let whole = (abs / 100).to_string();
+    let mut grouped = String::new();
+    for (i, c) in whole.chars().enumerate() {
+        if i > 0 && (whole.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(c);
+    }
+    format!("{sign}${grouped}.{:02}", abs % 100)
+}
+
 /// Dollars as typed — `1234.56`, `1,234`, `$12.5`, `-40`, `(40.00)` — in cents.
 fn parse_dollars_to_cents(s: &str) -> Result<i64> {
     let t = s.trim().replace([',', '$'], "");
@@ -3301,6 +3361,107 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
             );
             for w in &bundle.warnings {
                 println!("warning: {w}");
+            }
+        }
+
+        TaxCliCommands::Profile {
+            year,
+            status,
+            taxpayer_65,
+            taxpayer_blind,
+            spouse_65,
+            spouse_blind,
+            children,
+            other_dependents,
+            state,
+            federal_estimated,
+            state_estimated,
+            rentals,
+            interest_accounts,
+            dividend_accounts,
+        } => {
+            use accountir::commands::personal_tax_commands as ptc;
+            use accountir::events::types::{FilingStatus, PersonalTaxProfileData, RentalPropertyData};
+            if let Some(status) = status {
+                let filing_status = FilingStatus::parse(&status).ok_or_else(|| {
+                    anyhow::anyhow!("{status:?} is not a filing status; use single, mfj, mfs, hoh or qss")
+                })?;
+                let dollars = |s: Option<String>| -> Result<i64> {
+                    match s {
+                        None => Ok(0),
+                        Some(s) => parse_dollars_to_cents(&s),
+                    }
+                };
+                let accounts = |list: &str| -> Result<Vec<String>> {
+                    list.split(',')
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .map(|a| account_id_from(store, a))
+                        .collect()
+                };
+                let mut rental_properties = Vec::new();
+                for spec in &rentals {
+                    let (name, rest) = spec.split_once('=').ok_or_else(|| {
+                        anyhow::anyhow!("--rental {spec:?}: expected NAME=INCOME:EXPENSES")
+                    })?;
+                    let (income, expense) = rest.split_once(':').unwrap_or((rest, ""));
+                    rental_properties.push(RentalPropertyData {
+                        name: name.trim().to_string(),
+                        income_account_ids: accounts(income)?,
+                        expense_account_ids: accounts(expense)?,
+                    });
+                }
+                let profile = PersonalTaxProfileData {
+                    tax_year: year,
+                    filing_status,
+                    taxpayer_65_or_older: taxpayer_65,
+                    taxpayer_blind,
+                    spouse_65_or_older: spouse_65,
+                    spouse_blind,
+                    qualifying_children: children,
+                    other_dependents,
+                    state: state.map(|s| s.trim().to_ascii_uppercase()),
+                    federal_estimated_payments_cents: dollars(federal_estimated)?,
+                    state_estimated_payments_cents: dollars(state_estimated)?,
+                    rental_properties,
+                    extra_interest_account_ids: interest_accounts
+                        .iter()
+                        .map(|a| account_id_from(store, a))
+                        .collect::<Result<_>>()?,
+                    extra_dividend_account_ids: dividend_accounts
+                        .iter()
+                        .map(|a| account_id_from(store, a))
+                        .collect::<Result<_>>()?,
+                };
+                ptc::set_profile(store, "cli-user", &profile)?;
+            }
+            match ptc::get_profile(store.connection(), year) {
+                None => println!("No profile for {year}. Set one with --status."),
+                Some(p) => {
+                    println!("{year}: {}", p.filing_status.label());
+                    let mut household = Vec::new();
+                    if p.taxpayer_65_or_older { household.push("taxpayer 65+".to_string()); }
+                    if p.taxpayer_blind { household.push("taxpayer blind".to_string()); }
+                    if p.spouse_65_or_older { household.push("spouse 65+".to_string()); }
+                    if p.spouse_blind { household.push("spouse blind".to_string()); }
+                    if p.qualifying_children > 0 { household.push(format!("{} qualifying children", p.qualifying_children)); }
+                    if p.other_dependents > 0 { household.push(format!("{} other dependents", p.other_dependents)); }
+                    if !household.is_empty() { println!("  {}", household.join(", ")); }
+                    println!("  state: {}", p.state.as_deref().unwrap_or("none"));
+                    println!(
+                        "  estimated payments: federal {}, state {}",
+                        cents_to_dollars(p.federal_estimated_payments_cents),
+                        cents_to_dollars(p.state_estimated_payments_cents)
+                    );
+                    for r in &p.rental_properties {
+                        println!(
+                            "  rental {}: {} income account(s), {} expense account(s)",
+                            r.name,
+                            r.income_account_ids.len(),
+                            r.expense_account_ids.len()
+                        );
+                    }
+                }
             }
         }
 

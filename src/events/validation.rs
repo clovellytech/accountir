@@ -904,6 +904,63 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::TaxStatementRemoved { statement_id } => {
             validate_non_empty(statement_id, "statement_id")?;
         }
+        Event::PersonalTaxProfileSet(p) => {
+            validate_tax_year(p.tax_year)?;
+            for (field, cents) in [
+                (
+                    "federal_estimated_payments_cents",
+                    p.federal_estimated_payments_cents,
+                ),
+                (
+                    "state_estimated_payments_cents",
+                    p.state_estimated_payments_cents,
+                ),
+            ] {
+                if cents < 0 {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "{field}: a payment made cannot be negative"
+                    )));
+                }
+            }
+            // A household, not a headcount typo: past this, the number is a mistake.
+            if p.qualifying_children > 20 || p.other_dependents > 20 {
+                return Err(ValidationError::InvalidValue(
+                    "dependents: more than twenty is not a household this checks".to_string(),
+                ));
+            }
+            if let Some(state) = &p.state {
+                if state.len() != 2 || !state.chars().all(|c| c.is_ascii_uppercase()) {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "state: {state:?} is not a two-letter code like IL"
+                    )));
+                }
+            }
+            // Age and sight are the spouse's only on a joint return; anywhere else
+            // they would quietly raise the standard deduction for someone not on it.
+            if !p.filing_status.has_spouse() && (p.spouse_65_or_older || p.spouse_blind) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "a spouse's age or blindness counts only on a joint return, not {}",
+                    p.filing_status.label()
+                )));
+            }
+            for property in &p.rental_properties {
+                validate_non_empty(&property.name, "rental_properties[].name")?;
+                for id in property
+                    .income_account_ids
+                    .iter()
+                    .chain(&property.expense_account_ids)
+                {
+                    validate_non_empty(id, "rental_properties[] account id")?;
+                }
+            }
+            for id in p
+                .extra_interest_account_ids
+                .iter()
+                .chain(&p.extra_dividend_account_ids)
+            {
+                validate_non_empty(id, "extra income account id")?;
+            }
+        }
         Event::TaxStatementLinesRecorded(l) => {
             validate_non_empty(&l.statement_id, "statement_id")?;
             let mut seen = std::collections::BTreeSet::new();

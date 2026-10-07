@@ -1156,6 +1156,133 @@ pub struct TaxStatementData {
     pub note: Option<String>,
 }
 
+/// How a person files for one tax year.
+///
+/// The five statuses of Form 1040's filing-status checkboxes. Which one applies is
+/// a fact about a household on December 31 that no ledger holds, so it is recorded,
+/// never inferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilingStatus {
+    Single,
+    MarriedFilingJointly,
+    MarriedFilingSeparately,
+    HeadOfHousehold,
+    QualifyingSurvivingSpouse,
+}
+
+impl FilingStatus {
+    pub const ALL: [FilingStatus; 5] = [
+        FilingStatus::Single,
+        FilingStatus::MarriedFilingJointly,
+        FilingStatus::MarriedFilingSeparately,
+        FilingStatus::HeadOfHousehold,
+        FilingStatus::QualifyingSurvivingSpouse,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FilingStatus::Single => "Single",
+            FilingStatus::MarriedFilingJointly => "Married filing jointly",
+            FilingStatus::MarriedFilingSeparately => "Married filing separately",
+            FilingStatus::HeadOfHousehold => "Head of household",
+            FilingStatus::QualifyingSurvivingSpouse => "Qualifying surviving spouse",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FilingStatus::Single => "single",
+            FilingStatus::MarriedFilingJointly => "married_filing_jointly",
+            FilingStatus::MarriedFilingSeparately => "married_filing_separately",
+            FilingStatus::HeadOfHousehold => "head_of_household",
+            FilingStatus::QualifyingSurvivingSpouse => "qualifying_surviving_spouse",
+        }
+    }
+
+    /// Accepts the stored code, or the short forms a person types: `mfj`, `hoh`.
+    pub fn parse(s: &str) -> Option<FilingStatus> {
+        let s = s.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+        Some(match s.as_str() {
+            "single" | "s" => FilingStatus::Single,
+            "married_filing_jointly" | "mfj" | "joint" => FilingStatus::MarriedFilingJointly,
+            "married_filing_separately" | "mfs" => FilingStatus::MarriedFilingSeparately,
+            "head_of_household" | "hoh" => FilingStatus::HeadOfHousehold,
+            "qualifying_surviving_spouse" | "qss" | "qw" => FilingStatus::QualifyingSurvivingSpouse,
+            _ => return None,
+        })
+    }
+
+    /// Whether the return has a spouse on it, whose age and sight count too.
+    pub fn has_spouse(self) -> bool {
+        matches!(self, FilingStatus::MarriedFilingJointly)
+    }
+}
+
+/// A rental property reported on Schedule E, Part I, and the accounts it is kept
+/// in.
+///
+/// Named accounts rather than a guess from the chart: a rent account under one
+/// property and a repairs account under another look alike, and which property an
+/// expense belongs to is the one thing Schedule E is organised by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RentalPropertyData {
+    /// The address or name the schedule lists it under.
+    pub name: String,
+    /// Rents received. Each account counts with everything beneath it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub income_account_ids: Vec<String>,
+    /// The property's expenses. Each account counts with everything beneath it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expense_account_ids: Vec<String>,
+}
+
+/// Everything about one tax year's return that the books cannot know: who is
+/// filing, how, where, and what was paid in ahead of time.
+///
+/// One per year, replaced whole. A household changes between years — a marriage, a
+/// child, a move — and a profile carried forward silently would file this year as
+/// last year's household.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonalTaxProfileData {
+    pub tax_year: i32,
+    pub filing_status: FilingStatus,
+    /// 65 or older by the end of the year (born before January 2, 65 years earlier).
+    #[serde(default)]
+    pub taxpayer_65_or_older: bool,
+    #[serde(default)]
+    pub taxpayer_blind: bool,
+    #[serde(default)]
+    pub spouse_65_or_older: bool,
+    #[serde(default)]
+    pub spouse_blind: bool,
+    /// Children who qualify for the child tax credit (under 17 at year end).
+    #[serde(default)]
+    pub qualifying_children: u32,
+    /// Other dependents, for the $500 credit.
+    #[serde(default)]
+    pub other_dependents: u32,
+    /// The state of residence, two letters (`IL`), or none for no state return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Federal estimated tax paid for the year, including an overpayment applied
+    /// from the year before. Form 1040 line 26.
+    #[serde(default)]
+    pub federal_estimated_payments_cents: i64,
+    /// State estimated tax paid for the year, likewise.
+    #[serde(default)]
+    pub state_estimated_payments_cents: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rental_properties: Vec<RentalPropertyData>,
+    /// Taxable-interest accounts Schedule B reads beyond the ones a brokerage's
+    /// configuration names — a bank's savings interest, say.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_interest_account_ids: Vec<String>,
+    /// Ordinary-dividend accounts beyond the configured brokerages'.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_dividend_account_ids: Vec<String>,
+}
+
 /// Where a statement's figures came from, as the log records it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1463,6 +1590,10 @@ pub enum Event {
     ///
     /// Removing the statement removes its lines — see the projection.
     TaxStatementLinesRecorded(Box<TaxStatementLinesData>),
+    /// One tax year's filing facts: status, household, state, estimated payments,
+    /// and which accounts are which rental property. Replaces the year's profile
+    /// whole. See [`PersonalTaxProfileData`].
+    PersonalTaxProfileSet(Box<PersonalTaxProfileData>),
     /// These books receive a Schedule K-1 from another set of books managed in
     /// accountir: `partner_id`'s K-1 from the partnership whose ledger is
     /// `ledger_id`.
@@ -2125,6 +2256,7 @@ impl Event {
             Event::TaxStatementRecorded(_) => "tax_statement_recorded",
             Event::TaxStatementRemoved { .. } => "tax_statement_removed",
             Event::TaxStatementLinesRecorded(_) => "tax_statement_lines_recorded",
+            Event::PersonalTaxProfileSet(_) => "personal_tax_profile_set",
             Event::K1SourceLinked { .. } => "k1_source_linked",
             Event::K1SourceUnlinked { .. } => "k1_source_unlinked",
             Event::ScheduleBAnswerSet { .. } => "schedule_b_answer_set",
@@ -2229,6 +2361,9 @@ impl Event {
             Event::TaxStatementRecorded(s) => Some(&s.statement_id),
             Event::TaxStatementRemoved { statement_id } => Some(statement_id),
             Event::TaxStatementLinesRecorded(l) => Some(&l.statement_id),
+            // A year, not an entity: there is one profile per year and nothing else
+            // for an id to name.
+            Event::PersonalTaxProfileSet(_) => None,
             Event::K1SourceLinked { link_id, .. } => Some(link_id),
             Event::K1SourceUnlinked { link_id } => Some(link_id),
             // Keyed by (year, question), so no single id names the thing changed.

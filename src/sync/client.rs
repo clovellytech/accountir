@@ -1694,6 +1694,66 @@ impl SyncClient {
         .await
     }
 
+    /// Record a tax year's profile on the group's books, replacing the year's.
+    ///
+    /// Blind retry on a stale head is safe: a profile replaces the year's whole, so
+    /// re-sending it against a newer head means what it meant against the old one.
+    pub async fn set_personal_tax_profile(
+        &mut self,
+        profile: &crate::events::types::PersonalTaxProfileData,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-personal-tax-profile", |head| {
+            crate::sync::commands::personal_tax::SetPersonalTaxProfileRequest {
+                expected_head_seq: head,
+                profile: profile.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record a received statement on the group's books, or replace the one with
+    /// its id. Safe to retry for the same reason a profile is: it replaces.
+    pub async fn record_tax_statement(
+        &mut self,
+        statement: &crate::events::types::TaxStatementData,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/record-tax-statement", |head| {
+            crate::sync::commands::personal_tax::RecordTaxStatementRequest {
+                expected_head_seq: head,
+                statement: statement.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Take a statement off the group's books.
+    pub async fn remove_tax_statement(
+        &mut self,
+        statement_id: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/remove-tax-statement", |head| {
+            crate::sync::commands::personal_tax::RemoveTaxStatementRequest {
+                expected_head_seq: head,
+                statement_id: statement_id.to_string(),
+            }
+        })
+        .await
+    }
+
+    /// Replace a 1099-B's transaction detail on the group's books.
+    pub async fn record_tax_statement_lines(
+        &mut self,
+        lines: &crate::events::types::TaxStatementLinesData,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/record-tax-statement-lines", |head| {
+            crate::sync::commands::personal_tax::RecordTaxStatementLinesRequest {
+                expected_head_seq: head,
+                lines: lines.clone(),
+            }
+        })
+        .await
+    }
+
     /// Add a note to an entry on the group's books.
     ///
     /// Blind retry on a stale head is safe: notes are additive, so re-sending one

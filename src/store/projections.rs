@@ -310,6 +310,18 @@ impl<'a> Projector<'a> {
                     [statement_id],
                 )?;
             }
+            Event::PersonalTaxProfileSet(p) => {
+                // One row a year, replaced whole — see the event.
+                let profile =
+                    serde_json::to_string(p.as_ref()).expect("a profile always serializes");
+                self.conn.execute(
+                    "INSERT INTO personal_tax_profiles (tax_year, profile, updated_at_event)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(tax_year) DO UPDATE SET
+                       profile = excluded.profile, updated_at_event = excluded.updated_at_event",
+                    params![p.tax_year, profile, stored_event.id],
+                )?;
+            }
             Event::TaxStatementLinesRecorded(l) => {
                 // Replaces the whole list: a corrected consolidated statement is
                 // re-entered from the paper, and merging would keep the sales the
@@ -1925,6 +1937,7 @@ impl<'a> Projector<'a> {
              -- here is anything a replay cannot rebuild.
              DELETE FROM documents;
              DELETE FROM tax_statement_lines;
+             DELETE FROM personal_tax_profiles;
              DELETE FROM tax_statements;
              DELETE FROM k1_links;
              DELETE FROM schedule_b_answers;

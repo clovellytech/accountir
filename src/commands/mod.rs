@@ -14,6 +14,7 @@ pub mod investment_commands;
 pub mod investment_import;
 pub mod invoice_commands;
 pub mod partnership_commands;
+pub mod personal_tax_commands;
 pub mod plaid_commands;
 pub mod portfolio;
 pub mod reconciliation_commands;

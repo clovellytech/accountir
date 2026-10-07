@@ -691,6 +691,11 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::TaxStatementRemoved { statement_id } => {
             format!("Tax statement {} removed", widgets::truncate(statement_id, 8))
         }
+        Event::PersonalTaxProfileSet(p) => format!(
+            "{} tax profile: {}",
+            p.tax_year,
+            p.filing_status.label()
+        ),
         Event::TaxStatementLinesRecorded(l) => match l.lines.len() {
             0 => format!(
                 "Transaction detail cleared on statement {}",
