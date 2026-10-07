@@ -1111,6 +1111,38 @@ mod tests {
             assert_eq!(r.balance_cents, d(8_602));
             assert_eq!(r.state_withheld_cents, d(7_000));
             assert_eq!(r.line("34").map(|l| l.cents), Some(d(8_602)));
+
+            // Illinois from the same return: two exemptions, 4.95%, the W-2's state
+            // withholding against it.
+            let il = crate::tax::il1040::build_from(&store, &r).unwrap();
+            assert_eq!(il.base_income_cents, d(175_000));
+            assert_eq!(il.exemption_cents, d(5_700));
+            assert_eq!(il.net_income_cents, d(169_300));
+            assert_eq!(il.tax_cents, 838_035);
+            assert_eq!(il.payments_cents, d(7_000));
+            assert_eq!(il.balance_cents, -138_035);
+            assert_eq!(il.line("38").map(|l| l.cents), Some(138_035));
+        }
+
+        /// Above the cutoff the exemption is lost, and retirement income is taken
+        /// back out because Illinois does not tax it.
+        #[test]
+        fn illinois_drops_the_exemption_above_the_cutoff_and_exempts_retirement() {
+            let mut store = books();
+            statement(&mut store, "w2", FormKind::W2, &[("1", 600_000)]);
+            statement(&mut store, "ssa", FormKind::Ssa1099, &[("5", 40_000)]);
+            let profile = crate::commands::personal_tax_commands::tests::profile(
+                2025,
+                MarriedFilingJointly,
+            );
+            crate::commands::personal_tax_commands::set_profile(&mut store, "u", &profile)
+                .unwrap();
+            let r = build(&store, 2025).unwrap();
+            // 85% of the benefits are federally taxable at this income.
+            assert_eq!(r.social_security_taxable_cents, d(34_000));
+            let il = crate::tax::il1040::build_from(&store, &r).unwrap();
+            assert_eq!(il.exemption_cents, 0);
+            assert_eq!(il.base_income_cents, d(600_000));
         }
 
         #[test]

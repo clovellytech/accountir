@@ -527,6 +527,15 @@ enum TaxCliCommands {
         elect_pte: Option<bool>,
     },
 
+    /// Compute a personal return from these books: Form 1040 and, for an Illinois
+    /// resident, IL-1040. Prints every line, where it came from, and what is not
+    /// computed
+    #[command(name = "form1040")]
+    Form1040 {
+        #[arg(long)]
+        year: i32,
+    },
+
     /// Show or set a tax year's filing facts for a personal return (Form 1040):
     /// filing status, age and blindness, dependents, state, estimated payments.
     /// With only --year, prints the year's profile. Setting replaces the whole
@@ -3367,6 +3376,78 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
             );
             for w in &bundle.warnings {
                 println!("warning: {w}");
+            }
+        }
+
+        TaxCliCommands::Form1040 { year } => {
+            let federal = accountir::tax::form1040::build(store, year)?;
+            let print_lines = |title: &str, lines: &[accountir::tax::form1040::ReturnLine]| {
+                println!("{title}");
+                for l in lines {
+                    println!(
+                        "  {:>4}  {:<62} {:>18}{}",
+                        l.key,
+                        l.label,
+                        cents_to_dollars(l.cents),
+                        l.note.as_deref().map(|n| format!("   ({n})")).unwrap_or_default()
+                    );
+                }
+            };
+            print_lines(
+                &format!("Form 1040, {year} — {}", federal.filing_status.label()),
+                &federal.lines,
+            );
+            let e = &federal.schedule_e;
+            if !e.properties.is_empty() || !e.k1_lines.is_empty() {
+                println!("\nSchedule E");
+                for p in &e.properties {
+                    println!(
+                        "  {}: rents {}, expenses {}, net {}",
+                        p.name,
+                        cents_to_dollars(p.rents_cents),
+                        cents_to_dollars(p.expenses_cents),
+                        cents_to_dollars(p.net_cents)
+                    );
+                    for (name, cents) in &p.expenses {
+                        println!("      {name}: {}", cents_to_dollars(*cents));
+                    }
+                }
+                for k in &e.k1_lines {
+                    println!("  K-1 {} ({}): {}", k.issuer, k.form.label(), cents_to_dollars(k.cents));
+                }
+                if e.rental_suspended_cents != 0 {
+                    println!("  Suspended rental loss: {}", cents_to_dollars(e.rental_suspended_cents));
+                }
+                println!("  Line 26: {}", cents_to_dollars(e.total_cents));
+            }
+            let (st, lt) = federal.loss_carryforward_cents;
+            if st + lt != 0 {
+                println!(
+                    "\nCapital loss to carry to {}: short-term {}, long-term {}",
+                    year + 1,
+                    cents_to_dollars(st),
+                    cents_to_dollars(lt)
+                );
+            }
+            match accountir::tax::il1040::build_from(store, &federal) {
+                Ok(il) => {
+                    println!();
+                    print_lines(&format!("IL-1040, {year}"), &il.lines);
+                    if !il.warnings.is_empty() {
+                        println!("\nIllinois — check before filing:");
+                        for w in &il.warnings {
+                            println!("  - {w}");
+                        }
+                    }
+                }
+                Err(accountir::tax::il1040::Il1040Error::NotIllinois(..)) => {}
+                Err(e) => println!("\nIL-1040 not computed: {e}"),
+            }
+            if !federal.warnings.is_empty() {
+                println!("\nFederal — check before filing:");
+                for w in &federal.warnings {
+                    println!("  - {w}");
+                }
             }
         }
 
