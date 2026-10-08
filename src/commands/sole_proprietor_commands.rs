@@ -246,6 +246,56 @@ pub struct ScheduleCInputs {
     pub section_179_carryover_dollars: Option<i64>,
 }
 
+impl ScheduleCInputs {
+    /// As the log records them, for `tax_year`.
+    pub fn to_data(&self, tax_year: i32) -> crate::events::types::ScheduleCInputsData {
+        crate::events::types::ScheduleCInputsData {
+            tax_year,
+            home_office_cents: self.home_office_dollars.map(|d| d * 100),
+            other_business_income_cents: self.other_business_income_dollars.map(|d| d * 100),
+            section_179_carryover_cents: self.section_179_carryover_dollars.map(|d| d * 100),
+        }
+    }
+}
+
+/// Record a year's Schedule C inputs, replacing whatever the year had.
+///
+/// In the log so that every reader of the Schedule C — this business's page,
+/// its PDF, and the owner's personal books pulling it — computes the same
+/// line 31. See [`Event::ScheduleCInputsSet`].
+pub fn set_inputs(
+    store: &mut EventStore,
+    user_id: &str,
+    tax_year: i32,
+    inputs: &ScheduleCInputs,
+) -> Result<StoredEvent, SoleProprietorError> {
+    append(
+        store,
+        user_id,
+        Event::ScheduleCInputsSet(Box::new(inputs.to_data(tax_year))),
+    )
+}
+
+/// A year's recorded Schedule C inputs; all unset for a year nobody recorded.
+pub fn get_inputs(conn: &Connection, tax_year: i32) -> ScheduleCInputs {
+    conn.query_row(
+        "SELECT home_office_cents, other_business_income_cents, section_179_carryover_cents
+           FROM schedule_c_inputs WHERE tax_year = ?1",
+        [tax_year],
+        |r| {
+            Ok(ScheduleCInputs {
+                home_office_dollars: r.get::<_, Option<i64>>(0)?.map(|c| c / 100),
+                other_business_income_dollars: r.get::<_, Option<i64>>(1)?.map(|c| c / 100),
+                section_179_carryover_dollars: r.get::<_, Option<i64>>(2)?.map(|c| c / 100),
+            })
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
 /// The year's figures as the form will carry them, before any PDF is drawn.
 pub struct Figures {
     pub computed: crate::tax::schedule_c::Computed,

@@ -36,6 +36,10 @@ pub fn router() -> Router<SyncState> {
     Router::new()
         .route("/sync/commands/set-business-type", post(submit_set_type))
         .route(
+            "/sync/commands/set-schedule-c-inputs",
+            post(submit_set_inputs),
+        )
+        .route(
             "/sync/commands/set-sole-proprietor",
             post(submit_set_proprietor),
         )
@@ -132,6 +136,34 @@ async fn submit_set_proprietor(
             accounting_method: req.accounting_method,
             accounting_method_other: other,
         })),
+    )
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SetScheduleCInputsRequest {
+    pub expected_head_seq: i64,
+    pub inputs: crate::events::types::ScheduleCInputsData,
+}
+
+async fn submit_set_inputs(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetScheduleCInputsRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let i = &req.inputs;
+    if !(1900..=2200).contains(&i.tax_year) {
+        return Err(ApiError::bad_request("tax_year is not a tax year"));
+    }
+    if i.home_office_cents.is_some_and(|c| c < 0) || i.section_179_carryover_cents.is_some_and(|c| c < 0) {
+        return Err(ApiError::bad_request(
+            "line 30 and the §179 carryover cannot be negative",
+        ));
+    }
+    append(
+        st,
+        req.expected_head_seq,
+        actor,
+        Event::ScheduleCInputsSet(Box::new(req.inputs)),
     )
 }
 
@@ -249,6 +281,51 @@ mod tests {
 
     /// The round trip the whole module exists for: a member on hosted books says
     /// what the books are, and the instance's projection agrees.
+    /// A year's Schedule C inputs reach the instance whole, and a negative line
+    /// 30 is the caller's mistake.
+    #[tokio::test]
+    async fn schedule_c_inputs_reach_the_instance() {
+        let (base, store) = serve().await;
+        let head = head_of(&base).await;
+        let r = post_json(
+            &base,
+            "/sync/commands/set-schedule-c-inputs",
+            &SetScheduleCInputsRequest {
+                expected_head_seq: head,
+                inputs: crate::events::types::ScheduleCInputsData {
+                    tax_year: 2025,
+                    home_office_cents: Some(150_000),
+                    other_business_income_cents: Some(-20_000),
+                    section_179_carryover_cents: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(r.status(), 200, "{:?}", r.text().await);
+        {
+            let guard = store.lock().unwrap();
+            let inputs = crate::commands::sole_proprietor_commands::get_inputs(guard.connection(), 2025);
+            assert_eq!(inputs.home_office_dollars, Some(1_500));
+            assert_eq!(inputs.other_business_income_dollars, Some(-200));
+            assert_eq!(inputs.section_179_carryover_dollars, None);
+        }
+        let head = head_of(&base).await;
+        let r = post_json(
+            &base,
+            "/sync/commands/set-schedule-c-inputs",
+            &SetScheduleCInputsRequest {
+                expected_head_seq: head,
+                inputs: crate::events::types::ScheduleCInputsData {
+                    tax_year: 2025,
+                    home_office_cents: Some(-1),
+                    ..Default::default()
+                },
+            },
+        )
+        .await;
+        assert_eq!(r.status(), 400);
+    }
+
     #[tokio::test]
     async fn the_business_type_reaches_the_instance() {
         let (base, store) = serve().await;

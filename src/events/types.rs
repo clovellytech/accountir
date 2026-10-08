@@ -1290,6 +1290,20 @@ pub struct PersonalTaxProfileData {
     pub extra_dividend_account_ids: Vec<String>,
 }
 
+/// A year's Schedule C inputs, as the log records them. See
+/// [`Event::ScheduleCInputsSet`]. In cents; `None` is "not worked out", which is
+/// not the same as zero — the build says so for line 30.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleCInputsData {
+    pub tax_year: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_office_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_business_income_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub section_179_carryover_cents: Option<i64>,
+}
+
 /// Where a statement's figures came from, as the log records it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1755,6 +1769,32 @@ pub enum Event {
         tax_year: i32,
         answer_key: String,
     },
+    /// The figures a year's Schedule C needs that no ledger holds — line 30, and
+    /// Form 4562's lines 10 and 11 — replacing the year's whole set.
+    ///
+    /// In the log rather than typed afresh each time, because the Schedule C is
+    /// no longer built only on the page they are typed on: the owner's personal
+    /// books pull it too ([`Event::ScheduleCSourceLinked`]), and a pull that read
+    /// none of them would carry a different line 31 from the one the business
+    /// files.
+    ScheduleCInputsSet(Box<ScheduleCInputsData>),
+    /// These books receive the Schedule C of a sole proprietorship managed in
+    /// accountir, the way [`Event::K1SourceLinked`] receives a partner's K-1: a
+    /// standing link, with the figures arriving separately as
+    /// [`Event::TaxStatementRecorded`] carrying their provenance.
+    ///
+    /// The id is the business's ledger id — a business files one Schedule C, so
+    /// linking it twice is one link.
+    ScheduleCSourceLinked {
+        link_id: String,
+        ledger_id: String,
+        ledger_name: String,
+        /// Whose Schedule C it is, as those books name the proprietor. Empty
+        /// when they name nobody yet.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        proprietor_name: String,
+    },
+    ScheduleCSourceUnlinked { link_id: String },
 
     /// An asset is taken off the register entirely — entered in error, never
     /// owned. Distinct from a disposal, which is a real event in the world and
@@ -2314,6 +2354,9 @@ impl Event {
             Event::SoleProprietorSet(_) => "sole_proprietor_set",
             Event::ScheduleCAnswerSet { .. } => "schedule_c_answer_set",
             Event::ScheduleCAnswerCleared { .. } => "schedule_c_answer_cleared",
+            Event::ScheduleCInputsSet(_) => "schedule_c_inputs_set",
+            Event::ScheduleCSourceLinked { .. } => "schedule_c_source_linked",
+            Event::ScheduleCSourceUnlinked { .. } => "schedule_c_source_unlinked",
             Event::UserAdded { .. } => "user_added",
             Event::UserModified { .. } => "user_modified",
             Event::UserRemoved { .. } => "user_removed",
@@ -2437,6 +2480,10 @@ impl Event {
             // Keyed by (year, question), like the Schedule B answers.
             Event::ScheduleCAnswerSet { .. } => None,
             Event::ScheduleCAnswerCleared { .. } => None,
+            // A year, like the personal tax profile.
+            Event::ScheduleCInputsSet(_) => None,
+            Event::ScheduleCSourceLinked { link_id, .. } => Some(link_id),
+            Event::ScheduleCSourceUnlinked { link_id } => Some(link_id),
             Event::UserAdded { user_id, .. } => Some(user_id),
             Event::UserModified { user_id, .. } => Some(user_id),
             Event::UserRemoved { user_id } => Some(user_id),

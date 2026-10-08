@@ -31,6 +31,169 @@ pub fn router() -> Router<SyncState> {
             "/sync/commands/record-tax-statement-lines",
             post(submit_record_lines),
         )
+        .route("/sync/commands/link-k1-source", post(submit_link_k1))
+        .route("/sync/commands/unlink-k1-source", post(submit_unlink_k1))
+        .route(
+            "/sync/commands/link-schedule-c-source",
+            post(submit_link_schedule_c),
+        )
+        .route(
+            "/sync/commands/unlink-schedule-c-source",
+            post(submit_unlink_schedule_c),
+        )
+}
+
+/// A K-1 link, as the client resolved it against the partnership's books.
+///
+/// The instance cannot check it against those books: they are another group's,
+/// or a file on the client's machine, and an instance never reads either
+/// (MULTITENANT-SPEC §2a). The client that holds both made the checks in
+/// [`crate::commands::tax_statement_commands::k1_link_for`]; this checks its shape.
+#[derive(Serialize, Deserialize)]
+pub struct LinkK1SourceRequest {
+    pub expected_head_seq: i64,
+    pub link_id: String,
+    pub ledger_id: String,
+    pub ledger_name: String,
+    pub partner_id: String,
+    pub partner_name: String,
+}
+
+/// A Schedule C link, resolved by the client the way a K-1 link is.
+#[derive(Serialize, Deserialize)]
+pub struct LinkScheduleCSourceRequest {
+    pub expected_head_seq: i64,
+    pub link_id: String,
+    pub ledger_id: String,
+    pub ledger_name: String,
+    #[serde(default)]
+    pub proprietor_name: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct UnlinkSourceRequest {
+    pub expected_head_seq: i64,
+    pub link_id: String,
+}
+
+async fn submit_link_k1(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<LinkK1SourceRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let event = Event::K1SourceLinked {
+        link_id: req.link_id,
+        ledger_id: req.ledger_id,
+        ledger_name: req.ledger_name,
+        partner_id: req.partner_id,
+        partner_name: req.partner_name,
+    };
+    if let Err(e) = crate::events::validation::validate_event(&event) {
+        return Err(ApiError::bad_request(&e.to_string()));
+    }
+    append_unchecked(st, req.expected_head_seq, actor, event)
+}
+
+async fn submit_link_schedule_c(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<LinkScheduleCSourceRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let event = Event::ScheduleCSourceLinked {
+        link_id: req.link_id,
+        ledger_id: req.ledger_id,
+        ledger_name: req.ledger_name,
+        proprietor_name: req.proprietor_name,
+    };
+    if let Err(e) = crate::events::validation::validate_event(&event) {
+        return Err(ApiError::bad_request(&e.to_string()));
+    }
+    append_unchecked(st, req.expected_head_seq, actor, event)
+}
+
+async fn submit_unlink_k1(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<UnlinkSourceRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    unlink(st, req, actor, "k1_links", |link_id| Event::K1SourceUnlinked { link_id })
+}
+
+async fn submit_unlink_schedule_c(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<UnlinkSourceRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    unlink(st, req, actor, "schedule_c_links", |link_id| {
+        Event::ScheduleCSourceUnlinked { link_id }
+    })
+}
+
+/// Unlink, refused inside the write when the link is not there — checked against
+/// the books as they are under the lock, so two members unlinking at once is one
+/// unlink and one clear refusal.
+fn unlink(
+    st: SyncState,
+    req: UnlinkSourceRequest,
+    actor: String,
+    table: &'static str,
+    event: fn(String) -> Event,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    if req.link_id.trim().is_empty() {
+        return Err(ApiError::bad_request("link_id is required"));
+    }
+    let link_id = req.link_id;
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| {
+                let linked = tx
+                    .query_row(
+                        &format!("SELECT 1 FROM {table} WHERE link_id = ?1"),
+                        [&link_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !linked {
+                    return Ok(Verdict::Reject(ProfileError::Invalid(format!(
+                        "no link with id {link_id}"
+                    ))));
+                }
+                Ok(Verdict::<_, ProfileError>::Append(stamp(
+                    event(link_id.clone()),
+                    &actor,
+                )))
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<ProfileError>)
+}
+
+/// Append with nothing to check against the books' state: a link is
+/// last-writer-wins — linking twice is one link.
+fn append_unchecked(
+    st: SyncState,
+    expected_head_seq: i64,
+    actor: String,
+    event: Event,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            expected_head_seq,
+            move |_tx| {
+                Ok(Verdict::<_, ProfileError>::Append(stamp(
+                    event.clone(),
+                    &actor,
+                )))
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<ProfileError>)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -348,6 +511,70 @@ mod tests {
         assert_eq!(gone, reqwest::StatusCode::OK, "{body}");
     }
 
+    /// Hosted personal books can link a partnership's K-1 and a business's
+    /// Schedule C, resolved by the client; a link whose id is not the shape the
+    /// log requires is the caller's mistake; and an unlink of nothing is refused
+    /// inside the write.
+    #[tokio::test]
+    async fn links_land_are_checked_for_shape_and_unlinking_nothing_is_refused() {
+        let base = serve().await;
+        let (ok, body) = post(
+            &base,
+            "/sync/commands/link-k1-source",
+            serde_json::json!({
+                "expected_head_seq": 0, "link_id": "p-ledger:partner-1",
+                "ledger_id": "p-ledger", "ledger_name": "Art House LLC",
+                "partner_id": "partner-1", "partner_name": "Zak",
+            }),
+        )
+        .await;
+        assert_eq!(ok, reqwest::StatusCode::OK, "{body}");
+        let (bad, body) = post(
+            &base,
+            "/sync/commands/link-k1-source",
+            serde_json::json!({
+                "expected_head_seq": 1, "link_id": "wrong",
+                "ledger_id": "p-ledger", "ledger_name": "Art House LLC",
+                "partner_id": "partner-1", "partner_name": "Zak",
+            }),
+        )
+        .await;
+        assert_eq!(bad, reqwest::StatusCode::BAD_REQUEST, "{body}");
+
+        let (ok, body) = post(
+            &base,
+            "/sync/commands/link-schedule-c-source",
+            serde_json::json!({
+                "expected_head_seq": 1, "link_id": "b-ledger",
+                "ledger_id": "b-ledger", "ledger_name": "Bugbear Bikes LLC",
+                "proprietor_name": "Zak Patterson",
+            }),
+        )
+        .await;
+        assert_eq!(ok, reqwest::StatusCode::OK, "{body}");
+        let (ok, body) = post(
+            &base,
+            "/sync/commands/unlink-schedule-c-source",
+            serde_json::json!({ "expected_head_seq": 2, "link_id": "b-ledger" }),
+        )
+        .await;
+        assert_eq!(ok, reqwest::StatusCode::OK, "{body}");
+        let (refused, body) = post(
+            &base,
+            "/sync/commands/unlink-schedule-c-source",
+            serde_json::json!({ "expected_head_seq": 3, "link_id": "b-ledger" }),
+        )
+        .await;
+        assert_eq!(refused, reqwest::StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let (ok, body) = post(
+            &base,
+            "/sync/commands/unlink-k1-source",
+            serde_json::json!({ "expected_head_seq": 3, "link_id": "p-ledger:partner-1" }),
+        )
+        .await;
+        assert_eq!(ok, reqwest::StatusCode::OK, "{body}");
+    }
+
     #[tokio::test]
     async fn no_route_is_open() {
         let base = serve().await;
@@ -356,6 +583,10 @@ mod tests {
             "/sync/commands/record-tax-statement",
             "/sync/commands/remove-tax-statement",
             "/sync/commands/record-tax-statement-lines",
+            "/sync/commands/link-k1-source",
+            "/sync/commands/unlink-k1-source",
+            "/sync/commands/link-schedule-c-source",
+            "/sync/commands/unlink-schedule-c-source",
         ] {
             let r = reqwest::Client::new()
                 .post(format!("{base}{path}"))

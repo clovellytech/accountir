@@ -799,6 +799,39 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             validate_tax_year(*tax_year)?;
             validate_non_empty(answer_key, "answer_key")?;
         }
+        Event::ScheduleCInputsSet(i) => {
+            validate_tax_year(i.tax_year)?;
+            // Line 30 and a carryover are amounts claimed, never negative; other
+            // business income may be a loss.
+            for (v, field) in [
+                (i.home_office_cents, "home_office_cents"),
+                (i.section_179_carryover_cents, "section_179_carryover_cents"),
+            ] {
+                if v.is_some_and(|c| c < 0) {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "{field}: cannot be negative"
+                    )));
+                }
+            }
+        }
+        Event::ScheduleCSourceLinked {
+            link_id,
+            ledger_id,
+            ledger_name,
+            ..
+        } => {
+            validate_non_empty(ledger_id, "ledger_id")?;
+            validate_non_empty(ledger_name, "ledger_name")?;
+            if link_id != ledger_id {
+                return Err(ValidationError::InvalidValue(
+                    "link_id: must be the business's ledger id, so linking twice is one link"
+                        .to_string(),
+                ));
+            }
+        }
+        Event::ScheduleCSourceUnlinked { link_id } => {
+            validate_non_empty(link_id, "link_id")?;
+        }
         Event::TaxLineMappingSet {
             account_id,
             line_key,

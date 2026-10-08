@@ -154,7 +154,7 @@ pub fn for_partner(
 }
 
 /// The last event in the books, and its hash in hex.
-fn head(conn: &Connection) -> Result<(i64, String), K1PackageError> {
+pub(crate) fn head(conn: &Connection) -> Result<(i64, String), K1PackageError> {
     conn.query_row(
         "SELECT id, hash FROM events ORDER BY id DESC LIMIT 1",
         [],

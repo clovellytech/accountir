@@ -223,6 +223,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             56,
             include_str!("../../migrations/056_tax_line_mappings_per_return.sql"),
         ),
+        (
+            57,
+            include_str!("../../migrations/057_schedule_c_links_and_inputs.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -992,6 +996,21 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             ledger_name TEXT NOT NULL,
             partner_id TEXT NOT NULL,
             partner_name TEXT NOT NULL,
+            linked_at_event INTEGER REFERENCES events(id)
+        );
+        -- A year's Schedule C inputs, and linked Schedule Cs (migration 057).
+        CREATE TABLE IF NOT EXISTS schedule_c_inputs (
+            tax_year INTEGER PRIMARY KEY,
+            home_office_cents INTEGER,
+            other_business_income_cents INTEGER,
+            section_179_carryover_cents INTEGER,
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+        CREATE TABLE IF NOT EXISTS schedule_c_links (
+            link_id TEXT PRIMARY KEY,
+            ledger_id TEXT NOT NULL,
+            ledger_name TEXT NOT NULL,
+            proprietor_name TEXT NOT NULL DEFAULT '',
             linked_at_event INTEGER REFERENCES events(id)
         );
         -- The investments importer's registers (migration 050). Kept in step with

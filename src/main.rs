@@ -123,6 +123,62 @@ enum Commands {
     /// them into a partner's own books
     #[command(subcommand)]
     K1(K1CliCommands),
+
+    /// Schedule Cs: a business's figures for its owner's Form 1040, and links
+    /// that pull them into the owner's own books
+    #[command(subcommand)]
+    Business(BusinessCliCommands),
+}
+
+#[derive(Subcommand)]
+enum BusinessCliCommands {
+    /// In a sole proprietorship's books: the year's Schedule C as the owner's
+    /// 1040 takes it
+    Package {
+        #[arg(long)]
+        year: i32,
+    },
+    /// In a sole proprietorship's books: record the year's Schedule C inputs —
+    /// line 30, and Form 4562 lines 10 and 11. Leave one out to clear it
+    Inputs {
+        #[arg(long)]
+        year: i32,
+        /// Line 30, business use of the home, in dollars
+        #[arg(long)]
+        home_office: Option<i64>,
+        /// Wages and other active business income, for the §179 limit
+        #[arg(long, allow_hyphen_values = true)]
+        other_income: Option<i64>,
+        /// §179 disallowed last year and carried into this one
+        #[arg(long)]
+        section_179_carryover: Option<i64>,
+    },
+    /// In the owner's own books: receive a sole proprietorship's Schedule C
+    Link {
+        /// The business's database
+        #[arg(long)]
+        source: PathBuf,
+    },
+    /// List the businesses these books receive Schedule Cs from
+    Links {
+        /// Also say whether that year's Schedule C is pulled and still current
+        #[arg(long)]
+        year: Option<i32>,
+    },
+    /// Stop receiving a business's Schedule C. Schedule Cs already pulled stay
+    Unlink { link: String },
+    /// Pull a year's Schedule Cs through every link, or one
+    Pull {
+        #[arg(long)]
+        year: i32,
+        /// One link, by id or business name
+        #[arg(long)]
+        link: Option<String>,
+        /// The business's database, when this machine's registry does not know
+        /// where it is. Pulls only the link to those books
+        #[arg(long)]
+        source: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1037,6 +1093,12 @@ async fn main() -> Result<()> {
             let mut store = EventStore::open(&cli.database)?;
             accountir::store::migrations::run_migrations(store.connection())?;
             handle_k1_command(&mut store, cmd)?;
+        }
+
+        Commands::Business(cmd) => {
+            let mut store = EventStore::open(&cli.database)?;
+            accountir::store::migrations::run_migrations(store.connection())?;
+            handle_business_command(&mut store, cmd)?;
         }
     }
 
@@ -3098,6 +3160,12 @@ fn handle_statement_command(store: &mut EventStore, cmd: StatementCliCommands) -
                     link.ledger_name, link.partner_name
                 );
             }
+            for link in &inputs.missing_schedule_cs {
+                println!(
+                    "\nmissing: no {year} Schedule C from {} — `accountir business pull --year {year}`",
+                    link.ledger_name
+                );
+            }
             for d in &inputs.unread_documents {
                 println!(
                     "unread: {} ({}) — attached for {year}, but no statement was recorded from it",
@@ -3303,6 +3371,156 @@ fn handle_k1_command(store: &mut EventStore, cmd: K1CliCommands) -> Result<()> {
     Ok(())
 }
 
+fn resolve_schedule_c_link(
+    conn: &rusqlite::Connection,
+    needle: &str,
+) -> Result<accountir::domain::documents::ScheduleCLink> {
+    let lowered = needle.to_lowercase();
+    let matches: Vec<_> = accountir::commands::tax_statement_commands::list_schedule_c_links(conn)
+        .into_iter()
+        .filter(|l| l.link_id.starts_with(needle) || l.ledger_name.to_lowercase().contains(&lowered))
+        .collect();
+    match matches.len() {
+        1 => Ok(matches.into_iter().next().expect("exactly one")),
+        0 => anyhow::bail!("no Schedule C link {needle:?}"),
+        n => anyhow::bail!("{needle:?} matches {n} Schedule C links — use the link id"),
+    }
+}
+
+/// Where a linked business's books are on this machine, by ledger id.
+fn locate_business_books(link: &accountir::domain::documents::ScheduleCLink) -> Result<PathBuf> {
+    let registry = accountir::registry::Registry::open_default()?;
+    registry
+        .find_by_ledger_id(&link.ledger_id)?
+        .map(|b| b.db_path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}'s books are not registered on this machine — pass --source <its database>",
+                link.ledger_name
+            )
+        })
+}
+
+fn handle_business_command(store: &mut EventStore, cmd: BusinessCliCommands) -> Result<()> {
+    use accountir::commands::sole_proprietor_commands as spc;
+    use accountir::commands::tax_statement_commands as tsc;
+    use accountir::tax::information_returns::FormKind;
+
+    match cmd {
+        BusinessCliCommands::Package { year } => {
+            let p = accountir::tax::schedule_c_package::for_year(store.connection(), year)?;
+            println!("{} — {year} Schedule C for {}", p.business_name, p.proprietor_name);
+            for (code, cents) in &p.amounts {
+                let label = FormKind::ScheduleC.box_def(code).map_or("", |d| d.label);
+                println!("  {code:>14}  {:>14}  {label}", show_cents(*cents));
+            }
+            for w in &p.warnings {
+                println!("  ! {w}");
+            }
+        }
+        BusinessCliCommands::Inputs {
+            year,
+            home_office,
+            other_income,
+            section_179_carryover,
+        } => {
+            let inputs = spc::ScheduleCInputs {
+                home_office_dollars: home_office,
+                other_business_income_dollars: other_income,
+                section_179_carryover_dollars: section_179_carryover,
+            };
+            spc::set_inputs(store, "cli-user", year, &inputs)?;
+            println!("Recorded the {year} Schedule C inputs.");
+        }
+        BusinessCliCommands::Link { source } => {
+            let source = open_existing_books(&source)?;
+            let link = tsc::link_schedule_c_source(store, "cli-user", source.connection())?;
+            println!(
+                "These books now receive the Schedule C of {} (link {}).",
+                link.ledger_name, link.link_id
+            );
+        }
+        BusinessCliCommands::Links { year } => {
+            let links = tsc::list_schedule_c_links(store.connection());
+            if links.is_empty() {
+                println!("These books receive no Schedule Cs through a link.");
+            }
+            for link in links {
+                println!("{}  {}", link.link_id, link.ledger_name);
+                let Some(year) = year else { continue };
+                let freshness = locate_business_books(&link)
+                    .and_then(|path| open_existing_books(&path))
+                    .and_then(|source| {
+                        Ok(tsc::schedule_c_freshness(store.connection(), source.connection(), &link, year)?)
+                    });
+                match freshness {
+                    Ok(tsc::K1Freshness::NotPulled) => println!("  {year}: not pulled"),
+                    Ok(tsc::K1Freshness::EnteredByHand) => println!("  {year}: entered by hand"),
+                    Ok(tsc::K1Freshness::Current) => println!("  {year}: pulled, and still current"),
+                    Ok(tsc::K1Freshness::Changed(changes)) => {
+                        println!("  {year}: CHANGED since it was pulled — pull again");
+                        for c in changes {
+                            println!(
+                                "    {:>14}: {} recorded, {} now",
+                                c.code,
+                                show_cents(c.recorded),
+                                show_cents(c.now)
+                            );
+                        }
+                    }
+                    Err(e) => println!("  {year}: cannot check — {e}"),
+                }
+            }
+        }
+        BusinessCliCommands::Unlink { link } => {
+            let link = resolve_schedule_c_link(store.connection(), &link)?;
+            tsc::unlink_schedule_c_source(store, "cli-user", &link.link_id)?;
+            println!(
+                "No longer receiving {}'s Schedule C. Schedule Cs already pulled are kept.",
+                link.ledger_name
+            );
+        }
+        BusinessCliCommands::Pull { year, link, source } => {
+            let source = source.as_deref().map(open_existing_books).transpose()?;
+            let mut links = match &link {
+                Some(needle) => vec![resolve_schedule_c_link(store.connection(), needle)?],
+                None => tsc::list_schedule_c_links(store.connection()),
+            };
+            if let Some(source) = &source {
+                let id = accountir::documents::ledger_id(source.connection()).unwrap_or_default();
+                links.retain(|l| l.ledger_id == id);
+            }
+            if links.is_empty() {
+                anyhow::bail!(
+                    "No Schedule C links to pull through. Link one first: \
+                     `accountir business link --source <business.db>`"
+                );
+            }
+            for link in links {
+                let located;
+                let from = match &source {
+                    Some(source) => source,
+                    None => {
+                        located = open_existing_books(&locate_business_books(&link)?)?;
+                        &located
+                    }
+                };
+                let pulled = tsc::pull_schedule_c(store, "cli-user", from.connection(), &link, year)?;
+                println!(
+                    "{} {year} Schedule C from {}: line 31 {}.",
+                    if pulled.replaced { "Re-pulled" } else { "Pulled" },
+                    link.ledger_name,
+                    show_cents(pulled.statement.amount("31")),
+                );
+                for w in &pulled.warnings {
+                    println!("  ! {w}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()> {
     use accountir::commands::partnership_commands as pc;
     use accountir::tax::build_return_from_ledger;
@@ -3397,6 +3615,24 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
                 &format!("Form 1040, {year} — {}", federal.filing_status.label()),
                 &federal.lines,
             );
+            if !federal.schedule_c.is_empty() {
+                println!("\nSchedule C (Schedule 1, line 3)");
+                for b in &federal.schedule_c {
+                    println!("  {}: {}", b.issuer, cents_to_dollars(b.net_profit_cents));
+                }
+                println!("  Line 3: {}", cents_to_dollars(federal.business_income_cents));
+            }
+            let se = &federal.schedule_se;
+            if se.combined_cents != 0 {
+                println!(
+                    "\nSchedule SE: net earnings {}, Social Security {}, Medicare {}, tax {}, deductible half {}",
+                    cents_to_dollars(se.net_earnings_cents),
+                    cents_to_dollars(se.social_security_cents),
+                    cents_to_dollars(se.medicare_cents),
+                    cents_to_dollars(se.tax_cents),
+                    cents_to_dollars(se.deduction_cents)
+                );
+            }
             let e = &federal.schedule_e;
             if !e.properties.is_empty() || !e.k1_lines.is_empty() {
                 println!("\nSchedule E");

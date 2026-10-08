@@ -164,6 +164,19 @@ impl K1Link {
     }
 }
 
+/// A sole proprietorship managed in accountir whose Schedule C belongs on these
+/// books' Form 1040. The counterpart of [`K1Link`]; the id is the business's
+/// ledger id, since a business files one Schedule C.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleCLink {
+    pub link_id: String,
+    pub ledger_id: String,
+    pub ledger_name: String,
+    /// The proprietor as those books named them when linked. Empty if they named
+    /// nobody yet.
+    pub proprietor_name: String,
+}
+
 /// One transaction on a received statement — a Form 8949 row.
 ///
 /// Only a 1099-B has these, and only where the form requires a transaction to be

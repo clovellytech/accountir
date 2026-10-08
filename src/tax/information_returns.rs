@@ -50,6 +50,11 @@ pub enum FormKind {
     K1EstateOrTrust,
     IlK1P,
     PropertyTaxBill,
+    /// A Schedule C from a business the person owns. Not an information
+    /// return — nobody sends it — but it reaches the 1040 the same way: box by
+    /// box, pulled from the business's own books or typed from one prepared
+    /// elsewhere.
+    ScheduleC,
     Other,
 }
 
@@ -648,8 +653,48 @@ const K1_ESTATE_OR_TRUST: &[BoxDef] = &[
 
 const PROPERTY_TAX_BILL: &[BoxDef] = &[money("paid", "Real estate taxes paid", PROPERTY)];
 
+/// A business's Schedule C, as the owner's Form 1040 takes it.
+///
+/// Line 31 is the figure that leaves the form. The rest are what the 1040 needs
+/// beside it: the self-employment figure for Schedule SE (line 31 itself unless
+/// part of it is not self-employment income), and the three Section 199A figures
+/// Form 8995 reads. Gross receipts are carried so a 1099-NEC can be checked
+/// against the business it was paid to.
+const SCHEDULE_C: &[BoxDef] = &[
+    info(
+        "1",
+        "Gross receipts or sales (line 1)",
+        "Checked against 1099-NEC and 1099-K — not added",
+    ),
+    money(
+        "31",
+        "Net profit or (loss) (line 31)",
+        "Schedule 1, line 3",
+    ),
+    money(
+        "se",
+        "Net earnings from self-employment",
+        "Schedule SE, line 2",
+    ),
+    money(
+        "qbi",
+        "Qualified business income",
+        "Form 8995, line 1",
+    ),
+    money(
+        "qbi_w2_wages",
+        "W-2 wages paid by the business",
+        "Form 8995-A, above the threshold",
+    ),
+    money(
+        "qbi_ubia",
+        "Unadjusted basis of qualified property",
+        "Form 8995-A, above the threshold",
+    ),
+];
+
 impl FormKind {
-    pub const ALL: [FormKind; 17] = [
+    pub const ALL: [FormKind; 18] = [
         FormKind::W2,
         FormKind::F1099Int,
         FormKind::F1099Div,
@@ -666,6 +711,7 @@ impl FormKind {
         FormKind::K1EstateOrTrust,
         FormKind::IlK1P,
         FormKind::PropertyTaxBill,
+        FormKind::ScheduleC,
         FormKind::Other,
     ];
 
@@ -688,6 +734,7 @@ impl FormKind {
             FormKind::K1EstateOrTrust => "k1_1041",
             FormKind::IlK1P => "il_k1_p",
             FormKind::PropertyTaxBill => "property_tax_bill",
+            FormKind::ScheduleC => "schedule_c",
             FormKind::Other => "other",
         }
     }
@@ -714,6 +761,7 @@ impl FormKind {
             FormKind::K1EstateOrTrust => "Schedule K-1 (Form 1041)",
             FormKind::IlK1P => "Illinois Schedule K-1-P",
             FormKind::PropertyTaxBill => "Property tax bill",
+            FormKind::ScheduleC => "Schedule C (Form 1040)",
             FormKind::Other => "Other statement",
         }
     }
@@ -737,6 +785,7 @@ impl FormKind {
             FormKind::K1SCorporation => K1_S_CORPORATION,
             FormKind::K1EstateOrTrust => K1_ESTATE_OR_TRUST,
             FormKind::PropertyTaxBill => PROPERTY_TAX_BILL,
+            FormKind::ScheduleC => SCHEDULE_C,
             FormKind::IlK1P | FormKind::Other => &[],
         }
     }

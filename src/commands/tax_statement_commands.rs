@@ -34,7 +34,8 @@ use uuid::Uuid;
 use crate::commands::{document_commands, partnership_commands as pc, sole_proprietor_commands};
 use crate::documents;
 use crate::domain::documents::{
-    Acquired, K1Link, LedgerProvenance, StatementLine, StatementSource, TaxStatement,
+    Acquired, K1Link, LedgerProvenance, ScheduleCLink, StatementLine, StatementSource,
+    TaxStatement,
 };
 use crate::domain::BusinessType;
 use crate::events::types::{
@@ -45,6 +46,7 @@ use crate::store::event_store::EventStore;
 use crate::tax::information_returns::FormKind;
 use crate::tax::schedule_d::Category;
 use crate::tax::k1_package::{self, K1PackageError};
+use crate::tax::schedule_c_package::{self, ScheduleCPackageError};
 
 #[derive(Debug, Error)]
 pub enum StatementError {
@@ -78,6 +80,12 @@ pub enum StatementError {
     NotA1099B { form: &'static str },
     #[error(transparent)]
     Package(#[from] K1PackageError),
+    #[error("no Schedule C link with id {0}")]
+    NoSuchScheduleCLink(String),
+    #[error("{name} files {form}, not Schedule C")]
+    NotASoleProprietorship { name: String, form: &'static str },
+    #[error(transparent)]
+    ScheduleCPackage(#[from] ScheduleCPackageError),
 }
 
 /// A fresh id for a statement typed in by hand.
@@ -253,7 +261,20 @@ pub fn link_k1_source(
     source: &Connection,
     partner_id: &str,
 ) -> Result<K1Link, StatementError> {
-    let own = documents::ledger_id(store.connection())
+    let link = k1_link_for(store.connection(), source, partner_id)?;
+    append(store, user_id, k1_link_event(&link))?;
+    Ok(link)
+}
+
+/// The link [`link_k1_source`] would record, checked against both sets of books
+/// but not recorded — what a client sends to the group server when the person's
+/// books are hosted, since the instance cannot see the partnership's file.
+pub fn k1_link_for(
+    own_books: &Connection,
+    source: &Connection,
+    partner_id: &str,
+) -> Result<K1Link, StatementError> {
+    let own = documents::ledger_id(own_books)
         .ok_or(StatementError::NoLedgerId("these books"))?;
     let ledger_id = documents::ledger_id(source)
         .ok_or(StatementError::NoLedgerId("the partnership's books"))?;
@@ -276,25 +297,24 @@ pub fn link_k1_source(
         .find(|p| p.partner_id == partner_id)
         .ok_or_else(|| StatementError::NoSuchPartner(partner_id.to_string()))?;
 
-    let link = K1Link {
+    Ok(K1Link {
         link_id: K1Link::id_for(&ledger_id, &partner.partner_id),
         ledger_id,
         ledger_name,
         partner_id: partner.partner_id,
         partner_name: partner.name,
-    };
-    append(
-        store,
-        user_id,
-        Event::K1SourceLinked {
-            link_id: link.link_id.clone(),
-            ledger_id: link.ledger_id.clone(),
-            ledger_name: link.ledger_name.clone(),
-            partner_id: link.partner_id.clone(),
-            partner_name: link.partner_name.clone(),
-        },
-    )?;
-    Ok(link)
+    })
+}
+
+/// The event that records `link`.
+pub fn k1_link_event(link: &K1Link) -> Event {
+    Event::K1SourceLinked {
+        link_id: link.link_id.clone(),
+        ledger_id: link.ledger_id.clone(),
+        ledger_name: link.ledger_name.clone(),
+        partner_id: link.partner_id.clone(),
+        partner_name: link.partner_name.clone(),
+    }
 }
 
 /// Stop receiving a K-1 through a link. K-1s already pulled through it stay:
@@ -365,10 +385,23 @@ pub fn pull_k1(
     link: &K1Link,
     year: i32,
 ) -> Result<PulledK1, StatementError> {
-    check_source(source, link)?;
+    let pulled = k1_statement_for(store.connection(), source, link, year)?;
+    record(store, user_id, &pulled.statement)?;
+    Ok(pulled)
+}
+
+/// The K-1 [`pull_k1`] would record, computed but not recorded — for hosted
+/// books, whose client submits it as an ordinary statement.
+pub fn k1_statement_for(
+    own_books: &Connection,
+    source: &Connection,
+    link: &K1Link,
+    year: i32,
+) -> Result<PulledK1, StatementError> {
+    check_source(source, &link.ledger_id)?;
     let package = k1_package::for_partner(source, year, &link.partner_id)?;
     let statement_id = k1_statement_id(link, year);
-    let existing = get(store.connection(), &statement_id);
+    let existing = get(own_books, &statement_id);
 
     let statement = TaxStatement {
         statement_id,
@@ -392,13 +425,16 @@ pub fn pull_k1(
             event_hash: package.event_hash,
         }),
     };
-    record(store, user_id, &statement)?;
     Ok(PulledK1 {
         statement,
         replaced: existing.is_some(),
         warnings: package.warnings,
     })
 }
+
+/// How a pulled statement compares with what its source books say now. Named for
+/// the K-1 it was written for; a pulled Schedule C answers the same question.
+pub type StatementFreshness = K1Freshness;
 
 /// How a pulled K-1 compares with what the partnership's books say now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,43 +478,244 @@ pub fn k1_freshness(
     if !matches!(recorded.source, StatementSource::Ledger(_)) {
         return Ok(K1Freshness::EnteredByHand);
     }
-    check_source(source, link)?;
+    check_source(source, &link.ledger_id)?;
     let package = k1_package::for_partner(source, year, &link.partner_id)?;
-    let codes: BTreeSet<&String> = recorded
-        .amounts
-        .keys()
-        .chain(package.amounts.keys())
-        .collect();
+    Ok(compare(&recorded, &package.amounts))
+}
+
+/// Box by box: what was recorded against what the source books produce now.
+fn compare(recorded: &TaxStatement, now: &BTreeMap<String, i64>) -> K1Freshness {
+    let codes: BTreeSet<&String> = recorded.amounts.keys().chain(now.keys()).collect();
     let changes: Vec<BoxChange> = codes
         .into_iter()
         .filter_map(|code| {
             let before = recorded.amount(code);
-            let now = package.amounts.get(code).copied().unwrap_or(0);
-            (before != now).then(|| BoxChange {
+            let after = now.get(code).copied().unwrap_or(0);
+            (before != after).then(|| BoxChange {
                 code: code.clone(),
                 recorded: before,
-                now,
+                now: after,
             })
         })
         .collect();
-    Ok(if changes.is_empty() {
+    if changes.is_empty() {
         K1Freshness::Current
     } else {
         K1Freshness::Changed(changes)
-    })
+    }
 }
 
-/// Refuse to read a K-1 out of books other than the ones the link names — a
-/// restored copy of a different partnership has partners too.
-fn check_source(source: &Connection, link: &K1Link) -> Result<(), StatementError> {
+/// Refuse to read a statement out of books other than the ones the link names —
+/// a restored copy of a different partnership has partners too.
+fn check_source(source: &Connection, ledger_id: &str) -> Result<(), StatementError> {
     let found = documents::ledger_id(source).unwrap_or_default();
-    if found != link.ledger_id {
+    if found != ledger_id {
         return Err(StatementError::WrongSource {
-            expected: link.ledger_id.clone(),
+            expected: ledger_id.to_string(),
             found,
         });
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Schedule Cs from businesses managed here
+// ---------------------------------------------------------------------------
+
+/// Say that these books receive the Schedule C of the sole proprietorship whose
+/// books are `source`, so it reaches this person's Form 1040.
+///
+/// Linking the same business twice is one link: the id is its ledger id.
+pub fn link_schedule_c_source(
+    store: &mut EventStore,
+    user_id: &str,
+    source: &Connection,
+) -> Result<ScheduleCLink, StatementError> {
+    let link = schedule_c_link_for(store.connection(), source)?;
+    append(store, user_id, schedule_c_link_event(&link))?;
+    Ok(link)
+}
+
+/// The link [`link_schedule_c_source`] would record, checked but not recorded.
+pub fn schedule_c_link_for(
+    own_books: &Connection,
+    source: &Connection,
+) -> Result<ScheduleCLink, StatementError> {
+    let own = documents::ledger_id(own_books)
+        .ok_or(StatementError::NoLedgerId("these books"))?;
+    let ledger_id = documents::ledger_id(source)
+        .ok_or(StatementError::NoLedgerId("the business's books"))?;
+    if own == ledger_id {
+        return Err(StatementError::SameBooks);
+    }
+    let ledger_name = pc::get_profile(source)
+        .map(|p| p.legal_name)
+        .or_else(|| documents::ledger_name(source))
+        .unwrap_or_else(|| ledger_id.clone());
+    let kind = sole_proprietor_commands::business_type(source);
+    if kind != BusinessType::SoleProprietorship {
+        return Err(StatementError::NotASoleProprietorship {
+            name: ledger_name,
+            form: kind.form_name(),
+        });
+    }
+    Ok(ScheduleCLink {
+        link_id: ledger_id.clone(),
+        ledger_id,
+        ledger_name,
+        proprietor_name: sole_proprietor_commands::get_proprietor(source)
+            .map(|p| p.name)
+            .unwrap_or_default(),
+    })
+}
+
+/// The event that records `link`.
+pub fn schedule_c_link_event(link: &ScheduleCLink) -> Event {
+    Event::ScheduleCSourceLinked {
+        link_id: link.link_id.clone(),
+        ledger_id: link.ledger_id.clone(),
+        ledger_name: link.ledger_name.clone(),
+        proprietor_name: link.proprietor_name.clone(),
+    }
+}
+
+/// Stop receiving a business's Schedule C. Schedule Cs already pulled stay, for
+/// the reason [`unlink_k1_source`]'s K-1s do.
+pub fn unlink_schedule_c_source(
+    store: &mut EventStore,
+    user_id: &str,
+    link_id: &str,
+) -> Result<StoredEvent, StatementError> {
+    if get_schedule_c_link(store.connection(), link_id).is_none() {
+        return Err(StatementError::NoSuchScheduleCLink(link_id.to_string()));
+    }
+    append(
+        store,
+        user_id,
+        Event::ScheduleCSourceUnlinked {
+            link_id: link_id.to_string(),
+        },
+    )
+}
+
+pub fn list_schedule_c_links(conn: &Connection) -> Vec<ScheduleCLink> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT link_id, ledger_id, ledger_name, proprietor_name
+           FROM schedule_c_links ORDER BY ledger_name",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map([], row_to_schedule_c_link)
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+pub fn get_schedule_c_link(conn: &Connection, link_id: &str) -> Option<ScheduleCLink> {
+    conn.query_row(
+        "SELECT link_id, ledger_id, ledger_name, proprietor_name
+           FROM schedule_c_links WHERE link_id = ?1",
+        [link_id],
+        row_to_schedule_c_link,
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+fn row_to_schedule_c_link(r: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleCLink> {
+    Ok(ScheduleCLink {
+        link_id: r.get(0)?,
+        ledger_id: r.get(1)?,
+        ledger_name: r.get(2)?,
+        proprietor_name: r.get(3)?,
+    })
+}
+
+/// The id a Schedule C pulled through `link` for `year` is recorded under, so
+/// pulling again replaces it.
+pub fn schedule_c_statement_id(link: &ScheduleCLink, year: i32) -> String {
+    format!("sc:{}:{year}", link.ledger_id)
+}
+
+/// Compute the business's Schedule C for `year` and record it in these books,
+/// with where it came from.
+pub fn pull_schedule_c(
+    store: &mut EventStore,
+    user_id: &str,
+    source: &Connection,
+    link: &ScheduleCLink,
+    year: i32,
+) -> Result<PulledK1, StatementError> {
+    let pulled = schedule_c_statement_for(store.connection(), source, link, year)?;
+    record(store, user_id, &pulled.statement)?;
+    Ok(pulled)
+}
+
+/// The Schedule C [`pull_schedule_c`] would record, computed but not recorded.
+pub fn schedule_c_statement_for(
+    own_books: &Connection,
+    source: &Connection,
+    link: &ScheduleCLink,
+    year: i32,
+) -> Result<PulledK1, StatementError> {
+    check_source(source, &link.ledger_id)?;
+    let package = schedule_c_package::for_year(source, year)?;
+    let statement_id = schedule_c_statement_id(link, year);
+    let existing = get(own_books, &statement_id);
+    let statement = TaxStatement {
+        statement_id,
+        tax_year: year,
+        form: FormKind::ScheduleC,
+        issuer: package.business_name.clone(),
+        amounts: package.amounts,
+        document_ids: existing
+            .as_ref()
+            .map(|s| s.document_ids.clone())
+            .unwrap_or_default(),
+        note: existing.as_ref().and_then(|s| s.note.clone()),
+        // The provenance names the proprietor where a K-1's names the partner:
+        // whose figures, in those books, these are.
+        source: StatementSource::Ledger(LedgerProvenance {
+            ledger_id: package.ledger_id,
+            ledger_name: package.business_name,
+            partner_id: PROPRIETOR.to_string(),
+            partner_name: if package.proprietor_name.is_empty() {
+                "the proprietor".to_string()
+            } else {
+                package.proprietor_name
+            },
+            through_event: package.through_event,
+            event_hash: package.event_hash,
+        }),
+    };
+    Ok(PulledK1 {
+        statement,
+        replaced: existing.is_some(),
+        warnings: package.warnings,
+    })
+}
+
+/// What a Schedule C's provenance records in place of a partner id: there is
+/// one owner, and the books name them only by the proprietor record.
+pub const PROPRIETOR: &str = "proprietor";
+
+/// Compare the Schedule C recorded through `link` for `year` with the one the
+/// business's books produce now — figures, not event heads, as for a K-1.
+pub fn schedule_c_freshness(
+    conn: &Connection,
+    source: &Connection,
+    link: &ScheduleCLink,
+    year: i32,
+) -> Result<K1Freshness, StatementError> {
+    let Some(recorded) = get(conn, &schedule_c_statement_id(link, year)) else {
+        return Ok(K1Freshness::NotPulled);
+    };
+    if !matches!(recorded.source, StatementSource::Ledger(_)) {
+        return Ok(K1Freshness::EnteredByHand);
+    }
+    check_source(source, &link.ledger_id)?;
+    let package = schedule_c_package::for_year(source, year)?;
+    Ok(compare(&recorded, &package.amounts))
 }
 
 // ---------------------------------------------------------------------------
@@ -810,6 +1047,224 @@ mod tests {
         .unwrap();
         receive(&mut store, 10_000);
         (store, ids.remove(0))
+    }
+
+    /// A sole proprietorship with $10,000 of gross receipts on Schedule C line 1.
+    fn business() -> EventStore {
+        let mut store = books("business-ledger");
+        sole_proprietor_commands::set_business_type(
+            &mut store,
+            "user",
+            BusinessType::SoleProprietorship,
+        )
+        .unwrap();
+        pc::set_profile(
+            &mut store,
+            "user",
+            &BusinessProfile {
+                legal_name: "Bugbear Bikes LLC".to_string(),
+                address: address(),
+                ein: String::new(),
+                naics_code: "441227".to_string(),
+                formation_date: NaiveDate::from_ymd_opt(2020, 1, 1).unwrap(),
+                principal_activity: Some("Bicycle retail".to_string()),
+                principal_product: None,
+            },
+        )
+        .unwrap();
+        sole_proprietor_commands::set_proprietor(
+            &mut store,
+            "user",
+            &crate::domain::SoleProprietor {
+                name: "Zak Patterson".to_string(),
+                accounting_method: crate::domain::AccountingMethod::Cash,
+                accounting_method_other: None,
+            },
+        )
+        .unwrap();
+        for (ty, number, name) in [
+            (AccountType::Asset, "1000", "Cash"),
+            (AccountType::Revenue, "4000", "Sales"),
+        ] {
+            AccountCommands::new(&mut store, "user".to_string())
+                .create_account(CreateAccountCommand {
+                    account_type: ty,
+                    account_number: number.to_string(),
+                    name: name.to_string(),
+                    parent_id: None,
+                    currency: Some("USD".to_string()),
+                    description: None,
+                })
+                .unwrap();
+        }
+        let sales = account_id(&store, "4000");
+        crate::commands::tax_setup_commands::set_account_line_for(
+            &mut store,
+            "user",
+            &sales,
+            "sc1",
+            YEAR,
+            crate::tax::ReturnForm::ScheduleC,
+        )
+        .unwrap();
+        receive(&mut store, 10_000);
+        store
+    }
+
+    /// A business's line 31 reaches the owner's books as a Schedule C statement,
+    /// with the self-employment and QBI figures beside it and where it came from.
+    #[test]
+    fn a_pulled_schedule_c_carries_line_31_and_says_where_it_came_from() {
+        let source = business();
+        let mut me = personal();
+        let link = link_schedule_c_source(&mut me, "user", source.connection()).unwrap();
+        assert_eq!(link.ledger_name, "Bugbear Bikes LLC");
+        assert_eq!(link.proprietor_name, "Zak Patterson");
+
+        let pulled = pull_schedule_c(&mut me, "user", source.connection(), &link, YEAR).unwrap();
+        assert!(!pulled.replaced);
+        let sc = &list(me.connection(), Some(YEAR))[0];
+        assert_eq!(sc.form, FormKind::ScheduleC);
+        for code in ["1", "31", "se", "qbi"] {
+            assert_eq!(sc.amount(code), 1_000_000, "box {code}");
+        }
+        match &sc.source {
+            StatementSource::Ledger(p) => {
+                assert_eq!(p.ledger_id, "business-ledger");
+                assert_eq!(p.partner_id, PROPRIETOR);
+                assert_eq!(p.partner_name, "Zak Patterson");
+            }
+            other => panic!("expected ledger provenance, got {other:?}"),
+        }
+        assert_eq!(
+            schedule_c_freshness(me.connection(), source.connection(), &link, YEAR).unwrap(),
+            K1Freshness::Current
+        );
+    }
+
+    /// The business's books change after the pull: the personal books are told,
+    /// and pulling again replaces the Schedule C rather than adding a second.
+    #[test]
+    fn a_schedule_c_that_changed_since_it_was_pulled_says_so_and_a_repull_replaces_it() {
+        let mut source = business();
+        let mut me = personal();
+        let link = link_schedule_c_source(&mut me, "user", source.connection()).unwrap();
+        pull_schedule_c(&mut me, "user", source.connection(), &link, YEAR).unwrap();
+
+        receive(&mut source, 2_000);
+        assert!(matches!(
+            schedule_c_freshness(me.connection(), source.connection(), &link, YEAR).unwrap(),
+            K1Freshness::Changed(_)
+        ));
+        let again = pull_schedule_c(&mut me, "user", source.connection(), &link, YEAR).unwrap();
+        assert!(again.replaced);
+        let statements = list(me.connection(), Some(YEAR));
+        assert_eq!(statements.len(), 1, "replaced, not added to");
+        assert_eq!(statements[0].amount("31"), 1_200_000);
+    }
+
+    /// The pull reads the year's recorded inputs, so line 31 is the business's
+    /// own: $1,000 of home office comes off it here exactly as on its Schedule C.
+    #[test]
+    fn a_pull_uses_the_inputs_the_business_recorded_for_the_year() {
+        let mut source = business();
+        let mut me = personal();
+        let link = link_schedule_c_source(&mut me, "user", source.connection()).unwrap();
+        let pulled = pull_schedule_c(&mut me, "user", source.connection(), &link, YEAR).unwrap();
+        assert!(
+            pulled.warnings.iter().any(|w| w.contains("Line 30")),
+            "line 30 not worked out is said: {:?}",
+            pulled.warnings
+        );
+
+        sole_proprietor_commands::set_inputs(
+            &mut source,
+            "user",
+            YEAR,
+            &sole_proprietor_commands::ScheduleCInputs {
+                home_office_dollars: Some(1_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            sole_proprietor_commands::get_inputs(source.connection(), YEAR).home_office_dollars,
+            Some(1_000)
+        );
+        let pulled = pull_schedule_c(&mut me, "user", source.connection(), &link, YEAR).unwrap();
+        assert_eq!(pulled.statement.amount("31"), 900_000);
+        assert!(!pulled.warnings.iter().any(|w| w.contains("Line 30")));
+    }
+
+    /// Only a sole proprietorship has a Schedule C to give, and not to itself.
+    #[test]
+    fn a_schedule_c_link_is_refused_to_itself_and_to_books_that_file_another_return() {
+        let source = business();
+        let mut own = business();
+        assert!(matches!(
+            link_schedule_c_source(&mut own, "user", source.connection()),
+            Err(StatementError::SameBooks)
+        ));
+        let (partnership, _) = partnership();
+        let mut me = personal();
+        assert!(matches!(
+            link_schedule_c_source(&mut me, "user", partnership.connection()),
+            Err(StatementError::NotASoleProprietorship { .. })
+        ));
+        assert!(list_schedule_c_links(me.connection()).is_empty());
+    }
+
+    /// Linking twice is one link; unlinking keeps what was pulled.
+    #[test]
+    fn a_schedule_c_link_is_one_link_and_unlinking_keeps_the_pulled_figures() {
+        let source = business();
+        let mut me = personal();
+        let link = link_schedule_c_source(&mut me, "user", source.connection()).unwrap();
+        link_schedule_c_source(&mut me, "user", source.connection()).unwrap();
+        assert_eq!(list_schedule_c_links(me.connection()).len(), 1);
+        pull_schedule_c(&mut me, "user", source.connection(), &link, YEAR).unwrap();
+        unlink_schedule_c_source(&mut me, "user", &link.link_id).unwrap();
+        assert!(list_schedule_c_links(me.connection()).is_empty());
+        assert_eq!(list(me.connection(), Some(YEAR)).len(), 1);
+    }
+
+    /// The whole path: a linked business's Schedule C on the owner's 1040 —
+    /// Schedule 1 line 3, Schedule SE, half of it deducted, and Form 8995.
+    #[test]
+    fn a_linked_businesss_schedule_c_reaches_the_owners_form_1040() {
+        let source = business();
+        let mut me = personal();
+        crate::commands::personal_tax_commands::set_profile(
+            &mut me,
+            "user",
+            &crate::commands::personal_tax_commands::tests::profile(
+                YEAR,
+                crate::events::types::FilingStatus::Single,
+            ),
+        )
+        .unwrap();
+        let link = link_schedule_c_source(&mut me, "user", source.connection()).unwrap();
+
+        let before = crate::tax::form1040::build(&me, YEAR).unwrap();
+        assert_eq!(before.business_income_cents, 0);
+        assert!(
+            before.warnings.iter().any(|w| w.contains("has not been pulled")),
+            "a linked business with nothing pulled is said: {:?}",
+            before.warnings
+        );
+
+        pull_schedule_c(&mut me, "user", source.connection(), &link, YEAR).unwrap();
+        let r = crate::tax::form1040::build(&me, YEAR).unwrap();
+        assert_eq!(r.business_income_cents, 1_000_000);
+        assert_eq!(r.schedule_c[0].issuer, "Bugbear Bikes LLC");
+        // $10,000 × 92.35% = $9,235 of net earnings; 15.3% of it is $1,412.96.
+        assert_eq!(r.schedule_se.net_earnings_cents, 923_500);
+        assert_eq!(r.schedule_se.tax_cents, 114_514 + 26_782);
+        assert_eq!(r.schedule_se.deduction_cents, (114_514 + 26_782) / 2);
+        assert_eq!(r.agi_cents, 1_000_000 - r.schedule_se.deduction_cents);
+        assert!(r.total_tax_cents >= r.schedule_se.tax_cents);
+        assert!(!r.warnings.iter().any(|w| w.contains("has not been pulled")));
+        crate::tax::warning_shape::assert_all(&r.warnings);
     }
 
     #[test]

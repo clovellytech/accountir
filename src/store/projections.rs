@@ -389,6 +389,38 @@ impl<'a> Projector<'a> {
                 self.conn
                     .execute("DELETE FROM k1_links WHERE link_id = ?1", [link_id])?;
             }
+            Event::ScheduleCInputsSet(i) => {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schedule_c_inputs
+                       (tax_year, home_office_cents, other_business_income_cents,
+                        section_179_carryover_cents, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        i.tax_year,
+                        i.home_office_cents,
+                        i.other_business_income_cents,
+                        i.section_179_carryover_cents,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::ScheduleCSourceLinked {
+                link_id,
+                ledger_id,
+                ledger_name,
+                proprietor_name,
+            } => {
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO schedule_c_links
+                       (link_id, ledger_id, ledger_name, proprietor_name, linked_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![link_id, ledger_id, ledger_name, proprietor_name, stored_event.id],
+                )?;
+            }
+            Event::ScheduleCSourceUnlinked { link_id } => {
+                self.conn
+                    .execute("DELETE FROM schedule_c_links WHERE link_id = ?1", [link_id])?;
+            }
             Event::TaxLineMappingCleared {
                 account_id,
                 effective_from,
@@ -1960,6 +1992,8 @@ impl<'a> Projector<'a> {
              DELETE FROM personal_tax_profiles;
              DELETE FROM tax_statements;
              DELETE FROM k1_links;
+             DELETE FROM schedule_c_links;
+             DELETE FROM schedule_c_inputs;
              DELETE FROM schedule_b_answers;
              -- Projections too, and missing from this list until now: a rebuild
              -- that left them behind was a merge rather than a replay, so a

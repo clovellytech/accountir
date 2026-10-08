@@ -77,12 +77,37 @@ pub struct YearParams {
     pub senior_deduction: i64,
     /// Where it starts to phase out, at 6% of modified AGI above.
     pub senior_deduction_phaseout: ByStatus<i64>,
+    /// The Social Security wage base: the most earnings, wages and
+    /// self-employment together, that the 12.4% part of SE tax reaches.
+    pub social_security_wage_base: i64,
+    /// Taxable income (before the QBI deduction) up to which Form 8995's
+    /// simplified computation applies — above it, Form 8995-A and its W-2 wage
+    /// and property limits.
+    pub qbi_threshold: ByStatus<i64>,
 }
 
 /// Fixed by statute rather than indexed: the net investment income tax's
 /// thresholds (IRC §1411), the capital loss limit (§1211), and the Social Security
 /// base amounts (§86).
 pub const NIIT_RATE_BP: i64 = 380;
+
+/// Schedule SE: net earnings are 92.35% of net profit (the employer-equivalent
+/// half of the tax taken out), Social Security at 12.4% up to the wage base,
+/// Medicare at 2.9% on all of it, and nothing at all below $400 of net earnings.
+pub const SE_NET_EARNINGS_BP: i64 = 9_235;
+pub const SE_SOCIAL_SECURITY_BP: i64 = 1_240;
+pub const SE_MEDICARE_BP: i64 = 290;
+pub const SE_MINIMUM_EARNINGS: i64 = d(400);
+/// The Additional Medicare Tax (Form 8959): 0.9% of wages and self-employment
+/// income above the threshold. Fixed in the statute, not indexed.
+pub const ADDITIONAL_MEDICARE_THRESHOLD: ByStatus<i64> = ByStatus {
+    single: d(200_000),
+    married_jointly: d(250_000),
+    married_separately: d(125_000),
+    head_of_household: d(200_000),
+};
+/// The QBI deduction's rate, 20%.
+pub const QBI_RATE_BP: i64 = 2_000;
 pub const NIIT_THRESHOLD: ByStatus<i64> = ByStatus {
     single: d(200_000),
     married_jointly: d(250_000),
@@ -185,6 +210,15 @@ const Y2025: YearParams = YearParams {
         married_separately: d(75_000),
         head_of_household: d(75_000),
     },
+    // SSA's 2025 contribution and benefit base.
+    social_security_wage_base: d(176_100),
+    // Rev. Proc. 2024-40 §2.25: $197,300, joint $394,600.
+    qbi_threshold: ByStatus {
+        single: d(197_300),
+        married_jointly: d(394_600),
+        married_separately: d(197_300),
+        head_of_household: d(197_300),
+    },
 };
 
 const Y2026: YearParams = YearParams {
@@ -259,6 +293,16 @@ const Y2026: YearParams = YearParams {
         married_jointly: d(150_000),
         married_separately: d(75_000),
         head_of_household: d(75_000),
+    },
+    // SSA's announced 2026 base.
+    social_security_wage_base: d(184_500),
+    // Rev. Proc. 2025-32: $201,775, joint $403,550 — the same figures as the top of
+    // the 24% bracket, as in every year since 2018.
+    qbi_threshold: ByStatus {
+        single: d(201_775),
+        married_jointly: d(403_550),
+        married_separately: d(201_775),
+        head_of_household: d(201_775),
     },
 };
 

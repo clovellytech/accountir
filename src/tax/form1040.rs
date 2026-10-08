@@ -9,17 +9,22 @@
 //! - **The investment output** ([`super::personal_return`]): Schedule B from the
 //!   income accounts the brokerages' configurations name, Schedule D from the
 //!   1099-Bs, retirement distributions from the register.
-//! - **Statements**: W-2s, the other 1099s, SSA-1099s and K-1s, box by box.
+//! - **Statements**: W-2s, the other 1099s, SSA-1099s, K-1s and Schedule Cs,
+//!   box by box. A K-1 or a Schedule C from books kept in accountir arrives here
+//!   by being pulled into these books' log (see
+//!   [`crate::commands::tax_statement_commands`]), never by reading the other file.
 //! - **The ledger**, for one thing only: Schedule E rents and expenses, from the
 //!   accounts the profile assigns to each property.
 //! - **The year's parameters** ([`super::federal_params`]).
 //!
 //! # What it does not do, and says so
 //!
-//! Itemized deductions, the alternative minimum tax, self-employment tax, the
-//! qualified business income deduction, Form 8582 beyond the $25,000 allowance,
-//! refundable credits, and Schedule C. Each one that the year's figures suggest
-//! might matter becomes a warning, not a zero passed off as an answer. The line
+//! Itemized deductions, the alternative minimum tax, the QBI deduction above the
+//! Form 8995 threshold (Form 8995-A), the Additional Medicare Tax, Form 8582
+//! beyond the $25,000 allowance, and refundable credits. Each one that the year's
+//! figures suggest might matter becomes a warning, not a zero passed off as an
+//! answer. Schedule C income, Schedule SE and its deduction, and the QBI
+//! deduction below the threshold are computed. The line
 //! numbers follow the 2024 form's layout; the 2025 and 2026 forms renumber some of
 //! them, which is why every line carries its label.
 
@@ -81,6 +86,48 @@ pub struct K1Line {
     pub cents: i64,
 }
 
+/// One business's Schedule C, as it reaches Schedule 1 line 3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessLine {
+    pub issuer: String,
+    /// Line 31.
+    pub net_profit_cents: i64,
+}
+
+/// Schedule SE, short form.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleSe {
+    /// Line 3: net profit from Schedule C and K-1 box 14a, combined.
+    pub combined_cents: i64,
+    /// Line 4: 92.35% of it — the net earnings the tax is charged on.
+    pub net_earnings_cents: i64,
+    /// The 12.4% part, on what the wage base leaves after W-2 Social Security wages.
+    pub social_security_cents: i64,
+    /// The 2.9% part, on all of it.
+    pub medicare_cents: i64,
+    /// Line 12: the tax, to Schedule 2 line 4.
+    pub tax_cents: i64,
+    /// Line 13: half of it, deducted on Schedule 1 line 15.
+    pub deduction_cents: i64,
+}
+
+/// Form 8995, the simplified QBI deduction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Qbi {
+    /// Qualified business income, after the deductible part of SE tax that is
+    /// attributable to it.
+    pub business_income_cents: i64,
+    /// Section 199A dividends (1099-DIV box 5).
+    pub reit_dividends_cents: i64,
+    /// Taxable income before the deduction, which the limit is 20% of, less net
+    /// capital gain.
+    pub taxable_income_before_cents: i64,
+    pub deduction_cents: i64,
+    /// Whether taxable income is over the threshold, so Form 8995-A applies and
+    /// nothing is deducted here.
+    pub above_threshold: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScheduleE {
     pub properties: Vec<RentalProperty>,
@@ -106,6 +153,11 @@ pub struct Form1040 {
     pub params_verified: bool,
     pub lines: Vec<ReturnLine>,
     pub schedule_e: ScheduleE,
+    /// Schedule 1 line 3, business by business.
+    pub schedule_c: Vec<BusinessLine>,
+    pub business_income_cents: i64,
+    pub schedule_se: ScheduleSe,
+    pub qbi: Qbi,
     pub investment: InvestmentReturn,
     // The figures the state return starts from, named rather than read back out of
     // `lines` by key.
@@ -414,6 +466,156 @@ pub fn qdcg_tax(
     worksheet.min(tax_on(params, status, ti))
 }
 
+/// Schedule SE: self-employment tax on Schedule C net profit and K-1 box 14a.
+///
+/// Net earnings are 92.35% of the combined net profit; under $400 of them there
+/// is no tax at all. The 12.4% Social Security part stops at the wage base, which
+/// W-2 Social Security wages use up first. The 2.9% Medicare part has no limit.
+/// Half the tax is deductible (Schedule 1 line 15).
+pub fn schedule_se(
+    params: &YearParams,
+    schedule_c_cents: i64,
+    k1_cents: i64,
+    social_security_wages_cents: i64,
+) -> ScheduleSe {
+    let combined = schedule_c_cents + k1_cents;
+    let net_earnings = if combined > 0 {
+        apply_bp(combined, fp::SE_NET_EARNINGS_BP)
+    } else {
+        combined
+    };
+    if net_earnings < fp::SE_MINIMUM_EARNINGS {
+        return ScheduleSe {
+            combined_cents: combined,
+            net_earnings_cents: net_earnings.max(0),
+            ..Default::default()
+        };
+    }
+    let room = (params.social_security_wage_base - social_security_wages_cents.max(0)).max(0);
+    let social_security = apply_bp(net_earnings.min(room), fp::SE_SOCIAL_SECURITY_BP);
+    let medicare = apply_bp(net_earnings, fp::SE_MEDICARE_BP);
+    let tax = social_security + medicare;
+    ScheduleSe {
+        combined_cents: combined,
+        net_earnings_cents: net_earnings,
+        social_security_cents: social_security,
+        medicare_cents: medicare,
+        tax_cents: tax,
+        deduction_cents: tax / 2,
+    }
+}
+
+/// Form 8995: 20% of qualified business income and of Section 199A dividends,
+/// limited to 20% of taxable income (before the deduction) less net capital gain.
+///
+/// Only below the threshold. Above it the deduction turns on each business's W-2
+/// wages and property (Form 8995-A) and on whether it is a specified service
+/// business, which the books cannot say — so it is not computed, and the warning
+/// says what the figures would have been.
+pub fn qbi_deduction(
+    params: &YearParams,
+    status: FilingStatus,
+    business_income_cents: i64,
+    reit_dividends_cents: i64,
+    taxable_income_before_cents: i64,
+    net_capital_gain_cents: i64,
+    warnings: &mut Vec<String>,
+) -> Qbi {
+    let mut qbi = Qbi {
+        business_income_cents,
+        reit_dividends_cents,
+        taxable_income_before_cents,
+        ..Default::default()
+    };
+    if business_income_cents <= 0 && reit_dividends_cents <= 0 {
+        if business_income_cents < 0 {
+            warnings.push(format!(
+                "Qualified business income is a loss of {}. It carries to next year's QBI \
+                 deduction (Form 8995 line 16), which is not tracked here.",
+                dollars(-business_income_cents)
+            ));
+        }
+        return qbi;
+    }
+    let threshold = params.qbi_threshold.of(status);
+    if taxable_income_before_cents > threshold {
+        qbi.above_threshold = true;
+        warnings.push(format!(
+            "Taxable income before the QBI deduction is {}, over the {} threshold, so the \
+             deduction needs Form 8995-A — each business's W-2 wages and property, and whether \
+             it is a specified service business. It is not computed, and line 13 is zero.",
+            dollars(taxable_income_before_cents),
+            dollars(threshold)
+        ));
+        return qbi;
+    }
+    // A QBI loss offsets REIT dividends' component only through the carryforward,
+    // so each component is floored at zero.
+    let components = apply_bp(business_income_cents.max(0), fp::QBI_RATE_BP)
+        + apply_bp(reit_dividends_cents.max(0), fp::QBI_RATE_BP);
+    let limit = apply_bp(
+        (taxable_income_before_cents - net_capital_gain_cents).max(0),
+        fp::QBI_RATE_BP,
+    );
+    qbi.deduction_cents = components.min(limit);
+    qbi
+}
+
+/// A 1099-NEC is income of the business it was paid to, on that business's
+/// Schedule C — which is how it reaches this return. Say when no Schedule C on
+/// the return has room for it.
+fn nonemployee_compensation_warning(statements: &[TaxStatement]) -> Option<String> {
+    let nec = boxes(statements, &[FormKind::F1099Nec], "1");
+    if nec <= 0 {
+        return None;
+    }
+    let schedule_cs = statements.iter().filter(|s| s.form == FormKind::ScheduleC).count();
+    if schedule_cs == 0 {
+        return Some(format!(
+            "1099-NECs report {} of nonemployee compensation, and there is no Schedule C on \
+             this return. It belongs on the Schedule C of the business it was paid to: link that \
+             business and pull its Schedule C. It is not included here.",
+            dollars(nec)
+        ));
+    }
+    let receipts = boxes(statements, &[FormKind::ScheduleC], "1");
+    (receipts < nec).then(|| {
+        format!(
+            "1099-NECs report {} of nonemployee compensation, more than the {} of gross receipts \
+             on the Schedule Cs here. Each 1099-NEC belongs in the gross receipts of the business \
+             it was paid to — check that every business that received one is linked and pulled.",
+            dollars(nec),
+            dollars(receipts)
+        )
+    })
+}
+
+/// Linked K-1s and Schedule Cs with nothing pulled for the year: a return
+/// computed without them is missing their income, and looks complete.
+fn missing_pulls(conn: &Connection, year: i32, statements: &[TaxStatement]) -> Vec<String> {
+    let recorded = |id: &str| statements.iter().any(|s| s.statement_id == id);
+    let mut out = Vec::new();
+    for link in tax_statement_commands::list_schedule_c_links(conn) {
+        if !recorded(&tax_statement_commands::schedule_c_statement_id(&link, year)) {
+            out.push(format!(
+                "{} is linked, but its {year} Schedule C has not been pulled, so none of its \
+                 income is on this return.",
+                link.ledger_name
+            ));
+        }
+    }
+    for link in tax_statement_commands::list_k1_links(conn) {
+        if !recorded(&tax_statement_commands::k1_statement_id(&link, year)) {
+            out.push(format!(
+                "{} is linked, but {}'s {year} K-1 has not been pulled, so none of it is on this \
+                 return.",
+                link.ledger_name, link.partner_name
+            ));
+        }
+    }
+    out
+}
+
 /// Build a year's federal return from the books.
 pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
     let conn = store.connection();
@@ -497,6 +699,31 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
     let social_security = boxes(&statements, &[Ssa1099], "5");
     let early_withdrawal = boxes(&statements, &[F1099Int], "2");
 
+    // Schedule 1 line 3: each business's line 31.
+    let schedule_c: Vec<BusinessLine> = statements
+        .iter()
+        .filter(|s| s.form == ScheduleC)
+        .map(|s| BusinessLine {
+            issuer: s.issuer.clone(),
+            net_profit_cents: s.amount("31"),
+        })
+        .collect();
+    let business_income: i64 = schedule_c.iter().map(|b| b.net_profit_cents).sum();
+    let schedule_se = schedule_se(
+        params,
+        boxes(&statements, &[ScheduleC], "se"),
+        k1.self_employment,
+        boxes(&statements, &[W2], "3"),
+    );
+    if schedule_se.tax_cents > 0 && status.has_spouse() {
+        warnings.push(
+            "Schedule SE is figured as one person's. If a spouse owns any of these businesses \
+             or partnership interests, each spouse files a Schedule SE of their own, with their \
+             own wage base."
+                .to_string(),
+        );
+    }
+
     // Everything in AGI except Social Security and the rental figure, which both
     // depend on it.
     let base_income = wages
@@ -506,7 +733,9 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
         + capital_gain
         + unemployment
         + other_income
-        + k1.schedule_e.iter().map(|l| l.cents).sum::<i64>();
+        + business_income
+        + k1.schedule_e.iter().map(|l| l.cents).sum::<i64>()
+        - schedule_se.deduction_cents;
 
     // The $25,000 allowance for actively managed rentals (Form 8582, Part II),
     // phased out between $100,000 and $150,000 of modified AGI. Nothing at all for
@@ -552,7 +781,8 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
         k1_cents,
         total_cents: rental_allowed + k1_cents,
     };
-    let schedule_1_income = schedule_e.total_cents + unemployment + other_income;
+    let schedule_1_income =
+        business_income + schedule_e.total_cents + unemployment + other_income;
 
     let before_ss = wages
         + taxable_interest
@@ -563,10 +793,10 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
     let ss_taxable = taxable_social_security(
         status,
         social_security,
-        before_ss - early_withdrawal + tax_exempt_interest,
+        before_ss - early_withdrawal - schedule_se.deduction_cents + tax_exempt_interest,
     );
     let total_income = before_ss + ss_taxable;
-    let adjustments = early_withdrawal;
+    let adjustments = early_withdrawal + schedule_se.deduction_cents;
     let agi = total_income - adjustments;
 
     // The standard deduction, with a box per person 65 or older and per person blind.
@@ -630,15 +860,35 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
             dollars(salt),
         ));
     }
-    if k1.qbi != 0 {
-        warnings.push(format!(
-            "A K-1 reports {} of qualified business income. The QBI deduction (Form 8995) is \
-             not computed, so line 13 is zero and the tax is overstated if you qualify.",
-            dollars(k1.qbi)
-        ));
+    // Form 8995. The Schedule Cs' QBI is reduced by the deductible half of the SE
+    // tax their own earnings produced; a K-1's box 20 code Z is already the
+    // partnership's figure.
+    let sc_se = boxes(&statements, &[ScheduleC], "se").max(0);
+    let se_combined = schedule_se.combined_cents.max(0);
+    let sc_share_of_deduction = if se_combined > 0 {
+        ((schedule_se.deduction_cents as i128 * sc_se as i128) / se_combined as i128) as i64
+    } else {
+        0
+    };
+    let qbi = qbi_deduction(
+        params,
+        status,
+        boxes(&statements, &[ScheduleC], "qbi") - sc_share_of_deduction + k1.qbi,
+        boxes(&statements, &[F1099Div], "5"),
+        (agi - standard - senior_deduction).max(0),
+        net_capital_gain + qualified_dividends,
+        &mut warnings,
+    );
+    if year >= 2026 && qbi.business_income_cents >= 100_000 && !qbi.above_threshold {
+        warnings.push(
+            "From 2026 the QBI deduction has a $400 minimum for at least $1,000 of qualified \
+             business income from a business you materially participate in. It is not applied \
+             here."
+                .to_string(),
+        );
     }
 
-    let deduction = standard + senior_deduction;
+    let deduction = standard + senior_deduction + qbi.deduction_cents;
     let taxable_income = (agi - deduction).max(0);
     let income_tax = if qualified_dividends > 0 || net_capital_gain > 0 {
         qdcg_tax(
@@ -706,21 +956,18 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
                 .to_string(),
         );
     }
-    if k1.self_employment != 0 || boxes(&statements, &[F1099Nec], "1") != 0 {
-        warnings.push(
-            "There is self-employment income (a K-1's box 14 or a 1099-NEC). Schedule SE and \
-             its deduction are not computed, and a 1099-NEC's income belongs on Schedule C, \
-             which this return does not include."
-                .to_string(),
-        );
-    }
+    warnings.extend(nonemployee_compensation_warning(&statements));
+    warnings.extend(missing_pulls(conn, year, &statements));
     let medicare_wages = boxes(&statements, &[W2], "5");
-    if medicare_wages > 20_000_000 {
-        warnings.push(
-            "Medicare wages exceed $200,000: the Additional Medicare Tax (Form 8959) is not \
-             computed."
-                .to_string(),
-        );
+    if medicare_wages + schedule_se.net_earnings_cents
+        > fp::ADDITIONAL_MEDICARE_THRESHOLD.of(status)
+    {
+        warnings.push(format!(
+            "Medicare wages and self-employment earnings come to {}, over the Additional \
+             Medicare Tax threshold of {}: the 0.9% tax (Form 8959) is not computed.",
+            dollars(medicare_wages + schedule_se.net_earnings_cents),
+            dollars(fp::ADDITIONAL_MEDICARE_THRESHOLD.of(status))
+        ));
     }
     warnings.push(
         "The alternative minimum tax (Form 6251) is not computed. Large long-term gains, \
@@ -745,7 +992,8 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
 
     let total_credits = child_credit + foreign_credit;
     let tax_after_credits = (income_tax - total_credits).max(0);
-    let total_tax = tax_after_credits + niit;
+    let other_taxes = niit + schedule_se.tax_cents;
+    let total_tax = tax_after_credits + other_taxes;
 
     let withheld = boxes(&statements, &[W2], "2")
         + boxes(
@@ -823,14 +1071,24 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
             "Additional income (Schedule 1)",
             schedule_1_income,
             format!(
-                "Schedule E {}, unemployment {}, other {}",
+                "Schedule C {}, Schedule E {}, unemployment {}, other {}",
+                dollars(business_income),
                 dollars(schedule_e.total_cents),
                 dollars(unemployment),
                 dollars(other_income)
             ),
         ),
         line("9", "Total income", total_income),
-        line("10", "Adjustments to income (Schedule 1)", adjustments),
+        noted(
+            "10",
+            "Adjustments to income (Schedule 1)",
+            adjustments,
+            format!(
+                "Deductible part of SE tax {}, early withdrawal penalty {}",
+                dollars(schedule_se.deduction_cents),
+                dollars(early_withdrawal)
+            ),
+        ),
         line("11", "Adjusted gross income", agi),
         noted(
             "12",
@@ -847,7 +1105,24 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
                 }
             ),
         ),
-        line("13", "Qualified business income deduction", 0),
+        noted(
+            "13",
+            "Qualified business income deduction",
+            qbi.deduction_cents,
+            if qbi.above_threshold {
+                "Over the Form 8995 threshold — Form 8995-A is not computed".to_string()
+            } else {
+                format!(
+                    "Form 8995: 20% of {} QBI and {} REIT dividends, limited to 20% of {}",
+                    dollars(qbi.business_income_cents.max(0)),
+                    dollars(qbi.reit_dividends_cents),
+                    dollars(
+                        (qbi.taxable_income_before_cents - net_capital_gain - qualified_dividends)
+                            .max(0)
+                    )
+                )
+            },
+        ),
         line("13b", "Schedule 1-A deductions (senior)", senior_deduction),
         line("14", "Total deductions", deduction),
         line("15", "Taxable income", taxable_income),
@@ -868,9 +1143,15 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
         line("22", "Tax after credits", tax_after_credits),
         noted(
             "23",
-            "Other taxes (Schedule 2): net investment income tax",
-            niit,
-            format!("3.8% of the smaller of {} and AGI over the threshold", dollars(nii)),
+            "Other taxes (Schedule 2)",
+            other_taxes,
+            format!(
+                "Self-employment tax {}; net investment income tax {} (3.8% of the smaller of {} \
+                 and AGI over the threshold)",
+                dollars(schedule_se.tax_cents),
+                dollars(niit),
+                dollars(nii)
+            ),
         ),
         line("24", "Total tax", total_tax),
         line("25d", "Federal income tax withheld", withheld),
@@ -890,6 +1171,10 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
         params_verified: params.verified,
         lines,
         schedule_e,
+        schedule_c,
+        business_income_cents: business_income,
+        schedule_se,
+        qbi,
         investment,
         wages_cents: wages,
         taxable_interest_cents: taxable_interest,
@@ -922,6 +1207,85 @@ mod tests {
 
     fn d(dollars: i64) -> i64 {
         dollars * 100
+    }
+
+    /// W-2 Social Security wages use up the wage base first: with $170,000 of them
+    /// in 2025 only $6,100 of self-employment earnings is left for the 12.4%, while
+    /// Medicare's 2.9% takes all of it.
+    #[test]
+    fn wages_use_up_the_social_security_wage_base_before_self_employment() {
+        let p = for_year(2025).unwrap();
+        let se = schedule_se(p, d(50_000), 0, d(170_000));
+        assert_eq!(se.net_earnings_cents, d(46_175));
+        assert_eq!(se.social_security_cents, apply_bp(d(6_100), 1_240));
+        assert_eq!(se.medicare_cents, apply_bp(d(46_175), 290));
+        assert_eq!(se.deduction_cents, se.tax_cents / 2);
+    }
+
+    /// Under $400 of net earnings there is no self-employment tax at all, and a
+    /// K-1's box 14a counts toward the same total as a Schedule C.
+    #[test]
+    fn under_four_hundred_dollars_of_net_earnings_owes_no_self_employment_tax() {
+        let p = for_year(2025).unwrap();
+        assert_eq!(schedule_se(p, d(400), 0, 0).tax_cents, 0, "$369.40 of net earnings");
+        assert_eq!(schedule_se(p, -d(5_000), 0, 0).tax_cents, 0, "a loss");
+        assert!(schedule_se(p, d(300), d(200), 0).tax_cents > 0, "together they pass $400");
+    }
+
+    /// Form 8995 is 20% of QBI, but never more than 20% of taxable income less net
+    /// capital gain.
+    #[test]
+    fn the_qbi_deduction_is_limited_by_taxable_income_less_capital_gain() {
+        let p = for_year(2025).unwrap();
+        let mut w = Vec::new();
+        let q = qbi_deduction(p, Single, d(50_000), 0, d(100_000), 0, &mut w);
+        assert_eq!(q.deduction_cents, d(10_000), "20% of the QBI");
+        let q = qbi_deduction(p, Single, d(50_000), 0, d(40_000), d(10_000), &mut w);
+        assert_eq!(q.deduction_cents, d(6_000), "20% of $30,000 after the capital gain");
+        assert!(w.is_empty(), "{w:?}");
+    }
+
+    /// Over the threshold the deduction needs Form 8995-A, which is not computed:
+    /// nothing is deducted, and the warning says why.
+    #[test]
+    fn above_the_qbi_threshold_nothing_is_deducted_and_it_says_so() {
+        let p = for_year(2025).unwrap();
+        let mut w = Vec::new();
+        let q = qbi_deduction(p, Single, d(300_000), 0, d(250_000), 0, &mut w);
+        assert!(q.above_threshold);
+        assert_eq!(q.deduction_cents, 0);
+        assert!(w.iter().any(|w| w.contains("8995-A")), "{w:?}");
+        crate::tax::warning_shape::assert_all(&w);
+    }
+
+    fn stmt(form: FormKind, amounts: &[(&str, i64)]) -> TaxStatement {
+        TaxStatement {
+            statement_id: format!("{}-x", form.as_str()),
+            tax_year: 2025,
+            form,
+            issuer: "Issuer".to_string(),
+            amounts: amounts.iter().map(|(k, v)| (k.to_string(), d(*v))).collect(),
+            document_ids: Vec::new(),
+            source: Default::default(),
+            note: None,
+        }
+    }
+
+    /// A 1099-NEC is income of the business it was paid to: with no Schedule C on
+    /// the return it is missing, and with receipts below it something is.
+    #[test]
+    fn a_1099nec_with_no_schedule_c_to_hold_it_is_said() {
+        let nec = stmt(FormKind::F1099Nec, &[("1", 12_000)]);
+        let none = nonemployee_compensation_warning(std::slice::from_ref(&nec)).unwrap();
+        assert!(none.contains("no Schedule C"), "{none}");
+
+        let small = stmt(FormKind::ScheduleC, &[("1", 8_000), ("31", 5_000)]);
+        let short = nonemployee_compensation_warning(&[nec.clone(), small]).unwrap();
+        assert!(short.contains("more than"), "{short}");
+
+        let enough = stmt(FormKind::ScheduleC, &[("1", 20_000), ("31", 9_000)]);
+        assert_eq!(nonemployee_compensation_warning(&[nec, enough]), None);
+        crate::tax::warning_shape::assert_all([none, short]);
     }
 
     /// Ordinary income at ordinary rates, the dividends at 15%: a joint return with

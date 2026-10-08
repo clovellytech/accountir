@@ -1740,6 +1740,82 @@ impl SyncClient {
         .await
     }
 
+    /// Record a K-1 link on the group's books, resolved by this client against
+    /// the partnership's books (see
+    /// [`crate::commands::tax_statement_commands::k1_link_for`]). Linking twice
+    /// is one link, so a retry is safe.
+    pub async fn link_k1_source(
+        &mut self,
+        link: &crate::domain::documents::K1Link,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/link-k1-source", |head| {
+            crate::sync::commands::personal_tax::LinkK1SourceRequest {
+                expected_head_seq: head,
+                link_id: link.link_id.clone(),
+                ledger_id: link.ledger_id.clone(),
+                ledger_name: link.ledger_name.clone(),
+                partner_id: link.partner_id.clone(),
+                partner_name: link.partner_name.clone(),
+            }
+        })
+        .await
+    }
+
+    pub async fn unlink_k1_source(&mut self, link_id: &str) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/unlink-k1-source", |head| {
+            crate::sync::commands::personal_tax::UnlinkSourceRequest {
+                expected_head_seq: head,
+                link_id: link_id.to_string(),
+            }
+        })
+        .await
+    }
+
+    /// Record a Schedule C link on the group's books, resolved by this client.
+    pub async fn link_schedule_c_source(
+        &mut self,
+        link: &crate::domain::documents::ScheduleCLink,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/link-schedule-c-source", |head| {
+            crate::sync::commands::personal_tax::LinkScheduleCSourceRequest {
+                expected_head_seq: head,
+                link_id: link.link_id.clone(),
+                ledger_id: link.ledger_id.clone(),
+                ledger_name: link.ledger_name.clone(),
+                proprietor_name: link.proprietor_name.clone(),
+            }
+        })
+        .await
+    }
+
+    pub async fn unlink_schedule_c_source(
+        &mut self,
+        link_id: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/unlink-schedule-c-source", |head| {
+            crate::sync::commands::personal_tax::UnlinkSourceRequest {
+                expected_head_seq: head,
+                link_id: link_id.to_string(),
+            }
+        })
+        .await
+    }
+
+    /// Record a year's Schedule C inputs on the group's books. They replace the
+    /// year's whole set, so a retry is safe.
+    pub async fn set_schedule_c_inputs(
+        &mut self,
+        inputs: &crate::events::types::ScheduleCInputsData,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/set-schedule-c-inputs", |head| {
+            crate::sync::commands::schedule_c::SetScheduleCInputsRequest {
+                expected_head_seq: head,
+                inputs: inputs.clone(),
+            }
+        })
+        .await
+    }
+
     /// Take a statement off the group's books.
     pub async fn remove_tax_statement(
         &mut self,

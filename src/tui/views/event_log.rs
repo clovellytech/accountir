@@ -718,6 +718,13 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::K1SourceUnlinked { link_id } => {
             format!("K-1 link {} removed", widgets::truncate(link_id, 8))
         }
+        Event::ScheduleCInputsSet(i) => format!("Schedule C inputs set for {}", i.tax_year),
+        Event::ScheduleCSourceLinked { ledger_name, .. } => {
+            format!("Receives the Schedule C of {ledger_name}")
+        }
+        Event::ScheduleCSourceUnlinked { link_id } => {
+            format!("Schedule C link {} removed", widgets::truncate(link_id, 8))
+        }
         Event::ScheduleBAnswerSet {
             tax_year,
             answer_key,

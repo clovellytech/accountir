@@ -54,6 +54,8 @@ pub struct PersonalInputs {
     pub unrouted: Vec<Contribution>,
     /// Partnerships linked to these books with no K-1 recorded for the year.
     pub missing_k1s: Vec<K1Link>,
+    /// Businesses linked to these books with no Schedule C recorded for the year.
+    pub missing_schedule_cs: Vec<crate::domain::documents::ScheduleCLink>,
     /// The year's documents that no statement was read from.
     pub unread_documents: Vec<Document>,
 }
@@ -102,6 +104,13 @@ pub fn inputs_for_year(conn: &Connection, tax_year: i32) -> PersonalInputs {
             !statements.iter().any(|s| s.statement_id == id)
         })
         .collect();
+    let missing_schedule_cs = tax_statement_commands::list_schedule_c_links(conn)
+        .into_iter()
+        .filter(|link| {
+            let id = tax_statement_commands::schedule_c_statement_id(link, tax_year);
+            !statements.iter().any(|s| s.statement_id == id)
+        })
+        .collect();
     let unread_documents = document_commands::list(conn, Some(tax_year))
         .into_iter()
         .filter(|d| {
@@ -118,6 +127,7 @@ pub fn inputs_for_year(conn: &Connection, tax_year: i32) -> PersonalInputs {
         informational,
         unrouted,
         missing_k1s,
+        missing_schedule_cs,
         unread_documents,
     }
 }
