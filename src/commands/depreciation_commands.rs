@@ -894,6 +894,265 @@ mod tests {
         }
     }
 
+    /// Books for a sole proprietor, with the header and owner a Schedule C needs.
+    fn sole_books() -> EventStore {
+        use crate::domain::{AccountingMethod, BusinessType, SoleProprietor};
+        use crate::events::types::{AddressData, BusinessProfileData};
+        let mut s = store();
+        crate::commands::partnership_commands::append_event_locally(
+            &mut s,
+            "u",
+            Event::BusinessProfileSet(Box::new(BusinessProfileData {
+                legal_name: "Bugbear Investments LLC".into(),
+                address: AddressData {
+                    street: "1 Main St".into(),
+                    suite: None,
+                    city: "Chicago".into(),
+                    state: "IL".into(),
+                    postal_code: "60640".into(),
+                    country: None,
+                },
+                ein: "12-3456789".into(),
+                naics_code: "531120".into(),
+                formation_date: day(2024, 1, 1),
+                principal_activity: Some("Commercial real estate".into()),
+                principal_product: Some("Leasing".into()),
+            })),
+        )
+        .unwrap();
+        crate::commands::sole_proprietor_commands::set_business_type(
+            &mut s,
+            "u",
+            BusinessType::SoleProprietorship,
+        )
+        .unwrap();
+        crate::commands::sole_proprietor_commands::set_proprietor(
+            &mut s,
+            "u",
+            &SoleProprietor {
+                name: "Zak Patterson".into(),
+                accounting_method: AccountingMethod::Cash,
+                accounting_method_other: None,
+            },
+        )
+        .unwrap();
+        crate::commands::sole_proprietor_commands::set_ssn(s.connection(), "123-45-6789")
+            .unwrap();
+        for account in ["6500", "6501"] {
+            crate::commands::tax_setup_commands::set_account_line_for(
+                &mut s,
+                "u",
+                account,
+                "sc13",
+                2025,
+                crate::tax::ReturnForm::ScheduleC,
+            )
+            .unwrap();
+        }
+        s
+    }
+
+    /// $10,000 of seven-year equipment, $4,000 of it expensed under §179.
+    fn kiln_with_179() -> DepreciableAsset {
+        DepreciableAsset {
+            section_179_account_id: Some("6501".into()),
+            section_179_cents: 400_000,
+            ..kiln()
+        }
+    }
+
+    fn inputs(other: Option<i64>, carryover: Option<i64>) -> crate::commands::sole_proprietor_commands::ScheduleCInputs {
+        crate::commands::sole_proprietor_commands::ScheduleCInputs {
+            home_office_dollars: Some(0),
+            other_business_income_dollars: other,
+            section_179_carryover_dollars: carryover,
+        }
+    }
+
+    /// A sole proprietor's depreciation and §179 both land on Schedule C line 13.
+    ///
+    /// The register posts the year as a journal entry — ordinary depreciation to
+    /// the asset's expense account, §179 to its own — and Schedule C reads those
+    /// balances through its own mapping. Nothing is partnership-specific except
+    /// where each account is pointed: on Form 1065 the §179 account goes to
+    /// Schedule K line 12, on Schedule C both go to line 13. Here the owner has
+    /// wages enough to cover the §179, so all of it is deducted.
+    #[test]
+    fn a_sole_proprietors_depreciation_and_section_179_reach_schedule_c_line_13() {
+        use crate::commands::sole_proprietor_commands::{build_from_ledger, figures};
+        let mut s = sole_books();
+        add_asset(&mut s, "u", &kiln_with_179()).expect("added");
+        let posted = post_year(&mut s, "u", 2025, false).expect("posted");
+        assert_eq!(posted.section_179_cents, 400_000);
+
+        let both = crate::tax::lines::cents_to_dollars(
+            posted.depreciation_cents + posted.section_179_cents,
+        );
+        let f = figures(s.connection(), 2025, &inputs(Some(50_000), None)).unwrap();
+        assert_eq!(f.computed.lines.get("sc13"), both, "{:#?}", f.warnings);
+        let o = f.section_179.expect("Part I applied");
+        assert_eq!((o.allowed_cents, o.carryover_out_cents), (400_000, 0));
+
+        let bundle = build_from_ledger(s.connection(), 2025, &inputs(Some(50_000), None))
+            .expect("built");
+        assert_eq!(bundle.net_profit_dollars, -both);
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// Form 4562 travels with the Schedule C, headed as the owner's 1040 is, with
+    /// Part I's limit lines filled — they are applied here, not on a partner's
+    /// return.
+    #[test]
+    fn a_schedule_c_carries_its_form_4562_under_the_owners_name() {
+        use crate::tax::acroform::{field_map, get_value};
+        use crate::tax::form1065::F4562_NAMESPACE as NS;
+        use crate::tax::form4562::BOXES_2025 as B;
+        let mut s = sole_books();
+        add_asset(&mut s, "u", &kiln_with_179()).expect("added");
+        post_year(&mut s, "u", 2025, false).expect("posted");
+
+        let bundle = crate::commands::sole_proprietor_commands::build_from_ledger(
+            s.connection(),
+            2025,
+            &inputs(Some(50_000), None),
+        )
+        .expect("built");
+        let doc = lopdf::Document::load_mem(&bundle.pdf).unwrap();
+        let map = field_map(&doc);
+        let read = |leaf: &str| get_value(&doc, &map, &format!("{NS}.Page1[0].{leaf}"));
+        assert_eq!(read(B.name).as_deref(), Some("Zak Patterson"));
+        assert_eq!(read(B.ein).as_deref(), Some("123-45-6789"));
+        // $50,000 of wages less the $857 of ordinary depreciation: line 11 is
+        // figured before §179, not before every deduction.
+        assert_eq!(read(B.l11_income_limit).as_deref(), Some("49,143"));
+        assert_eq!(read(B.l12_deduction).as_deref(), Some("4,000"));
+        assert_eq!(read(B.l13_carryover_out), None, "nothing carries");
+        // The partnership's warning about splitting line 22 does not apply here.
+        assert!(
+            !bundle.warnings.iter().any(|w| w.contains("line 16a")),
+            "{:#?}",
+            bundle.warnings
+        );
+    }
+
+    /// §179 cannot make a loss. A business with no income and no wages to
+    /// count deducts its depreciation, and the §179 waits for next year.
+    #[test]
+    fn section_179_beyond_business_income_carries_forward() {
+        use crate::commands::sole_proprietor_commands::{build_from_ledger, figures};
+        let mut s = sole_books();
+        add_asset(&mut s, "u", &kiln_with_179()).expect("added");
+        let posted = post_year(&mut s, "u", 2025, false).expect("posted");
+        let depreciation = crate::tax::lines::cents_to_dollars(posted.depreciation_cents);
+
+        let f = figures(s.connection(), 2025, &inputs(None, None)).unwrap();
+        assert_eq!(f.computed.lines.get("sc13"), depreciation, "only the depreciation");
+        let o = f.section_179.unwrap();
+        assert_eq!((o.allowed_cents, o.carryover_out_cents), (0, 400_000));
+        assert!(f.warnings.iter().any(|w| w.contains("carries to next year")));
+        assert!(
+            f.warnings.iter().any(|w| w.contains("counts this business alone")),
+            "with no other income entered, the page says the limit may be too low"
+        );
+
+        // Part of it covered by $1,500 of wages; the rest still carries.
+        let f = figures(s.connection(), 2025, &inputs(Some(1_500), None)).unwrap();
+        let o = f.section_179.unwrap();
+        // Line 11 is the business's loss before §179 plus the wages.
+        assert_eq!(o.business_income_cents, (1_500 - depreciation) * 100);
+        assert_eq!(o.allowed_cents + o.carryover_out_cents, 400_000);
+
+        // And last year's carryover is used once there is income for it.
+        let f = figures(s.connection(), 2025, &inputs(Some(100_000), Some(2_000))).unwrap();
+        let o = f.section_179.unwrap();
+        assert_eq!((o.allowed_cents, o.carryover_out_cents), (600_000, 0));
+        assert_eq!(f.computed.lines.get("sc13"), depreciation + 6_000);
+
+        let bundle = build_from_ledger(s.connection(), 2025, &inputs(None, None)).unwrap();
+        crate::tax::warning_shape::assert_all(&bundle.warnings);
+    }
+
+    /// Form 4562 goes with the Schedule C only when the instructions require it:
+    /// in the year the kiln was placed in service, and not in a later year of
+    /// nothing but continuing depreciation.
+    #[test]
+    fn form_4562_is_attached_only_in_a_year_that_requires_it() {
+        use crate::commands::sole_proprietor_commands::build_from_ledger;
+        let mut s = sole_books();
+        let placed = DepreciableAsset {
+            acquired_on: day(2024, 3, 1),
+            placed_in_service: day(2024, 3, 1),
+            ..kiln()
+        };
+        add_asset(&mut s, "u", &placed).expect("added");
+        // From 2024, so both years read line 13 through the same accounts.
+        for account in ["6500", "6501"] {
+            crate::commands::tax_setup_commands::set_account_line_for(
+                &mut s,
+                "u",
+                account,
+                "sc13",
+                2024,
+                crate::tax::ReturnForm::ScheduleC,
+            )
+            .unwrap();
+        }
+        post_year(&mut s, "u", 2024, false).expect("posted 2024");
+        post_year(&mut s, "u", 2025, false).expect("posted 2025");
+        let has_4562 = |year: i32| {
+            let b = build_from_ledger(s.connection(), year, &inputs(None, None)).unwrap();
+            let doc = lopdf::Document::load_mem(&b.pdf).unwrap();
+            let map = crate::tax::acroform::field_map(&doc);
+            let found = map
+                .names()
+                .any(|n| n.starts_with(crate::tax::form1065::F4562_NAMESPACE));
+            (found, b.warnings)
+        };
+        let (attached, _) = has_4562(2024);
+        assert!(attached, "placed in service in 2024: required");
+
+        let (attached, warnings) = has_4562(2025);
+        assert!(!attached, "only continuing depreciation in 2025: not required");
+        assert!(
+            warnings.iter().any(|w| w.contains("No Form 4562 is attached")),
+            "{warnings:#?}"
+        );
+        crate::tax::warning_shape::assert_all(&warnings);
+    }
+
+    /// A year nobody posted would file without its depreciation and say nothing;
+    /// a posting the register has since moved away from would file stale figures.
+    #[test]
+    fn an_unposted_or_stale_year_is_said_rather_than_filed_quietly() {
+        use crate::commands::sole_proprietor_commands::figures;
+        let mut s = sole_books();
+        let (id, _) = add_asset(&mut s, "u", &kiln()).expect("added");
+
+        let f = figures(s.connection(), 2025, &inputs(None, None)).unwrap();
+        assert!(
+            f.warnings.iter().any(|w| w.contains("register computes")),
+            "an unposted year: {:#?}",
+            f.warnings
+        );
+
+        post_year(&mut s, "u", 2025, false).expect("posted");
+        let f = figures(s.connection(), 2025, &inputs(None, None)).unwrap();
+        assert!(
+            !f.warnings.iter().any(|w| w.contains("register")),
+            "posted and current: {:#?}",
+            f.warnings
+        );
+
+        set_override(&mut s, "u", &id, 2025, 50_000, "Restated").expect("override");
+        let f = figures(s.connection(), 2025, &inputs(None, None)).unwrap();
+        assert!(
+            f.warnings.iter().any(|w| w.contains("post 2025 again")),
+            "a stale posting: {:#?}",
+            f.warnings
+        );
+        crate::tax::warning_shape::assert_all(&f.warnings);
+    }
+
     /// An override is what gets posted, the reason travels with it, and clearing
     /// it leaves the posting visibly out of date.
     #[test]

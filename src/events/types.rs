@@ -1451,6 +1451,15 @@ pub enum Event {
         /// `a_mapping_event_written_before_years_existed_reserialises_byte_for_byte`.
         #[serde(default, skip_serializing_if = "is_any_year")]
         effective_from: i32,
+        /// Which return this assignment is for — `"1065"` or `"schedule_c"`, see
+        /// [`crate::tax::ReturnForm`]. Each return keeps its own assignments, so
+        /// mapping an account for Schedule C leaves its Form 1065 line alone.
+        ///
+        /// Absent on events written before the split, which are read by their
+        /// key (a line key names its form), and omitted again on the way out for
+        /// the byte-for-byte reason `effective_from` is.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<String>,
     },
     /// What a partner's percentages became, and from when.
     ///
@@ -1627,6 +1636,11 @@ pub enum Event {
         /// [`Event::TaxLineMappingSet`].
         #[serde(default, skip_serializing_if = "is_any_year")]
         effective_from: i32,
+        /// Which return's assignment is cleared. Absent on events written before
+        /// each return kept its own, when an account had one assignment for both
+        /// — so an absent form clears both, which is what it did then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        form: Option<String>,
     },
     /// One Schedule B answer is given, for one tax year.
     ///
@@ -3002,6 +3016,8 @@ mod partnership_event_shape {
         for legacy in [
             r#"{"type":"tax_line_mapping_set","account_id":"6100","line_key":"l21"}"#,
             r#"{"type":"tax_line_mapping_cleared","account_id":"6100"}"#,
+            r#"{"type":"tax_line_mapping_set","account_id":"6100","line_key":"sc18","effective_from":2026,"form":"schedule_c"}"#,
+            r#"{"type":"tax_line_mapping_cleared","account_id":"6100","effective_from":2026,"form":"1065"}"#,
             r#"{"type":"tax_deduction_limit_set","account_id":"3055","deductible_pct":50}"#,
             r#"{"type":"tax_deduction_limit_cleared","account_id":"3055"}"#,
         ] {
@@ -3022,6 +3038,7 @@ mod partnership_event_shape {
             account_id: "6100".into(),
             line_key: "l21".into(),
             effective_from: 2026,
+            form: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains(r#""effective_from":2026"#), "{json}");

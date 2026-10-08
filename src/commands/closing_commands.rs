@@ -405,10 +405,11 @@ const YEAR_ACCOUNT_TAX_LINE: &str = "sl21";
 fn already_mapped_for_tax(tx: &Connection, account_id: &str, year: i32) -> bool {
     tx.query_row(
         "SELECT 1 FROM tax_line_mappings t
-          WHERE t.account_id = ?1 AND t.effective_from <= ?2
+          WHERE t.account_id = ?1 AND t.form = '1065' AND t.effective_from <= ?2
             AND t.effective_from = (
                 SELECT MAX(u.effective_from) FROM tax_line_mappings u
-                 WHERE u.account_id = t.account_id AND u.effective_from <= ?2)",
+                 WHERE u.account_id = t.account_id AND u.form = t.form
+                   AND u.effective_from <= ?2)",
         rusqlite::params![account_id, year],
         |_| Ok(true),
     )
@@ -971,6 +972,7 @@ pub(crate) fn build_close_books_in_txn(
                 account_id: account_id.clone(),
                 line_key: YEAR_ACCOUNT_TAX_LINE.to_string(),
                 effective_from: cmd.year,
+                form: Some(crate::tax::ReturnForm::Form1065.as_str().to_string()),
             });
         }
     }

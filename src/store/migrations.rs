@@ -219,6 +219,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             55,
             include_str!("../../migrations/055_personal_tax_profiles.sql"),
         ),
+        (
+            56,
+            include_str!("../../migrations/056_tax_line_mappings_per_return.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -768,13 +772,16 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         -- row with the greatest `effective_from` at or before it, and `0` means
         -- "as far back as these books go" — written before assignments were
         -- dated.
+        -- Per return since migration 056: `form` is '1065' or 'schedule_c', and
+        -- each return keeps its own assignments.
         CREATE TABLE IF NOT EXISTS tax_line_mappings (
             account_id TEXT NOT NULL,
+            form TEXT NOT NULL DEFAULT '1065',
             effective_from INTEGER NOT NULL DEFAULT 0,
             line_key TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at_event INTEGER REFERENCES events(id),
-            PRIMARY KEY (account_id, effective_from)
+            PRIMARY KEY (account_id, form, effective_from)
         );
 
         CREATE INDEX IF NOT EXISTS idx_tax_line_mappings_line ON tax_line_mappings(line_key);
@@ -2104,5 +2111,93 @@ mod plaid_item_rebuild {
             [],
         )
         .expect("a connection recorded on hosted books has no proxy handle");
+    }
+}
+
+#[cfg(test)]
+mod tax_line_mappings_per_return {
+    use super::*;
+
+    const MIGRATION: &str = include_str!("../../migrations/056_tax_line_mappings_per_return.sql");
+
+    fn rows(conn: &Connection) -> Vec<(String, String, i32, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT account_id, form, effective_from, line_key FROM tax_line_mappings
+                  ORDER BY account_id, form, effective_from",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .flatten()
+            .collect()
+    }
+
+    /// The shared row kept only the last return's line; the log remembers the
+    /// other one, and the migration brings it back — unless a clear came after.
+    #[test]
+    fn an_assignment_the_shared_row_lost_is_recovered_from_the_log() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TABLE tax_line_mappings;
+             CREATE TABLE tax_line_mappings (
+                 account_id TEXT NOT NULL,
+                 effective_from INTEGER NOT NULL DEFAULT 0,
+                 line_key TEXT NOT NULL,
+                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                 updated_at_event INTEGER REFERENCES events(id),
+                 PRIMARY KEY (account_id, effective_from)
+             );
+             INSERT INTO events (id, event_type, payload, hash, user_id, timestamp) VALUES
+               (1, 'tax_line_mapping_set',
+                '{\"type\":\"tax_line_mapping_set\",\"account_id\":\"6100\",\"line_key\":\"l20\",\"effective_from\":2025}', x'01', 'u', 't'),
+               (2, 'tax_line_mapping_set',
+                '{\"type\":\"tax_line_mapping_set\",\"account_id\":\"6100\",\"line_key\":\"sc18\",\"effective_from\":2025}', x'02', 'u', 't'),
+               (3, 'tax_line_mapping_set',
+                '{\"type\":\"tax_line_mapping_set\",\"account_id\":\"7000\",\"line_key\":\"l13\"}', x'03', 'u', 't'),
+               (4, 'tax_line_mapping_cleared',
+                '{\"type\":\"tax_line_mapping_cleared\",\"account_id\":\"7000\"}', x'04', 'u', 't'),
+               (5, 'tax_line_mapping_set',
+                '{\"type\":\"tax_line_mapping_set\",\"account_id\":\"7000\",\"line_key\":\"sc20b\"}', x'05', 'u', 't');
+             INSERT INTO tax_line_mappings (account_id, effective_from, line_key, updated_at_event) VALUES
+               ('6100', 2025, 'sc18', 2),
+               ('7000', 0, 'sc20b', 5),
+               ('8000', 0, 'l21', NULL);",
+        )
+        .unwrap();
+
+        conn.execute_batch(MIGRATION).unwrap();
+
+        assert_eq!(
+            rows(&conn),
+            vec![
+                ("6100".into(), "1065".into(), 2025, "l20".into()),
+                ("6100".into(), "schedule_c".into(), 2025, "sc18".into()),
+                ("7000".into(), "schedule_c".into(), 0, "sc20b".into()),
+                // A row no event accounts for (pre-027 adoption) is kept as is.
+                ("8000".into(), "1065".into(), 0, "l21".into()),
+            ],
+            "7000's 1065 line was cleared after it was set, so it stays cleared"
+        );
+    }
+
+    /// A database built by `init_schema` already has the new shape; the
+    /// migration must still run cleanly over it.
+    #[test]
+    fn the_migration_runs_over_a_fresh_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO tax_line_mappings (account_id, form, effective_from, line_key)
+             VALUES ('6100', 'schedule_c', 0, 'sc18')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATION).unwrap();
+        assert_eq!(
+            rows(&conn),
+            vec![("6100".into(), "schedule_c".into(), 0, "sc18".into())]
+        );
     }
 }

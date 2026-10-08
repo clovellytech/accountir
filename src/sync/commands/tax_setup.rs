@@ -61,6 +61,11 @@ pub struct SetTaxLineMappingRequest {
     /// A key from `tax::lines::MAPPABLE_LINES` — `l21`, `k13a`, `sl1`. The key
     /// and not the printed number, because the IRS renumbers between revisions.
     pub line_key: String,
+    /// Which return's assignments this changes — `"1065"` or `"schedule_c"`.
+    /// Absent from older clients: a set is then read by its key, a clear
+    /// clears both, which is what those clients meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,6 +79,11 @@ pub struct ClearTaxLineMappingRequest {
     #[serde(default)]
     pub effective_from: i32,
     pub account_id: String,
+    /// Which return's assignments this changes — `"1065"` or `"schedule_c"`.
+    /// Absent from older clients: a set is then read by its key, a clear
+    /// clears both, which is what those clients meant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub form: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -94,7 +104,13 @@ async fn submit_set_mapping(
     // Checked before the append rather than inside it: `validate_event` would
     // catch this too, but as a store error — a 500 for what is squarely the
     // caller's mistake. Same reasoning as `set-business-profile`.
-    if crate::tax::any_line_def(&req.line_key).is_none() {
+    // `OFF_RETURN` is not a line but is a valid assignment — "deliberately on
+    // none", the way a child is held off its mapped parent's line. Validation
+    // accepts it; refusing it here left that choice working on a local ledger
+    // and failing on group books.
+    if req.line_key != crate::tax::lines::OFF_RETURN
+        && crate::tax::any_line_def(&req.line_key).is_none()
+    {
         return Err(ApiError::bad_request(
             "line_key is not a Form 1065 or Schedule C line this version knows",
         ));
@@ -102,6 +118,7 @@ async fn submit_set_mapping(
     if req.account_id.trim().is_empty() {
         return Err(ApiError::bad_request("account_id is required"));
     }
+    check_form(req.form.as_deref(), Some(&req.line_key))?;
     append(
         st,
         req.expected_head_seq,
@@ -110,6 +127,7 @@ async fn submit_set_mapping(
             account_id: req.account_id,
             line_key: req.line_key,
             effective_from: req.effective_from,
+            form: req.form,
         },
     )
 }
@@ -122,6 +140,7 @@ async fn submit_clear_mapping(
     if req.account_id.trim().is_empty() {
         return Err(ApiError::bad_request("account_id is required"));
     }
+    check_form(req.form.as_deref(), None)?;
     append(
         st,
         req.expected_head_seq,
@@ -129,8 +148,27 @@ async fn submit_clear_mapping(
         Event::TaxLineMappingCleared {
             account_id: req.account_id,
             effective_from: req.effective_from,
+            form: req.form,
         },
     )
+}
+
+/// The request's `form`, checked before the append for the reason the line key
+/// is: a bad one is the caller's mistake, and deserves a 400 rather than the 500
+/// a validation failure inside the store would become.
+fn check_form(form: Option<&str>, line_key: Option<&str>) -> Result<(), ApiError> {
+    let Some(form) = form else { return Ok(()) };
+    let Some(parsed) = crate::tax::ReturnForm::parse(form) else {
+        return Err(ApiError::bad_request(
+            "form is not a return this version knows",
+        ));
+    };
+    match line_key.and_then(crate::tax::ReturnForm::of_key) {
+        Some(of_key) if of_key != parsed => Err(ApiError::bad_request(
+            "line_key is a line of the other return",
+        )),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -411,6 +449,76 @@ mod tests {
 
         let guard = store.lock().unwrap();
         assert!(crate::tax::lines::load_mapping(guard.connection(), 2025).is_empty());
+    }
+
+    /// Schedule C's assignments travel with their form, and leave the Form
+    /// 1065 line alone — including "held off", which is not a line but is an
+    /// answer, and was refused here while the local path accepted it.
+    #[tokio::test]
+    async fn a_replica_keeps_each_returns_assignment_apart() {
+        use crate::tax::lines::{load_mapping_for, OFF_RETURN};
+        use crate::tax::ReturnForm::{Form1065, ScheduleC};
+        let (base, store) = serve().await;
+        for (key, form) in [("l20", "1065"), (OFF_RETURN, "schedule_c")] {
+            let head = head_of(&base).await;
+            let r = post(
+                &base,
+                "set-tax-line-mapping",
+                serde_json::json!({"expected_head_seq": head, "account_id": "6100",
+                                   "line_key": key, "form": form}),
+            )
+            .await;
+            assert_eq!(r.status(), 200, "{:?}", r.text().await);
+        }
+        {
+            let guard = store.lock().unwrap();
+            let c = guard.connection();
+            assert_eq!(
+                load_mapping_for(c, Form1065, 2025)
+                    .get("6100")
+                    .map(String::as_str),
+                Some("l20")
+            );
+            assert_eq!(
+                load_mapping_for(c, ScheduleC, 2025)
+                    .get("6100")
+                    .map(String::as_str),
+                Some(OFF_RETURN)
+            );
+        }
+
+        let head = head_of(&base).await;
+        let r = post(
+            &base,
+            "clear-tax-line-mapping",
+            serde_json::json!({"expected_head_seq": head, "account_id": "6100", "form": "schedule_c"}),
+        )
+        .await;
+        assert_eq!(r.status(), 200);
+        let guard = store.lock().unwrap();
+        let c = guard.connection();
+        assert!(load_mapping_for(c, ScheduleC, 2025).is_empty());
+        assert_eq!(
+            load_mapping_for(c, Form1065, 2025)
+                .get("6100")
+                .map(String::as_str),
+            Some("l20")
+        );
+    }
+
+    /// A key of the other return, filed under this one, is the caller's mistake.
+    #[tokio::test]
+    async fn a_key_filed_under_the_wrong_return_is_a_bad_request() {
+        let (base, _) = serve().await;
+        let head = head_of(&base).await;
+        let r = post(
+            &base,
+            "set-tax-line-mapping",
+            serde_json::json!({"expected_head_seq": head, "account_id": "x",
+                               "line_key": "l20", "form": "schedule_c"}),
+        )
+        .await;
+        assert_eq!(r.status(), 400);
     }
 
     #[tokio::test]
