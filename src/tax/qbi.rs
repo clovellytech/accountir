@@ -197,6 +197,7 @@ pub fn statement(
 
     build_table(&TableStatement {
         legal_name: &profile.legal_name,
+        id_label: "EIN",
         ein: &profile.ein,
         heading: format!(
             "Schedule K-1 (Form 1065) {year} — box 20, code Z: Section 199A information"

@@ -299,7 +299,7 @@ pub fn figures(
         year,
     );
     let limits = crate::tax::lines::load_effective_limits(conn, year);
-    let mut computed = crate::tax::schedule_c::compute(&statement, &mapping, &limits);
+    let computed = crate::tax::schedule_c::compute(&statement, &mapping, &limits);
     let mut warnings = Vec::new();
 
     // --- the register against the ledger --------------------------------
@@ -479,8 +479,8 @@ pub fn build_from_ledger(
 }
 
 
-/// Put Form 4562 — and the basis statement, when an asset's basis moved — behind
-/// the Schedule C, headed with the owner's name and SSN as the 1040 is.
+/// Put Form 4562 and its depreciation schedule behind the Schedule C, headed with
+/// the owner's name and SSN as the 1040 is.
 ///
 /// Built from the same register and the same Part I the figures used, so line 22
 /// of the 4562 is line 13 of the Schedule C whenever the two are reconciled.
@@ -540,7 +540,7 @@ fn attach_form_4562(
     .map_err(store_err)?;
     bundle.warnings.extend(warnings);
 
-    let statement = form4562::basis_statement(&schedule, name, ssn.unwrap_or(""))
+    let statement = form4562::depreciation_statement(&schedule, name, "SSN", ssn.unwrap_or(""))
         .map_err(store_err)?;
     if filled.is_none() && statement.is_none() {
         return Ok(());

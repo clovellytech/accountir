@@ -1343,34 +1343,34 @@ fn money(cents: i64) -> String {
     format_dollars(cents_to_dollars(cents))
 }
 
-/// The statement behind any asset whose basis changed after it was bought.
+/// The depreciation schedule behind Form 4562: every asset on the register, with
+/// its basis, what was taken before this year and in it, and what is left.
 ///
-/// Form 4562 has a basis column only for property placed in service this year,
-/// and nowhere at all to say that an older asset's basis moved — a grant that
-/// reimbursed a fit-out, a rebate. Its depreciation still reaches line 17 on the
-/// adjusted figure, so this page shows how it got there: cost, each adjustment
-/// and why, the adjusted basis, and the depreciation on it. A year fixed by hand
-/// is named with its reason too, since it is the other way a figure on the form
-/// departs from the tables. `None` when no asset carries an adjustment in effect.
-pub fn basis_statement(
+/// # Why every asset, not only the ones the form has a row for
+///
+/// Form 4562 itemises only property placed in service this year. Everything
+/// older is one figure on line 17 — "MACRS deductions for assets placed in
+/// service in tax years beginning before" this one — with nothing on the form
+/// saying which assets it is or how much of each is left to recover. This page is
+/// that missing detail, the schedule a preparer would otherwise keep beside the
+/// return: one row per asset, so line 17 and the year's own rows can be traced
+/// to the property behind them.
+///
+/// It also carries what used to be a statement of its own: an asset whose basis
+/// moved after purchase — a grant that reimbursed a fit-out, a rebate — has a
+/// note under its row saying by how much, from when, and why, and so does a year
+/// whose depreciation was fixed by hand. `None` when the register has nothing for
+/// the year.
+pub fn depreciation_statement(
     schedule: &YearSchedule<'_>,
-    legal_name: &str,
-    ein: &str,
+    name: &str,
+    id_label: &str,
+    identifying_number: &str,
 ) -> Result<Option<Document>, FormError> {
     use super::statement::{build_table, Column, TableLine, TableStatement};
 
     let year = schedule.tax_year;
-    let rows: Vec<_> = schedule
-        .rows
-        .iter()
-        .filter(|r| {
-            r.asset
-                .basis_adjustments
-                .iter()
-                .any(|a| a.effective_year <= year)
-        })
-        .collect();
-    if rows.is_empty() {
+    if schedule.rows.is_empty() {
         return Ok(None);
     }
 
@@ -1389,25 +1389,28 @@ pub fn basis_statement(
     };
     let columns = vec![
         column("Asset", 54.0, false),
-        column("In service", 206.0, false),
-        column("Cost", 322.0, true),
-        column("Adjustments", 396.0, true),
-        column("Adjusted basis", 474.0, true),
-        column("Method", 484.0, false),
-        column("Prior years", 612.0, true),
-        column(&year.to_string(), 676.0, true),
-        column("Accumulated", 738.0, true),
+        column("In service", 210.0, false),
+        column("Basis", 336.0, true),
+        column("Method", 346.0, false),
+        column("Prior years", 520.0, true),
+        column(&year.to_string(), 590.0, true),
+        column("Accumulated", 664.0, true),
+        column("Remaining", 738.0, true),
     ];
 
     let mut lines = Vec::new();
-    for r in rows {
+    let (mut basis_total, mut prior_total, mut year_total, mut accumulated_total) = (0, 0, 0, 0);
+    for r in &schedule.rows {
         let a = r.asset;
         let this_year = r.total_cents();
+        let prior = r.accumulated_cents - this_year;
+        basis_total += r.adjusted_cost_cents;
+        prior_total += prior;
+        year_total += this_year;
+        accumulated_total += r.accumulated_cents;
         lines.push(TableLine::Cells(vec![
             a.description.chars().take(30).collect(),
             a.placed_in_service.to_string(),
-            dollars(a.cost_cents),
-            dollars(r.adjusted_cost_cents - a.cost_cents),
             dollars(r.adjusted_cost_cents),
             format!(
                 "{} {} {}",
@@ -1415,11 +1418,34 @@ pub fn basis_statement(
                 convention_label(r.convention),
                 recovery_label(a.class.recovery_years(a.system))
             ),
-            dollars(r.accumulated_cents - this_year),
+            dollars(prior),
             dollars(this_year),
             dollars(r.accumulated_cents),
+            dollars(r.adjusted_cost_cents - r.accumulated_cents),
         ]));
-        for adjustment in a.basis_adjustments.iter().filter(|b| b.effective_year <= year) {
+        // How this year's figure is made up, when it is more than the tables'
+        // MACRS: §179 and bonus are taken once, in the first year, and a reader
+        // checking the row against a percentage table needs to see them apart.
+        if r.section_179_cents != 0 || r.bonus_cents != 0 {
+            let mut parts = Vec::new();
+            if r.section_179_cents != 0 {
+                parts.push(format!("§179 {}", dollars(r.section_179_cents)));
+            }
+            if r.bonus_cents != 0 {
+                parts.push(format!("special depreciation allowance {}", dollars(r.bonus_cents)));
+            }
+            parts.push(format!("MACRS {}", dollars(r.macrs_cents)));
+            lines.push(TableLine::Note(format!("{year}: {}", parts.join(", "))));
+        }
+        let adjustments: Vec<_> = a
+            .basis_adjustments
+            .iter()
+            .filter(|b| b.effective_year <= year)
+            .collect();
+        if !adjustments.is_empty() {
+            lines.push(TableLine::Note(format!("Cost {}", dollars(a.cost_cents))));
+        }
+        for adjustment in adjustments {
             lines.push(TableLine::Note(format!(
                 "Basis {} by {} from {}: {}",
                 if adjustment.amount_cents < 0 {
@@ -1439,21 +1465,39 @@ pub fn basis_statement(
                 fixed.note
             )));
         }
+        if let Some(d) = a.disposed_on.filter(|d| d.year() == year) {
+            lines.push(TableLine::Note(format!("Disposed of {d}")));
+        }
     }
+    lines.push(TableLine::Cells(vec![
+        "Total".to_string(),
+        String::new(),
+        dollars(basis_total),
+        String::new(),
+        dollars(prior_total),
+        dollars(year_total),
+        dollars(accumulated_total),
+        dollars(basis_total - accumulated_total),
+    ]));
 
     build_table(&TableStatement {
-        legal_name,
-        ein,
-        heading: format!("Form 4562 ({year}) — basis adjustments statement"),
-        subheading: "Depreciable property whose basis changed after it was placed in service"
+        legal_name: name,
+        id_label,
+        ein: identifying_number,
+        heading: format!("Form 4562 ({year}) — depreciation schedule"),
+        subheading: "Every depreciable asset: its basis, the depreciation taken, and what remains"
             .to_string(),
         columns,
         lines,
         footnotes: vec![
-            "From the year an adjustment takes effect, depreciation is figured on the adjusted \
-             basis less the depreciation already allowed, over the rest of the recovery period. \
-             An adjustment in the year the property was placed in service is part of its basis \
-             from the start."
+            "Basis is cost plus or minus any adjustment in effect by the end of the year. The \
+             year's column includes §179 and the special depreciation allowance where taken; \
+             remaining is basis less accumulated depreciation. Land is not depreciated and is \
+             not listed."
+                .to_string(),
+            "From the year a basis adjustment takes effect, depreciation is figured on the \
+             adjusted basis less the depreciation already allowed, over the rest of the \
+             recovery period."
                 .to_string(),
         ],
     })
@@ -1532,6 +1576,100 @@ mod tests {
     fn value(f: &Filled, name: &str) -> Option<String> {
         let map = field_map(&f.document);
         get_value(&f.document, &map, name)
+    }
+
+    fn statement_text(doc: &Document) -> String {
+        doc.get_pages()
+            .keys()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The schedule lists every asset — the building bought this year and the
+    /// improvement written off whole — with its basis, the year's depreciation,
+    /// what has accumulated and what remains, and a total row.
+    #[test]
+    fn the_depreciation_schedule_lists_every_asset_and_what_remains() {
+        let mut fitout = asset(
+            "5113 N Lincoln Improvements",
+            PropertyClass::QualifiedImprovement,
+            date(2025, 12, 29),
+            1_980_600,
+        );
+        fitout.bonus = BonusElection::Take;
+        let assets = vec![
+            asset(
+                "5113 N Lincoln Ave",
+                PropertyClass::Nonresidential,
+                date(2025, 9, 12),
+                17_899_300,
+            ),
+            fitout,
+        ];
+        let s = compute_year(&assets, 2025);
+        let doc = depreciation_statement(&s, "Zak Patterson", "SSN", "123-45-6789")
+            .unwrap()
+            .expect("a schedule");
+        let text = statement_text(&doc);
+
+        for r in &s.rows {
+            assert!(text.contains(&r.asset.description), "{} missing", r.asset.description);
+            let remaining = money(r.adjusted_cost_cents - r.accumulated_cents);
+            assert!(text.contains(&remaining), "remaining {remaining} missing:\n{text}");
+        }
+        assert!(text.contains("178,993"), "the building's basis");
+        assert!(
+            text.contains("special depreciation allowance 19,806"),
+            "how the improvement's year is made up:\n{text}"
+        );
+        assert!(text.contains("Total"));
+        assert!(text.contains("depreciation schedule"));
+    }
+
+    /// An asset from an earlier year is on the schedule even though the form
+    /// has no row for it — it is the detail behind line 17.
+    #[test]
+    fn an_older_asset_is_on_the_schedule_with_its_prior_years() {
+        let assets = vec![asset(
+            "Kiln",
+            PropertyClass::SevenYear,
+            date(2023, 3, 1),
+            1_000_000,
+        )];
+        let s = compute_year(&assets, 2025);
+        let row = &s.rows[0];
+        let prior = row.accumulated_cents - row.total_cents();
+        assert!(prior > 0);
+        let text =
+            statement_text(&depreciation_statement(&s, "Studio", "EIN", "12-3456789").unwrap().unwrap());
+        assert!(text.contains("Kiln"));
+        assert!(text.contains(&money(prior)), "prior years {}:\n{text}", money(prior));
+    }
+
+    /// A basis that moved after purchase is still explained under its row.
+    #[test]
+    fn a_basis_adjustment_is_noted_under_its_asset() {
+        let mut kiln = asset("Kiln", PropertyClass::SevenYear, date(2024, 3, 1), 1_000_000);
+        kiln.basis_adjustments.push(crate::domain::BasisAdjustment {
+            adjustment_id: "a".into(),
+            effective_year: 2025,
+            amount_cents: -200_000,
+            note: "Grant reimbursed part of the cost".into(),
+        });
+        let assets = [kiln];
+        let s = compute_year(&assets, 2025);
+        let text =
+            statement_text(&depreciation_statement(&s, "Studio", "EIN", "12-3456789").unwrap().unwrap());
+        assert!(text.contains("Cost 10,000"), "{text}");
+        assert!(text.contains("Grant reimbursed part of the cost"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_register_has_no_schedule() {
+        let assets: [DepreciableAsset; 0] = [];
+        let s = compute_year(&assets, 2025);
+        assert!(depreciation_statement(&s, "Studio", "EIN", "12-3456789").unwrap().is_none());
     }
 
     #[test]

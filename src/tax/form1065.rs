@@ -1503,11 +1503,13 @@ fn build_return_inner(
         namespace_fields(&mut filled.document, F4562_NAMESPACE);
         append_document(&mut doc, filled.document)?;
     }
-    // Behind the form: any asset whose basis moved after purchase — a grant that
-    // reimbursed it, say — which none of the form's own lines has room to explain.
-    if let Some(statement) = super::form4562::basis_statement(
+    // Behind the form: the depreciation schedule, asset by asset — the detail
+    // behind line 17 that the form itself has no rows for, with any basis
+    // adjustment or hand-fixed year noted under its asset.
+    if let Some(statement) = super::form4562::depreciation_statement(
         &year_schedule,
         &req.profile.legal_name,
+        "EIN",
         &req.profile.ein,
     )? {
         append_document(&mut doc, statement)?;

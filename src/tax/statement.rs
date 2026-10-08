@@ -172,6 +172,9 @@ pub enum TableLine {
 /// basis adjustments statement, whose rows each need eight figures.
 pub struct TableStatement<'a> {
     pub legal_name: &'a str,
+    /// What the number is called: "EIN" behind a partnership's return, "SSN"
+    /// behind a sole proprietor's, whose return is identified by the owner.
+    pub id_label: &'a str,
     pub ein: &'a str,
     pub heading: String,
     pub subheading: String,
@@ -231,7 +234,7 @@ fn table_page_ops(
         BODY_SIZE,
         MARGIN,
         y,
-        &format!("{}  ·  EIN {}", req.legal_name, req.ein),
+        &format!("{}  ·  {} {}", req.legal_name, req.id_label, req.ein),
     );
     y -= LINE_H * 1.6;
 
@@ -788,6 +791,7 @@ mod tests {
         let note = format!("{} closing-word", "reimbursed build-out costs ".repeat(12));
         let doc = build_table(&TableStatement {
             legal_name: "Acme Trading LLP",
+            id_label: "EIN",
             ein: "12-3456789",
             heading: "Heading".to_string(),
             subheading: "Subheading".to_string(),
