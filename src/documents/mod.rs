@@ -113,21 +113,39 @@ pub fn check_size(size: u64) -> Result<(), BlobError> {
 }
 
 /// The identity of a set of books: the `company_id` its `CompanyCreated` event
-/// carries.
+/// carries — or, for books with none, the hash of the first event in their log.
 ///
-/// It is in the log, so every replica of the books and every restored copy agrees
-/// on it — which a file path does not survive.
+/// Either is in the log, so every replica of the books and every restored copy
+/// agrees on it — which a file path does not survive.
+///
+/// # Why there is a fallback
+///
+/// Books created on a group server begin with their accounts, not with a
+/// `CompanyCreated` event, so they have no company id at all. Without an identity
+/// they could not be linked to a person's return, nor keep documents. The first
+/// event's hash is as fixed as a company id — a replica that disagreed about it
+/// would fail verification — and is prefixed so it can never be mistaken for one.
 pub fn ledger_id(conn: &Connection) -> Option<String> {
-    conn.query_row(
-        "SELECT company_id FROM company
-          WHERE company_id IS NOT NULL AND company_id != ''
-          ORDER BY created_at_event LIMIT 1",
-        [],
-        |r| r.get(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
+    let company: Option<String> = conn
+        .query_row(
+            "SELECT company_id FROM company
+              WHERE company_id IS NOT NULL AND company_id != ''
+              ORDER BY created_at_event LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    company.or_else(|| {
+        conn.query_row("SELECT hash FROM events ORDER BY id LIMIT 1", [], |r| {
+            r.get::<_, Vec<u8>>(0)
+        })
+        .optional()
+        .ok()
+        .flatten()
+        .map(|hash| format!("log-{}", hex::encode(hash)))
+    })
 }
 
 /// The name a set of books goes by, for a link that has to say which books.
@@ -322,6 +340,40 @@ fn open_private(path: &Path) -> std::io::Result<fs::File> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Books a group server created begin with accounts, not a company, and still
+    /// have an identity every copy of them agrees on; books with a company keep
+    /// its id.
+    #[test]
+    fn books_without_a_company_are_known_by_their_first_event() {
+        use crate::store::migrations::SchemaStore;
+        let mut store = crate::store::event_store::EventStore::in_memory().unwrap();
+        SchemaStore::init_schema(&mut store).unwrap();
+        assert_eq!(super::ledger_id(store.connection()), None, "no events, no identity");
+        crate::commands::account_commands::AccountCommands::new(&mut store, "u".to_string())
+            .create_account(crate::commands::account_commands::CreateAccountCommand {
+                account_type: crate::domain::AccountType::Asset,
+                account_number: "1000".to_string(),
+                name: "Cash".to_string(),
+                parent_id: None,
+                currency: None,
+                description: None,
+            })
+            .unwrap();
+        let id = super::ledger_id(store.connection()).unwrap();
+        assert!(id.starts_with("log-"), "{id}");
+        assert_eq!(super::ledger_id(store.connection()).unwrap(), id, "stable");
+
+        store
+            .connection()
+            .execute(
+                "INSERT INTO company (id, company_id, name, base_currency, fiscal_year_start_month)
+                 VALUES ('c', 'company-1', 'Co', 'USD', 1)",
+                [],
+            )
+            .unwrap();
+        assert_eq!(super::ledger_id(store.connection()).as_deref(), Some("company-1"));
+    }
     use super::*;
 
     fn store() -> (LocalBlobStore, tempfile::TempDir) {

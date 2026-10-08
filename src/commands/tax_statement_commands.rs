@@ -262,8 +262,18 @@ pub fn link_k1_source(
     partner_id: &str,
 ) -> Result<K1Link, StatementError> {
     let link = k1_link_for(store.connection(), source, partner_id)?;
-    append(store, user_id, k1_link_event(&link))?;
+    record_k1_link(store, user_id, &link)?;
     Ok(link)
+}
+
+/// Record a link [`k1_link_for`] worked out — for a caller that resolved it
+/// against the partnership's books itself.
+pub fn record_k1_link(
+    store: &mut EventStore,
+    user_id: &str,
+    link: &K1Link,
+) -> Result<StoredEvent, StatementError> {
+    append(store, user_id, k1_link_event(link))
 }
 
 /// The link [`link_k1_source`] would record, checked against both sets of books
@@ -304,6 +314,41 @@ pub fn k1_link_for(
         partner_id: partner.partner_id,
         partner_name: partner.name,
     })
+}
+
+/// Open another set of books to read a K-1 or a Schedule C out of, without
+/// writing to them.
+///
+/// Read-only, because they are somebody's books — possibly open in another
+/// window, possibly a replica of a group's — and reading a figure out of them is
+/// no reason to touch them. That also means they cannot be brought up to date
+/// here, so books last opened by an older version are refused with the remedy
+/// rather than read through a schema the computation does not expect.
+pub fn open_source_books(path: &std::path::Path) -> Result<Connection, StatementError> {
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| StatementError::Store(format!("{}: {e}", path.display())))?;
+    let has_table = |name: &str| -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    };
+    let has_form_column = conn
+        .prepare("SELECT form FROM tax_line_mappings LIMIT 0")
+        .is_ok();
+    if !(has_table("schedule_c_inputs") && has_table("k1_links") && has_form_column) {
+        return Err(StatementError::Invalid(format!(
+            "{} was last opened by an older version of accountir. Open those books once in \
+             this version to bring them up to date, then try again.",
+            path.display()
+        )));
+    }
+    Ok(conn)
 }
 
 /// The event that records `link`.
@@ -532,8 +577,17 @@ pub fn link_schedule_c_source(
     source: &Connection,
 ) -> Result<ScheduleCLink, StatementError> {
     let link = schedule_c_link_for(store.connection(), source)?;
-    append(store, user_id, schedule_c_link_event(&link))?;
+    record_schedule_c_link(store, user_id, &link)?;
     Ok(link)
+}
+
+/// Record a link [`schedule_c_link_for`] worked out.
+pub fn record_schedule_c_link(
+    store: &mut EventStore,
+    user_id: &str,
+    link: &ScheduleCLink,
+) -> Result<StoredEvent, StatementError> {
+    append(store, user_id, schedule_c_link_event(link))
 }
 
 /// The link [`link_schedule_c_source`] would record, checked but not recorded.
@@ -721,6 +775,12 @@ pub fn schedule_c_freshness(
 // ---------------------------------------------------------------------------
 // Conversions between the log's shapes, the projection's and the domain's
 // ---------------------------------------------------------------------------
+
+/// A statement as the log records it — what a client submits to the group server
+/// when the books it is recorded in are hosted.
+pub fn statement_data(s: &TaxStatement) -> TaxStatementData {
+    to_data(s)
+}
 
 fn to_data(s: &TaxStatement) -> TaxStatementData {
     TaxStatementData {

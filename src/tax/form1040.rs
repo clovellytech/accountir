@@ -956,6 +956,14 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
                 .to_string(),
         );
     }
+    if agi < 0 {
+        warnings.push(format!(
+            "Adjusted gross income is a loss of {}. A business loss beyond the year's other \
+             income may be a net operating loss to carry forward (Form 172), and a large one is \
+             limited as an excess business loss (Form 461). Neither is computed here.",
+            dollars(-agi)
+        ));
+    }
     warnings.extend(nonemployee_compensation_warning(&statements));
     warnings.extend(missing_pulls(conn, year, &statements));
     let medicare_wages = boxes(&statements, &[W2], "5");
