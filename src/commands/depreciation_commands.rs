@@ -1021,6 +1021,8 @@ mod tests {
         let map = field_map(&doc);
         let read = |leaf: &str| get_value(&doc, &map, &format!("{NS}.Page1[0].{leaf}"));
         assert_eq!(read(B.name).as_deref(), Some("Zak Patterson"));
+        // Line C's name, which ties this 4562 to this Schedule C.
+        assert_eq!(read(B.activity).as_deref(), Some("Bugbear Investments LLC"));
         assert_eq!(read(B.ein).as_deref(), Some("123-45-6789"));
         // $50,000 of wages less the $857 of ordinary depreciation: line 11 is
         // figured before §179, not before every deduction.
