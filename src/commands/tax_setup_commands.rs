@@ -55,6 +55,23 @@ pub fn set_account_line(
     line_key: &str,
     effective_from: i32,
 ) -> Result<StoredEvent, TaxSetupError> {
+    let form = crate::tax::ReturnForm::of_mapping(None, line_key);
+    set_account_line_for(store, user_id, account_id, line_key, effective_from, form)
+}
+
+/// [`set_account_line`] for one return's assignments.
+///
+/// Each return keeps its own, so pointing an account at a Schedule C line
+/// leaves whatever Form 1065 line it had untouched, ready for the day the books
+/// file a partnership return again. A key of the other return is refused.
+pub fn set_account_line_for(
+    store: &mut EventStore,
+    user_id: &str,
+    account_id: &str,
+    line_key: &str,
+    effective_from: i32,
+    form: crate::tax::ReturnForm,
+) -> Result<StoredEvent, TaxSetupError> {
     if line_key != crate::tax::lines::OFF_RETURN
         && crate::commands::retirement_commands::is_value_change_account(
             store.connection(),
@@ -75,6 +92,7 @@ pub fn set_account_line(
             account_id: account_id.to_string(),
             line_key: line_key.to_string(),
             effective_from,
+            form: Some(form.as_str().to_string()),
         },
     )
 }
@@ -183,12 +201,31 @@ pub fn clear_account_line(
     account_id: &str,
     effective_from: i32,
 ) -> Result<StoredEvent, TaxSetupError> {
+    clear_account_line_for(
+        store,
+        user_id,
+        account_id,
+        effective_from,
+        crate::tax::ReturnForm::Form1065,
+    )
+}
+
+/// [`clear_account_line`] for one return's assignments; the other return's are
+/// left alone.
+pub fn clear_account_line_for(
+    store: &mut EventStore,
+    user_id: &str,
+    account_id: &str,
+    effective_from: i32,
+    form: crate::tax::ReturnForm,
+) -> Result<StoredEvent, TaxSetupError> {
     append(
         store,
         user_id,
         Event::TaxLineMappingCleared {
             account_id: account_id.to_string(),
             effective_from,
+            form: Some(form.as_str().to_string()),
         },
     )
 }
@@ -421,6 +458,107 @@ mod tests {
         s
     }
 
+    /// The reported problem: mapping an account for Schedule C overwrote its
+    /// Form 1065 line, so a business that switched what it filed lost the
+    /// partnership mapping it had built.
+    #[test]
+    fn each_return_keeps_its_own_assignment() {
+        use crate::tax::lines::load_mapping_for;
+        use crate::tax::ReturnForm::{Form1065, ScheduleC};
+        let mut s = store();
+        set_account_line_for(&mut s, "u1", "6100", "l20", YEAR, Form1065).unwrap();
+        set_account_line_for(&mut s, "u1", "6100", "sc18", YEAR, ScheduleC).unwrap();
+
+        let f1065 = load_mapping_for(s.connection(), Form1065, YEAR);
+        let sc = load_mapping_for(s.connection(), ScheduleC, YEAR);
+        assert_eq!(f1065.get("6100").map(String::as_str), Some("l20"));
+        assert_eq!(sc.get("6100").map(String::as_str), Some("sc18"));
+
+        // Taking it off Schedule C leaves the 1065 line where it was.
+        clear_account_line_for(&mut s, "u1", "6100", YEAR, ScheduleC).unwrap();
+        assert!(load_mapping_for(s.connection(), ScheduleC, YEAR).is_empty());
+        assert_eq!(
+            load_mapping_for(s.connection(), Form1065, YEAR)
+                .get("6100")
+                .map(String::as_str),
+            Some("l20")
+        );
+    }
+
+    /// A key filed under the other return would be an account that silently
+    /// reaches no line, so it is refused at the command.
+    #[test]
+    fn a_key_of_the_other_return_is_refused() {
+        use crate::tax::ReturnForm::{Form1065, ScheduleC};
+        let mut s = store();
+        assert!(set_account_line_for(&mut s, "u1", "6100", "l20", YEAR, ScheduleC).is_err());
+        assert!(set_account_line_for(&mut s, "u1", "6100", "sc18", YEAR, Form1065).is_err());
+        // Off the return is not a line of either, and may be said of both.
+        set_account_line_for(
+            &mut s,
+            "u1",
+            "6100",
+            crate::tax::lines::OFF_RETURN,
+            YEAR,
+            ScheduleC,
+        )
+        .unwrap();
+    }
+
+    /// A clear from before the split names no form: it cleared the one row
+    /// both returns shared, so on replay it clears both.
+    #[test]
+    fn a_clear_without_a_form_clears_both_returns() {
+        use crate::tax::lines::load_mapping_for;
+        use crate::tax::ReturnForm::{Form1065, ScheduleC};
+        let mut s = store();
+        set_account_line_for(&mut s, "u1", "6100", "l20", YEAR, Form1065).unwrap();
+        set_account_line_for(&mut s, "u1", "6100", "sc18", YEAR, ScheduleC).unwrap();
+        append(
+            &mut s,
+            "u1",
+            Event::TaxLineMappingCleared {
+                account_id: "6100".into(),
+                effective_from: YEAR,
+                form: None,
+            },
+        )
+        .unwrap();
+        assert!(load_mapping_for(s.connection(), Form1065, YEAR).is_empty());
+        assert!(load_mapping_for(s.connection(), ScheduleC, YEAR).is_empty());
+    }
+
+    /// Schedule C's tree is walked on Schedule C's assignments alone. While the
+    /// two shared a row, a child still carrying a 1065 line was the nearest
+    /// answer and kept the parent's Schedule C line from reaching it.
+    #[test]
+    fn a_parents_schedule_c_line_reaches_children_whatever_their_1065_lines() {
+        use crate::tax::lines::{load_effective_mapping_for, load_mapping_for};
+        use crate::tax::ReturnForm::{Form1065, ScheduleC};
+        let mut s = store();
+        s.connection()
+            .execute_batch(
+                "INSERT INTO accounts (id, account_type, account_number, name, parent_id) VALUES
+                   ('6000', 'expense', '6000', 'Software', NULL),
+                   ('6010', 'expense', '6010', 'Canva', '6000'),
+                   ('6020', 'expense', '6020', 'Flodesk', '6000');",
+            )
+            .unwrap();
+        set_account_line_for(&mut s, "u1", "6010", "l20", YEAR, Form1065).unwrap();
+        set_account_line_for(&mut s, "u1", "6000", "sc18", YEAR, ScheduleC).unwrap();
+
+        let sc = load_effective_mapping_for(s.connection(), ScheduleC, YEAR);
+        for child in ["6000", "6010", "6020"] {
+            assert_eq!(sc.get(child).map(String::as_str), Some("sc18"), "{child}");
+        }
+        // And the editor's view is still only what was said.
+        assert_eq!(load_mapping_for(s.connection(), ScheduleC, YEAR).len(), 1);
+        // The 1065 side is untouched.
+        let f1065 = load_effective_mapping_for(s.connection(), Form1065, YEAR);
+        assert_eq!(f1065.get("6010").map(String::as_str), Some("l20"));
+        assert_eq!(f1065.get("6020"), None);
+    }
+
     /// Grouping applies from its year forward, and stopping it later leaves the
     /// earlier years grouped.
     #[test]
@@ -445,7 +583,8 @@ mod tests {
         set_illinois_tax_addback(&mut s, "u1", "6000", true, 2023).unwrap();
         set_illinois_tax_addback(&mut s, "u1", "6000", false, 2025).unwrap();
 
-        let on = |y| crate::tax::lines::load_illinois_tax_addbacks(s.connection(), y).contains("6000");
+        let on =
+            |y| crate::tax::lines::load_illinois_tax_addbacks(s.connection(), y).contains("6000");
         assert!(!on(2022), "before it was set");
         assert!(on(2023));
         assert!(on(2024), "a year with no row of its own inherits 2023's");

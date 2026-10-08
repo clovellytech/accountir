@@ -1683,12 +1683,26 @@ impl SyncClient {
         line_key: &str,
         effective_from: i32,
     ) -> Result<i64, SyncClientError> {
+        let form = crate::tax::ReturnForm::of_mapping(None, line_key);
+        self.set_tax_line_mapping_for(account_id, line_key, effective_from, form)
+            .await
+    }
+
+    /// [`Self::set_tax_line_mapping`] for one return's assignments.
+    pub async fn set_tax_line_mapping_for(
+        &mut self,
+        account_id: &str,
+        line_key: &str,
+        effective_from: i32,
+        form: crate::tax::ReturnForm,
+    ) -> Result<i64, SyncClientError> {
         self.submit_retrying("/sync/commands/set-tax-line-mapping", |head| {
             crate::sync::commands::tax_setup::SetTaxLineMappingRequest {
                 expected_head_seq: head,
                 effective_from,
                 account_id: account_id.to_string(),
                 line_key: line_key.to_string(),
+                form: Some(form.as_str().to_string()),
             }
         })
         .await
@@ -1834,11 +1848,27 @@ impl SyncClient {
         account_id: &str,
         effective_from: i32,
     ) -> Result<i64, SyncClientError> {
+        self.clear_tax_line_mapping_for(
+            account_id,
+            effective_from,
+            crate::tax::ReturnForm::Form1065,
+        )
+        .await
+    }
+
+    /// [`Self::clear_tax_line_mapping`] for one return's assignments.
+    pub async fn clear_tax_line_mapping_for(
+        &mut self,
+        account_id: &str,
+        effective_from: i32,
+        form: crate::tax::ReturnForm,
+    ) -> Result<i64, SyncClientError> {
         self.submit_retrying("/sync/commands/clear-tax-line-mapping", |head| {
             crate::sync::commands::tax_setup::ClearTaxLineMappingRequest {
                 expected_head_seq: head,
                 effective_from,
                 account_id: account_id.to_string(),
+                form: Some(form.as_str().to_string()),
             }
         })
         .await

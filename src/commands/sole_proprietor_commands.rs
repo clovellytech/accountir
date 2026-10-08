@@ -58,11 +58,11 @@ pub fn business_type(conn: &Connection) -> BusinessType {
 
 /// Say which return these books file.
 ///
-/// Does **not** touch the existing account-to-line mappings, deliberately. They
-/// are still there, still pointing at the other form's lines, and
-/// [`stale_mappings`] is what reports them — because throwing away somebody's
-/// mapping work on a click is not recoverable, and a mapping that is visibly
-/// wrong is easier to live with than one that silently vanished.
+/// Does **not** touch the account-to-line mappings. Each return keeps its own
+/// (see [`crate::tax::ReturnForm`]), so switching changes which set the books
+/// are read through and leaves both as they were — the Form 1065 assignments
+/// are still there, intact, on the day the books file a partnership return
+/// again.
 pub fn set_business_type(
     store: &mut EventStore,
     user_id: &str,
@@ -75,44 +75,6 @@ pub fn set_business_type(
             business_type: business_type.as_str().to_string(),
         },
     )
-}
-
-/// Account mappings that point at the other return's lines.
-///
-/// Switching what a set of books files leaves every mapping aimed at a form this
-/// book no longer produces. Those accounts then reach no line, which
-/// `lines::sum_by_line` reports as money missing from the return — correct, but
-/// after the fact and one warning for all of them. This says it up front, per
-/// account, at the point somebody can fix it.
-pub fn stale_mappings(conn: &Connection) -> Vec<(String, String, &'static str)> {
-    let want = match business_type(conn) {
-        BusinessType::Partnership => "Form 1065",
-        BusinessType::SoleProprietorship => "Schedule C",
-    };
-    let mut out = Vec::new();
-    let Ok(mut stmt) = conn.prepare(
-        "SELECT m.account_id, COALESCE(a.name, m.account_id), m.line_key
-           FROM tax_line_mappings m
-           LEFT JOIN accounts a ON a.id = m.account_id
-          ORDER BY a.account_number",
-    ) else {
-        return out;
-    };
-    if let Ok(rows) = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    }) {
-        for (account_id, name, key) in rows.flatten() {
-            match crate::tax::line_key_form(&key) {
-                Some(form) if form != want => out.push((account_id, name, form)),
-                _ => {}
-            }
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -308,7 +270,13 @@ pub fn build_from_ledger(
         .income_statement(start, end)
         .map_err(|e| SoleProprietorError::Store(format!("income statement: {e}")))?;
 
-    let mapping = crate::tax::lines::load_effective_mapping(conn, year);
+    // Schedule C's own assignments, inherited down the account tree: a parent
+    // mapped to a line carries every child that does not say otherwise.
+    let mapping = crate::tax::lines::load_effective_mapping_for(
+        conn,
+        crate::tax::ReturnForm::ScheduleC,
+        year,
+    );
     let limits = crate::tax::lines::load_effective_limits(conn, year);
     let computed = crate::tax::schedule_c::compute(&statement, &mapping, &limits);
     let proprietor = get_proprietor(conn);
@@ -325,23 +293,6 @@ pub fn build_from_ledger(
     };
     let mut bundle = crate::tax::schedule_c::build(&req, &computed)
         .map_err(|e| SoleProprietorError::Store(e.to_string()))?;
-
-    // Mappings aimed at the other form, reported per account. `sum_by_line`
-    // already says money is missing; this says which form it went looking on,
-    // which is the part that tells somebody what to do about it.
-    let stale = stale_mappings(conn);
-    if !stale.is_empty() {
-        let named: Vec<String> = stale
-            .iter()
-            .map(|(_, name, form)| format!("{name} ({form})"))
-            .collect();
-        bundle.warnings.push(format!(
-            "{} account(s) are still mapped to lines of a form these books no longer file, so \
-             none of their balances reach this return: {}. Remap them to Schedule C lines.",
-            stale.len(),
-            named.join(", ")
-        ));
-    }
 
     // A year that has not been answered at all is worth saying once, rather than
     // producing a form whose questions are silently all blank.

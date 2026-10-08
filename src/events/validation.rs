@@ -790,9 +790,11 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::TaxLineMappingSet {
             account_id,
             line_key,
+            form,
             ..
         } => {
             validate_non_empty(account_id, "account_id")?;
+            validate_mapping_form(form.as_deref(), Some(line_key))?;
             // Checked against the catalogue, not merely for emptiness: a key
             // nothing recognises is an account whose balance silently reaches no
             // line on the return, which is the failure `tax::lines` exists to
@@ -819,8 +821,11 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                 )));
             }
         }
-        Event::TaxLineMappingCleared { account_id, .. } => {
+        Event::TaxLineMappingCleared {
+            account_id, form, ..
+        } => {
             validate_non_empty(account_id, "account_id")?;
+            validate_mapping_form(form.as_deref(), None)?;
         }
         Event::TaxDeductionLimitSet {
             account_id,
@@ -1320,6 +1325,37 @@ fn validate_non_empty(value: &str, field_name: &str) -> Result<(), ValidationErr
     } else {
         Ok(())
     }
+}
+
+/// A mapping event's `form`, when it names one, has to be a return this
+/// version knows — and a line key has to be a line of that return.
+///
+/// The second half is what keeps the two sets of assignments apart: a
+/// Schedule C key filed under Form 1065 would sit in the 1065 set as a key no
+/// 1065 line recognises, and its account would quietly reach no line.
+/// [`crate::tax::lines::OFF_RETURN`] belongs to no catalogue and may be either.
+fn validate_mapping_form(
+    form: Option<&str>,
+    line_key: Option<&str>,
+) -> Result<(), ValidationError> {
+    let Some(form) = form else { return Ok(()) };
+    let Some(parsed) = crate::tax::ReturnForm::parse(form) else {
+        return Err(ValidationError::InvalidValue(format!(
+            "no return is called {form:?}"
+        )));
+    };
+    if let Some(key) = line_key {
+        if let Some(of_key) = crate::tax::ReturnForm::of_key(key) {
+            if of_key != parsed {
+                return Err(ValidationError::InvalidValue(format!(
+                    "{key:?} is a {} line, not a {} one",
+                    of_key.label(),
+                    parsed.label()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_currency_code(code: &str) -> Result<(), ValidationError> {

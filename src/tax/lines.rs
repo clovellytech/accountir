@@ -33,6 +33,7 @@
 //! arithmetic on the printed page come out exactly: see
 //! [`tests::the_totals_on_the_page_are_the_arithmetic_of_the_lines_on_the_page`].
 
+use super::ReturnForm;
 use crate::queries::reports::IncomeStatement;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1243,7 +1244,21 @@ pub fn split_deductible(balance: i64, pct: u8) -> (i64, i64) {
 /// actually made. This is what a *return* wants: the line every account ends up
 /// on once those choices are inherited.
 pub fn load_effective_mapping(conn: &Connection, year: i32) -> BTreeMap<String, String> {
-    let mut mapping = inherit_through_tree(&load_mapping(conn, year), &load_parents(conn));
+    load_effective_mapping_for(conn, ReturnForm::Form1065, year)
+}
+
+/// [`load_effective_mapping`] for one return's assignments.
+///
+/// Each return is inherited through the tree on its own: a child carrying a
+/// Form 1065 line must not stop a parent's Schedule C line reaching it, which it
+/// did while both returns shared one row per account.
+pub fn load_effective_mapping_for(
+    conn: &Connection,
+    form: ReturnForm,
+    year: i32,
+) -> BTreeMap<String, String> {
+    let mut mapping =
+        inherit_through_tree(&load_mapping_for(conn, form, year), &load_parents(conn));
     // The non-taxable fence, applied here and not left to the mapping table
     // (INVESTMENTS-SPEC.md §8, phase 2).
     //
@@ -1271,9 +1286,24 @@ pub fn load_effective_mapping(conn: &Connection, year: i32) -> BTreeMap<String, 
     mapping
 }
 
-/// Every saved mapping as account id → line key, exactly as stored.
+/// Every saved Form 1065 mapping as account id → line key, exactly as stored.
 pub fn load_mapping(conn: &Connection, year: i32) -> BTreeMap<String, String> {
-    load_dated(conn, "tax_line_mappings", "line_key", year)
+    load_mapping_for(conn, ReturnForm::Form1065, year)
+}
+
+/// One return's saved mappings as account id → line key, exactly as stored.
+pub fn load_mapping_for(
+    conn: &Connection,
+    form: ReturnForm,
+    year: i32,
+) -> BTreeMap<String, String> {
+    load_dated_where(
+        conn,
+        "tax_line_mappings",
+        "line_key",
+        year,
+        Some(("form", form.as_str())),
+    )
 }
 
 /// The rows of a dated assignment table that are in force for a tax year.
@@ -1293,25 +1323,48 @@ fn load_dated(
     value_column: &str,
     year: i32,
 ) -> BTreeMap<String, String> {
+    load_dated_where(conn, table, value_column, year, None)
+}
+
+/// [`load_dated`], narrowed to the rows whose `column` holds `value` — the
+/// resolution by year happening within that slice, so one return's assignment
+/// for 2026 never hides another return's from 2024.
+fn load_dated_where(
+    conn: &Connection,
+    table: &str,
+    value_column: &str,
+    year: i32,
+    filter: Option<(&str, &str)>,
+) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
+    let (outer, inner) = match filter {
+        Some((column, _)) => (
+            format!("AND t.{column} = ?2"),
+            format!("AND u.{column} = t.{column}"),
+        ),
+        None => (String::new(), String::new()),
+    };
     // `CAST(... AS TEXT)` because one of the two value columns is an INTEGER,
     // and reading an integer as a string makes `query_map` yield an error per
     // row — which `flatten` then drops, so every deduction limit silently
     // vanished rather than failing loudly.
     let sql = format!(
         "SELECT account_id, CAST({value_column} AS TEXT) FROM {table} t
-          WHERE effective_from <= ?1
+          WHERE effective_from <= ?1 {outer}
             AND effective_from = (
                 SELECT MAX(effective_from) FROM {table} u
-                 WHERE u.account_id = t.account_id AND u.effective_from <= ?1
+                 WHERE u.account_id = t.account_id AND u.effective_from <= ?1 {inner}
             )"
     );
     let Ok(mut stmt) = conn.prepare(&sql) else {
         return out;
     };
-    let Ok(rows) = stmt.query_map([year], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-    }) else {
+    let read = |r: &rusqlite::Row<'_>| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?));
+    let rows = match filter {
+        Some((_, value)) => stmt.query_map(rusqlite::params![year, value], read),
+        None => stmt.query_map(rusqlite::params![year], read),
+    };
+    let Ok(rows) = rows else {
         return out;
     };
     for (account_id, value) in rows.flatten() {
@@ -1340,7 +1393,17 @@ pub enum Provenance {
 
 /// Where an account's assignment for a year came from.
 pub fn provenance(conn: &Connection, account_id: &str, year: i32) -> Provenance {
-    let years = assignment_years(conn, account_id);
+    provenance_for(conn, ReturnForm::Form1065, account_id, year)
+}
+
+/// [`provenance`] for one return's assignments.
+pub fn provenance_for(
+    conn: &Connection,
+    form: ReturnForm,
+    account_id: &str,
+    year: i32,
+) -> Provenance {
+    let years = assignment_years_for(conn, form, account_id);
     match years.iter().filter(|y| **y <= year).max() {
         None => Provenance::None,
         Some(&y) if y == year => Provenance::SetHere,
@@ -1354,12 +1417,17 @@ pub fn provenance(conn: &Connection, account_id: &str, year: i32) -> Provenance 
 /// What the desktop needs to say "set here" rather than "inherited from 2024",
 /// and what a reviewer needs to see that a filed year has not been disturbed.
 pub fn assignment_years(conn: &Connection, account_id: &str) -> Vec<i32> {
+    assignment_years_for(conn, ReturnForm::Form1065, account_id)
+}
+
+/// [`assignment_years`] for one return's assignments.
+pub fn assignment_years_for(conn: &Connection, form: ReturnForm, account_id: &str) -> Vec<i32> {
     let mut out = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT effective_from FROM tax_line_mappings
-          WHERE account_id = ?1 ORDER BY effective_from",
+          WHERE account_id = ?1 AND form = ?2 ORDER BY effective_from",
     ) {
-        if let Ok(rows) = stmt.query_map([account_id], |r| r.get::<_, i32>(0)) {
+        if let Ok(rows) = stmt.query_map([account_id, form.as_str()], |r| r.get::<_, i32>(0)) {
             out.extend(rows.flatten());
         }
     }
@@ -1396,9 +1464,9 @@ pub fn set_account_line(
         return Err(MappingError::UnknownLine(line_key.to_string()));
     }
     conn.execute(
-        "INSERT INTO tax_line_mappings (account_id, effective_from, line_key, updated_at)
-         VALUES (?1, ?2, ?3, datetime('now'))
-         ON CONFLICT(account_id, effective_from)
+        "INSERT INTO tax_line_mappings (account_id, form, effective_from, line_key, updated_at)
+         VALUES (?1, '1065', ?2, ?3, datetime('now'))
+         ON CONFLICT(account_id, form, effective_from)
            DO UPDATE SET line_key = ?3, updated_at = datetime('now')",
         rusqlite::params![account_id, effective_from, line_key],
     )?;
@@ -1414,7 +1482,8 @@ pub fn clear_account_line(
     effective_from: i32,
 ) -> Result<(), MappingError> {
     conn.execute(
-        "DELETE FROM tax_line_mappings WHERE account_id = ?1 AND effective_from = ?2",
+        "DELETE FROM tax_line_mappings
+          WHERE account_id = ?1 AND form = '1065' AND effective_from = ?2",
         rusqlite::params![account_id, effective_from],
     )?;
     Ok(())

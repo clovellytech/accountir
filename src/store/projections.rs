@@ -50,14 +50,24 @@ impl<'a> Projector<'a> {
                 account_id,
                 line_key,
                 effective_from,
+                form,
             } => {
+                // Each return keeps its own row, so a Schedule C assignment
+                // leaves the account's Form 1065 line where it was.
+                let form = crate::tax::ReturnForm::of_mapping(form.as_deref(), line_key);
                 self.conn.execute(
                     "INSERT INTO tax_line_mappings
-                       (account_id, effective_from, line_key, updated_at, updated_at_event)
-                     VALUES (?1, ?2, ?3, datetime('now'), ?4)
-                     ON CONFLICT(account_id, effective_from) DO UPDATE SET
-                       line_key = ?3, updated_at = datetime('now'), updated_at_event = ?4",
-                    params![account_id, effective_from, line_key, stored_event.id],
+                       (account_id, form, effective_from, line_key, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5)
+                     ON CONFLICT(account_id, form, effective_from) DO UPDATE SET
+                       line_key = ?4, updated_at = datetime('now'), updated_at_event = ?5",
+                    params![
+                        account_id,
+                        form.as_str(),
+                        effective_from,
+                        line_key,
+                        stored_event.id
+                    ],
                 )?;
             }
             Event::PartnerSharesChanged {
@@ -267,20 +277,30 @@ impl<'a> Projector<'a> {
                      VALUES (?1, ?2, ?3, datetime('now'), ?4)
                      ON CONFLICT(account_id, effective_from) DO UPDATE SET
                        added_back = ?3, updated_at = datetime('now'), updated_at_event = ?4",
-                    params![account_id, effective_from, *added_back as i64, stored_event.id],
+                    params![
+                        account_id,
+                        effective_from,
+                        *added_back as i64,
+                        stored_event.id
+                    ],
                 )?;
             }
             Event::TaxLineMappingCleared {
                 account_id,
                 effective_from,
+                form,
             } => {
                 // That year's row only — see `TaxDeductionLimitCleared`. The
                 // account then falls back to the most recent earlier year, and
                 // to its parent's assignment if there is none.
+                //
+                // No form means an event from when one row served both returns,
+                // and it cleared that row — so it clears both.
                 self.conn.execute(
                     "DELETE FROM tax_line_mappings
-                      WHERE account_id = ?1 AND effective_from = ?2",
-                    params![account_id, effective_from],
+                      WHERE account_id = ?1 AND effective_from = ?2
+                        AND (?3 IS NULL OR form = ?3)",
+                    params![account_id, effective_from, form],
                 )?;
             }
             Event::ScheduleBAnswerSet {

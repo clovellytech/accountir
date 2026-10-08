@@ -723,7 +723,7 @@ fn deletion_blockers(
     for (sql, what) in [
         (
             "SELECT COUNT(*) FROM tax_line_mappings WHERE account_id = ?1",
-            "a Form 1065 line assignment",
+            "a tax line assignment",
         ),
         (
             "SELECT COUNT(*) FROM tax_deduction_limits WHERE account_id = ?1",
@@ -1445,7 +1445,7 @@ mod tests {
             .unwrap()
             .expect("a mapped account must be refused")
             .to_string();
-        assert!(refusal.contains("Form 1065 line assignment"), "{refusal}");
+        assert!(refusal.contains("tax line assignment"), "{refusal}");
     }
 
     #[test]

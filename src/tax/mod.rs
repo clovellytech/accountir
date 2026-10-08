@@ -42,11 +42,9 @@ pub use schedule_m::ScheduleM;
 
 /// The definition of a line key on **either** return.
 ///
-/// One `tax_line_mappings` table serves both forms, because one set of books
-/// files one return and an account maps to one line. Every gate that asks "is
-/// this a real line key" therefore has to ask both catalogues — a gate that knew
-/// only Form 1065 would refuse every Schedule C mapping, and one that knew only
-/// Schedule C would refuse every partnership's.
+/// Every gate that asks "is this a real line key" has to ask both catalogues —
+/// a gate that knew only Form 1065 would refuse every Schedule C mapping, and one
+/// that knew only Schedule C would refuse every partnership's.
 ///
 /// The two vocabularies do not overlap: Schedule C's keys are prefixed `sc` and
 /// [`schedule_c::tests`] holds them to it. So the order of the lookup cannot
@@ -57,12 +55,83 @@ pub fn any_line_def(key: &str) -> Option<&'static TaxLineDef> {
 
 /// Which return a line key belongs to, for a message that has to say.
 pub fn line_key_form(key: &str) -> Option<&'static str> {
-    if lines::line_def(key).is_some() {
-        Some("Form 1065")
-    } else if schedule_c::line_def(key).is_some() {
-        Some("Schedule C")
-    } else {
-        None
+    ReturnForm::of_key(key).map(ReturnForm::label)
+}
+
+/// Which return an account-to-line assignment is for.
+///
+/// # Why each return keeps its own assignments
+///
+/// `tax_line_mappings` once held one row per account and year, shared by both
+/// returns, so mapping an account on the Schedule C page overwrote its Form 1065
+/// line. A business that switched to filing Schedule C and back — or that was
+/// set to the wrong type for a week — lost the partnership mapping it had built,
+/// and worse, a 1065 key left on a child account silently overrode a parent's
+/// Schedule C line, because the nearest answer in the tree was a line of the
+/// other form. The returns now keep separate assignments: switching what the
+/// books file changes which set is read, never what either set says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ReturnForm {
+    Form1065,
+    ScheduleC,
+}
+
+impl ReturnForm {
+    /// What `tax_line_mappings.form` and the events' `form` field hold.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReturnForm::Form1065 => "1065",
+            ReturnForm::ScheduleC => "schedule_c",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ReturnForm> {
+        match s {
+            "1065" => Some(ReturnForm::Form1065),
+            "schedule_c" => Some(ReturnForm::ScheduleC),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReturnForm::Form1065 => "Form 1065",
+            ReturnForm::ScheduleC => "Schedule C",
+        }
+    }
+
+    /// The return a line key is a line of, or `None` for
+    /// [`lines::OFF_RETURN`] and for keys neither catalogue knows.
+    pub fn of_key(key: &str) -> Option<ReturnForm> {
+        if lines::line_def(key).is_some() {
+            Some(ReturnForm::Form1065)
+        } else if schedule_c::line_def(key).is_some() {
+            Some(ReturnForm::ScheduleC)
+        } else {
+            None
+        }
+    }
+
+    /// The return these books file.
+    pub fn filed_by(business_type: crate::domain::BusinessType) -> ReturnForm {
+        match business_type {
+            crate::domain::BusinessType::Partnership => ReturnForm::Form1065,
+            crate::domain::BusinessType::SoleProprietorship => ReturnForm::ScheduleC,
+        }
+    }
+
+    /// Which return a mapping event is about.
+    ///
+    /// The explicit `form` wins. Events written before assignments were kept per
+    /// return carry none, and those are read by their key: a line key names its
+    /// own form. [`lines::OFF_RETURN`] names none, and every writer of it before
+    /// the split was the Form 1065 page or the investments register (whose
+    /// accounts [`lines::load_effective_mapping`] fences off every return
+    /// regardless), so it is a Form 1065 assignment.
+    pub fn of_mapping(form: Option<&str>, line_key: &str) -> ReturnForm {
+        form.and_then(ReturnForm::parse)
+            .or_else(|| ReturnForm::of_key(line_key))
+            .unwrap_or(ReturnForm::Form1065)
     }
 }
 

@@ -776,6 +776,7 @@ pub(crate) fn build_registration_in_txn(
             account_id: cmd.value_change_account_id.clone(),
             line_key: crate::tax::lines::OFF_RETURN.to_string(),
             effective_from: 0,
+            form: None,
         },
     ]))
 }
