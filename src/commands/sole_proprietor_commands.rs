@@ -231,7 +231,192 @@ pub fn set_answer(
 // Building the return
 // ---------------------------------------------------------------------------
 
-/// Build a Schedule C for `year` from the books.
+/// What a Schedule C needs that no ledger holds, as typed on the Schedule C page.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScheduleCInputs {
+    /// Line 30, business use of the home. `None` is "not worked out yet", which
+    /// the build reports; it is not the same as zero.
+    pub home_office_dollars: Option<i64>,
+    /// Wages and taxable income from the owner's *other* active trades or
+    /// businesses, for the §179 business income limit (Form 4562 line 11). `None`
+    /// means nobody has worked it out, and the limit is then this business's
+    /// income alone — the cautious reading, and said out loud.
+    pub other_business_income_dollars: Option<i64>,
+    /// §179 disallowed last year and carried into this one (Form 4562 line 10).
+    pub section_179_carryover_dollars: Option<i64>,
+}
+
+/// The year's figures as the form will carry them, before any PDF is drawn.
+pub struct Figures {
+    pub computed: crate::tax::schedule_c::Computed,
+    /// Part I of Form 4562, when there is any §179 to apply.
+    pub section_179: Option<crate::tax::form4562::Section179Outcome>,
+    /// The inputs Part I was applied with, for the Form 4562 that shows it.
+    pub section_179_limit: crate::tax::form4562::Section179Limit,
+    /// What the depreciation register and the ledger disagree about, and what
+    /// the §179 limit did to line 13.
+    pub warnings: Vec<String>,
+}
+
+/// Compute a year's Schedule C figures: the ledger through Schedule C's own
+/// mapping, checked against the depreciation register, with the §179 business
+/// income limit applied to line 13.
+///
+/// The one computation the Schedule C page's preview and the PDF both read, so
+/// the two cannot disagree about a figure.
+///
+/// # Why line 13 can differ from the ledger
+///
+/// The register posts the whole §179 election to the books. On a partnership
+/// return that is right — the limits are applied on each partner's return — but a
+/// sole proprietor applies them here, on Form 4562, and only line 12 of that form
+/// is deducted. The rest carries to next year. So line 13 is the ledger's
+/// depreciation with the §179 part replaced by what Part I allows, and a warning
+/// says by how much. It is only done when line 13 and the register agree: if they
+/// do not, the ledger's §179 is not known to be the register's, and adjusting it
+/// would be guessing.
+pub fn figures(
+    conn: &Connection,
+    year: i32,
+    inputs: &ScheduleCInputs,
+) -> Result<Figures, SoleProprietorError> {
+    use crate::tax::form4562::{section_179_outcome, Section179Limit};
+    use crate::tax::lines::{cents_to_dollars, format_dollars};
+
+    let (start, end) = (
+        chrono::NaiveDate::from_ymd_opt(year, 1, 1).expect("January 1 exists in every year"),
+        chrono::NaiveDate::from_ymd_opt(year, 12, 31).expect("December 31 exists in every year"),
+    );
+    let statement = crate::queries::reports::Reports::new(conn)
+        .income_statement(start, end)
+        .map_err(|e| SoleProprietorError::Store(format!("income statement: {e}")))?;
+
+    // Schedule C's own assignments, inherited down the account tree: a parent
+    // mapped to a line carries every child that does not say otherwise.
+    let mapping = crate::tax::lines::load_effective_mapping_for(
+        conn,
+        crate::tax::ReturnForm::ScheduleC,
+        year,
+    );
+    let limits = crate::tax::lines::load_effective_limits(conn, year);
+    let mut computed = crate::tax::schedule_c::compute(&statement, &mapping, &limits);
+    let mut warnings = Vec::new();
+
+    // --- the register against the ledger --------------------------------
+    //
+    // The register computes the year; the ledger is what line 13 is filled from.
+    // They agree only once the year is posted, and stop agreeing the moment an
+    // asset is edited afterwards. Without this a year nobody posted files a
+    // Schedule C with its depreciation quietly missing.
+    let assets = crate::commands::depreciation_commands::list_assets(conn);
+    let schedule = crate::tax::depreciation::compute_year(&assets, year);
+    warnings.extend(schedule.warnings.iter().cloned());
+    let register_179 = schedule.section_179_cents();
+    let register_dollars = cents_to_dollars(schedule.line_16a_cents() + register_179);
+    let ledger_13 = computed.lines.get("sc13");
+    let mut reconciled = true;
+    if !schedule.rows.is_empty() {
+        if !computed.lines.is_mapped("sc13") {
+            if register_dollars != 0 {
+                reconciled = false;
+                warnings.push(format!(
+                    "The depreciation register computes ${} of depreciation and §179 for {year}, \
+                     but no account is mapped to line 13, so none of it reaches this return. \
+                     Post {year} on the Depreciation page, then map the depreciation expense and \
+                     §179 accounts to line 13 on this page.",
+                    format_dollars(register_dollars)
+                ));
+            }
+        } else if ledger_13 != register_dollars {
+            reconciled = false;
+            warnings.push(format!(
+                "Line 13 carries ${} from the ledger, and the depreciation register computes ${} \
+                 of depreciation and §179 for {year}. Either {year} has not been posted since the \
+                 register last changed, or something else is mapped to line 13. The form is \
+                 filled with the ledger's figure.",
+                format_dollars(ledger_13),
+                format_dollars(register_dollars)
+            ));
+        }
+        if let Some(stale) = crate::commands::depreciation_commands::posting_is_stale(conn, year) {
+            warnings.push(stale);
+        }
+    }
+
+    // --- §179, limited by business income ---------------------------------
+    let section_179_limit = Section179Limit {
+        carryover_in_cents: inputs.section_179_carryover_dollars.unwrap_or(0).max(0) * 100,
+        // Filled in below, once there is a profit to measure.
+        business_income_cents: 0,
+    };
+    let mut figures = Figures {
+        computed,
+        section_179: None,
+        section_179_limit,
+        warnings,
+    };
+    if register_179 == 0 && section_179_limit.carryover_in_cents == 0 {
+        return Ok(figures);
+    }
+    if !reconciled {
+        figures.warnings.push(
+            "The §179 business income limit was not applied to line 13, because line 13 and the \
+             depreciation register disagree — the ledger's §179 is not known to be the \
+             register's. Post the year and check line 13 first."
+                .to_string(),
+        );
+        return Ok(figures);
+    }
+
+    // Line 11 is figured without the §179 deduction: this business's profit with
+    // the posted §179 added back, plus whatever else the owner earns actively.
+    let lines = &figures.computed.lines;
+    let profit_before_179 = lines.line_31(
+        lines.get("sc48"),
+        inputs.home_office_dollars.unwrap_or(0),
+    ) + cents_to_dollars(register_179);
+    let business_income =
+        profit_before_179 + inputs.other_business_income_dollars.unwrap_or(0);
+    figures.section_179_limit.business_income_cents = business_income * 100;
+    let outcome = section_179_outcome(&schedule, figures.section_179_limit);
+
+    let delta = cents_to_dollars(outcome.allowed_cents) - cents_to_dollars(register_179);
+    if delta != 0 {
+        figures.computed.lines.adjust("sc13", delta);
+        figures.warnings.push(format!(
+            "Line 13 is ${} rather than the ledger's ${}: Form 4562 allows ${} of §179 this year \
+             (line 12) against ${} posted{}, and ${} carries to next year (line 13). Enter that \
+             carryover on next year's Schedule C page.",
+            format_dollars(ledger_13 + delta),
+            format_dollars(ledger_13),
+            format_dollars(cents_to_dollars(outcome.allowed_cents)),
+            format_dollars(cents_to_dollars(register_179)),
+            if outcome.carryover_in_cents > 0 {
+                format!(
+                    " plus ${} carried in",
+                    format_dollars(cents_to_dollars(outcome.carryover_in_cents))
+                )
+            } else {
+                String::new()
+            },
+            format_dollars(cents_to_dollars(outcome.carryover_out_cents))
+        ));
+    }
+    if inputs.other_business_income_dollars.is_none() && outcome.carryover_out_cents > 0 {
+        figures.warnings.push(
+            "The §179 business income limit counts this business alone, because no wages or \
+             other business income were entered. The limit includes wages and the profit of \
+             every active trade or business — enter them on the Schedule C page and more of \
+             the §179 may be deductible this year."
+                .to_string(),
+        );
+    }
+    figures.section_179 = Some(outcome);
+    Ok(figures)
+}
+
+/// Build a Schedule C for `year` from the books, with Form 4562 behind it when
+/// the depreciation register has anything in it.
 ///
 /// Refuses on a partnership rather than producing a Schedule C for one. A
 /// partnership that filed this form would be filing the wrong return entirely,
@@ -239,7 +424,7 @@ pub fn set_answer(
 pub fn build_from_ledger(
     conn: &Connection,
     year: i32,
-    home_office_dollars: Option<i64>,
+    inputs: &ScheduleCInputs,
 ) -> Result<crate::tax::schedule_c::Bundle, SoleProprietorError> {
     if business_type(conn) != BusinessType::SoleProprietorship {
         return Err(SoleProprietorError::NotASoleProprietorship(
@@ -262,23 +447,7 @@ pub fn build_from_ledger(
         )
     })?;
 
-    let (start, end) = (
-        chrono::NaiveDate::from_ymd_opt(year, 1, 1).expect("January 1 exists in every year"),
-        chrono::NaiveDate::from_ymd_opt(year, 12, 31).expect("December 31 exists in every year"),
-    );
-    let statement = crate::queries::reports::Reports::new(conn)
-        .income_statement(start, end)
-        .map_err(|e| SoleProprietorError::Store(format!("income statement: {e}")))?;
-
-    // Schedule C's own assignments, inherited down the account tree: a parent
-    // mapped to a line carries every child that does not say otherwise.
-    let mapping = crate::tax::lines::load_effective_mapping_for(
-        conn,
-        crate::tax::ReturnForm::ScheduleC,
-        year,
-    );
-    let limits = crate::tax::lines::load_effective_limits(conn, year);
-    let computed = crate::tax::schedule_c::compute(&statement, &mapping, &limits);
+    let figures = figures(conn, year, inputs)?;
     let proprietor = get_proprietor(conn);
     let ssn = get_ssn(conn);
     let answers = crate::tax::schedule_c::load(conn, year);
@@ -289,10 +458,13 @@ pub fn build_from_ledger(
         proprietor: proprietor.as_ref(),
         ssn: ssn.as_deref(),
         answers: &answers,
-        home_office_dollars,
+        home_office_dollars: inputs.home_office_dollars,
     };
-    let mut bundle = crate::tax::schedule_c::build(&req, &computed)
+    let mut bundle = crate::tax::schedule_c::build(&req, &figures.computed)
         .map_err(|e| SoleProprietorError::Store(e.to_string()))?;
+    bundle.warnings.extend(figures.warnings.iter().cloned());
+
+    attach_form_4562(&mut bundle, conn, year, &profile, proprietor.as_ref(), ssn.as_deref(), &figures)?;
 
     // A year that has not been answered at all is worth saying once, rather than
     // producing a form whose questions are silently all blank.
@@ -305,6 +477,93 @@ pub fn build_from_ledger(
     }
 
     Ok(bundle)
+}
+
+
+/// Put Form 4562 — and the basis statement, when an asset's basis moved — behind
+/// the Schedule C, headed with the owner's name and SSN as the 1040 is.
+///
+/// Built from the same register and the same Part I the figures used, so line 22
+/// of the 4562 is line 13 of the Schedule C whenever the two are reconciled.
+fn attach_form_4562(
+    bundle: &mut crate::tax::schedule_c::Bundle,
+    conn: &Connection,
+    year: i32,
+    profile: &crate::domain::BusinessProfile,
+    proprietor: Option<&SoleProprietor>,
+    ssn: Option<&str>,
+    figures: &Figures,
+) -> Result<(), SoleProprietorError> {
+    use crate::tax::acroform::{append_document, namespace_fields};
+    use crate::tax::form4562::{self, Filer};
+
+    let store_err = |e: crate::tax::acroform::FormError| SoleProprietorError::Store(e.to_string());
+    let assets = crate::commands::depreciation_commands::list_assets(conn);
+    let schedule = crate::tax::depreciation::compute_year(&assets, year);
+    if schedule.rows.is_empty() {
+        return Ok(());
+    }
+
+    // Only when the Schedule C instructions require one: property placed in
+    // service this year, or §179 — elected now or carried in. A year of nothing
+    // but depreciation continuing on older assets is entered on line 13 with no
+    // Form 4562, and filing one anyway is a form the IRS did not ask for.
+    let required = schedule.placed_this_year().next().is_some()
+        || schedule.section_179_cents() > 0
+        || figures.section_179_limit.carryover_in_cents > 0;
+    if !required {
+        // Listed property is the one trigger the register cannot see: it
+        // records no business-use percentage, so it cannot tell a delivery van
+        // from a lathe.
+        bundle.warnings.push(format!(
+            "No Form 4562 is attached: nothing was placed in service in {year} and there is no \
+             §179, so the depreciation goes on line 13 without one. If any asset is listed \
+             property — a car, a truck, or other property used partly for personal purposes — \
+             Form 4562 is required anyway, for Part V."
+        ));
+        return Ok(());
+    }
+    let name = proprietor
+        .map(|p| p.name.as_str())
+        .unwrap_or(profile.legal_name.as_str());
+    let activity = profile
+        .principal_activity
+        .clone()
+        .unwrap_or_else(|| profile.legal_name.clone());
+    let (filled, warnings) = form4562::build(
+        profile,
+        &schedule,
+        &activity,
+        year,
+        Filer::SoleProprietor {
+            name,
+            ssn,
+            limit: figures.section_179_limit,
+        },
+    )
+    .map_err(store_err)?;
+    bundle.warnings.extend(warnings);
+
+    let statement = form4562::basis_statement(&schedule, name, ssn.unwrap_or(""))
+        .map_err(store_err)?;
+    if filled.is_none() && statement.is_none() {
+        return Ok(());
+    }
+
+    let mut doc = lopdf::Document::load_mem(&bundle.pdf)
+        .map_err(|e| SoleProprietorError::Store(e.to_string()))?;
+    if let Some(mut filled) = filled {
+        namespace_fields(&mut filled.document, crate::tax::form1065::F4562_NAMESPACE);
+        append_document(&mut doc, filled.document).map_err(store_err)?;
+    }
+    if let Some(statement) = statement {
+        append_document(&mut doc, statement).map_err(store_err)?;
+    }
+    let mut buf = Vec::new();
+    doc.save_to(&mut buf)
+        .map_err(|e| SoleProprietorError::Store(e.to_string()))?;
+    bundle.pdf = buf;
+    Ok(())
 }
 
 fn append(
@@ -493,7 +752,7 @@ mod tests {
     fn a_partnership_cannot_build_a_schedule_c() {
         let s = with_profile();
         assert!(matches!(
-            build_from_ledger(s.connection(), 2025, None),
+            build_from_ledger(s.connection(), 2025, &ScheduleCInputs::default()),
             Err(SoleProprietorError::NotASoleProprietorship(_))
         ));
     }
@@ -505,7 +764,7 @@ mod tests {
         set_proprietor(&mut s, "u", &proprietor()).unwrap();
         set_ssn(s.connection(), "123-45-6789").unwrap();
 
-        let bundle = build_from_ledger(s.connection(), 2025, Some(0)).expect("a Schedule C");
+        let bundle = build_from_ledger(s.connection(), 2025, &ScheduleCInputs { home_office_dollars: Some(0), ..Default::default() }).expect("a Schedule C");
         assert!(bundle.pdf.len() > 1000);
         // No answers given, so the form says so rather than looking answered.
         assert!(
@@ -544,7 +803,7 @@ mod tests {
         );
 
         // And the failure a person meets at that point says where to go.
-        let err = match build_from_ledger(s.connection(), 2025, None) {
+        let err = match build_from_ledger(s.connection(), 2025, &ScheduleCInputs::default()) {
             Err(e) => e.to_string(),
             Ok(_) => panic!("built a Schedule C with no business details"),
         };
@@ -581,7 +840,7 @@ mod tests {
             "filling the header turned the books back into a partnership"
         );
         set_proprietor(&mut s, "u", &proprietor()).unwrap();
-        assert!(build_from_ledger(s.connection(), 2025, Some(0)).is_ok());
+        assert!(build_from_ledger(s.connection(), 2025, &ScheduleCInputs { home_office_dollars: Some(0), ..Default::default() }).is_ok());
     }
 
     /// Many sole proprietors have never applied for an EIN, and the return is
@@ -619,7 +878,7 @@ mod tests {
         .expect("an absent EIN is a legitimate profile");
         set_proprietor(&mut s, "u", &proprietor()).unwrap();
 
-        let bundle = build_from_ledger(s.connection(), 2025, Some(0)).expect("a Schedule C");
+        let bundle = build_from_ledger(s.connection(), 2025, &ScheduleCInputs { home_office_dollars: Some(0), ..Default::default() }).expect("a Schedule C");
         assert!(bundle.pdf.len() > 1000);
         // And nothing complains about the missing number, because nothing should.
         assert!(

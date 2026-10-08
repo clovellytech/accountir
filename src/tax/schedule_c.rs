@@ -869,6 +869,13 @@ impl ScheduleCLines {
         self.mapped.is_empty()
     }
 
+    /// Move a line by a number of dollars the books do not hold — the part of
+    /// §179 the business income limit disallows, or last year's carryover now
+    /// allowed. Marks the line as carrying a figure, since it now does.
+    pub(crate) fn adjust(&mut self, key: &'static str, dollars: i64) {
+        *self.mapped.entry(key).or_insert(0) += dollars;
+    }
+
     /// Set a line directly. Tests only — the real path is [`compute`], which is
     /// the only thing that knows the sign conventions.
     #[cfg(test)]
@@ -1230,6 +1237,40 @@ pub struct Bundle {
 }
 
 /// Build a Schedule C from the books.
+/// Line A: the activity, *including the product or service*, as the line asks.
+///
+/// The business details hold the two separately — Form 1065 asks for them in two
+/// boxes — and printing only the activity answered half of line A. The product is
+/// added unless the activity already says it, so "Bicycle retail" and "Bicycles"
+/// make "Bicycle retail — Bicycles" while "Lessor non-residential" and "Lessor"
+/// stay as they are.
+pub fn principal_business(profile: &BusinessProfile) -> Option<String> {
+    let activity = profile
+        .principal_activity
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty());
+    let product = profile
+        .principal_product
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    match (activity, product) {
+        (Some(a), Some(p)) if a.to_lowercase().contains(&p.to_lowercase()) => Some(a.to_string()),
+        (Some(a), Some(p)) => Some(format!("{a} — {p}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(p)) => Some(p.to_string()),
+        (None, None) => None,
+    }
+}
+
+/// Line C: the business's name, unless it is only the owner's own name.
+pub fn business_name<'a>(req: &ScheduleCRequest<'a>) -> Option<&'a str> {
+    let name = req.profile.legal_name.trim();
+    let owner = req.proprietor.map(|p| p.name.trim());
+    (!name.is_empty() && owner.is_none_or(|o| !o.eq_ignore_ascii_case(name))).then_some(name)
+}
+
 pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, FormError> {
     let mut warnings = computed.warnings.clone();
     let lines = &computed.lines;
@@ -1292,7 +1333,7 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
             }
         }
         None => warnings.push(
-            "No sole proprietor is recorded, so the name at the top of the form is blank.              Schedule C is attached to that person's Form 1040 and the IRS pairs the two by name              and number — a form with neither identifies nobody."
+            "No sole proprietor is recorded, so the name at the top of the form is blank. Schedule C is attached to that person's Form 1040 and the IRS pairs the two by name and number — a form with neither identifies nobody."
                 .to_string(),
         ),
     }
@@ -1300,17 +1341,17 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
     match req.ssn {
         Some(ssn) => set_text(&mut doc, &map, field::SSN, ssn)?,
         None => warnings.push(
-            "No social security number is held on this machine, so the number box is blank. It              is deliberately not in the event log — see the sole proprietor page — so it has to              be entered on the machine the return is prepared on."
+            "No social security number is held on this machine, so the number box is blank. It is deliberately not in the event log — see the sole proprietor page — so it has to be entered on the machine the return is prepared on."
                 .to_string(),
         ),
     }
 
-    set_text(
-        &mut doc,
-        &map,
-        field::BUSINESS_NAME,
-        &req.profile.legal_name,
-    )?;
+    // Line C is for a business name *separate* from the owner's — "if no separate
+    // business name, leave blank". A sole proprietor trading under their own name
+    // has none, and repeating it here is the box answered wrongly.
+    if let Some(name) = business_name(req) {
+        set_text(&mut doc, &map, field::BUSINESS_NAME, name)?;
+    }
     set_text(
         &mut doc,
         &map,
@@ -1334,8 +1375,8 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
         field::CITY_STATE_ZIP,
         &city_line(req.profile),
     )?;
-    if let Some(activity) = &req.profile.principal_activity {
-        set_text(&mut doc, &map, field::PRINCIPAL_BUSINESS, activity)?;
+    if let Some(line_a) = principal_business(req.profile) {
+        set_text(&mut doc, &map, field::PRINCIPAL_BUSINESS, &line_a)?;
     }
 
     // --- the questions ---
@@ -1392,7 +1433,7 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
     }
     if other.len() > field::PART_V_ROWS.len() {
         warnings.push(format!(
-            "Part V has {} printed rows and {} accounts are mapped to line 48. The first {} are              listed; the rest need a continuation statement, which this program does not produce.              The total on line 48 includes all of them.",
+            "Part V has {} printed rows and {} accounts are mapped to line 48. The first {} are listed; the rest need a continuation statement, which this program does not produce. The total on line 48 includes all of them.",
             field::PART_V_ROWS.len(),
             other.len(),
             field::PART_V_ROWS.len()
@@ -1490,13 +1531,13 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
     // --- what the books cannot answer ---
     if req.home_office_dollars.is_none() {
         warnings.push(
-            "Line 30, business use of the home, is blank. It is not in the books — it comes off              Form 8829, or the simplified-method worksheet in the instructions — so it has to be              worked out and entered. If no part of a home is used for the business, that is              correct as it stands."
+            "Line 30, business use of the home, is blank. It is not in the books — it comes off Form 8829, or the simplified-method worksheet in the instructions — so it has to be worked out and entered. If no part of a home is used for the business, that is correct as it stands."
                 .to_string(),
         );
     }
     if lines.is_mapped("sc9") {
         warnings.push(
-            "Line 9 carries car and truck expenses, so Part IV has to be completed — the date              the vehicle went into service, the miles split between business, commuting and              other, and four questions about its use. None of that is in a ledger, so Part IV is              blank. If a Form 4562 is required for this business, Part IV is answered there              instead."
+            "Line 9 carries car and truck expenses, so Part IV has to be completed — the date the vehicle went into service, the miles split between business, commuting and other, and four questions about its use. None of that is in a ledger, so Part IV is blank. If a Form 4562 is required for this business, Part IV is answered there instead."
                 .to_string(),
         );
     }
@@ -1514,7 +1555,7 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
     }
     if lines.is_mapped("sc24b") {
         warnings.push(
-            "Line 24b is deductible meals, which is generally half of what was spent. Check the              account mapped to it carries the deductible half rather than the whole — the form              does not halve it."
+            "Line 24b is deductible meals, which is generally half of what was spent. Check the account mapped to it carries the deductible half rather than the whole — the form does not halve it."
                 .to_string(),
         );
     }
@@ -1531,14 +1572,16 @@ pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, 
     })
 }
 
-fn address_line(p: &BusinessProfile) -> String {
+/// Line E, first row: the street, with the suite or room number the line asks for.
+pub fn address_line(p: &BusinessProfile) -> String {
     match &p.address.suite {
         Some(s) if !s.trim().is_empty() => format!("{}, {}", p.address.street, s),
         _ => p.address.street.clone(),
     }
 }
 
-fn city_line(p: &BusinessProfile) -> String {
+/// Line E, second row.
+pub fn city_line(p: &BusinessProfile) -> String {
     format!(
         "{}, {} {}",
         p.address.city, p.address.state, p.address.postal_code
@@ -1690,6 +1733,47 @@ mod tests {
             principal_activity: Some("Fine arts instruction".into()),
             principal_product: Some("Art classes".into()),
         }
+    }
+
+    /// Line A asks for the activity *including the product or service*; the
+    /// product is added unless the activity already names it.
+    #[test]
+    fn line_a_carries_the_product_as_well_as_the_activity() {
+        let mut p = profile();
+        assert_eq!(
+            principal_business(&p).as_deref(),
+            Some("Fine arts instruction — Art classes")
+        );
+        p.principal_activity = Some("Lessor non-residential".into());
+        p.principal_product = Some("Lessor".into());
+        assert_eq!(principal_business(&p).as_deref(), Some("Lessor non-residential"));
+        p.principal_product = None;
+        assert_eq!(principal_business(&p).as_deref(), Some("Lessor non-residential"));
+        p.principal_activity = None;
+        assert_eq!(principal_business(&p), None);
+    }
+
+    /// Line C is for a name separate from the owner's: "if no separate business
+    /// name, leave blank".
+    #[test]
+    fn line_c_is_blank_when_the_business_is_just_the_owners_name() {
+        let answers = ScheduleC::default();
+        let mut profile = profile();
+        let owner = proprietor();
+        let req = |profile: &BusinessProfile| {
+            business_name(&ScheduleCRequest {
+                year: FORM_TAX_YEAR,
+                profile,
+                proprietor: Some(&owner),
+                ssn: None,
+                answers: &answers,
+                home_office_dollars: None,
+            })
+            .map(str::to_string)
+        };
+        assert_eq!(req(&profile).as_deref(), Some("Bunny Ears Art House"));
+        profile.legal_name = "jinny choi".into();
+        assert_eq!(req(&profile), None);
     }
 
     fn proprietor() -> SoleProprietor {
@@ -2119,7 +2203,8 @@ mod tests {
         );
         assert_eq!(
             box_of(&doc, field::PRINCIPAL_BUSINESS),
-            "Fine arts instruction"
+            "Fine arts instruction — Art classes",
+            "line A is the activity including the product or service"
         );
         assert_eq!(box_of(&doc, field::CITY_STATE_ZIP), "Chicago, IL 60640");
     }

@@ -208,7 +208,16 @@ pub struct Boxes {
     pub l6_rows: [[&'static str; 3]; 2],
     pub l8_total_elected: &'static str,
     pub l9_tentative: &'static str,
+    /// Line 10, carryover of disallowed §179 from the prior year. Filled only for
+    /// a sole proprietor: a partnership's limits are applied on each partner's
+    /// return, so its own line 10 has nothing to say.
+    pub l10_carryover_in: &'static str,
+    /// Line 11, the business income limitation. Sole proprietor only, as above.
+    pub l11_income_limit: &'static str,
     pub l12_deduction: &'static str,
+    /// Line 13, carryover of disallowed §179 to next year — the inner column,
+    /// left of the amounts. Sole proprietor only.
+    pub l13_carryover_out: &'static str,
     pub l14_bonus: &'static str,
     pub l17_prior_years: &'static str,
     /// Part IV's total. On page 2 from the 2025 revision; on page 1 before it,
@@ -265,7 +274,10 @@ pub const BOXES_2025: Boxes = Boxes {
     l5_dollar_limit: "f1_8[0]",
     l8_total_elected: "f1_16[0]",
     l9_tentative: "f1_17[0]",
+    l10_carryover_in: "f1_18[0]",
+    l11_income_limit: "f1_19[0]",
     l12_deduction: "f1_20[0]",
+    l13_carryover_out: "f1_21[0]",
     l14_bonus: "f1_22[0]",
     l17_prior_years: "f1_25[0]",
     l6_rows: [
@@ -430,7 +442,10 @@ pub const BOXES_2023: Boxes = Boxes {
     l5_dollar_limit: "f1_8[0]",
     l8_total_elected: "f1_16[0]",
     l9_tentative: "f1_17[0]",
+    l10_carryover_in: "f1_18[0]",
+    l11_income_limit: "f1_19[0]",
     l12_deduction: "f1_20[0]",
+    l13_carryover_out: "f1_21[0]",
     l14_bonus: "f1_22[0]",
     l17_prior_years: "f1_25[0]",
     l6_rows: [
@@ -581,7 +596,10 @@ pub const BOXES_2024: Boxes = Boxes {
     l5_dollar_limit: "f1_8[0]",
     l8_total_elected: "f1_16[0]",
     l9_tentative: "f1_17[0]",
+    l10_carryover_in: "f1_18[0]",
+    l11_income_limit: "f1_19[0]",
     l12_deduction: "f1_20[0]",
+    l13_carryover_out: "f1_21[0]",
     l14_bonus: "f1_22[0]",
     l17_prior_years: "f1_25[0]",
     l6_rows: [
@@ -771,6 +789,98 @@ pub struct Filled {
     pub line_16a_cents: i64,
 }
 
+/// Who files the return this Form 4562 is attached to.
+///
+/// It decides two things the form cannot decide for itself: whose name and number
+/// head it, and whether the §179 limits are applied here at all.
+#[derive(Debug, Clone, Copy)]
+pub enum Filer<'a> {
+    /// Form 1065. The dollar and income limits on §179 are applied on each
+    /// partner's own return, so lines 10, 11 and 13 stay blank here and line 12
+    /// is reported separately on Schedule K.
+    Partnership,
+    /// Schedule C, attached to the owner's Form 1040. The form is headed with the
+    /// owner's name and SSN — the numbers the IRS pairs the return by — and the
+    /// whole of Part I is applied here, because there is nobody downstream to
+    /// apply it.
+    SoleProprietor {
+        name: &'a str,
+        ssn: Option<&'a str>,
+        limit: Section179Limit,
+    },
+}
+
+/// The two Part I inputs a ledger cannot supply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Section179Limit {
+    /// Line 10: §179 disallowed last year and carried into this one.
+    pub carryover_in_cents: i64,
+    /// Line 11: taxable income from every active trade or business, wages
+    /// included, figured *without* the §179 deduction.
+    pub business_income_cents: i64,
+}
+
+/// Part I worked through, line by line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Section179Outcome {
+    /// Line 8: elected across the register.
+    pub elected_cents: i64,
+    /// Line 9: the elected amount within the dollar limit.
+    pub tentative_cents: i64,
+    /// Line 10.
+    pub carryover_in_cents: i64,
+    /// Line 11.
+    pub business_income_cents: i64,
+    /// Line 12: what is deducted this year.
+    pub allowed_cents: i64,
+    /// Line 13: what carries to next year.
+    pub carryover_out_cents: i64,
+}
+
+/// Lines 1 to 5 for a year: the maximum, the cost of §179 property placed in
+/// service, the threshold, the reduction, and the dollar limit. `None` for a year
+/// whose figures this program does not carry.
+fn dollar_limit(schedule: &YearSchedule<'_>) -> Option<(i64, i64, i64, i64, i64)> {
+    let (maximum, threshold) = section_179_limits(schedule.tax_year)?;
+    // Line 2 is the cost of *all* §179 property placed in service, not only the
+    // part elected — it is what the phase-out is measured against.
+    let total_cost: i64 = schedule
+        .placed_this_year()
+        .filter(|r| r.asset.class.section_179() != crate::domain::Section179Eligibility::NotEligible)
+        .map(|r| r.asset.cost_cents)
+        .sum();
+    let reduction = (total_cost - threshold).max(0);
+    Some((maximum, total_cost, threshold, reduction, (maximum - reduction).max(0)))
+}
+
+/// Part I of Form 4562 for a sole proprietor: how much of the §179 elected is
+/// deducted this year, and how much waits.
+///
+/// Line 12 is the lesser of what is available (line 9 plus last year's
+/// carryover) and the business income limit, which can never be negative — §179
+/// cannot make a loss, or add to one. The rest is line 13. Where the year's
+/// dollar limit is not known, line 9 is the whole election and the form says so.
+pub fn section_179_outcome(
+    schedule: &YearSchedule<'_>,
+    limit: Section179Limit,
+) -> Section179Outcome {
+    let elected = schedule.section_179_cents();
+    let tentative = match dollar_limit(schedule) {
+        Some((.., limit)) => limit.min(elected),
+        None => elected,
+    };
+    let available = tentative + limit.carryover_in_cents.max(0);
+    let allowed = available.min(limit.business_income_cents.max(0));
+    Section179Outcome {
+        elected_cents: elected,
+        tentative_cents: tentative,
+        carryover_in_cents: limit.carryover_in_cents.max(0),
+        business_income_cents: limit.business_income_cents,
+        allowed_cents: allowed,
+        carryover_out_cents: available - allowed,
+    }
+}
+
 /// Build Form 4562 from a computed year, or `None` when the register is empty.
 ///
 /// An empty register is not the same as no depreciation: a partnership can have
@@ -782,6 +892,7 @@ pub fn build(
     schedule: &YearSchedule<'_>,
     activity: &str,
     year: i32,
+    filer: Filer<'_>,
 ) -> Result<(Option<Filled>, Vec<String>), FormError> {
     let mut warnings = Vec::new();
 
@@ -833,9 +944,21 @@ pub fn build(
     strip_xfa(&mut doc);
     let map = field_map(&doc);
 
-    set_text(&mut doc, &map, boxes.name, &profile.legal_name)?;
+    // The name and number of the return this is attached to: the partnership's,
+    // or — on a Schedule C — the owner's, as on their Form 1040.
+    match filer {
+        Filer::Partnership => {
+            set_text(&mut doc, &map, boxes.name, &profile.legal_name)?;
+            set_text(&mut doc, &map, boxes.ein, &profile.ein)?;
+        }
+        Filer::SoleProprietor { name, ssn, .. } => {
+            set_text(&mut doc, &map, boxes.name, name)?;
+            if let Some(ssn) = ssn {
+                set_text(&mut doc, &map, boxes.ein, ssn)?;
+            }
+        }
+    }
     set_text(&mut doc, &map, boxes.activity, activity)?;
-    set_text(&mut doc, &map, boxes.ein, &profile.ein)?;
 
     // --- Part I: §179 -----------------------------------------------------
     let elected: Vec<(&str, i64, i64)> = schedule
@@ -852,22 +975,18 @@ pub fn build(
         .collect();
 
     let total_elected: i64 = elected.iter().map(|(_, _, e)| e).sum();
+    let sole_limit = match filer {
+        Filer::SoleProprietor { limit, .. } => Some(limit),
+        Filer::Partnership => None,
+    };
+    // A sole proprietor with last year's carryover fills Part I even in a year
+    // that elects nothing new: lines 10 to 13 are where the carryover is used.
+    let part_i = !elected.is_empty() || sole_limit.is_some_and(|l| l.carryover_in_cents > 0);
+    let outcome = sole_limit.map(|l| section_179_outcome(schedule, l));
 
-    if !elected.is_empty() {
-        // Line 2 is the cost of *all* §179 property placed in service, not only
-        // the part elected — it is what the phase-out is measured against.
-        let total_cost: i64 = schedule
-            .placed_this_year()
-            .filter(|r| {
-                r.asset.class.section_179() != crate::domain::Section179Eligibility::NotEligible
-            })
-            .map(|r| r.asset.cost_cents)
-            .sum();
-
-        match section_179_limits(schedule.tax_year) {
-            Some((maximum, threshold)) => {
-                let reduction = (total_cost - threshold).max(0);
-                let dollar_limit = (maximum - reduction).max(0);
+    if part_i {
+        match dollar_limit(schedule) {
+            Some((maximum, total_cost, threshold, reduction, dollar_limit)) => {
                 let tentative = dollar_limit.min(total_elected);
 
                 set_text(&mut doc, &map, boxes.l1_maximum, &money(maximum))?;
@@ -876,14 +995,15 @@ pub fn build(
                 set_text(&mut doc, &map, boxes.l4_reduction, &money(reduction))?;
                 set_text(&mut doc, &map, boxes.l5_dollar_limit, &money(dollar_limit))?;
                 set_text(&mut doc, &map, boxes.l9_tentative, &money(tentative))?;
-                set_text(&mut doc, &map, boxes.l12_deduction, &money(tentative))?;
+                if outcome.is_none() {
+                    set_text(&mut doc, &map, boxes.l12_deduction, &money(tentative))?;
+                }
 
                 if tentative < total_elected {
                     warnings.push(format!(
                         "Form 4562: {} of §179 is elected across the register, but the dollar \
-                         limit for {} allows {}. Line 12 carries the limit. The difference \
-                         carries forward on line 13 — which needs the two figures the books do \
-                         not hold, so it is left blank.",
+                         limit for {} allows {}. Line 9 carries the limit, and the difference \
+                         is not deductible this year.",
                         money(total_elected),
                         schedule.tax_year,
                         money(tentative)
@@ -892,8 +1012,9 @@ pub fn build(
             }
             None => warnings.push(format!(
                 "Form 4562: the §179 dollar limit and phase-out threshold for {} are not known \
-                 to this program, so Part I lines 1 to 5 are blank and line 12 is unfilled. \
-                 Both figures are indexed each year — fill them from the {} instructions.",
+                 to this program, so Part I lines 1 to 5 are blank and line 9 is the whole \
+                 election. Both figures are indexed each year — fill them from the {} \
+                 instructions.",
                 schedule.tax_year, schedule.tax_year
             )),
         }
@@ -920,15 +1041,35 @@ pub fn build(
             ));
         }
 
-        // The two inputs a ledger cannot supply. Both cap line 12, so a return
-        // filed without checking them can claim more than the statute allows.
-        warnings.push(
-            "Form 4562 line 10 (carryover of disallowed §179 from the prior year) and line 11 \
-             (the business income limitation) are left blank — neither is in the books. Line 12 \
-             is filled as the tentative deduction on line 9, which is correct only when there is \
-             no carryover and business income covers it. Check both before filing."
-                .to_string(),
-        );
+        match outcome {
+            // A sole proprietor's limits are applied here, so the lines that apply
+            // them are filled rather than left to a partner.
+            Some(o) => {
+                if o.carryover_in_cents != 0 {
+                    set_text(&mut doc, &map, boxes.l10_carryover_in, &money(o.carryover_in_cents))?;
+                }
+                set_text(
+                    &mut doc,
+                    &map,
+                    boxes.l11_income_limit,
+                    &money(o.business_income_cents.max(0)),
+                )?;
+                set_text(&mut doc, &map, boxes.l12_deduction, &money(o.allowed_cents))?;
+                if o.carryover_out_cents != 0 {
+                    set_text(&mut doc, &map, boxes.l13_carryover_out, &money(o.carryover_out_cents))?;
+                }
+            }
+            // The two inputs a ledger cannot supply. Both cap line 12, so a return
+            // filed without checking them can claim more than the statute allows.
+            None => warnings.push(
+                "Form 4562 line 10 (carryover of disallowed §179 from the prior year) and line \
+                 11 (the business income limitation) are left blank — neither is in the books. \
+                 Line 12 is filled as the tentative deduction on line 9, which is correct only \
+                 when there is no carryover and business income covers it. Check both before \
+                 filing."
+                    .to_string(),
+            ),
+        }
     }
 
     // --- Part II: bonus ---------------------------------------------------
@@ -985,16 +1126,18 @@ pub fn build(
     // Line 22 is what the form says it is: line 12 plus 14 through 17 plus the
     // (g) columns. It is *not* what page 1 line 16a takes, which is why the two
     // are reported separately below.
-    let line_12 = if elected.is_empty() {
-        0
-    } else {
-        schedule.section_179_cents()
+    let line_12 = match outcome {
+        Some(o) if part_i => o.allowed_cents,
+        _ if elected.is_empty() => 0,
+        _ => schedule.section_179_cents(),
     };
     let line_22 = line_12 + bonus + prior + current_year_total;
     set_text(&mut doc, &map, boxes.l22_total, &money(line_22))?;
 
     let line_16a = line_22 - line_12;
-    if line_12 != 0 {
+    // A sole proprietor's line 22 is exactly what Schedule C line 13 takes, so
+    // the warning below — about a partnership splitting it — would be wrong there.
+    if line_12 != 0 && matches!(filer, Filer::Partnership) {
         warnings.push(format!(
             "Form 4562 line 22 is {}, and that is not the figure for page 1 line 16a. It \
              includes the {} of §179 on line 12, which a partnership reports separately on \
@@ -1395,7 +1538,7 @@ mod tests {
     fn an_empty_register_produces_no_form() {
         let assets: Vec<DepreciableAsset> = Vec::new();
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts instruction", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts instruction", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         assert!(form.is_none());
     }
 
@@ -1419,7 +1562,7 @@ mod tests {
             1_000_000,
         )];
         let s = compute_year(&assets, 2019);
-        let (form, warnings) = build(&profile(), &s, "Fine arts instruction", 2019).unwrap();
+        let (form, warnings) = build(&profile(), &s, "Fine arts instruction", 2019, Filer::Partnership).unwrap();
         assert!(form.is_none(), "no form rather than another year's form");
         assert!(
             warnings.iter().any(|w| {
@@ -1447,7 +1590,7 @@ mod tests {
             1_000_000,
         )];
         let s = compute_year(&assets, FORM_TAX_YEAR);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         let row = &BOXES_2025.section_b.twenty_five_year;
@@ -1484,7 +1627,7 @@ mod tests {
             1_000_000,
         )];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts instruction", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts instruction", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         assert_eq!(
@@ -1522,7 +1665,7 @@ mod tests {
             39_000_000,
         )];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         let row = &BOXES_2025.section_b.nonresidential_real[0]; // 19j, first row
@@ -1561,7 +1704,7 @@ mod tests {
             ),
         ];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         assert_eq!(
@@ -1605,7 +1748,7 @@ mod tests {
             ),
         ];
         let s = compute_year(&assets, 2025);
-        let (form, warnings) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, warnings) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         let row = &BOXES_2025.section_b.fifteen_year;
@@ -1650,7 +1793,7 @@ mod tests {
             ),
         ];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         // 7-year year 3 is 17.49%.
@@ -1679,7 +1822,7 @@ mod tests {
         let kiln = asset("Kiln", PropertyClass::SevenYear, date(2025, 3, 1), 1_000_000);
         let assets = [fitout, kiln];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         let fifteen = &BOXES_2025.section_b.fifteen_year;
@@ -1704,7 +1847,7 @@ mod tests {
         a.section_179_cents = 400_000;
         let assets = [a];
         let s = compute_year(&assets, 2025);
-        let (form, warnings) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, warnings) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         assert_eq!(f.section_179_cents, 400_000);
@@ -1730,7 +1873,7 @@ mod tests {
         a.section_179_cents = 400_000_00;
         let assets = [a];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         assert_eq!(
@@ -1773,7 +1916,7 @@ mod tests {
         a.section_179_cents = 400_000;
         let assets = [a];
         let s = compute_year(&assets, 2025);
-        let (_, warnings) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (_, warnings) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         assert!(
             warnings
                 .iter()
@@ -1793,7 +1936,7 @@ mod tests {
         a.section_179_cents = 400_000;
         let assets = [a];
         let s = compute_year(&assets, 2030);
-        let (form, warnings) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, warnings) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         assert!(value(&f, BOXES_2025.l1_maximum)
@@ -1817,7 +1960,7 @@ mod tests {
         a.bonus = BonusElection::Take;
         let assets = [a];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         assert_eq!(value(&f, BOXES_2025.l14_bonus).as_deref(), Some("10,000"));
@@ -1858,7 +2001,7 @@ mod tests {
             ),
         ];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         assert_eq!(f.line_22_cents, s.total_cents());
@@ -1878,7 +2021,7 @@ mod tests {
         a.system = System::Ads;
         let assets = [a];
         let s = compute_year(&assets, 2025);
-        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR).unwrap();
+        let (form, _) = build(&profile(), &s, "Fine arts", FORM_TAX_YEAR, Filer::Partnership).unwrap();
         let f = form.expect("a form");
 
         // 20a class life, with the ADS 10-year period.
@@ -2073,7 +2216,7 @@ mod tests {
                 1_000_000,
             )];
             let s = compute_year(&assets, revision.year);
-            let (_, warnings) = build(&profile(), &s, "Fine arts", revision.year).unwrap();
+            let (_, warnings) = build(&profile(), &s, "Fine arts", revision.year, Filer::Partnership).unwrap();
             assert!(
                 warnings
                     .iter()
@@ -2165,7 +2308,10 @@ mod tests {
             ("l5_dollar_limit", b.l5_dollar_limit),
             ("l8_total_elected", b.l8_total_elected),
             ("l9_tentative", b.l9_tentative),
+            ("l10_carryover_in", b.l10_carryover_in),
+            ("l11_income_limit", b.l11_income_limit),
             ("l12_deduction", b.l12_deduction),
+            ("l13_carryover_out", b.l13_carryover_out),
             ("l14_bonus", b.l14_bonus),
             ("l17_prior_years", b.l17_prior_years),
             ("l22_total", b.l22_total),

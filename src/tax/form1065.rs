@@ -1454,7 +1454,13 @@ fn build_return_inner(
         .clone()
         .unwrap_or_else(|| req.profile.legal_name.clone());
     let (form_4562, f4562_warnings) =
-        super::form4562::build(&req.profile, &year_schedule, &activity, req.year)?;
+        super::form4562::build(
+            &req.profile,
+            &year_schedule,
+            &activity,
+            req.year,
+            super::form4562::Filer::Partnership,
+        )?;
     warnings.extend(f4562_warnings);
     if let Some(mut filled) = form_4562 {
         namespace_fields(&mut filled.document, F4562_NAMESPACE);
@@ -5821,7 +5827,7 @@ mod tests {
                 let (below, what_below) = pair[1];
                 assert!(
                     top(above) > top(below),
-                    "on the {year} Schedule K-1, {what_above} ({above}, y={:.0}) is not above                      {what_below} ({below}, y={:.0}) — one of them is pointing at the other's                      row",
+                    "on the {year} Schedule K-1, {what_above} ({above}, y={:.0}) is not above {what_below} ({below}, y={:.0}) — one of them is pointing at the other's row",
                     top(above),
                     top(below)
                 );
