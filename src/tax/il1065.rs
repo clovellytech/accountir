@@ -650,6 +650,7 @@ fn special_statement(
 
     build_table(&TableStatement {
         legal_name: &profile.legal_name,
+        id_label: "EIN",
         ein: &profile.ein,
         heading: format!("Form IL-1065 ({year}) — Illinois special depreciation (Form IL-4562)"),
         subheading: format!(

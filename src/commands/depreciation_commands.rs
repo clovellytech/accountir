@@ -1029,6 +1029,16 @@ mod tests {
         assert_eq!(read(B.l11_income_limit).as_deref(), Some("49,143"));
         assert_eq!(read(B.l12_deduction).as_deref(), Some("4,000"));
         assert_eq!(read(B.l13_carryover_out), None, "nothing carries");
+        // The depreciation schedule follows the form, identified by the SSN the
+        // Schedule C is filed under rather than labelled an EIN.
+        let text: String = doc
+            .get_pages()
+            .keys()
+            .filter_map(|p| doc.extract_text(&[*p]).ok())
+            .collect();
+        assert!(text.contains("depreciation schedule"), "no schedule attached");
+        assert!(text.contains("SSN 123-45-6789"), "{text}");
+        assert!(!text.contains("EIN 123-45-6789"));
         // The partnership's warning about splitting line 22 does not apply here.
         assert!(
             !bundle.warnings.iter().any(|w| w.contains("line 16a")),
