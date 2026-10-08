@@ -1266,9 +1266,33 @@ pub fn principal_business(profile: &BusinessProfile) -> Option<String> {
 
 /// Line C: the business's name, unless it is only the owner's own name.
 pub fn business_name<'a>(req: &ScheduleCRequest<'a>) -> Option<&'a str> {
-    let name = req.profile.legal_name.trim();
-    let owner = req.proprietor.map(|p| p.name.trim());
+    separate_business_name(req.profile, req.proprietor)
+}
+
+/// [`business_name`] from its two inputs, for callers with no request in hand.
+pub fn separate_business_name<'a>(
+    profile: &'a BusinessProfile,
+    proprietor: Option<&SoleProprietor>,
+) -> Option<&'a str> {
+    let name = profile.legal_name.trim();
+    let owner = proprietor.map(|p| p.name.trim());
     (!name.is_empty() && owner.is_none_or(|o| !o.eq_ignore_ascii_case(name))).then_some(name)
+}
+
+/// What Form 4562's "Business or activity to which this form relates" box says
+/// on a Schedule C's 4562: the business name from line C, or — when there is no
+/// separate business name — the principal business from line A.
+///
+/// The box exists to tie the 4562 to one Schedule C among however many the 1040
+/// carries, so it has to name that Schedule C the way the Schedule C names
+/// itself. It used to print the activity even when line C carried a name, which
+/// left a 4562 headed "Lessor non-residential" behind a Schedule C headed
+/// "Bugbear Investments".
+pub fn form_4562_activity(profile: &BusinessProfile, proprietor: Option<&SoleProprietor>) -> String {
+    separate_business_name(profile, proprietor)
+        .map(str::to_string)
+        .or_else(|| principal_business(profile))
+        .unwrap_or_else(|| profile.legal_name.clone())
 }
 
 pub fn build(req: &ScheduleCRequest<'_>, computed: &Computed) -> Result<Bundle, FormError> {
@@ -1751,6 +1775,20 @@ mod tests {
         assert_eq!(principal_business(&p).as_deref(), Some("Lessor non-residential"));
         p.principal_activity = None;
         assert_eq!(principal_business(&p), None);
+    }
+
+    /// Form 4562's activity box names the Schedule C it belongs to: line C's
+    /// name, or line A's principal business when there is no separate name.
+    #[test]
+    fn a_form_4562_is_headed_with_line_c_or_else_line_a() {
+        let mut p = profile();
+        let owner = proprietor();
+        assert_eq!(form_4562_activity(&p, Some(&owner)), "Bunny Ears Art House");
+        p.legal_name = "Jinny Choi".into();
+        assert_eq!(
+            form_4562_activity(&p, Some(&owner)),
+            "Fine arts instruction — Art classes"
+        );
     }
 
     /// Line C is for a name separate from the owner's: "if no separate business

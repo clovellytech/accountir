@@ -525,10 +525,7 @@ fn attach_form_4562(
     let name = proprietor
         .map(|p| p.name.as_str())
         .unwrap_or(profile.legal_name.as_str());
-    let activity = profile
-        .principal_activity
-        .clone()
-        .unwrap_or_else(|| profile.legal_name.clone());
+    let activity = crate::tax::schedule_c::form_4562_activity(profile, proprietor);
     let (filled, warnings) = form4562::build(
         profile,
         &schedule,
