@@ -170,6 +170,11 @@ pub struct Form1040 {
     pub retirement_taxable_cents: i64,
     pub social_security_taxable_cents: i64,
     pub capital_gain_cents: i64,
+    /// Form 4797's ordinary gain or loss on Schedule 1, line 4 — a K-1's net §1231
+    /// loss. (A net §1231 gain is in `capital_gain_cents`.)
+    pub other_gains_cents: i64,
+    /// The K-1s' net §1231 gain or loss, before it is sent to Schedule D or line 4.
+    pub section_1231_cents: i64,
     pub agi_cents: i64,
     pub deduction_cents: i64,
     pub taxable_income_cents: i64,
@@ -321,6 +326,13 @@ struct K1Totals {
     self_employment: i64,
     qbi: i64,
     foreign_tax: i64,
+    /// Net short- and long-term capital gain passed through to Schedule D.
+    short_term: i64,
+    long_term: i64,
+    /// Net §1231 gain or loss, for Form 4797.
+    section_1231: i64,
+    /// Unrecaptured §1250 gain, taxed at up to 25% — reported, not computed.
+    unrecaptured_1250: i64,
 }
 
 fn k1_totals(statements: &[TaxStatement]) -> K1Totals {
@@ -380,6 +392,18 @@ fn k1_totals(statements: &[TaxStatement]) -> K1Totals {
         if !foreign.is_empty() {
             t.foreign_tax += s.amount(foreign);
         }
+        // (short-term, long-term, §1231, unrecaptured §1250) per form.
+        let (st, lt, s1231, u1250) = match s.form {
+            FormKind::K1Partnership => ("8", "9a", "10", "9c"),
+            FormKind::K1SCorporation => ("7", "8a", "9", "8c"),
+            _ => ("3", "4a", "", "4c"),
+        };
+        t.short_term += s.amount(st);
+        t.long_term += s.amount(lt);
+        if !s1231.is_empty() {
+            t.section_1231 += s.amount(s1231);
+        }
+        t.unrecaptured_1250 += s.amount(u1250);
     }
     t
 }
@@ -664,8 +688,37 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
 
     // Schedule D, with last year's carryovers.
     let sd = &investment.schedule_d;
-    let short = sd.short_term_cents - profile.short_term_loss_carryover_cents;
-    let long = sd.long_term_cents - profile.long_term_loss_carryover_cents;
+    // K-1 capital gains reach Schedule D too (lines 5 and 12), and so does a net
+    // §1231 gain through Form 4797 Part I (line 11). A net §1231 *loss* is ordinary
+    // and goes to Schedule 1, line 4 instead. Leaving these out understated AGI by
+    // whatever a partnership's property sales came to.
+    let section_1231_gain = k1.section_1231.max(0);
+    let other_gains = k1.section_1231.min(0);
+    let short = sd.short_term_cents + k1.short_term - profile.short_term_loss_carryover_cents;
+    let long = sd.long_term_cents + k1.long_term + section_1231_gain
+        - profile.long_term_loss_carryover_cents;
+    if k1.section_1231 != 0 {
+        warnings.push(format!(
+            "A K-1 reports a net §1231 {} of {}, carried through Form 4797 {}. The \
+             five-year lookback that recaptures earlier §1231 losses as ordinary income is \
+             not applied — check Form 4797 Part I line 8 if you had any.",
+            if k1.section_1231 > 0 { "gain" } else { "loss" },
+            dollars(k1.section_1231.abs()),
+            if k1.section_1231 > 0 {
+                "to Schedule D as a long-term gain"
+            } else {
+                "to Schedule 1, line 4, as an ordinary loss"
+            }
+        ));
+    }
+    if k1.unrecaptured_1250 > 0 {
+        warnings.push(format!(
+            "A K-1 reports {} of unrecaptured §1250 gain, which is taxed at up to 25% rather \
+             than the 15%/20% capital gain rates. The tax here applies the lower rates to all \
+             of the gain, so it may be understated.",
+            dollars(k1.unrecaptured_1250)
+        ));
+    }
     let net_gain = short + long;
     let loss_limit = fp::CAPITAL_LOSS_LIMIT.of(status);
     let capital_gain = if net_gain >= 0 {
@@ -731,6 +784,7 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
         + ordinary_dividends
         + retirement_taxable
         + capital_gain
+        + other_gains
         + unemployment
         + other_income
         + business_income
@@ -782,7 +836,7 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
         total_cents: rental_allowed + k1_cents,
     };
     let schedule_1_income =
-        business_income + schedule_e.total_cents + unemployment + other_income;
+        business_income + other_gains + schedule_e.total_cents + unemployment + other_income;
 
     let before_ss = wages
         + taxable_interest
@@ -1079,8 +1133,9 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
             "Additional income (Schedule 1)",
             schedule_1_income,
             format!(
-                "Schedule C {}, Schedule E {}, unemployment {}, other {}",
+                "Schedule C {}, Form 4797 {}, Schedule E {}, unemployment {}, other {}",
                 dollars(business_income),
+                dollars(other_gains),
                 dollars(schedule_e.total_cents),
                 dollars(unemployment),
                 dollars(other_income)
@@ -1193,6 +1248,8 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
         retirement_taxable_cents: retirement_taxable,
         social_security_taxable_cents: ss_taxable,
         capital_gain_cents: capital_gain,
+        other_gains_cents: other_gains,
+        section_1231_cents: k1.section_1231,
         agi_cents: agi,
         deduction_cents: deduction,
         taxable_income_cents: taxable_income,

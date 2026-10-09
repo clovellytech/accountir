@@ -33,6 +33,8 @@
 //! A group server implements [`BlobStore`] against its own storage (see
 //! `PERSONAL-TAX-SPEC.md`), and nothing above the trait changes.
 
+pub mod pdf_text;
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

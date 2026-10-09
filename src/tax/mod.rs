@@ -31,6 +31,7 @@ pub mod il4562;
 pub mod il_k1p;
 pub mod information_returns;
 pub mod investment_reconciliation;
+pub mod k1_extract;
 pub mod k1_package;
 pub mod schedule_c_package;
 pub mod liabilities;
