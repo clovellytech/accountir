@@ -66,10 +66,15 @@
             statusEl.innerHTML = msg;
         }
 
-        // `?item=<proxy item id>` re-opens an existing connection in update mode to
-        // ask for investments consent. Nothing is exchanged afterwards: the
-        // connection, its access token and its account ids all stay as they were.
-        const updateItem = new URLSearchParams(window.location.search).get('item');
+        // `?item=<proxy item id>` re-opens an existing connection in update mode.
+        // Nothing is exchanged afterwards: the connection, its access token and its
+        // account ids all stay as they were. `&purpose=accounts` asks the bank to
+        // let the person change which accounts it shares — the safe way to add one,
+        // since a fresh link replaces what is shared with whatever is picked then.
+        // Without it, the update asks for investments consent.
+        const params = new URLSearchParams(window.location.search);
+        const updateItem = params.get('item');
+        const purpose = params.get('purpose') === 'accounts' ? 'accounts' : 'investments';
 
         async function init() {
             try {
@@ -77,7 +82,7 @@
                     ? {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ proxy_item_id: updateItem }),
+                        body: JSON.stringify({ proxy_item_id: updateItem, purpose: purpose }),
                     }
                     : { method: 'POST' });
                 if (!resp.ok) {
@@ -92,7 +97,9 @@
                     token: link_token,
                     onSuccess: async (publicToken, metadata) => {
                         if (updateItem) {
-                            showStatus('success', 'Investments access added. Go back to Accountir and pull again.');
+                            showStatus('success', purpose === 'accounts'
+                                ? 'Accounts updated. Go back to Accountir, press Refresh accounts on this connection, map any new accounts, and share it again with any group that needs them.'
+                                : 'Investments access added. Go back to Accountir and pull again.');
                             closeNote.style.display = 'block';
                             return;
                         }
@@ -125,7 +132,15 @@
                                 return;
                             }
 
-                            showStatus('success', 'Bank connected successfully!');
+                            const saved = await exchangeResp.json().catch(() => ({}));
+                            if (saved.notice) {
+                                const p = document.createElement('p');
+                                p.textContent = saved.notice;
+                                showStatus('success', 'Bank connected successfully!');
+                                statusEl.appendChild(p);
+                            } else {
+                                showStatus('success', 'Bank connected successfully!');
+                            }
                             closeNote.style.display = 'block';
                         } catch (e) {
                             showStatus('error', 'Error: ' + e.message);

@@ -782,6 +782,12 @@ struct PlaidLinkTokenRequest {
     /// ledger has no proxy id at all, so the desktop resolves it (from the grant
     /// it filed) before opening the page.
     proxy_item_id: String,
+    /// What the update is for: `"accounts"` re-opens the connection to change
+    /// which accounts it shares, keeping the ones it has; `"investments"` (the
+    /// default, and the only kind before accounts could be added) asks for
+    /// investments consent.
+    #[serde(default)]
+    purpose: Option<String>,
 }
 
 async fn plaid_link_token(
@@ -793,8 +799,22 @@ async fn plaid_link_token(
     // Update mode: Link re-opens the connection to ask for investments consent and
     // keeps its Item and account ids. Parsed as a UUID because it is spliced into
     // the proxy's path, and anything else there is a different route.
+    let mut purpose = None;
     let path = match update {
         Some(Json(req)) => {
+            purpose = match req.purpose.as_deref() {
+                None | Some("investments") => None,
+                Some("accounts") => Some("accounts"),
+                Some(other) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            success: false,
+                            error: format!("{other:?} is not something a connection can be updated for."),
+                        }),
+                    ))
+                }
+            };
             let id = uuid::Uuid::parse_str(req.proxy_item_id.trim()).map_err(|_| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -814,6 +834,11 @@ async fn plaid_link_token(
         .post(format!("{}{}", plaid_cfg.proxy_url, path));
     if let Some(ref key) = plaid_cfg.api_key {
         req = req.bearer_auth(key);
+    }
+    // Only an accounts update sends a body: a proxy that predates it reads a
+    // bodiless request as investments, exactly as before.
+    if let Some(purpose) = purpose {
+        req = req.json(&serde_json::json!({ "purpose": purpose }));
     }
     let resp = req
         .send()
@@ -866,6 +891,72 @@ struct PlaidLinkAccountInfo {
 struct PlaidExchangeTokenResponse {
     success: bool,
     item_id: String,
+    /// What the proxy did with an existing connection to the same bank, in
+    /// words, when it did anything worth saying. Shown on the Link page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice: Option<String>,
+}
+
+/// Say what a link did to the user's other connections at the same bank.
+///
+/// The proxy used to replace an existing connection with whatever accounts the
+/// new link picked, silently, which is how one Bank of America connection
+/// serving three sets of books ended up holding one account. It now keeps the
+/// old connection unless the new one covers all of its accounts; this is where
+/// the person learns which happened. `None` for a first connection, or from a
+/// proxy that does not report it.
+fn exchange_notice(body: &serde_json::Value) -> Option<String> {
+    match body["outcome"].as_str()? {
+        "replaced" => {
+            let grants = body["grants_remapped"].as_u64().unwrap_or(0);
+            Some(if grants > 0 {
+                format!(
+                    "This replaced your existing connection to this bank, which had no accounts \
+                     the new one is missing. {grants} shared feed(s) were moved onto it and \
+                     will pull from where they need to."
+                )
+            } else {
+                "This replaced your existing connection to this bank, which had no accounts the \
+                 new one is missing."
+                    .to_string()
+            })
+        }
+        "kept_separate" => {
+            let kept: Vec<String> = body["kept_separate_from"]
+                .as_array()?
+                .iter()
+                .map(|c| {
+                    let missing: Vec<String> = c["missing_accounts"]
+                        .as_array()
+                        .map(|a| {
+                            a.iter()
+                                .map(|m| match m["mask"].as_str() {
+                                    Some(mask) if !mask.is_empty() => format!(
+                                        "{} …{mask}",
+                                        m["name"].as_str().unwrap_or("an account")
+                                    ),
+                                    _ => m["name"].as_str().unwrap_or("an account").to_string(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    missing.join(", ")
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            Some(format!(
+                "This was added as a separate connection. Your existing connection to this bank \
+                 was left as it was, because it has accounts this link did not pick{}. To add \
+                 accounts to an existing connection instead, use Add accounts on the Plaid page.",
+                if kept.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", kept.join("; "))
+                }
+            ))
+        }
+        _ => None,
+    }
 }
 
 async fn plaid_exchange_token(
@@ -973,6 +1064,7 @@ async fn plaid_exchange_token(
         return Ok(Json(PlaidExchangeTokenResponse {
             success: true,
             item_id: String::new(),
+            notice: exchange_notice(&body),
         }));
     }
 
@@ -1047,6 +1139,7 @@ async fn plaid_exchange_token(
         return Ok(Json(PlaidExchangeTokenResponse {
             success: true,
             item_id,
+            notice: exchange_notice(&body),
         }));
     }
 
@@ -1088,6 +1181,7 @@ async fn plaid_exchange_token(
     Ok(Json(PlaidExchangeTokenResponse {
         success: true,
         item_id,
+        notice: exchange_notice(&body),
     }))
 }
 
@@ -3250,6 +3344,50 @@ pub async fn run_server(store: EventStore, db_path: PathBuf) -> anyhow::Result<(
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod exchange_notice_tests {
+    use super::exchange_notice;
+
+    /// A link kept apart from an existing connection says so, and names what the
+    /// existing one has that this link did not pick — the accounts other books
+    /// depend on, which the old behaviour silently took away.
+    #[test]
+    fn a_link_kept_separate_names_what_the_existing_connection_still_holds() {
+        let said = exchange_notice(&serde_json::json!({
+            "outcome": "kept_separate",
+            "kept_separate_from": [{
+                "item_id": "x",
+                "institution_name": "Bank of America",
+                "missing_accounts": [
+                    {"name": "Bugbear Bikes LLC", "mask": "1187"},
+                    {"name": "Bugbear Bikes Zak CC", "mask": "8559"}
+                ]
+            }]
+        }))
+        .expect("a notice");
+        assert!(said.contains("separate connection"), "{said}");
+        assert!(said.contains("Bugbear Bikes LLC …1187, Bugbear Bikes Zak CC …8559"), "{said}");
+        assert!(said.contains("Add accounts"), "{said}");
+        assert!(!said.contains("  "), "{said}");
+    }
+
+    #[test]
+    fn a_replacement_says_how_many_shared_feeds_moved_with_it() {
+        let said = exchange_notice(&serde_json::json!({"outcome": "replaced", "grants_remapped": 2}))
+            .expect("a notice");
+        assert!(said.contains("2 shared feed(s)"), "{said}");
+        assert!(!said.contains("  "), "{said}");
+    }
+
+    /// A first connection, and a proxy that does not report an outcome, say
+    /// nothing extra.
+    #[test]
+    fn a_first_link_or_an_older_proxy_adds_nothing() {
+        assert!(exchange_notice(&serde_json::json!({"outcome": "new"})).is_none());
+        assert!(exchange_notice(&serde_json::json!({"item_id": "x"})).is_none());
+    }
 }
 
 #[cfg(test)]
