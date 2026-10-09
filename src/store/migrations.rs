@@ -227,6 +227,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             57,
             include_str!("../../migrations/057_schedule_c_links_and_inputs.sql"),
         ),
+        (
+            58,
+            include_str!("../../migrations/058_typed_documents_and_state_k1s.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -961,6 +965,22 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             recorded_at_event INTEGER REFERENCES events(id)
         );
         CREATE INDEX IF NOT EXISTS idx_tax_statements_year ON tax_statements(tax_year, form);
+        -- State K-1s (migration 058).
+        CREATE TABLE IF NOT EXISTS state_tax_statements (
+            statement_id TEXT PRIMARY KEY,
+            tax_year INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            issuer TEXT NOT NULL,
+            form TEXT NOT NULL,
+            amounts TEXT NOT NULL,
+            apportionment_ppm INTEGER,
+            federal_statement_id TEXT,
+            document_ids TEXT NOT NULL DEFAULT '[]',
+            note TEXT,
+            recorded_at_event INTEGER REFERENCES events(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_state_tax_statements_year
+            ON state_tax_statements(tax_year, state);
         -- A statement's transaction-by-transaction detail: the Form 8949 rows a
         -- 1099-B's category subtotals are not enough for (migration 054). See
         -- 054_tax_statement_lines.sql for why a 1099-B needs a list where every
@@ -1149,6 +1169,9 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             subject_id        TEXT,
             attached_at       TEXT NOT NULL,
             attached_at_event INTEGER REFERENCES events(id),
+            -- What it was recognised as (migration 058).
+            kind TEXT,
+            kind_parts TEXT NOT NULL DEFAULT '',
             CHECK ((subject_kind IS NULL) = (subject_id IS NULL))
         );
         CREATE INDEX IF NOT EXISTS idx_documents_subject

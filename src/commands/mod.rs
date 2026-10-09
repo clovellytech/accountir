@@ -12,6 +12,7 @@ pub mod import_commands;
 pub mod ingest_commands;
 pub mod investment_commands;
 pub mod investment_import;
+pub mod k1_import_commands;
 pub mod invoice_commands;
 pub mod partnership_commands;
 pub mod personal_tax_commands;

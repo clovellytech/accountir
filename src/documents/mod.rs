@@ -33,6 +33,7 @@
 //! A group server implements [`BlobStore`] against its own storage (see
 //! `PERSONAL-TAX-SPEC.md`), and nothing above the trait changes.
 
+pub mod classify;
 pub mod pdf_text;
 
 use std::fs;

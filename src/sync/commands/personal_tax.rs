@@ -31,6 +31,14 @@ pub fn router() -> Router<SyncState> {
             "/sync/commands/record-tax-statement-lines",
             post(submit_record_lines),
         )
+        .route(
+            "/sync/commands/record-state-tax-statement",
+            post(submit_record_state),
+        )
+        .route(
+            "/sync/commands/remove-state-tax-statement",
+            post(submit_remove_state),
+        )
         .route("/sync/commands/link-k1-source", post(submit_link_k1))
         .route("/sync/commands/unlink-k1-source", post(submit_unlink_k1))
         .route(
@@ -209,6 +217,12 @@ pub struct RecordTaxStatementRequest {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct RecordStateTaxStatementRequest {
+    pub expected_head_seq: i64,
+    pub statement: crate::events::types::StateTaxStatementData,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct RemoveTaxStatementRequest {
     pub expected_head_seq: i64,
     pub statement_id: String,
@@ -331,6 +345,82 @@ async fn submit_remove(
                 }
                 Ok(Verdict::<_, ProfileError>::Append(stamp(
                     Event::TaxStatementRemoved {
+                        statement_id: statement_id.clone(),
+                    },
+                    &actor,
+                )))
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<ProfileError>)
+}
+
+async fn submit_record_state(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<RecordStateTaxStatementRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    let statement = req.statement;
+    let event = Event::StateTaxStatementRecorded(Box::new(statement.clone()));
+    if let Err(e) = crate::events::validation::validate_event(&event) {
+        return Err(ApiError::bad_request(&e.to_string()));
+    }
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| {
+                for id in &statement.document_ids {
+                    let attached = tx
+                        .query_row("SELECT 1 FROM documents WHERE document_id = ?1", [id], |_| {
+                            Ok(())
+                        })
+                        .optional()?
+                        .is_some();
+                    if !attached {
+                        return Ok(Verdict::Reject(ProfileError::Invalid(format!(
+                            "the state K-1 cites document {id}, which these books do not have"
+                        ))));
+                    }
+                }
+                Ok(Verdict::<_, ProfileError>::Append(stamp(event.clone(), &actor)))
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<ProfileError>)
+}
+
+async fn submit_remove_state(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<RemoveTaxStatementRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    if req.statement_id.trim().is_empty() {
+        return Err(ApiError::bad_request("statement_id is required"));
+    }
+    let statement_id = req.statement_id;
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| {
+                let recorded = tx
+                    .query_row(
+                        "SELECT 1 FROM state_tax_statements WHERE statement_id = ?1",
+                        [&statement_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !recorded {
+                    return Ok(Verdict::Reject(ProfileError::Invalid(format!(
+                        "no state K-1 with id {statement_id}"
+                    ))));
+                }
+                Ok(Verdict::<_, ProfileError>::Append(stamp(
+                    Event::StateTaxStatementRemoved {
                         statement_id: statement_id.clone(),
                     },
                     &actor,

@@ -697,9 +697,51 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
                 let (kind, id) = subject.as_columns();
                 validate_non_empty(id, kind)?;
             }
+            validate_document_kind(d.kind.as_deref(), &d.parts)?;
         }
         Event::DocumentRemoved { document_id } => {
             validate_non_empty(document_id, "document_id")?;
+        }
+        Event::DocumentClassified {
+            document_id,
+            kind,
+            parts,
+        } => {
+            validate_non_empty(document_id, "document_id")?;
+            validate_document_kind(kind.as_deref(), parts)?;
+        }
+        Event::StateTaxStatementRecorded(d) => {
+            validate_non_empty(&d.statement_id, "statement_id")?;
+            validate_non_empty(&d.issuer, "issuer")?;
+            validate_non_empty(&d.form, "form")?;
+            validate_tax_year(d.tax_year)?;
+            if !is_state_code(&d.state) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "state: {:?} is not a two-letter postal code",
+                    d.state
+                )));
+            }
+            // Codes from the shared vocabulary only: a code nothing reads is a figure
+            // that silently reaches no return.
+            if let Some(code) = d
+                .amounts
+                .keys()
+                .find(|c| !crate::tax::k1_extract::state_codes::ALL.contains(&c.as_str()))
+            {
+                return Err(ValidationError::InvalidValue(format!(
+                    "a state K-1 has no figure {code:?}"
+                )));
+            }
+            if let Some(ppm) = d.apportionment_ppm {
+                if !(0..=1_000_000).contains(&ppm) {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "apportionment_ppm: {ppm} is not between 0 and 1,000,000"
+                    )));
+                }
+            }
+        }
+        Event::StateTaxStatementRemoved { statement_id } => {
+            validate_non_empty(statement_id, "statement_id")?;
         }
         Event::InvestmentImportsForgotten(d) => {
             validate_non_empty(&d.item_id, "item_id")?;
@@ -1580,6 +1622,29 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// A document kind, if any, is a kind with a name; its parts are postal codes,
+/// the only parts any kind has today.
+fn validate_document_kind(kind: Option<&str>, parts: &[String]) -> Result<(), ValidationError> {
+    if let Some(k) = kind {
+        validate_non_empty(k, "kind")?;
+    }
+    if let Some(p) = parts.iter().find(|p| !is_state_code(p)) {
+        return Err(ValidationError::InvalidValue(format!(
+            "parts: {p:?} is not a two-letter postal code"
+        )));
+    }
+    if kind.is_none() && !parts.is_empty() {
+        return Err(ValidationError::InvalidValue(
+            "parts without a kind: parts are what a kind of document carries".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_state_code(s: &str) -> bool {
+    s.len() == 2 && s.bytes().all(|b| b.is_ascii_uppercase())
+}
+
 fn validate_non_empty(value: &str, field_name: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         Err(ValidationError::EmptyField(field_name.to_string()))
@@ -1918,6 +1983,8 @@ mod tests {
             tax_year: None,
             form: None,
             subject: None,
+            kind: None,
+            parts: Vec::new(),
         }))
     }
 

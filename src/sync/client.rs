@@ -1830,6 +1830,34 @@ impl SyncClient {
         .await
     }
 
+    /// Record a state K-1 on the group's books.
+    pub async fn record_state_tax_statement(
+        &mut self,
+        statement: &crate::events::types::StateTaxStatementData,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/record-state-tax-statement", |head| {
+            crate::sync::commands::personal_tax::RecordStateTaxStatementRequest {
+                expected_head_seq: head,
+                statement: statement.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Take a state K-1 off the group's books.
+    pub async fn remove_state_tax_statement(
+        &mut self,
+        statement_id: &str,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/remove-state-tax-statement", |head| {
+            crate::sync::commands::personal_tax::RemoveTaxStatementRequest {
+                expected_head_seq: head,
+                statement_id: statement_id.to_string(),
+            }
+        })
+        .await
+    }
+
     /// Replace a 1099-B's transaction detail on the group's books.
     pub async fn record_tax_statement_lines(
         &mut self,
@@ -2584,6 +2612,27 @@ impl SyncClient {
                 tax_year: doc.tax_year,
                 form: doc.form.clone(),
                 subject: doc.subject.clone(),
+                kind: doc.kind.clone(),
+                parts: doc.parts.clone(),
+            }
+        })
+        .await
+    }
+
+    /// Record what an attached document was recognised as, on the group's books.
+    /// The client read the bytes; the instance never does.
+    pub async fn classify_document(
+        &mut self,
+        document_id: &str,
+        kind: Option<String>,
+        parts: Vec<String>,
+    ) -> Result<i64, SyncClientError> {
+        self.submit_retrying("/sync/commands/classify-document", |head| {
+            super::commands::documents::ClassifyDocumentRequest {
+                expected_head_seq: head,
+                document_id: document_id.to_string(),
+                kind: kind.clone(),
+                parts: parts.clone(),
             }
         })
         .await

@@ -87,6 +87,9 @@ pub fn attach(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
 
+    // What it is, read from what is in it, so every replica knows — including one
+    // that never holds the bytes.
+    let classified = crate::documents::classify::classify(doc.bytes, &media_type);
     let stored = blobs.put(doc.bytes)?;
     let document_id = Uuid::new_v4().to_string();
     append(
@@ -105,6 +108,8 @@ pub fn attach(
                 .map(|f| f.trim().to_string())
                 .filter(|f| !f.is_empty()),
             subject: doc.subject.as_ref().map(wire_subject),
+            kind: classified.kind,
+            parts: classified.parts,
         })),
     )?;
     get(store.connection(), &document_id).ok_or_else(|| {
@@ -177,10 +182,44 @@ pub fn remove(
     )
 }
 
+/// Recognise a document already attached, from its bytes, and record what it is
+/// if that differs from what the books say. `Ok(None)` when nothing changed.
+///
+/// For documents attached before files were typed, and for any a newer version
+/// recognises that an older one did not.
+pub fn classify(
+    store: &mut EventStore,
+    blobs: &dyn BlobStore,
+    user_id: &str,
+    document_id: &str,
+) -> Result<Option<Document>, DocumentError> {
+    let doc = get(store.connection(), document_id)
+        .ok_or_else(|| DocumentError::NoSuchDocument(document_id.to_string()))?;
+    let bytes = read(store.connection(), blobs, document_id)?;
+    let found = crate::documents::classify::classify(&bytes, &doc.media_type);
+    if found.kind == doc.kind && found.parts == doc.parts {
+        return Ok(None);
+    }
+    append(store, user_id, classified_event(document_id, found))?;
+    Ok(get(store.connection(), document_id))
+}
+
+/// The event recording what a document is.
+pub fn classified_event(
+    document_id: &str,
+    found: crate::documents::classify::Classification,
+) -> Event {
+    Event::DocumentClassified {
+        document_id: document_id.to_string(),
+        kind: found.kind,
+        parts: found.parts,
+    }
+}
+
 /// Documents on the books, newest first — all of them, or one tax year's.
 pub fn list(conn: &Connection, tax_year: Option<i32>) -> Vec<Document> {
     let sql = "SELECT document_id, sha256, size_bytes, media_type, filename, title, tax_year,
-                      form, subject_kind, subject_id, attached_at
+                      form, subject_kind, subject_id, attached_at, kind, kind_parts
                  FROM documents
                 WHERE ?1 IS NULL OR tax_year = ?1
                 ORDER BY attached_at DESC, document_id";
@@ -195,7 +234,7 @@ pub fn list(conn: &Connection, tax_year: Option<i32>) -> Vec<Document> {
 pub fn get(conn: &Connection, document_id: &str) -> Option<Document> {
     conn.query_row(
         "SELECT document_id, sha256, size_bytes, media_type, filename, title, tax_year,
-                form, subject_kind, subject_id, attached_at
+                form, subject_kind, subject_id, attached_at, kind, kind_parts
            FROM documents WHERE document_id = ?1",
         [document_id],
         row_to_document,
@@ -248,7 +287,13 @@ pub fn check(conn: &Connection, blobs: &dyn BlobStore) -> Vec<(Document, Availab
 
 /// The statements that name a document as what they were read from.
 fn statements_citing(conn: &Connection, document_id: &str) -> Vec<String> {
-    let Ok(mut stmt) = conn.prepare("SELECT statement_id, document_ids FROM tax_statements") else {
+    // Federal and state statements alike: either is figures on a return with this
+    // document behind them.
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT statement_id, document_ids FROM tax_statements
+         UNION ALL
+         SELECT statement_id, document_ids FROM state_tax_statements",
+    ) else {
         return Vec::new();
     };
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)));
@@ -269,6 +314,8 @@ fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
     let attached_at: String = row.get(10)?;
     let kind: Option<String> = row.get(8)?;
     let id: Option<String> = row.get(9)?;
+    let doc_kind: Option<String> = row.get(11)?;
+    let parts: String = row.get::<_, Option<String>>(12)?.unwrap_or_default();
     Ok(Document {
         document_id: row.get(0)?,
         sha256: row.get(1)?,
@@ -283,6 +330,13 @@ fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
         subject: kind
             .zip(id)
             .and_then(|(kind, id)| DocumentSubject::from_columns(&kind, &id)),
+        kind: doc_kind,
+        parts: parts
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect(),
         attached_at: DateTime::parse_from_rfc3339(&attached_at)
             .map(|t| t.with_timezone(&Utc))
             .unwrap_or_default(),
@@ -313,7 +367,7 @@ pub fn for_subject(conn: &Connection, subject: &DocumentSubject) -> Vec<Document
     let (kind, id) = subject.as_columns();
     let Ok(mut stmt) = conn.prepare(
         "SELECT document_id, sha256, size_bytes, media_type, filename, title, tax_year,
-                form, subject_kind, subject_id, attached_at
+                form, subject_kind, subject_id, attached_at, kind, kind_parts
            FROM documents
           WHERE subject_kind = ?1 AND subject_id = ?2
           ORDER BY attached_at, document_id",

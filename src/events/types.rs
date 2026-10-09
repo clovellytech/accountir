@@ -906,6 +906,49 @@ pub struct DocumentAttachedData {
     /// What it is about, where it is about one thing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<DocumentSubjectData>,
+    /// What kind of document this was recognised as, from its contents — a
+    /// [`crate::documents::classify`] kind such as `k1_1065`. Absent on a file
+    /// nothing recognised, and on documents attached before files were typed;
+    /// [`Event::DocumentClassified`] types those afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// What the document carries within its kind — for a K-1 package, the postal
+    /// codes of the state K-1s in it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<String>,
+}
+
+/// A state K-1, as the partner's books record it: what the partnership told
+/// one state about this partner's share.
+///
+/// Its own record rather than boxes on the federal statement, because a state
+/// K-1 is a different document with different questions — which state, how much
+/// of the income is that state's, what tax the partnership already paid there —
+/// and one federal K-1 can come with ten of them. Amounts are keyed by
+/// [`crate::tax::k1_extract::state_codes`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateTaxStatementData {
+    pub statement_id: String,
+    pub tax_year: i32,
+    /// Two-letter postal code.
+    pub state: String,
+    /// Who sent it: the partnership.
+    pub issuer: String,
+    /// The form, in the state's own words: "Maryland Schedule K-1 (510/511)".
+    pub form: String,
+    /// Code to cents. A `BTreeMap` so the event's hash does not depend on order.
+    pub amounts: BTreeMap<String, i64>,
+    /// The state's apportionment percentage in parts per million, where the K-1
+    /// gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apportionment_ppm: Option<i64>,
+    /// The federal K-1 it accompanies, when that is recorded too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federal_statement_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub document_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// What a document is about, on the wire.
@@ -2003,6 +2046,21 @@ pub enum Event {
     DocumentRemoved {
         document_id: String,
     },
+    /// A document already attached is recognised as a kind — one attached before
+    /// files were typed, or one a newer version recognises.
+    DocumentClassified {
+        document_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        parts: Vec<String>,
+    },
+    /// A state K-1 is recorded, or re-recorded with corrected figures — the same
+    /// id replaces. See [`StateTaxStatementData`].
+    StateTaxStatementRecorded(Box<StateTaxStatementData>),
+    StateTaxStatementRemoved {
+        statement_id: String,
+    },
     /// What the broker said an account held on a date. Posts nothing for a taxable
     /// account; for a sheltered one it is what a value update is computed from.
     HoldingsSnapshotRecorded(Box<HoldingsSnapshotData>),
@@ -2314,6 +2372,9 @@ impl Event {
             Event::IllinoisTaxAddbackSet { .. } => "illinois_tax_addback_set",
             Event::DocumentAttached(_) => "document_attached",
             Event::DocumentRemoved { .. } => "document_removed",
+            Event::DocumentClassified { .. } => "document_classified",
+            Event::StateTaxStatementRecorded(_) => "state_tax_statement_recorded",
+            Event::StateTaxStatementRemoved { .. } => "state_tax_statement_removed",
             Event::TaxStatementRecorded(_) => "tax_statement_recorded",
             Event::TaxStatementRemoved { .. } => "tax_statement_removed",
             Event::TaxStatementLinesRecorded(_) => "tax_statement_lines_recorded",
@@ -2422,6 +2483,9 @@ impl Event {
             Event::IllinoisTaxAddbackSet { account_id, .. } => Some(account_id),
             Event::DocumentAttached(d) => Some(&d.document_id),
             Event::DocumentRemoved { document_id } => Some(document_id),
+            Event::DocumentClassified { document_id, .. } => Some(document_id),
+            Event::StateTaxStatementRecorded(d) => Some(&d.statement_id),
+            Event::StateTaxStatementRemoved { statement_id } => Some(statement_id),
             Event::TaxStatementRecorded(s) => Some(&s.statement_id),
             Event::TaxStatementRemoved { statement_id } => Some(statement_id),
             Event::TaxStatementLinesRecorded(l) => Some(&l.statement_id),
@@ -2923,6 +2987,8 @@ mod tests {
                 tax_year: Some(2025),
                 form: Some("1099_int".to_string()),
                 subject: None,
+                kind: None,
+                parts: Vec::new(),
             })),
             Event::DocumentRemoved {
                 document_id: "doc-1".to_string(),

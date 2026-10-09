@@ -503,6 +503,20 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::DocumentRemoved { document_id } => {
             format!("Removed document {}", widgets::truncate(document_id, 8))
         }
+        Event::DocumentClassified {
+            document_id, kind, ..
+        } => format!(
+            "Document {} recognised as {}",
+            widgets::truncate(document_id, 8),
+            kind.as_deref().unwrap_or("nothing in particular")
+        ),
+        Event::StateTaxStatementRecorded(d) => format!(
+            "Recorded {} {} from {}",
+            d.tax_year, d.form, d.issuer
+        ),
+        Event::StateTaxStatementRemoved { statement_id } => {
+            format!("Removed state K-1 {}", widgets::truncate(statement_id, 12))
+        }
         Event::InvestmentImportsForgotten(d) => format!(
             "Forgot {} import(s) from {}: {}",
             d.provider_transaction_ids.len(),

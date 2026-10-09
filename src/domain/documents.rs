@@ -27,6 +27,10 @@ pub struct Document {
     pub form: Option<String>,
     /// What it is about, where it is about one thing.
     pub subject: Option<DocumentSubject>,
+    /// What it was recognised as — see [`crate::documents::classify`].
+    pub kind: Option<String>,
+    /// What it carries within its kind: for a K-1 package, its state K-1s.
+    pub parts: Vec<String>,
     pub attached_at: DateTime<Utc>,
 }
 
@@ -37,6 +41,11 @@ impl Document {
             Some(title) if !title.is_empty() => title,
             _ => &self.filename,
         }
+    }
+
+    /// What it is, in a line, when it was recognised as anything.
+    pub fn kind_description(&self) -> Option<String> {
+        crate::documents::classify::describe(self.kind.as_deref(), &self.parts)
     }
 
     /// The size, in the units a person reads.
@@ -93,6 +102,28 @@ impl DocumentSubject {
             }),
             _ => None,
         }
+    }
+}
+
+/// A state K-1, as recorded. See [`crate::events::types::StateTaxStatementData`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateTaxStatement {
+    pub statement_id: String,
+    pub tax_year: i32,
+    pub state: String,
+    pub issuer: String,
+    pub form: String,
+    /// [`crate::tax::k1_extract::state_codes`] to cents.
+    pub amounts: BTreeMap<String, i64>,
+    pub apportionment_ppm: Option<i64>,
+    pub federal_statement_id: Option<String>,
+    pub document_ids: Vec<String>,
+    pub note: Option<String>,
+}
+
+impl StateTaxStatement {
+    pub fn amount(&self, code: &str) -> Option<i64> {
+        self.amounts.get(code).copied()
     }
 }
 

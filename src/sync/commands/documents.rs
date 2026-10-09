@@ -28,12 +28,14 @@ use crate::events::types::{DocumentAttachedData, DocumentSubjectData, Event};
 use crate::store::event_store::Verdict;
 use crate::sync::{outcome_to_response, project, stamp, ApiError, AuthedUser, SyncState};
 use axum::{extract::State, routing::post, Json, Router};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<SyncState> {
     Router::new()
         .route("/sync/commands/attach-document", post(submit_attach))
         .route("/sync/commands/remove-document", post(submit_remove))
+        .route("/sync/commands/classify-document", post(submit_classify))
 }
 
 /// Record that a file has been attached. The bytes are not in this request — see the
@@ -56,6 +58,24 @@ pub struct AttachDocumentRequest {
     pub form: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<DocumentSubjectData>,
+    /// What the client recognised the file as. The instance never sees the bytes,
+    /// so it records what it is told; the shape is checked like any event's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<String>,
+}
+
+/// What a client recognised an attached document as. See
+/// [`crate::documents::classify`].
+#[derive(Serialize, Deserialize)]
+pub struct ClassifyDocumentRequest {
+    pub expected_head_seq: i64,
+    pub document_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -99,8 +119,54 @@ async fn submit_attach(
             tax_year: req.tax_year,
             form: req.form,
             subject: req.subject,
+            kind: req.kind,
+            parts: req.parts,
         })),
     )
+}
+
+async fn submit_classify(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<ClassifyDocumentRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    if req.document_id.trim().is_empty() {
+        return Err(ApiError::bad_request("document_id is required"));
+    }
+    let event = Event::DocumentClassified {
+        document_id: req.document_id.clone(),
+        kind: req.kind,
+        parts: req.parts,
+    };
+    // Shape first, so a malformed kind is the caller's 400 rather than the store's 500.
+    if let Err(e) = crate::events::validation::validate_event(&event) {
+        return Err(ApiError::bad_request(&e.to_string()));
+    }
+    let document_id = req.document_id;
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| {
+                let attached = tx
+                    .query_row(
+                        "SELECT 1 FROM documents WHERE document_id = ?1",
+                        [&document_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !attached {
+                    return Ok(Verdict::Reject(DocumentError::NoSuchDocument(
+                        document_id.clone(),
+                    )));
+                }
+                Ok(Verdict::<_, DocumentError>::Append(stamp(event.clone(), &actor)))
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<DocumentError>)
 }
 
 async fn submit_remove(

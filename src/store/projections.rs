@@ -1182,8 +1182,8 @@ impl<'a> Projector<'a> {
                     "INSERT OR REPLACE INTO documents
                        (document_id, sha256, size_bytes, media_type, filename, title,
                         tax_year, form, subject_kind, subject_id, attached_at,
-                        attached_at_event)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        attached_at_event, kind, kind_parts)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                     params![
                         d.document_id,
                         d.sha256,
@@ -1196,7 +1196,9 @@ impl<'a> Projector<'a> {
                         kind,
                         id,
                         stored_event.timestamp.to_rfc3339(),
-                        stored_event.id
+                        stored_event.id,
+                        d.kind,
+                        d.parts.join(",")
                     ],
                 )?;
             }
@@ -1205,6 +1207,49 @@ impl<'a> Projector<'a> {
                 self.conn.execute(
                     "DELETE FROM documents WHERE document_id = ?1",
                     [document_id],
+                )?;
+            }
+            Event::DocumentClassified {
+                document_id,
+                kind,
+                parts,
+            } => {
+                self.conn.execute(
+                    "UPDATE documents SET kind = ?2, kind_parts = ?3 WHERE document_id = ?1",
+                    params![document_id, kind, parts.join(",")],
+                )?;
+            }
+            Event::StateTaxStatementRecorded(s) => {
+                // Replaces, like a federal statement: the same id is the same K-1.
+                let amounts = serde_json::to_string(&s.amounts)
+                    .expect("a map of strings to integers always serializes");
+                let document_ids = serde_json::to_string(&s.document_ids)
+                    .expect("a list of strings always serializes");
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO state_tax_statements
+                       (statement_id, tax_year, state, issuer, form, amounts,
+                        apportionment_ppm, federal_statement_id, document_ids, note,
+                        recorded_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        s.statement_id,
+                        s.tax_year,
+                        s.state,
+                        s.issuer,
+                        s.form,
+                        amounts,
+                        s.apportionment_ppm,
+                        s.federal_statement_id,
+                        document_ids,
+                        s.note,
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::StateTaxStatementRemoved { statement_id } => {
+                self.conn.execute(
+                    "DELETE FROM state_tax_statements WHERE statement_id = ?1",
+                    [statement_id],
                 )?;
             }
             // The opposite of the arm above, and the only one in this file that takes
@@ -1991,6 +2036,7 @@ impl<'a> Projector<'a> {
              DELETE FROM tax_statement_lines;
              DELETE FROM personal_tax_profiles;
              DELETE FROM tax_statements;
+             DELETE FROM state_tax_statements;
              DELETE FROM k1_links;
              DELETE FROM schedule_c_links;
              DELETE FROM schedule_c_inputs;

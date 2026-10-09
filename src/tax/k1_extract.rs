@@ -1043,7 +1043,7 @@ fn read_pa(page: &PageText, st: &mut StateK1Extract) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A made-up package laid out the way the forms are: a federal K-1, a QBI
