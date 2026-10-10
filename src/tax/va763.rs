@@ -374,6 +374,9 @@ mod at {
     pub const DEPENDENTS: (At, &str) = ((1, 442.0, 473.0), "Dependents");
     pub const SECTION1: (At, At) = ((1, 481.0, 472.0), (1, 552.0, 473.0));
     pub const SECTION2: (At, At) = ((1, 481.0, 434.0), (1, 552.0, 434.0));
+    /// You 65, spouse 65, you blind, spouse blind: counted in SECTION2, which
+    /// is what the form adds; the boxes themselves are left for the filer.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const SECTION2_BOXES: [At; 4] = [
         (1, 373.0, 434.0),
         (1, 399.0, 434.0),
