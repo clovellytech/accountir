@@ -1043,6 +1043,35 @@ pub(crate) mod tests {
     /// A made-up package laid out the way the forms are: a federal K-1, a QBI
     /// statement, and Maryland's and Virginia's K-1s. Nothing in it belongs to
     /// anybody.
+    /// A real K-1 package, read by path from `ACCOUNTIR_REAL_K1` — opt-in, since
+    /// the file is a person's own and never belongs in the repository. Asserts
+    /// amounts only, and prints nothing from the file.
+    #[test]
+    #[ignore]
+    fn a_real_package_reads_as_its_figures() {
+        let Ok(path) = std::env::var("ACCOUNTIR_REAL_K1") else {
+            return;
+        };
+        let doc = lopdf::Document::load(path).expect("the file opens");
+        let x = extract(&crate::documents::pdf_text::pages(&doc));
+        let f = |code: &str| x.federal.get(code).copied();
+        assert_eq!(f("1"), Some(791_400));
+        assert_eq!(f("2"), Some(-952_000));
+        assert_eq!(f("10"), Some(3_597_400));
+        assert_eq!(f("19a"), Some(327_600));
+        let st = |state: &str, code: &str| {
+            x.states
+                .iter()
+                .find(|s| s.state == state)
+                .and_then(|s| s.amounts.get(code).copied())
+        };
+        assert_eq!(st("MD", state_codes::SOURCE_INCOME), Some(1_643_800));
+        assert_eq!(st("MD", state_codes::NONRESIDENT_TAX_PAID), Some(142_200));
+        assert_eq!(st("VA", state_codes::SOURCE_INCOME), Some(1_449_400));
+        assert_eq!(st("VA", state_codes::WITHHOLDING), Some(70_900));
+        assert_eq!(x.states.len(), 10);
+    }
+
     pub(crate) fn sample_package() -> lopdf::Document {
         let t = |x: f32, y: f32, s: &str| (x, y, s.to_string());
         // Federal page: box numbers and labels, with figures just below.

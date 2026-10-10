@@ -128,7 +128,9 @@ fn schedule_cr(
                 .map(|r| {
                     if r.special_tax_cents > 0 {
                         warnings.push(format!(
-                            "Schedule CR credits Maryland's state tax (${}) but not its 2.25%                              special nonresident tax (${}), which Maryland levies in place of a                              county tax; whether Illinois allows it is for you to confirm.",
+                            "Schedule CR credits Maryland's state tax (${}) but not its 2.25% \
+                             special nonresident tax (${}), which Maryland levies in place of a \
+                             county tax; whether Illinois allows it is for you to confirm.",
                             r.state_tax_cents / 100,
                             r.special_tax_cents / 100
                         ));
@@ -149,16 +151,27 @@ fn schedule_cr(
                 .map_err(|e| e.to_string()),
         ));
     }
+    // A state showing a loss or nothing, with nothing paid there, has no tax to
+    // credit and is not worth a warning.
     let others: Vec<&str> = states
         .iter()
+        .filter(|s| !matches!(s.state.as_str(), "MD" | "VA"))
+        .filter(|s| {
+            use crate::tax::k1_extract::state_codes as sc;
+            let get = |c: &str| s.amount(c).unwrap_or(0);
+            get(sc::SOURCE_INCOME) > 0
+                || get(sc::NONRESIDENT_TAX_PAID) + get(sc::WITHHOLDING) + get(sc::PTE_ELECTION_TAX)
+                    > 0
+        })
         .map(|s| s.state.as_str())
-        .filter(|s| !matches!(*s, "MD" | "VA"))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
     if !others.is_empty() {
         warnings.push(format!(
-            "Schedule CR has no figure for {}: their returns are not prepared here. If you              owe tax to any of them, add its credit by hand.",
+            "Schedule CR has no figure for {}: their K-1s show income or tax paid, and \
+             their returns are not prepared here. If you owe tax to any of them, add its \
+             credit by hand.",
             others.join(", ")
         ));
     }

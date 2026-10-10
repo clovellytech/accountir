@@ -107,6 +107,8 @@ pub struct AllocationRow {
 pub struct Va763 {
     pub tax_year: i32,
     pub filing_status: FilingStatus,
+    /// The state of residence, as the profile gives it.
+    pub residence: Option<String>,
     /// Section 1 (you, spouse, dependents) and section 2 (65 or older, blind):
     /// (count, dollars).
     pub exemptions: [(i64, i64); 2],
@@ -340,6 +342,7 @@ pub fn compute(conn: &Connection, federal: &Form1040) -> Result<Va763, StateRetu
     Ok(Va763 {
         tax_year: year,
         filing_status: status,
+        residence: profile.state.clone(),
         exemptions,
         allocation,
         percentage_tenths,
@@ -453,7 +456,9 @@ pub fn fill(r: &Va763) -> Result<lopdf::Document, FormError> {
     };
 
     put(&mut doc, at::FILING_STATUS.0, status_code(r.filing_status))?;
-    put(&mut doc, at::STATE_OF_RESIDENCE.0, "Illinois")?;
+    if let Some(state) = &r.residence {
+        put(&mut doc, at::STATE_OF_RESIDENCE.0, state)?;
+    }
     let (s1, s2) = (r.exemptions[0], r.exemptions[1]);
     if r.filing_status == FilingStatus::MarriedFilingJointly {
         put(&mut doc, at::SPOUSE.0, "1")?;

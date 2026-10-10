@@ -211,6 +211,9 @@ enum DocumentCliCommands {
     Remove { id: String },
     /// Check that every document's bytes are on this machine and intact
     Check,
+    /// Recognise what a document is from its contents — for documents attached
+    /// before files were typed. Records the kind only if it changed
+    Classify { id: String },
 }
 
 #[derive(Subcommand)]
@@ -280,6 +283,29 @@ enum K1CliCommands {
     },
     /// Stop receiving K-1s through a link. K-1s already pulled stay
     Unlink { link: String },
+    /// Read a K-1 package (federal K-1 and state K-1s) out of an attached PDF and
+    /// show what was found. Records nothing
+    Extract {
+        /// The document id, or enough of its start to be unique
+        document: String,
+    },
+    /// Read a K-1 package out of an attached PDF and record it: the federal K-1
+    /// as a statement (or, if that partnership's K-1 is already recorded, link
+    /// the document to it and list any differences) and one state statement per
+    /// state K-1
+    Accept {
+        document: String,
+        /// The tax year, when the K-1 does not say
+        #[arg(long)]
+        year: Option<i32>,
+    },
+    /// List the state K-1s recorded
+    States {
+        #[arg(long)]
+        year: Option<i32>,
+    },
+    /// Remove a recorded state K-1
+    RemoveState { id: String },
     /// Pull a year's K-1s through every link, or one
     Pull {
         #[arg(long)]
@@ -641,6 +667,32 @@ enum TaxCliCommands {
         /// An ordinary-dividend account beyond the brokerages' configured ones. Repeat
         #[arg(long = "dividend-account")]
         dividend_accounts: Vec<String>,
+    },
+
+    /// Build Maryland Form 505 with Form 505NR (nonresident) as one fillable PDF,
+    /// from the federal return and the Maryland K-1s recorded
+    #[command(name = "md505")]
+    Md505 {
+        #[arg(long)]
+        year: i32,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Build Virginia Form 763 (nonresident) as a fillable PDF, from the federal
+    /// return and the Virginia K-1s recorded
+    #[command(name = "va763")]
+    Va763 {
+        #[arg(long)]
+        year: i32,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Which states the year's K-1s may need a return for, and why
+    StateObligations {
+        #[arg(long)]
+        year: i32,
     },
 
     /// Mark an account as Illinois income or replacement tax, so IL-1065 line 16
@@ -2912,6 +2964,9 @@ fn handle_document_command(store: &mut EventStore, cmd: DocumentCliCommands) -> 
                 doc.filename, doc.size_bytes, doc.media_type, doc.document_id
             );
             println!("sha256 {}", doc.sha256);
+            if let Some(kind) = doc.kind_description() {
+                println!("Recognised as: {kind}");
+            }
             let kind =
                 accountir::commands::sole_proprietor_commands::business_type(store.connection());
             if !kind.is_individual() {
@@ -2950,6 +3005,9 @@ fn handle_document_command(store: &mut EventStore, cmd: DocumentCliCommands) -> 
                 if let Some(title) = &d.title {
                     println!("    {title}");
                 }
+                if let Some(kind) = d.kind_description() {
+                    println!("    {kind}");
+                }
             }
         }
         DocumentCliCommands::Export { id, output } => {
@@ -2963,6 +3021,18 @@ fn handle_document_command(store: &mut EventStore, cmd: DocumentCliCommands) -> 
                 output.display(),
                 bytes.len()
             );
+        }
+        DocumentCliCommands::Classify { id } => {
+            let id = resolve_document(store.connection(), &id)?;
+            let blobs = dc::local_store(store.connection())?;
+            match dc::classify(store, &blobs, "cli-user", &id)? {
+                Some(d) => println!(
+                    "{}: {}",
+                    d.filename,
+                    d.kind_description().unwrap_or_else(|| "not a kind recognised".to_string())
+                ),
+                None => println!("Unchanged."),
+            }
         }
         DocumentCliCommands::Remove { id } => {
             let id = resolve_document(store.connection(), &id)?;
@@ -3177,6 +3247,45 @@ fn handle_statement_command(store: &mut EventStore, cmd: StatementCliCommands) -
     Ok(())
 }
 
+fn print_k1_extraction(x: &accountir::tax::k1_extract::K1Extraction) {
+    use accountir::tax::information_returns::FormKind;
+    use accountir::tax::k1_extract::state_codes;
+    println!(
+        "K-1 package — {}, tax year {}",
+        x.issuer.as_deref().unwrap_or("partnership not found"),
+        x.tax_year.map(|y| y.to_string()).unwrap_or_else(|| "not found".into())
+    );
+    if !x.federal.is_empty() {
+        println!(
+            "\nFederal Schedule K-1 (Form 1065), page {}",
+            x.federal_page.map(|p| p.to_string()).unwrap_or_default()
+        );
+        for (code, cents) in &x.federal {
+            let label = FormKind::K1Partnership
+                .box_def(code)
+                .map(|b| b.label)
+                .unwrap_or("");
+            println!("  {:>8}  {:<46} {:>14}", code, label, cents_to_dollars(*cents));
+        }
+    }
+    for st in &x.states {
+        let pages: Vec<String> = st.pages.iter().map(u32::to_string).collect();
+        println!("\n{} — {} (page {})", st.state, st.form, pages.join(", "));
+        for (code, cents) in &st.amounts {
+            println!("  {:<56} {:>14}", state_codes::label(code), cents_to_dollars(*cents));
+        }
+        if let Some(ppm) = st.apportionment_ppm {
+            println!("  {:<56} {:>13.4}%", "Apportionment", ppm as f64 / 10_000.0);
+        }
+        for w in &st.warnings {
+            println!("  warning: {w}");
+        }
+    }
+    for w in &x.warnings {
+        println!("warning: {w}");
+    }
+}
+
 /// Open another set of books by path, refusing to create one that is not there.
 fn open_existing_books(path: &std::path::Path) -> Result<EventStore> {
     if !path.is_file() {
@@ -3324,6 +3433,68 @@ fn handle_k1_command(store: &mut EventStore, cmd: K1CliCommands) -> Result<()> {
                 "No longer receiving {}'s K-1 from {}. K-1s already pulled are kept.",
                 link.partner_name, link.ledger_name
             );
+        }
+        K1CliCommands::Extract { document } => {
+            use accountir::commands::k1_import_commands as kic;
+            let id = resolve_document(store.connection(), &document)?;
+            let blobs = accountir::commands::document_commands::local_store(store.connection())?;
+            let x = kic::extract(store.connection(), &blobs, &id)?;
+            print_k1_extraction(&x);
+            println!("\nNothing recorded. `accountir k1 accept {document}` records it.");
+        }
+        K1CliCommands::Accept { document, year } => {
+            use accountir::commands::k1_import_commands as kic;
+            let id = resolve_document(store.connection(), &document)?;
+            let blobs = accountir::commands::document_commands::local_store(store.connection())?;
+            let x = kic::extract(store.connection(), &blobs, &id)?;
+            print_k1_extraction(&x);
+            let plan = kic::accept(store, "cli-user", &id, &x, year)?;
+            println!();
+            match (&plan.federal_statement_id, plan.linked_to_existing) {
+                (Some(sid), true) => {
+                    println!(
+                        "{}'s {} K-1 was already recorded ({sid}); the document is now linked \
+                         to it and its figures are left as they were.",
+                        plan.issuer, plan.tax_year
+                    );
+                    for d in &plan.differences {
+                        println!("  differs — {d}");
+                    }
+                }
+                (Some(sid), false) => println!("Recorded the federal K-1 as {sid}."),
+                (None, _) => {}
+            }
+            for d in &plan.dropped {
+                println!("  not recorded — {d}");
+            }
+            for sid in &plan.state_statement_ids {
+                println!("Recorded state K-1 {sid}.");
+            }
+        }
+        K1CliCommands::States { year } => {
+            use accountir::commands::k1_import_commands as kic;
+            use accountir::tax::k1_extract::state_codes;
+            let list = kic::list_state_statements(store.connection(), year);
+            if list.is_empty() {
+                println!("No state K-1s recorded.");
+            }
+            for s in list {
+                println!("{}  {}  {}  {} — {}", s.statement_id, s.tax_year, s.state, s.issuer, s.form);
+                for (code, cents) in &s.amounts {
+                    println!(
+                        "    {:<46} {:>14}",
+                        state_codes::label(code),
+                        cents_to_dollars(*cents)
+                    );
+                }
+                if let Some(ppm) = s.apportionment_ppm {
+                    println!("    {:<46} {:>13.4}%", "Apportionment", ppm as f64 / 10_000.0);
+                }
+            }
+        }
+        K1CliCommands::RemoveState { id } => {
+            accountir::commands::k1_import_commands::remove_state_statement(store, "cli-user", &id)?;
+            println!("Removed {id}.");
         }
         K1CliCommands::Pull { year, link, source } => {
             let source = source.as_deref().map(open_existing_books).transpose()?;
@@ -3594,6 +3765,85 @@ fn handle_tax_command(store: &mut EventStore, cmd: TaxCliCommands) -> Result<()>
             );
             for w in &bundle.warnings {
                 println!("warning: {w}");
+            }
+        }
+
+        TaxCliCommands::Md505 { year, output } => {
+            let federal = accountir::tax::form1040::build(store, year)?;
+            let r = accountir::tax::md505::compute(store.connection(), &federal)?;
+            let pdf = accountir::tax::md505::build_pdf(&r)?;
+            std::fs::write(&output, &pdf)?;
+            println!("Maryland Form 505 and Form 505NR, {year}");
+            println!("  {:>5}  {:<52} {:>14} {:>14} {:>14}", "line", "", "federal", "Maryland", "non-MD");
+            for row in &r.income {
+                println!(
+                    "  {:>5}  {:<52} {:>14} {:>14} {:>14}",
+                    row.line,
+                    row.label,
+                    cents_to_dollars(row.federal_cents),
+                    cents_to_dollars(row.maryland_cents),
+                    cents_to_dollars(row.non_maryland_cents())
+                );
+            }
+            for l in &r.lines {
+                println!("  {:>5}  {:<52} {:>14}", l.key, l.label, cents_to_dollars(l.cents));
+            }
+            println!(
+                "  factors: AGI {:.6}, income (505NR 9) {:.6}, nonresident (505NR 15) {:.6}",
+                r.agi_factor_ppm as f64 / 1e6,
+                r.income_factor_ppm as f64 / 1e6,
+                r.nonresident_factor_ppm as f64 / 1e6
+            );
+            println!("\nWrote {}.", output.display());
+            for w in &r.warnings {
+                println!("warning: {w}");
+            }
+        }
+
+        TaxCliCommands::Va763 { year, output } => {
+            let federal = accountir::tax::form1040::build(store, year)?;
+            let r = accountir::tax::va763::compute(store.connection(), &federal)?;
+            let pdf = accountir::tax::va763::build_pdf(&r)?;
+            std::fs::write(&output, &pdf)?;
+            println!("Virginia Form 763, {year}");
+            for l in &r.lines {
+                println!("  {:>5}  {:<52} {:>14}", l.key, l.label, cents_to_dollars(l.cents));
+            }
+            println!("  {:>5}  {:<52} {:>13}%", "16", "Nonresident allocation percentage", r.percentage_text());
+            println!("\n  Allocation (page 2)            {:>14} {:>14}", "all sources", "Virginia");
+            for a in &r.allocation {
+                println!(
+                    "  {:>5}  {:<24} {:>14} {:>14}",
+                    a.line,
+                    a.label.chars().take(24).collect::<String>(),
+                    cents_to_dollars(a.all_sources_cents),
+                    cents_to_dollars(a.virginia_cents)
+                );
+            }
+            println!("\nWrote {}.", output.display());
+            for w in &r.warnings {
+                println!("warning: {w}");
+            }
+        }
+
+        TaxCliCommands::StateObligations { year } => {
+            let federal = accountir::tax::form1040::build(store, year)?;
+            let list = accountir::tax::state_obligations::summarise(store.connection(), &federal);
+            if list.is_empty() {
+                println!("No state K-1s recorded for {year}.");
+            }
+            for o in list {
+                println!(
+                    "{}  {:<28} income {:>12}  paid {:>10}{}",
+                    o.state,
+                    o.verdict.label(),
+                    cents_to_dollars(o.income_cents),
+                    cents_to_dollars(o.paid_cents),
+                    o.balance_cents
+                        .map(|b| format!("  balance {}", cents_to_dollars(b)))
+                        .unwrap_or_default()
+                );
+                println!("    {}", o.note);
             }
         }
 

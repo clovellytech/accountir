@@ -228,6 +228,8 @@ impl IncomeRow {
 pub struct Md505 {
     pub tax_year: i32,
     pub filing_status: FilingStatus,
+    /// The state of residence, as the profile gives it.
+    pub residence: Option<String>,
     /// Lines 1–17.
     pub income: Vec<IncomeRow>,
     /// Form 505 lines 18 onward, then Form 505NR's lines keyed `nr1`…`nr17`.
@@ -553,6 +555,7 @@ pub fn compute(conn: &Connection, federal: &Form1040) -> Result<Md505, StateRetu
     Ok(Md505 {
         tax_year: year,
         filing_status: status,
+        residence: profile.state.clone(),
         income,
         lines,
         exemptions,
@@ -583,6 +586,9 @@ type At = (u32, f32, f32);
 mod at_505 {
     use super::At;
     pub const RESIDENCE_STATE: At = (1, 284.0, 258.0);
+    /// "Dates you resided in Maryland … If none, enter NONE": the FROM box,
+    /// which the form names "Check box 504".
+    pub const RESIDED_FROM: At = (1, 338.0, 197.0);
     /// Exemptions A to D: (count box, dollar box).
     pub const EXEMPTIONS: [(At, At); 4] = [
         ((1, 310.0, 149.0), (1, 461.0, 150.0)),
@@ -760,7 +766,10 @@ pub fn fill(r: &Md505) -> Result<(lopdf::Document, lopdf::Document), FormError> 
     };
     set_check(&mut doc, &map, "Check Box 1", status_state)?;
     set_check(&mut doc, &map, "Check Box 100", "Yes")?;
-    put(&mut doc, &map, &w, at_505::RESIDENCE_STATE, "IL")?;
+    if let Some(state) = &r.residence {
+        put(&mut doc, &map, &w, at_505::RESIDENCE_STATE, state)?;
+    }
+    put(&mut doc, &map, &w, at_505::RESIDED_FROM, "NONE")?;
     tick(&mut doc, &map, &w, at_505::SELF, "Yes")?;
     if r.filing_status == FilingStatus::MarriedFilingJointly {
         tick(&mut doc, &map, &w, at_505::SPOUSE, "Yes")?;
@@ -881,6 +890,7 @@ mod tests {
         let w = acroform::widgets(&doc, &map);
         let mut points: Vec<At> = vec![
             at_505::RESIDENCE_STATE,
+            at_505::RESIDED_FROM,
             at_505::SELF,
             at_505::SPOUSE,
             at_505::YOU_65,
