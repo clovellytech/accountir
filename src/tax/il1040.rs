@@ -9,8 +9,15 @@
 //! # What it does not do, and says so
 //!
 //! Schedule M's other additions and subtractions, Schedule ICR's credits beyond the
-//! property tax credit, the K-1-P pass-through items, Schedule CR (tax paid to other
-//! states), and use tax. Warnings name each that the year's figures make relevant.
+//! property tax credit, the K-1-P pass-through items, and use tax. Warnings name
+//! each that the year's figures make relevant.
+//!
+//! # Schedule CR
+//!
+//! Tax paid to another state on income Illinois also taxes is credited, state by
+//! state, up to the Illinois tax on that income. The other states' taxes are the
+//! ones this crate computes — Maryland's Form 505 and Virginia's Form 763 — so a
+//! state whose return is not prepared here gets no credit, and a warning.
 
 use crate::commands::{personal_tax_commands, tax_statement_commands};
 use crate::events::types::FilingStatus;
@@ -76,11 +83,120 @@ pub struct Il1040 {
     pub net_income_cents: i64,
     pub tax_cents: i64,
     pub credits_cents: i64,
+    /// Schedule CR, one row per state credited.
+    pub schedule_cr: Vec<CrRow>,
     pub total_tax_cents: i64,
     pub payments_cents: i64,
     /// Positive is a refund, negative is owed.
     pub balance_cents: i64,
     pub warnings: Vec<String>,
+}
+
+/// One state on Schedule CR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrRow {
+    pub state: &'static str,
+    /// The income that state taxed, as Illinois base income includes it.
+    pub income_cents: i64,
+    /// The tax that state charges on it (its return's tax, not what was withheld).
+    pub tax_paid_cents: i64,
+    /// Illinois tax × income ÷ Illinois base income: the most that can be credited.
+    pub limit_cents: i64,
+    pub credit_cents: i64,
+}
+
+/// Schedule CR's rows for the states this crate prepares returns for. A state
+/// whose return cannot be computed is left out, with the reason in `warnings`.
+fn schedule_cr(
+    conn: &rusqlite::Connection,
+    federal: &Form1040,
+    illinois_tax: i64,
+    base_income: i64,
+    warnings: &mut Vec<String>,
+) -> Vec<CrRow> {
+    use crate::tax::{md505, va763};
+    let mut candidates: Vec<(&'static str, Result<(i64, i64), String>)> = Vec::new();
+    let states = crate::commands::k1_import_commands::list_state_statements(
+        conn,
+        Some(federal.tax_year),
+    );
+    let has = |code: &str| states.iter().any(|s| s.state == code);
+    if has("MD") {
+        candidates.push((
+            "MD",
+            md505::compute(conn, federal)
+                .map(|r| {
+                    if r.special_tax_cents > 0 {
+                        warnings.push(format!(
+                            "Schedule CR credits Maryland's state tax (${}) but not its 2.25%                              special nonresident tax (${}), which Maryland levies in place of a                              county tax; whether Illinois allows it is for you to confirm.",
+                            r.state_tax_cents / 100,
+                            r.special_tax_cents / 100
+                        ));
+                    }
+                    (r.maryland_agi_cents, r.state_tax_cents)
+                })
+                .map_err(|e| e.to_string()),
+        ));
+    }
+    if has("VA") {
+        candidates.push((
+            "VA",
+            va763::compute(conn, federal)
+                .map(|r| {
+                    let income = r.allocation.last().map(|t| t.virginia_cents).unwrap_or(0);
+                    (income, r.tax_cents)
+                })
+                .map_err(|e| e.to_string()),
+        ));
+    }
+    let others: Vec<&str> = states
+        .iter()
+        .map(|s| s.state.as_str())
+        .filter(|s| !matches!(*s, "MD" | "VA"))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !others.is_empty() {
+        warnings.push(format!(
+            "Schedule CR has no figure for {}: their returns are not prepared here. If you              owe tax to any of them, add its credit by hand.",
+            others.join(", ")
+        ));
+    }
+
+    let mut rows = Vec::new();
+    let mut left = illinois_tax;
+    for (state, result) in candidates {
+        let (income, tax_paid) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                warnings.push(format!("Schedule CR: no {state} credit — {e}."));
+                continue;
+            }
+        };
+        if income <= 0 || tax_paid <= 0 {
+            continue;
+        }
+        let limit = if base_income <= 0 {
+            0
+        } else {
+            ((illinois_tax as i128 * income.min(base_income) as i128) / base_income as i128) as i64
+        };
+        let credit = tax_paid.min(limit).min(left).max(0);
+        left -= credit;
+        rows.push(CrRow {
+            state,
+            income_cents: income,
+            tax_paid_cents: tax_paid,
+            limit_cents: limit,
+            credit_cents: credit,
+        });
+    }
+    if !rows.is_empty() {
+        warnings.push(
+            "Schedule CR must be attached, with a copy of each other state's return.".to_string(),
+        );
+    }
+    rows
 }
 
 impl Il1040 {
@@ -214,7 +330,10 @@ pub fn build_from(store: &EventStore, federal: &Form1040) -> Result<Il1040, Il10
                 .to_string(),
         );
     }
-    let credits = property_credit;
+    let schedule_cr = schedule_cr(conn, federal, tax, base_income, &mut warnings);
+    let other_state_credit: i64 = schedule_cr.iter().map(|r| r.credit_cents).sum();
+    let property_credit = property_credit.min(tax - other_state_credit);
+    let credits = other_state_credit + property_credit;
     let total_tax = (tax - credits).max(0);
 
     let withheld = federal.state_withheld_cents;
@@ -223,8 +342,8 @@ pub fn build_from(store: &EventStore, federal: &Form1040) -> Result<Il1040, Il10
     let balance = payments - total_tax;
 
     warnings.push(
-        "Not computed: other Schedule M items, IL-1040 K-1-P pass-through items, credit for \
-         tax paid to other states (Schedule CR), and use tax on out-of-state purchases."
+        "Not computed: other Schedule M items, IL-1040 K-1-P pass-through items, and use tax \
+         on out-of-state purchases."
             .to_string(),
     );
 
@@ -266,7 +385,9 @@ pub fn build_from(store: &EventStore, federal: &Form1040) -> Result<Il1040, Il10
         },
         line("11", "Net income", net_income),
         line("12", "Income tax (4.95%)", tax),
-        line("16", "Credits (Schedule ICR: property tax)", credits),
+        line("15", "Income tax paid to other states (Schedule CR)", other_state_credit),
+        line("16", "Credits (Schedule ICR: property tax)", property_credit),
+        line("18", "Total credits", credits),
         line("24", "Total tax", total_tax),
         line("25", "Illinois income tax withheld", withheld),
         line("26", "Estimated payments", estimated),
@@ -286,6 +407,7 @@ pub fn build_from(store: &EventStore, federal: &Form1040) -> Result<Il1040, Il10
         net_income_cents: net_income,
         tax_cents: tax,
         credits_cents: credits,
+        schedule_cr,
         total_tax_cents: total_tax,
         payments_cents: payments,
         balance_cents: balance,

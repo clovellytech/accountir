@@ -889,12 +889,6 @@ fn read_labelled_total(page: &PageText, st: &mut StateK1Extract, label: &str) {
 }
 
 /// The column headed by a chunk containing `header`: its x range.
-fn column_of(page: &PageText, header: &str) -> Option<(f32, f32)> {
-    page.chunks()
-        .find(|c| squash(&c.text).contains(&squash(header)))
-        .map(|c| (c.x - 25.0, c.x_end.max(c.x + 40.0) + 40.0))
-}
-
 /// Arizona: the "source income" column, on the total line. The column is the
 /// heading nearest above that line — the phrase also appears in the form's prose.
 fn read_column_row(page: &PageText, st: &mut StateK1Extract, header: &str, row: &str) {

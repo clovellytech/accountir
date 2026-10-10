@@ -451,4 +451,57 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    /// From the attached package to both nonresident returns: the K-1's Maryland
+    /// and Virginia figures reach the forms, what the partnership paid lands on
+    /// the payment lines, and both PDFs fill.
+    #[test]
+    fn a_package_carries_through_to_both_state_returns() {
+        let (mut store, _dir, blobs) = books();
+        let doc = attach_sample(&mut store, &blobs);
+        let x = extract(store.connection(), &blobs, &doc.document_id).unwrap();
+        accept(&mut store, "u", &doc.document_id, &x, None).unwrap();
+        let profile = crate::commands::personal_tax_commands::tests::profile(
+            2025,
+            crate::events::types::FilingStatus::Single,
+        );
+        crate::commands::personal_tax_commands::set_profile(&mut store, "u", &profile).unwrap();
+        let federal = crate::tax::form1040::build(&store, 2025).unwrap();
+
+        let md = crate::tax::md505::compute(store.connection(), &federal).unwrap();
+        assert_eq!(md.maryland_agi_cents, 1_000_000 - 20_000, "Maryland income less the decoupling subtraction");
+        assert_eq!(md.cents("47"), 90_000);
+        assert_eq!(md.special_tax_cents, crate::tax::md505::round_dollars(md.maryland_taxable_cents * 225 / 10_000) * 100);
+        assert_eq!(md.balance_cents, md.payments_cents - md.total_tax_cents);
+
+        let va = crate::tax::va763::compute(store.connection(), &federal).unwrap();
+        assert_eq!(va.cents("19a"), 40_000);
+        assert_eq!(va.cents("7"), 10_000);
+        assert_eq!(va.allocation.last().unwrap().virginia_cents, 400_000);
+
+        let md_pdf = crate::tax::md505::build_pdf(&md).unwrap();
+        let va_pdf = crate::tax::va763::build_pdf(&va).unwrap();
+        assert_eq!(lopdf::Document::load_mem(&md_pdf).unwrap().get_pages().len(), 6, "Form 505 and Form 505NR");
+        assert_eq!(lopdf::Document::load_mem(&va_pdf).unwrap().get_pages().len(), 2);
+
+        // Illinois credits each state's tax, up to Illinois' own tax on that income.
+        let mut profile = profile;
+        profile.state = Some("IL".to_string());
+        crate::commands::personal_tax_commands::set_profile(&mut store, "u", &profile).unwrap();
+        let il = crate::tax::il1040::build_from(&store, &federal).unwrap();
+        assert_eq!(il.schedule_cr.len(), 2, "{:?}", il.schedule_cr);
+        let md_row = il.schedule_cr.iter().find(|r| r.state == "MD").unwrap();
+        assert_eq!(md_row.tax_paid_cents, md.state_tax_cents, "the special tax is left out");
+        assert_eq!(md_row.income_cents, md.maryland_agi_cents);
+        for row in &il.schedule_cr {
+            assert_eq!(
+                row.limit_cents,
+                il.tax_cents * row.income_cents / il.base_income_cents
+            );
+            assert_eq!(row.credit_cents, row.tax_paid_cents.min(row.limit_cents));
+        }
+        let credited: i64 = il.schedule_cr.iter().map(|r| r.credit_cents).sum();
+        assert_eq!(il.line("15").unwrap().cents, credited);
+        assert_eq!(il.total_tax_cents, il.tax_cents - il.credits_cents);
+    }
 }

@@ -326,9 +326,6 @@ struct K1Totals {
     self_employment: i64,
     qbi: i64,
     foreign_tax: i64,
-    /// Net short- and long-term capital gain passed through to Schedule D.
-    short_term: i64,
-    long_term: i64,
     /// Net §1231 gain or loss, for Form 4797.
     section_1231: i64,
     /// Unrecaptured §1250 gain, taxed at up to 25% — reported, not computed.
@@ -392,14 +389,13 @@ fn k1_totals(statements: &[TaxStatement]) -> K1Totals {
         if !foreign.is_empty() {
             t.foreign_tax += s.amount(foreign);
         }
-        // (short-term, long-term, §1231, unrecaptured §1250) per form.
-        let (st, lt, s1231, u1250) = match s.form {
-            FormKind::K1Partnership => ("8", "9a", "10", "9c"),
-            FormKind::K1SCorporation => ("7", "8a", "9", "8c"),
-            _ => ("3", "4a", "", "4c"),
+        // (§1231, unrecaptured §1250) per form. The capital gains themselves are
+        // Schedule D's, which reads them from the same statements.
+        let (s1231, u1250) = match s.form {
+            FormKind::K1Partnership => ("10", "9c"),
+            FormKind::K1SCorporation => ("9", "8c"),
+            _ => ("", "4c"),
         };
-        t.short_term += s.amount(st);
-        t.long_term += s.amount(lt);
         if !s1231.is_empty() {
             t.section_1231 += s.amount(s1231);
         }
@@ -688,14 +684,15 @@ pub fn build(store: &EventStore, year: i32) -> Result<Form1040, Form1040Error> {
 
     // Schedule D, with last year's carryovers.
     let sd = &investment.schedule_d;
-    // K-1 capital gains reach Schedule D too (lines 5 and 12), and so does a net
-    // §1231 gain through Form 4797 Part I (line 11). A net §1231 *loss* is ordinary
-    // and goes to Schedule 1, line 4 instead. Leaving these out understated AGI by
-    // whatever a partnership's property sales came to.
+    // K-1 capital gains are already on Schedule D (lines 5 and 12, from the
+    // statements). A net §1231 gain joins them through Form 4797 Part I (line 11);
+    // a net §1231 *loss* is ordinary and goes to Schedule 1, line 4 instead.
+    // Leaving §1231 out understated AGI by whatever a partnership's property sales
+    // came to.
     let section_1231_gain = k1.section_1231.max(0);
     let other_gains = k1.section_1231.min(0);
-    let short = sd.short_term_cents + k1.short_term - profile.short_term_loss_carryover_cents;
-    let long = sd.long_term_cents + k1.long_term + section_1231_gain
+    let short = sd.short_term_cents - profile.short_term_loss_carryover_cents;
+    let long = sd.long_term_cents + section_1231_gain
         - profile.long_term_loss_carryover_cents;
     if k1.section_1231 != 0 {
         warnings.push(format!(
@@ -1572,6 +1569,33 @@ mod tests {
             let il = crate::tax::il1040::build_from(&store, &r).unwrap();
             assert_eq!(il.exemption_cents, 0);
             assert_eq!(il.base_income_cents, d(600_000));
+        }
+
+        /// A K-1's capital gains reach Schedule D; a net §1231 gain joins the
+        /// long-term gains, and a net §1231 loss is ordinary (Form 4797, line 4).
+        #[test]
+        fn k1_capital_gains_and_section_1231_reach_the_return() {
+            let mut store = books();
+            statement(
+                &mut store,
+                "k1a",
+                FormKind::K1Partnership,
+                &[("8", -200), ("9a", 1_000), ("10", 3_000), ("9c", 400)],
+            );
+            let profile = crate::commands::personal_tax_commands::tests::profile(2025, Single);
+            crate::commands::personal_tax_commands::set_profile(&mut store, "u", &profile)
+                .unwrap();
+            let r = build(&store, 2025).unwrap();
+            assert_eq!(r.capital_gain_cents, d(3_800));
+            assert_eq!(r.other_gains_cents, 0);
+            assert_eq!(r.section_1231_cents, d(3_000));
+            assert!(r.warnings.iter().any(|w| w.contains("1250")), "{:?}", r.warnings);
+
+            statement(&mut store, "k1b", FormKind::K1Partnership, &[("10", -4_000)]);
+            let r = build(&store, 2025).unwrap();
+            assert_eq!(r.capital_gain_cents, d(800));
+            assert_eq!(r.other_gains_cents, d(-1_000));
+            assert_eq!(r.agi_cents, d(-200));
         }
 
         #[test]

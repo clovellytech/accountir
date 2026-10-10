@@ -205,6 +205,77 @@ fn walk_field(doc: &Document, obj: &Object, prefix: &str, out: &mut BTreeMap<Str
     }
 }
 
+/// One place a field is drawn: its name, the page, and its rectangle in points.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Widget {
+    pub name: String,
+    pub page: u32,
+    pub rect: [f32; 4],
+}
+
+/// Every widget of every field, with where it is drawn.
+///
+/// For forms whose field names do not say what they are. Maryland's 2025 Form
+/// 505 names the box for line 47 `43 Enter Dollars 5`, and its Form 505NR's
+/// names carry line breaks and tabs; the only stable thing about a box is
+/// where it sits on the page, so those forms are mapped by position and the
+/// name is looked up from it.
+pub fn widgets(doc: &Document, map: &FieldMap) -> Vec<Widget> {
+    let page_of: BTreeMap<ObjectId, u32> =
+        doc.get_pages().into_iter().map(|(n, id)| (id, n)).collect();
+    let rect_of = |d: &lopdf::Dictionary| -> Option<[f32; 4]> {
+        let a = d.get(b"Rect").ok()?;
+        let a = doc.dereference(a).ok()?.1.as_array().ok()?.clone();
+        let n: Vec<f32> = a
+            .iter()
+            .filter_map(|o| match o {
+                Object::Integer(i) => Some(*i as f32),
+                Object::Real(r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        (n.len() == 4).then(|| [n[0].min(n[2]), n[1].min(n[3]), n[0].max(n[2]), n[1].max(n[3])])
+    };
+    let mut out = Vec::new();
+    for (name, id) in &map.0 {
+        let Ok(dict) = doc.get_dictionary(*id) else {
+            continue;
+        };
+        let mut push = |d: &lopdf::Dictionary| {
+            let page = d
+                .get(b"P")
+                .ok()
+                .and_then(|p| p.as_reference().ok())
+                .and_then(|p| page_of.get(&p).copied());
+            if let (Some(page), Some(rect)) = (page, rect_of(d)) {
+                out.push(Widget {
+                    name: name.clone(),
+                    page,
+                    rect,
+                });
+            }
+        };
+        push(dict);
+        if let Some(kids) = dict.get(b"Kids").ok().and_then(|k| k.as_array().ok()) {
+            for kid in kids {
+                if let Ok((_, Object::Dictionary(k))) = doc.dereference(kid) {
+                    push(k);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The field drawn at a point on a page, if exactly one is.
+pub fn field_at(widgets: &[Widget], page: u32, x: f32, y: f32) -> Option<&str> {
+    let mut hits = widgets.iter().filter(|w| {
+        w.page == page && w.rect[0] <= x && x <= w.rect[2] && w.rect[1] <= y && y <= w.rect[3]
+    });
+    let first = hits.next()?;
+    hits.all(|w| w.name == first.name).then_some(first.name.as_str())
+}
+
 /// Terminal fields by fully qualified name.
 pub struct FieldMap(BTreeMap<String, ObjectId>);
 
@@ -661,7 +732,9 @@ pub fn append_document(base: &mut Document, mut other: Document) -> Result<(), F
     // Union the field lists, or the appended pages show widgets that the form
     // does not consider part of itself.
     let af = acroform_ref(base).ok_or_else(|| FormError::Malformed("no AcroForm".into()))?;
-    let mut all = base.get_dictionary(af)?.get(b"Fields")?.as_array()?.clone();
+    // /Fields may be its own object (Maryland's forms keep it so).
+    let listed = base.get_dictionary(af)?.get(b"Fields")?.clone();
+    let mut all = base.dereference(&listed)?.1.as_array()?.clone();
     all.extend(fields);
     let dict = base.get_object_mut(af)?.as_dict_mut()?;
     dict.set("Fields", Object::Array(all));
