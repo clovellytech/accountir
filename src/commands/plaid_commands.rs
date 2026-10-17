@@ -937,16 +937,39 @@ impl<'a> PlaidCommands<'a> {
 
     /// Import all: confirm all pending transfer candidates, then import remaining unmatched.
     /// Returns (transfers_imported, unmatched_imported).
+    ///
+    /// Rows that look already booked ([`find_pending_booked_duplicates`]) are held
+    /// back and stay in review.
     pub fn import_all_staged(&mut self) -> Result<(u32, u32), PlaidCommandError> {
+        let held_back: HashSet<String> =
+            find_pending_booked_duplicates(self.store.connection())?
+                .into_keys()
+                .collect();
+        self.import_all_staged_except(&held_back)
+    }
+
+    /// [`Self::import_all_staged`] with the caller choosing what to hold back, by
+    /// staged row id. A transfer candidate is held back when either leg is.
+    pub fn import_all_staged_except(
+        &mut self,
+        held_back: &HashSet<String>,
+    ) -> Result<(u32, u32), PlaidCommandError> {
         // Collect pending transfer candidate IDs
         let candidate_ids: Vec<String> = {
             let conn = self.store.connection();
             let mut stmt = conn.prepare(
-                "SELECT id FROM plaid_transfer_candidates WHERE status IN ('pending', 'manual')",
+                "SELECT id, staged_txn_id_1, staged_txn_id_2
+                   FROM plaid_transfer_candidates WHERE status IN ('pending', 'manual')",
             )?;
             let ids: Vec<String> = stmt
-                .query_map([], |row| row.get(0))?
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get(1)?, row.get(2)?))
+                })?
                 .filter_map(|r| r.ok())
+                .filter(|(_, a, b): &(String, String, String)| {
+                    !held_back.contains(a) && !held_back.contains(b)
+                })
+                .map(|(id, _, _)| id)
                 .collect();
             ids
         };
@@ -982,6 +1005,7 @@ impl<'a> PlaidCommands<'a> {
             drop(stmt);
             let conn = self.store.connection();
             rows.into_iter()
+                .filter(|(id, _, _)| !held_back.contains(id))
                 .filter_map(|(id, item_id, plaid_account_id)| {
                     match handled_by_investments(conn, &item_id, &plaid_account_id) {
                         Ok(true) => None,
@@ -1499,6 +1523,20 @@ fn load_transfer_pair(
     Ok((txn1, txn2))
 }
 
+/// The columns of a [`StagedTransaction`], in its field order.
+///
+/// The ledger account comes from the connection's *current* mapping, not the
+/// copy taken at staging time. A row staged before its account was mapped, or
+/// while it was mapped to the wrong account, would otherwise keep that forever:
+/// remapping updates `plaid_local_accounts` and nothing else. The stored copy is
+/// used only when the mapping row is gone.
+const STAGED_SELECT: &str = "SELECT s.id, s.item_id, s.plaid_transaction_id, s.plaid_account_id,
+            CASE WHEN m.item_id IS NOT NULL THEN m.local_account_id ELSE s.local_account_id END,
+            s.amount_cents, s.date, s.name, s.merchant_name, s.currency, s.status, s.payment_meta
+       FROM plaid_staged_transactions s
+       LEFT JOIN plaid_local_accounts m
+         ON m.item_id = s.item_id AND m.plaid_account_id = s.plaid_account_id";
+
 /// Load a single staged transaction by ID.
 fn parse_payment_meta(json: Option<String>) -> Option<PaymentMeta> {
     json.and_then(|s| serde_json::from_str(&s).ok())
@@ -1509,9 +1547,7 @@ fn load_staged_transaction(
     id: &str,
 ) -> Result<StagedTransaction, PlaidCommandError> {
     conn.query_row(
-        "SELECT id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
-                amount_cents, date, name, merchant_name, currency, status, payment_meta
-         FROM plaid_staged_transactions WHERE id = ?1",
+        &format!("{STAGED_SELECT} WHERE s.id = ?1"),
         [id],
         |row| {
             Ok(StagedTransaction {
@@ -1578,13 +1614,9 @@ pub fn load_pending_transfers(
 pub fn load_pending_staged(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<StagedTransaction>, PlaidCommandError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, item_id, plaid_transaction_id, plaid_account_id, local_account_id,
-                amount_cents, date, name, merchant_name, currency, status, payment_meta
-         FROM plaid_staged_transactions
-         WHERE status = 'pending'
-         ORDER BY date DESC",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "{STAGED_SELECT} WHERE s.status = 'pending' ORDER BY s.date DESC"
+    ))?;
 
     let txns = stmt
         .query_map([], |row| {
@@ -1622,6 +1654,220 @@ pub fn staged_counts(conn: &rusqlite::Connection) -> Result<(u32, u32), PlaidCom
         |row| row.get(0),
     )?;
     Ok((staged, transfers))
+}
+
+/// How far apart, in days, a staged row and a booked entry can be and still be
+/// read as the same transaction. Covers a hand-entered or CSV-imported entry dated
+/// by the transaction while the bank reports the posting date. Same-day matches
+/// are always taken first.
+pub const DUPLICATE_DATE_WINDOW_DAYS: i64 = 3;
+
+/// The booked entry a staged row appears to duplicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BookedMatch {
+    pub entry_id: String,
+    pub date: String,
+    pub memo: Option<String>,
+    /// False when the dates differ, by up to [`DUPLICATE_DATE_WINDOW_DAYS`].
+    pub same_day: bool,
+}
+
+/// One live journal line in the account being matched.
+struct BookedLine {
+    entry_id: String,
+    date: NaiveDate,
+    memo: Option<String>,
+    amount: i64,
+}
+
+impl BookedLine {
+    fn to_match(&self, same_day: bool) -> BookedMatch {
+        BookedMatch {
+            entry_id: self.entry_id.clone(),
+            date: self.date.to_string(),
+            memo: self.memo.clone(),
+            same_day,
+        }
+    }
+}
+
+/// Find staged rows that are already in the books under a different Plaid id.
+///
+/// The import's own duplicate check is the Plaid transaction id, and that is only
+/// unique within one connection: when a bank is disconnected and linked again,
+/// Plaid issues a new id for every transaction it sends back, including the two
+/// years of history a fresh link pulls. Every one of those passes the id check. A
+/// re-link of one Bank of America login staged 2,286 rows, 1,947 of them already
+/// booked.
+///
+/// So this matches on what the transaction is: a line of a live entry in the same
+/// ledger account, for the same signed amount, on the same day — or, failing that,
+/// within [`DUPLICATE_DATE_WINDOW_DAYS`]. Matching is one to one, so two identical
+/// $5 charges on one day with one already booked flag one, not both.
+///
+/// Keyed by staged row id. Rows with no local account are never matched.
+pub fn find_booked_duplicates<'a>(
+    conn: &rusqlite::Connection,
+    txns: impl IntoIterator<Item = &'a StagedTransaction>,
+) -> Result<HashMap<String, BookedMatch>, PlaidCommandError> {
+    let mut by_account: HashMap<&str, Vec<(&'a StagedTransaction, NaiveDate)>> = HashMap::new();
+    for t in txns {
+        let Some(account) = t.local_account_id.as_deref() else {
+            continue;
+        };
+        let Ok(date) = NaiveDate::parse_from_str(&t.date, "%Y-%m-%d") else {
+            continue;
+        };
+        by_account.entry(account).or_default().push((t, date));
+    }
+
+    let window = chrono::Duration::days(DUPLICATE_DATE_WINDOW_DAYS);
+    let mut found = HashMap::new();
+    // A reversing entry is live but cancels the one it voids; matching against
+    // it would read a refund as already booked.
+    let mut stmt = conn.prepare(
+        "SELECT l.entry_id, e.date, e.memo, l.amount
+           FROM journal_lines l JOIN journal_entries e ON e.id = l.entry_id
+          WHERE l.account_id = ?1 AND e.is_void = 0
+            AND e.date BETWEEN ?2 AND ?3
+            AND e.id NOT IN (SELECT voided_by_entry_id FROM journal_entries
+                              WHERE voided_by_entry_id IS NOT NULL)",
+    )?;
+
+    for (account, mut rows) in by_account {
+        rows.sort_by(|a, b| (a.1, &a.0.id).cmp(&(b.1, &b.0.id)));
+        let lo = rows[0].1 - window;
+        let hi = rows[rows.len() - 1].1 + window;
+        let booked: Vec<BookedLine> = stmt
+            .query_map(
+                rusqlite::params![account, lo.to_string(), hi.to_string()],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .filter_map(|(entry_id, d, memo, amount)| {
+                Some(BookedLine {
+                    entry_id,
+                    date: NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok()?,
+                    memo,
+                    amount,
+                })
+            })
+            .collect();
+
+        // The bank-side line is posted as the negated Plaid amount (Plaid reports
+        // money out as positive); see `import_single_staged`.
+        let mut by_amount: HashMap<i64, Vec<usize>> = HashMap::new();
+        for (i, b) in booked.iter().enumerate() {
+            by_amount.entry(b.amount).or_default().push(i);
+        }
+        let mut used = vec![false; booked.len()];
+
+        // Same-day matches for every row first, so a row two days off cannot take
+        // the entry that is some other row's exact twin.
+        let mut unmatched = Vec::new();
+        for (t, date) in rows {
+            let hit = by_amount
+                .get(&-t.amount_cents)
+                .and_then(|ix| ix.iter().copied().find(|&i| !used[i] && booked[i].date == date));
+            match hit {
+                Some(i) => {
+                    used[i] = true;
+                    found.insert(t.id.clone(), booked[i].to_match(true));
+                }
+                None => unmatched.push((t, date)),
+            }
+        }
+        for (t, date) in unmatched {
+            let days = |i: usize| (booked[i].date - date).num_days().abs();
+            let hit = by_amount.get(&-t.amount_cents).and_then(|ix| {
+                ix.iter()
+                    .copied()
+                    .filter(|&i| !used[i] && days(i) <= DUPLICATE_DATE_WINDOW_DAYS)
+                    .min_by_key(|&i| (days(i), booked[i].date))
+            });
+            if let Some(i) = hit {
+                used[i] = true;
+                found.insert(t.id.clone(), booked[i].to_match(false));
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// [`find_booked_duplicates`] over everything awaiting review: the pending rows
+/// and both legs of every open transfer candidate. Run together so one booked
+/// entry is never claimed by a pending row and a transfer leg at once.
+pub fn find_pending_booked_duplicates(
+    conn: &rusqlite::Connection,
+) -> Result<HashMap<String, BookedMatch>, PlaidCommandError> {
+    let staged = load_pending_staged(conn)?;
+    let candidates = load_pending_transfers(conn)?;
+    find_booked_duplicates(
+        conn,
+        staged
+            .iter()
+            .chain(candidates.iter().flat_map(|c| [&c.txn1, &c.txn2])),
+    )
+}
+
+/// Take staged rows out of review as already booked. Status `duplicate`: kept,
+/// not deleted, so staging recognises the Plaid id and never stages it again.
+/// An open transfer candidate built on one of them is rejected, and its other
+/// leg goes back to review on its own.
+///
+/// Machine-local, like rejecting a transfer: nothing here is in the books.
+pub fn dismiss_staged_duplicates(
+    conn: &rusqlite::Connection,
+    staged_ids: &[String],
+) -> Result<usize, PlaidCommandError> {
+    retire_staged(conn, staged_ids, "duplicate")
+}
+
+/// Take staged rows out of review because the user doesn't want them posted, for
+/// whatever reason. Status `dismissed`, otherwise as
+/// [`dismiss_staged_duplicates`]: kept so a later pull doesn't stage them again.
+pub fn dismiss_staged(
+    conn: &rusqlite::Connection,
+    staged_ids: &[String],
+) -> Result<usize, PlaidCommandError> {
+    retire_staged(conn, staged_ids, "dismissed")
+}
+
+fn retire_staged(
+    conn: &rusqlite::Connection,
+    staged_ids: &[String],
+    status: &str,
+) -> Result<usize, PlaidCommandError> {
+    let tx = conn.unchecked_transaction()?;
+    let mut n = 0;
+    for id in staged_ids {
+        let candidates: Vec<String> = tx
+            .prepare(
+                "SELECT id FROM plaid_transfer_candidates
+                  WHERE status IN ('pending', 'manual')
+                    AND (staged_txn_id_1 = ?1 OR staged_txn_id_2 = ?1)",
+            )?
+            .query_map([id], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for c in &candidates {
+            reject_transfer(&tx, c)?;
+        }
+        n += tx.execute(
+            "UPDATE plaid_staged_transactions SET status = ?2
+              WHERE id = ?1 AND status IN ('pending', 'matched')",
+            [id.as_str(), status],
+        )?;
+    }
+    tx.commit()?;
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -2413,6 +2659,178 @@ mod tests {
             .unwrap();
         assert_eq!((added, skipped), (0, 1), "inactive-account txn is skipped");
         assert_eq!(count(&store, "SELECT COUNT(*) FROM journal_entries"), 0);
+    }
+
+    /// Book `booked` directly, then stage `staged` as if from a re-linked
+    /// connection (fresh Plaid ids), and return what the matcher flags.
+    fn relinked(
+        booked: &[SyncedTransaction],
+        staged: &[SyncedTransaction],
+    ) -> (EventStore, HashMap<String, BookedMatch>) {
+        let (mut store, _local) = setup();
+        PlaidCommands::new(&mut store, "u".to_string())
+            .import_transactions("item1", booked)
+            .unwrap();
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions("item1", staged)
+            .unwrap();
+        let found = find_pending_booked_duplicates(store.connection()).unwrap();
+        (store, found)
+    }
+
+    fn staged_id(store: &EventStore, plaid_id: &str) -> String {
+        store
+            .connection()
+            .query_row(
+                "SELECT id FROM plaid_staged_transactions WHERE plaid_transaction_id = ?1",
+                [plaid_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The re-link case: the same purchase comes back under a new Plaid id, so the
+    /// id check passes it, and only what it is gives it away.
+    #[test]
+    fn a_re_linked_transaction_is_recognised_as_already_booked() {
+        let (store, found) = relinked(
+            &[txn("old1", "2026-03-04", 4.50)],
+            &[txn("new1", "2026-03-04", 4.50), txn("new2", "2026-03-05", 9.00)],
+        );
+        let hit = found.get(&staged_id(&store, "new1")).expect("flagged");
+        assert!(hit.same_day);
+        assert_eq!(hit.date, "2026-03-04");
+        assert!(!found.contains_key(&staged_id(&store, "new2")), "not booked");
+    }
+
+    /// Two identical charges on one day, one of them booked: one is a duplicate
+    /// and the other is new. Flagging both would lose a real transaction.
+    #[test]
+    fn one_booked_entry_answers_for_one_staged_row() {
+        let (_store, found) = relinked(
+            &[txn("old1", "2026-03-04", 4.50)],
+            &[txn("new1", "2026-03-04", 4.50), txn("new2", "2026-03-04", 4.50)],
+        );
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn a_nearby_date_matches_but_says_so_and_a_distant_one_does_not() {
+        let (store, found) = relinked(
+            &[txn("old1", "2026-03-04", 4.50), txn("old2", "2026-04-01", 7.00)],
+            &[txn("new1", "2026-03-06", 4.50), txn("new2", "2026-04-08", 7.00)],
+        );
+        let near = found.get(&staged_id(&store, "new1")).expect("within the window");
+        assert!(!near.same_day);
+        assert!(!found.contains_key(&staged_id(&store, "new2")), "a week off");
+    }
+
+    /// An exact twin is not stolen by a row a couple of days off that happens to
+    /// be processed first.
+    #[test]
+    fn a_same_day_match_wins_over_a_nearby_one() {
+        let (store, found) = relinked(
+            &[txn("old1", "2026-03-04", 4.50)],
+            &[txn("new1", "2026-03-02", 4.50), txn("new2", "2026-03-04", 4.50)],
+        );
+        assert!(found.get(&staged_id(&store, "new2")).unwrap().same_day);
+        assert!(!found.contains_key(&staged_id(&store, "new1")));
+    }
+
+    /// A refund of the same amount is money the other way, not a duplicate.
+    #[test]
+    fn the_opposite_sign_is_not_a_match() {
+        let (_store, found) = relinked(
+            &[txn("old1", "2026-03-04", 4.50)],
+            &[txn("new1", "2026-03-04", -4.50)],
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn import_all_holds_back_what_is_already_booked() {
+        let (mut store, _) = relinked(
+            &[txn("old1", "2026-03-04", 4.50)],
+            &[txn("new1", "2026-03-04", 4.50), txn("new2", "2026-03-05", 9.00)],
+        );
+        let (_, unmatched) = PlaidCommands::new(&mut store, "u".to_string())
+            .import_all_staged()
+            .unwrap();
+        assert_eq!(unmatched, 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM journal_entries"), 2);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM plaid_staged_transactions WHERE status = 'pending'"
+            ),
+            1,
+            "the duplicate stays in review rather than vanishing"
+        );
+    }
+
+    /// A connection re-linked with two savings accounts mapped the wrong way round:
+    /// fixing the mapping has to fix the rows already staged, or they import into
+    /// the account the user just corrected away from.
+    #[test]
+    fn a_staged_row_follows_its_account_when_remapped() {
+        let (mut store, _) = relinked(&[], &[txn("new1", "2026-03-04", 4.50)]);
+        let other = mk_account(&mut store, "1010", "Savings", AccountType::Asset);
+        store
+            .connection()
+            .execute(
+                "UPDATE plaid_local_accounts SET local_account_id = ?1
+                  WHERE item_id = 'item1' AND plaid_account_id = 'pa1'",
+                [&other],
+            )
+            .unwrap();
+        let staged = load_pending_staged(store.connection()).unwrap();
+        assert_eq!(staged[0].local_account_id.as_deref(), Some(other.as_str()));
+
+        PlaidCommands::new(&mut store, "u".to_string())
+            .import_all_staged()
+            .unwrap();
+        assert_eq!(
+            count(
+                &store,
+                &format!("SELECT COUNT(*) FROM journal_lines WHERE account_id = '{other}'")
+            ),
+            1,
+            "posted to the corrected account"
+        );
+    }
+
+    /// Any row can be dismissed, flagged or not, and stays dismissed.
+    #[test]
+    fn any_staged_row_can_be_dismissed() {
+        let (mut store, found) = relinked(&[], &[txn("new1", "2026-03-04", 4.50)]);
+        assert!(found.is_empty());
+        let id = staged_id(&store, "new1");
+        assert_eq!(dismiss_staged(store.connection(), &[id]).unwrap(), 1);
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions("item1", &[txn("new1", "2026-03-04", 4.50)])
+            .unwrap();
+        assert!(load_pending_staged(store.connection()).unwrap().is_empty());
+        let (_, unmatched) = PlaidCommands::new(&mut store, "u".to_string())
+            .import_all_staged()
+            .unwrap();
+        assert_eq!(unmatched, 0);
+    }
+
+    /// Dismissed rows leave review and stay out: a later pull that sends the same
+    /// Plaid id again must not stage it a second time.
+    #[test]
+    fn a_dismissed_duplicate_is_not_staged_again() {
+        let (mut store, found) = relinked(
+            &[txn("old1", "2026-03-04", 4.50)],
+            &[txn("new1", "2026-03-04", 4.50)],
+        );
+        let ids: Vec<String> = found.into_keys().collect();
+        assert_eq!(dismiss_staged_duplicates(store.connection(), &ids).unwrap(), 1);
+        assert!(load_pending_staged(store.connection()).unwrap().is_empty());
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions("item1", &[txn("new1", "2026-03-04", 4.50)])
+            .unwrap();
+        assert!(load_pending_staged(store.connection()).unwrap().is_empty());
     }
 }
 
