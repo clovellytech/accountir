@@ -1530,12 +1530,116 @@ fn load_transfer_pair(
 /// while it was mapped to the wrong account, would otherwise keep that forever:
 /// remapping updates `plaid_local_accounts` and nothing else. The stored copy is
 /// used only when the mapping row is gone.
+///
+/// Then the account's split, if it has one (see [`AccountSplit`]): a row whose
+/// name matches none of the split's keep patterns goes to its other account.
+/// Applied here, at read time, for the same reason as the mapping — so review,
+/// duplicate matching and import all see one answer, and changing the rule
+/// reaches rows already staged.
 const STAGED_SELECT: &str = "SELECT s.id, s.item_id, s.plaid_transaction_id, s.plaid_account_id,
-            CASE WHEN m.item_id IS NOT NULL THEN m.local_account_id ELSE s.local_account_id END,
+            CASE WHEN sp.local_account_id IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM json_each(sp.keep_patterns) p
+                     WHERE p.value <> '' AND instr(upper(s.name), upper(p.value)) > 0)
+                 THEN sp.split_to_account_id
+                 ELSE CASE WHEN m.item_id IS NOT NULL THEN m.local_account_id
+                           ELSE s.local_account_id END
+            END,
             s.amount_cents, s.date, s.name, s.merchant_name, s.currency, s.status, s.payment_meta
        FROM plaid_staged_transactions s
        LEFT JOIN plaid_local_accounts m
-         ON m.item_id = s.item_id AND m.plaid_account_id = s.plaid_account_id";
+         ON m.item_id = s.item_id AND m.plaid_account_id = s.plaid_account_id
+       LEFT JOIN plaid_account_splits sp
+         ON sp.local_account_id =
+            CASE WHEN m.item_id IS NOT NULL THEN m.local_account_id ELSE s.local_account_id END";
+
+/// One bank feed whose rows belong to two ledger accounts.
+///
+/// The case it exists for: Bank of America reports a business card's employee
+/// card inside the parent account, so a single Plaid account carries the parent's
+/// payments, rewards and fees and the cardholder's purchases. Rows on a feed
+/// mapped to `local_account_id` go to `split_to_account_id`, except those whose
+/// name contains one of `keep_patterns` (case-insensitive), which stay.
+///
+/// Keyed by the ledger account, not the connection, so it survives a re-link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSplit {
+    pub local_account_id: String,
+    pub split_to_account_id: String,
+    pub keep_patterns: Vec<String>,
+}
+
+/// Every split these books have, by the account whose feed is split.
+pub fn load_account_splits(
+    conn: &rusqlite::Connection,
+) -> Result<HashMap<String, AccountSplit>, PlaidCommandError> {
+    let mut stmt = conn.prepare(
+        "SELECT local_account_id, split_to_account_id, keep_patterns FROM plaid_account_splits",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let (local, to, patterns) = row?;
+        out.insert(
+            local.clone(),
+            AccountSplit {
+                local_account_id: local,
+                split_to_account_id: to,
+                // A pattern list that does not parse keeps nothing, which sends
+                // every row to the other account — loud in review, not silent.
+                keep_patterns: serde_json::from_str(&patterns).unwrap_or_default(),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Set (or replace) the split for one account's feed.
+///
+/// Blank patterns are dropped: an empty string is contained in every name, so it
+/// would keep every row and quietly turn the split off.
+pub fn set_account_split(
+    conn: &rusqlite::Connection,
+    split: &AccountSplit,
+) -> Result<(), PlaidCommandError> {
+    let patterns: Vec<&str> = split
+        .keep_patterns
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    conn.execute(
+        "INSERT INTO plaid_account_splits (local_account_id, split_to_account_id, keep_patterns)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(local_account_id) DO UPDATE
+            SET split_to_account_id = excluded.split_to_account_id,
+                keep_patterns = excluded.keep_patterns",
+        rusqlite::params![
+            split.local_account_id,
+            split.split_to_account_id,
+            serde_json::to_string(&patterns).unwrap_or_else(|_| "[]".to_string()),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Stop splitting an account's feed. Rows staged on it go back to the account
+/// itself.
+pub fn clear_account_split(
+    conn: &rusqlite::Connection,
+    local_account_id: &str,
+) -> Result<(), PlaidCommandError> {
+    conn.execute(
+        "DELETE FROM plaid_account_splits WHERE local_account_id = ?1",
+        [local_account_id],
+    )?;
+    Ok(())
+}
 
 /// Load a single staged transaction by ID.
 fn parse_payment_meta(json: Option<String>) -> Option<PaymentMeta> {
@@ -2797,6 +2901,57 @@ mod tests {
             1,
             "posted to the corrected account"
         );
+    }
+
+    /// A feed carrying two cards: payments and fees stay on the parent, everything
+    /// else goes to the cardholder's card — and is then matched against what is
+    /// already booked there, which is the point on a re-link.
+    #[test]
+    fn a_split_feed_sends_purchases_to_the_other_account() {
+        let named = |id: &str, amount: f64, name: &str| SyncedTransaction {
+            name: name.to_string(),
+            ..txn(id, "2026-03-04", amount)
+        };
+        let (mut store, parent) = setup();
+        let card = mk_account(&mut store, "2010", "Zak card", AccountType::Liability);
+        PlaidCommands::new(&mut store, "u".to_string())
+            .stage_transactions(
+                "item1",
+                &[
+                    named("buy", 42.00, "Jandb Importers Inc"),
+                    named("pay", -500.00, "PAYMENT - THANK YOU"),
+                    named("fee", 0.39, "PURCHASE *FINANCE CHARGE*"),
+                ],
+            )
+            .unwrap();
+        set_account_split(
+            store.connection(),
+            &AccountSplit {
+                local_account_id: parent.clone(),
+                split_to_account_id: card.clone(),
+                keep_patterns: vec!["payment".into(), " ".into(), "FINANCE CHARGE".into()],
+            },
+        )
+        .unwrap();
+
+        let account_of = |store: &EventStore, plaid_id: &str| {
+            load_pending_staged(store.connection())
+                .unwrap()
+                .into_iter()
+                .find(|t| t.plaid_transaction_id == plaid_id)
+                .and_then(|t| t.local_account_id)
+        };
+        assert_eq!(account_of(&store, "buy").as_deref(), Some(card.as_str()));
+        assert_eq!(account_of(&store, "pay").as_deref(), Some(parent.as_str()), "case-insensitive");
+        assert_eq!(account_of(&store, "fee").as_deref(), Some(parent.as_str()));
+        assert_eq!(
+            load_account_splits(store.connection()).unwrap()[&parent].keep_patterns,
+            vec!["payment", "FINANCE CHARGE"],
+            "a blank pattern would match every name and switch the split off"
+        );
+
+        clear_account_split(store.connection(), &parent).unwrap();
+        assert_eq!(account_of(&store, "buy").as_deref(), Some(parent.as_str()));
     }
 
     /// Any row can be dismissed, flagged or not, and stays dismissed.

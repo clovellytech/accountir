@@ -231,6 +231,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             58,
             include_str!("../../migrations/058_typed_documents_and_state_k1s.sql"),
         ),
+        (
+            59,
+            include_str!("../../migrations/059_plaid_account_splits.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -464,6 +468,13 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         CREATE INDEX IF NOT EXISTS idx_staged_status ON plaid_staged_transactions(status);
         CREATE INDEX IF NOT EXISTS idx_staged_amount ON plaid_staged_transactions(amount_cents);
         CREATE INDEX IF NOT EXISTS idx_staged_date ON plaid_staged_transactions(date);
+
+        -- One feed carrying two ledger accounts' rows (migration 059).
+        CREATE TABLE IF NOT EXISTS plaid_account_splits (
+            local_account_id TEXT PRIMARY KEY,
+            split_to_account_id TEXT NOT NULL,
+            keep_patterns TEXT NOT NULL DEFAULT '[]'
+        );
 
         -- Detected transfer candidate pairs
         CREATE TABLE IF NOT EXISTS plaid_transfer_candidates (
