@@ -1972,6 +1972,15 @@ impl<'a> Projector<'a> {
                     [reconciliation_id],
                 )?;
             }
+            Event::IngestMappingSet { key, account_id } => {
+                self.conn.execute(
+                    "INSERT INTO ingest_account_mappings (key, account_id, updated_at, updated_at_event)
+                     VALUES (?1, ?2, datetime('now'), ?3)
+                     ON CONFLICT(key) DO UPDATE SET
+                       account_id = ?2, updated_at = datetime('now'), updated_at_event = ?3",
+                    params![key, account_id, stored_event.id],
+                )?;
+            }
         }
 
         Ok(())

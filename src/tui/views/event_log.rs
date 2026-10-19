@@ -900,6 +900,9 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
                 widgets::truncate(reconciliation_id, 8)
             )
         }
+        Event::IngestMappingSet { key, account_id } => {
+            format!("Mapped {} → {}", key, widgets::truncate(account_id, 8))
+        }
         Event::PlaidItemConnected {
             institution_name,
             plaid_accounts,

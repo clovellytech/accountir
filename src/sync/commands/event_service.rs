@@ -50,6 +50,7 @@ pub fn router() -> Router<SyncState> {
             "/sync/commands/record-event-service-sync",
             post(submit_record_sync),
         )
+        .route("/sync/commands/set-ingest-mapping", post(submit_set_mapping))
 }
 
 /// The state-dependent refusals, checked under the write lock.
@@ -354,6 +355,48 @@ async fn submit_record_sync(
     outcome_to_response(outcome, ApiError::domain::<EventServiceCommandError>)
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct SetIngestMappingRequest {
+    pub expected_head_seq: i64,
+    /// A key from `ingest_commands::MAPPING_DEFS` — `pos_revenue`, `cogs`.
+    pub key: String,
+    pub account_id: String,
+}
+
+/// Point one of the feed's mapping keys at an account in the group's books.
+///
+/// Until this existed the mappings lived on each member's machine, and a second
+/// machine pulling the same shop feed found every one of them unset. The check
+/// is the one the local command runs — see
+/// [`crate::commands::ingest_mapping_commands`].
+async fn submit_set_mapping(
+    AuthedUser(actor): AuthedUser,
+    State(st): State<SyncState>,
+    Json(req): Json<SetIngestMappingRequest>,
+) -> Result<Json<crate::sync::SubmitResponse>, ApiError> {
+    use crate::commands::ingest_mapping_commands::{check_set_ingest_mapping, IngestMappingError};
+    let mut store = st.store.lock().unwrap();
+    let outcome = store
+        .append_checked(
+            req.expected_head_seq,
+            move |tx| {
+                Ok(match check_set_ingest_mapping(tx, &req.key, &req.account_id)? {
+                    Ok(()) => Verdict::Append(stamp(
+                        Event::IngestMappingSet {
+                            key: req.key.clone(),
+                            account_id: req.account_id.clone(),
+                        },
+                        &actor,
+                    )),
+                    Err(e) => Verdict::Reject(e),
+                })
+            },
+            project,
+        )
+        .map_err(ApiError::store)?;
+    outcome_to_response(outcome, ApiError::domain::<IngestMappingError>)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +451,36 @@ mod tests {
             .send()
             .await
             .unwrap()
+    }
+
+    /// The reported problem: mappings set on one member's machine never reached
+    /// another's. Set through the group, the mapping is an event in the log every
+    /// member replicates; an unknown key is refused before it gets there.
+    #[tokio::test]
+    async fn a_mapping_set_through_the_group_lands_in_the_log() {
+        let base = serve().await;
+        let mut client = crate::sync::SyncClient::new(base.clone(), TOKEN);
+        let account_id = client
+            .ensure_account_path("Sales", crate::domain::AccountType::Revenue)
+            .await
+            .unwrap()
+            .account_id;
+
+        client.set_ingest_mapping("pos_revenue", &account_id).await.unwrap();
+        let events: serde_json::Value = reqwest::Client::new()
+            .get(format!("{base}/sync/events?since=0&limit=10"))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let dump = events.to_string();
+        assert!(dump.contains("ingest_mapping_set") && dump.contains("pos_revenue"), "{dump}");
+
+        let refused = client.set_ingest_mapping("not_a_key", &account_id).await;
+        assert!(refused.is_err(), "an unknown key must not reach the log");
     }
 
     /// The thing that was blocked: a member on hosted books connects a service and

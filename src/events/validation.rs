@@ -1452,6 +1452,10 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
         Event::ReconciliationAbandoned { reconciliation_id } => {
             validate_non_empty(reconciliation_id, "reconciliation_id")?;
         }
+        Event::IngestMappingSet { key, account_id } => {
+            validate_non_empty(key, "key")?;
+            validate_non_empty(account_id, "account_id")?;
+        }
         Event::PlaidItemConnected {
             item_id,
             proxy_item_id,

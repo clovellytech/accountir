@@ -10,6 +10,7 @@ pub mod event_service_commands;
 pub mod fiscal_year_commands;
 pub mod import_commands;
 pub mod ingest_commands;
+pub mod ingest_mapping_commands;
 pub mod investment_commands;
 pub mod investment_import;
 pub mod k1_import_commands;

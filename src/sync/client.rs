@@ -32,7 +32,8 @@ use super::commands::investments::{
 };
 use super::commands::event_service::{
     RecordEventServiceSyncRequest, RegisterEventServiceRequest, RegisterEventServiceResponse,
-    RemoveEventServiceRequest, SetServiceReportingRequest, SetServiceReportingResponse,
+    RemoveEventServiceRequest, SetIngestMappingRequest, SetServiceReportingRequest,
+    SetServiceReportingResponse,
 };
 use super::commands::partnership::{
     AdmitPartnerRequest, AdmitPartnerResponse, ClearRelationshipRequest, LinkEquityAccountRequest,
@@ -766,6 +767,24 @@ impl SyncClient {
             }
         }
         Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Point an event-service mapping key at an account in the group's books, so
+    /// every member's pull of the feed books it the same way.
+    pub async fn set_ingest_mapping(
+        &mut self,
+        key: impl Into<String>,
+        account_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (key, account_id) = (key.into(), account_id.into());
+        self.submit_retrying("/sync/commands/set-ingest-mapping", |head| {
+            SetIngestMappingRequest {
+                expected_head_seq: head,
+                key: key.clone(),
+                account_id: account_id.clone(),
+            }
+        })
+        .await
     }
 
     /// Record a completed sync of an event service against the group's books, so

@@ -2345,6 +2345,17 @@ pub enum Event {
     ReconciliationAbandoned {
         reconciliation_id: String,
     },
+    /// An event-service mapping key — `pos_revenue`, `cogs`, `pos_square` — is
+    /// pointed at a ledger account.
+    ///
+    /// An event rather than a local table write so that every member pulling the
+    /// group's shop feed books it to the same accounts. Before this, each machine
+    /// kept its own mappings and a second machine found none at all.
+    ///
+    /// The key is not checked against the catalogue here but by the commands
+    /// that write it: keys get added (`pos_zelle`), and a replica a version
+    /// behind must still be able to replay an event naming one it does not know.
+    IngestMappingSet { key: String, account_id: String },
 }
 
 impl Event {
@@ -2456,6 +2467,7 @@ impl Event {
             Event::TransactionUncleared { .. } => "transaction_uncleared",
             Event::ReconciliationCompleted { .. } => "reconciliation_completed",
             Event::ReconciliationAbandoned { .. } => "reconciliation_abandoned",
+            Event::IngestMappingSet { .. } => "ingest_mapping_set",
         }
     }
 
@@ -2594,6 +2606,7 @@ impl Event {
                 reconciliation_id, ..
             } => Some(reconciliation_id),
             Event::ReconciliationAbandoned { reconciliation_id } => Some(reconciliation_id),
+            Event::IngestMappingSet { account_id, .. } => Some(account_id),
         }
     }
 }

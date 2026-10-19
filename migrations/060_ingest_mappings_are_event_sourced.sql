@@ -1,0 +1,17 @@
+-- Make the event-service account mappings part of the event log.
+--
+-- `ingest_account_mappings` was written by direct SQL and never replicated, so on
+-- group-hosted books each member's machine kept its own copy: map the shop's
+-- sales on one laptop and a second laptop pulling the same feed found nothing
+-- mapped. Which account a sale books to is a fact about the business, the same
+-- reasoning migration 027 applied to tax line assignments.
+--
+-- From here on an `IngestMappingSet` event puts a row here, and records itself in
+-- `updated_at_event`. A row with no event is one this machine made before the
+-- change: still honoured locally, and offered on the Services page for
+-- publishing to the group.
+--
+-- Not truncated by `Projector::rebuild`, unlike tax_line_mappings: standalone
+-- books have years of mappings that no event backs, and nothing here would adopt
+-- them first. A replay overwrites every key an event names and leaves the rest.
+ALTER TABLE ingest_account_mappings ADD COLUMN updated_at_event INTEGER REFERENCES events(id);

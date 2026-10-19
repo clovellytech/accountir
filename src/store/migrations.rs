@@ -235,6 +235,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             59,
             include_str!("../../migrations/059_plaid_account_splits.sql"),
         ),
+        (
+            60,
+            include_str!("../../migrations/060_ingest_mappings_are_event_sourced.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -511,7 +515,10 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
         CREATE TABLE IF NOT EXISTS ingest_account_mappings (
             key TEXT PRIMARY KEY,
             account_id TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            -- The `IngestMappingSet` that wrote the row (migration 060); NULL
+            -- for a mapping made on this machine before mappings were events.
+            updated_at_event INTEGER REFERENCES events(id)
         );
 
         -- Vendor → payable account rules (per-vendor AP matching)
