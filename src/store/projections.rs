@@ -1981,6 +1981,72 @@ impl<'a> Projector<'a> {
                     params![key, account_id, stored_event.id],
                 )?;
             }
+            Event::VendorRuleSet {
+                rule_id,
+                pattern,
+                account_id,
+            } => {
+                self.conn.execute(
+                    "DELETE FROM vendor_account_rules WHERE LOWER(pattern) = LOWER(?1) AND id <> ?2",
+                    params![pattern, rule_id],
+                )?;
+                self.conn.execute(
+                    "INSERT INTO vendor_account_rules (id, pattern, account_id, updated_at, updated_at_event)
+                     VALUES (?1, ?2, ?3, datetime('now'), ?4)
+                     ON CONFLICT(id) DO UPDATE SET
+                       pattern = ?2, account_id = ?3, updated_at = datetime('now'), updated_at_event = ?4",
+                    params![rule_id, pattern, account_id, stored_event.id],
+                )?;
+            }
+            Event::VendorRuleDeleted { rule_id } => {
+                self.conn
+                    .execute("DELETE FROM vendor_account_rules WHERE id = ?1", [rule_id])?;
+            }
+            Event::RecurringTransferRuleCreated {
+                rule_id,
+                source_account_id,
+                dest_account_id,
+                day_of_month,
+                amount_mode,
+                fixed_amount_cents,
+                memo,
+                start_month,
+            } => {
+                // `created_at` orders the list, so it is the event's time rather
+                // than the moment this machine happened to replay it.
+                self.conn.execute(
+                    "INSERT INTO recurring_transfer_rules
+                       (id, source_account_id, dest_account_id, day_of_month, amount_mode,
+                        fixed_amount_cents, memo, start_month, active, created_at, created_at_event)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10)
+                     ON CONFLICT(id) DO UPDATE SET
+                       source_account_id = ?2, dest_account_id = ?3, day_of_month = ?4,
+                       amount_mode = ?5, fixed_amount_cents = ?6, memo = ?7, start_month = ?8,
+                       created_at_event = ?10",
+                    params![
+                        rule_id,
+                        source_account_id,
+                        dest_account_id,
+                        day_of_month,
+                        amount_mode,
+                        fixed_amount_cents,
+                        memo,
+                        start_month,
+                        stored_event.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                        stored_event.id
+                    ],
+                )?;
+            }
+            Event::RecurringTransferRuleActiveSet { rule_id, active } => {
+                self.conn.execute(
+                    "UPDATE recurring_transfer_rules SET active = ?2 WHERE id = ?1",
+                    params![rule_id, *active as i64],
+                )?;
+            }
+            Event::RecurringTransferRuleDeleted { rule_id } => {
+                self.conn
+                    .execute("DELETE FROM recurring_transfer_rules WHERE id = ?1", [rule_id])?;
+            }
         }
 
         Ok(())

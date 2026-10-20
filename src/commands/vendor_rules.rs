@@ -2,6 +2,10 @@
 //! supplier) is matched against a list of `pattern → account` rules so postings
 //! route to a per-vendor payable account instead of one lumped AP. Matching is
 //! case-insensitive substring; the longest matching pattern wins (most specific).
+//!
+//! Since migration 061 the rules are a projection of events: change them
+//! through `commands::shared_rules` so every member of a group gets them. The
+//! direct writes here are what rules made before that look like.
 
 use rusqlite::Connection;
 use uuid::Uuid;

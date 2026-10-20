@@ -1,0 +1,15 @@
+-- Make recurring transfer rules part of the event log.
+--
+-- The transfers a rule posts were always shared, but the rule itself lived on
+-- the machine that made it. So a second member saw no rule, and could not see
+-- which months were still due.
+--
+-- From here on `RecurringTransferRuleCreated`, `…ActiveSet` and `…Deleted` write
+-- this table, and `created_at_event` records the creating event. A row with
+-- none was made on this machine before the change, and the Recurring
+-- Transfers page offers to publish it under the *same* id: each transfer it
+-- posted carries `recurring:<rule_id>:<YYYY-MM>` as its reference, and a new id
+-- would offer every one of those months again.
+--
+-- Not truncated by `Projector::rebuild`, for the reason migration 060 gives.
+ALTER TABLE recurring_transfer_rules ADD COLUMN created_at_event INTEGER REFERENCES events(id);

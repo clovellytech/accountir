@@ -90,7 +90,9 @@ impl ProposedTransfer {
 }
 
 // ---------------------------------------------------------------------------
-// Rule CRUD (plain config table, like vendor_account_rules)
+// Rule storage. Since migration 062 the table is a projection of rule events:
+// change rules through `commands::shared_rules` so every member gets them. The
+// direct writes below are what rules made before that look like.
 // ---------------------------------------------------------------------------
 
 pub fn list_rules(conn: &Connection) -> Vec<RecurringTransferRule> {

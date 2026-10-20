@@ -239,6 +239,14 @@ pub fn run_migrations(conn: &Connection) -> Result<(), MigrationError> {
             60,
             include_str!("../../migrations/060_ingest_mappings_are_event_sourced.sql"),
         ),
+        (
+            61,
+            include_str!("../../migrations/061_vendor_rules_are_event_sourced.sql"),
+        ),
+        (
+            62,
+            include_str!("../../migrations/062_recurring_transfer_rules_are_event_sourced.sql"),
+        ),
     ];
 
     for (version, sql) in migrations {
@@ -526,7 +534,27 @@ pub fn init_schema(conn: &Connection) -> Result<(), MigrationError> {
             id TEXT PRIMARY KEY,
             pattern TEXT NOT NULL,
             account_id TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            -- The `VendorRuleSet` that wrote the row (migration 061); NULL for a
+            -- rule made on this machine before rules were events.
+            updated_at_event INTEGER REFERENCES events(id)
+        );
+
+        -- Monthly transfer rules (migration 019; event-sourced since 062).
+        CREATE TABLE IF NOT EXISTS recurring_transfer_rules (
+            id TEXT PRIMARY KEY,
+            source_account_id TEXT NOT NULL,
+            dest_account_id TEXT NOT NULL,
+            day_of_month INTEGER NOT NULL,
+            amount_mode TEXT NOT NULL DEFAULT 'full_balance',
+            fixed_amount_cents INTEGER,
+            memo TEXT NOT NULL DEFAULT '',
+            start_month TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            -- The `RecurringTransferRuleCreated` behind the row (migration 062);
+            -- NULL for a rule made on this machine before rules were events.
+            created_at_event INTEGER REFERENCES events(id)
         );
 
         -- Accounts Payable / Accounts Receivable

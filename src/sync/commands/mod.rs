@@ -23,6 +23,7 @@ pub mod personal_tax;
 pub mod plaid;
 pub mod reconciliation;
 pub mod schedule_c;
+pub mod shared_rules;
 pub mod tax_setup;
 
 pub fn router() -> Router<SyncState> {
@@ -41,5 +42,6 @@ pub fn router() -> Router<SyncState> {
         .merge(plaid::router())
         .merge(reconciliation::router())
         .merge(schedule_c::router())
+        .merge(shared_rules::router())
         .merge(tax_setup::router())
 }

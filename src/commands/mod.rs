@@ -25,6 +25,7 @@ pub mod retirement_commands;
 pub mod revert_commands;
 pub mod sawyer_commands;
 pub mod share_period_commands;
+pub mod shared_rules;
 pub mod sole_proprietor_commands;
 pub mod square_commands;
 pub mod stripe_commands;

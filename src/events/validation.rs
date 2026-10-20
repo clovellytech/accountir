@@ -1456,6 +1456,66 @@ pub fn validate_event(event: &Event) -> Result<(), ValidationError> {
             validate_non_empty(key, "key")?;
             validate_non_empty(account_id, "account_id")?;
         }
+        Event::VendorRuleSet {
+            rule_id,
+            pattern,
+            account_id,
+        } => {
+            validate_non_empty(rule_id, "rule_id")?;
+            // An empty pattern is a substring of every name, so it would route
+            // every bill from every vendor to one account.
+            validate_non_empty(pattern, "pattern")?;
+            validate_non_empty(account_id, "account_id")?;
+        }
+        Event::VendorRuleDeleted { rule_id }
+        | Event::RecurringTransferRuleActiveSet { rule_id, .. }
+        | Event::RecurringTransferRuleDeleted { rule_id } => {
+            validate_non_empty(rule_id, "rule_id")?;
+        }
+        Event::RecurringTransferRuleCreated {
+            rule_id,
+            source_account_id,
+            dest_account_id,
+            day_of_month,
+            amount_mode,
+            fixed_amount_cents,
+            start_month,
+            ..
+        } => {
+            validate_non_empty(rule_id, "rule_id")?;
+            validate_non_empty(source_account_id, "source_account_id")?;
+            validate_non_empty(dest_account_id, "dest_account_id")?;
+            if source_account_id == dest_account_id {
+                return Err(ValidationError::InvalidValue(
+                    "a transfer's source and destination must differ".to_string(),
+                ));
+            }
+            if !(1..=31).contains(day_of_month) {
+                return Err(ValidationError::InvalidValue(format!(
+                    "day_of_month {day_of_month} is not a day of a month"
+                )));
+            }
+            match (amount_mode.as_str(), fixed_amount_cents) {
+                ("full_balance", _) => {}
+                ("fixed", Some(c)) if *c > 0 => {}
+                ("fixed", _) => {
+                    return Err(ValidationError::InvalidValue(
+                        "a fixed transfer needs a positive amount".to_string(),
+                    ))
+                }
+                (other, _) => {
+                    return Err(ValidationError::InvalidValue(format!(
+                        "amount_mode {other:?} is neither full_balance nor fixed"
+                    )))
+                }
+            }
+            if chrono::NaiveDate::parse_from_str(&format!("{start_month}-01"), "%Y-%m-%d").is_err()
+            {
+                return Err(ValidationError::InvalidValue(format!(
+                    "start_month {start_month:?} is not YYYY-MM"
+                )));
+            }
+        }
         Event::PlaidItemConnected {
             item_id,
             proxy_item_id,

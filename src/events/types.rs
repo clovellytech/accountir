@@ -2356,6 +2356,38 @@ pub enum Event {
     /// that write it: keys get added (`pos_zelle`), and a replica a version
     /// behind must still be able to replay an event naming one it does not know.
     IngestMappingSet { key: String, account_id: String },
+    /// Bills from a counterparty whose name contains `pattern` go to this
+    /// payable account. Replaces any other rule with the same pattern, compared
+    /// case-insensitively: two rules for one vendor would be chosen between by
+    /// length, not by which was meant.
+    ///
+    /// An event so that every member's sync of the shop feed routes a
+    /// supplier's bill the same way. See migration 061.
+    VendorRuleSet {
+        rule_id: String,
+        pattern: String,
+        account_id: String,
+    },
+    VendorRuleDeleted { rule_id: String },
+    /// A monthly transfer rule — see `commands::recurring_transfers`.
+    ///
+    /// The id is kept when a rule made before rules were events is published,
+    /// because the transfers it already posted carry it in their references.
+    RecurringTransferRuleCreated {
+        rule_id: String,
+        source_account_id: String,
+        dest_account_id: String,
+        day_of_month: u32,
+        /// `"full_balance"` or `"fixed"`.
+        amount_mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fixed_amount_cents: Option<i64>,
+        memo: String,
+        /// First period considered, inclusive, as `"YYYY-MM"`.
+        start_month: String,
+    },
+    RecurringTransferRuleActiveSet { rule_id: String, active: bool },
+    RecurringTransferRuleDeleted { rule_id: String },
 }
 
 impl Event {
@@ -2468,6 +2500,11 @@ impl Event {
             Event::ReconciliationCompleted { .. } => "reconciliation_completed",
             Event::ReconciliationAbandoned { .. } => "reconciliation_abandoned",
             Event::IngestMappingSet { .. } => "ingest_mapping_set",
+            Event::VendorRuleSet { .. } => "vendor_rule_set",
+            Event::VendorRuleDeleted { .. } => "vendor_rule_deleted",
+            Event::RecurringTransferRuleCreated { .. } => "recurring_transfer_rule_created",
+            Event::RecurringTransferRuleActiveSet { .. } => "recurring_transfer_rule_active_set",
+            Event::RecurringTransferRuleDeleted { .. } => "recurring_transfer_rule_deleted",
         }
     }
 
@@ -2607,6 +2644,11 @@ impl Event {
             } => Some(reconciliation_id),
             Event::ReconciliationAbandoned { reconciliation_id } => Some(reconciliation_id),
             Event::IngestMappingSet { account_id, .. } => Some(account_id),
+            Event::VendorRuleSet { rule_id, .. } => Some(rule_id),
+            Event::VendorRuleDeleted { rule_id } => Some(rule_id),
+            Event::RecurringTransferRuleCreated { rule_id, .. } => Some(rule_id),
+            Event::RecurringTransferRuleActiveSet { rule_id, .. } => Some(rule_id),
+            Event::RecurringTransferRuleDeleted { rule_id } => Some(rule_id),
         }
     }
 }

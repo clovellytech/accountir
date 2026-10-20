@@ -35,6 +35,10 @@ use super::commands::event_service::{
     RemoveEventServiceRequest, SetIngestMappingRequest, SetServiceReportingRequest,
     SetServiceReportingResponse,
 };
+use super::commands::shared_rules::{
+    CreateRecurringRuleRequest, RuleIdRequest, SetRecurringRuleActiveRequest,
+    SetVendorRuleRequest,
+};
 use super::commands::partnership::{
     AdmitPartnerRequest, AdmitPartnerResponse, ClearRelationshipRequest, LinkEquityAccountRequest,
     SetBusinessProfileRequest, SetIl1065SettingsRequest, SetPartnerSharesRequest, SetFixedAllocationRequest, ClearFixedAllocationRequest, SetLiabilityClassRequest, ClearLiabilityClassRequest,
@@ -767,6 +771,105 @@ impl SyncClient {
             }
         }
         Err(SyncClientError::ConflictExhausted(MAX_RETRIES))
+    }
+
+    /// Route a vendor's bills to a payable account, for every member. `rule_id`
+    /// keeps an existing rule's id when publishing one; `None` for a new rule.
+    pub async fn set_vendor_rule(
+        &mut self,
+        rule_id: Option<String>,
+        pattern: impl Into<String>,
+        account_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (pattern, account_id) = (pattern.into(), account_id.into());
+        self.submit_retrying("/sync/commands/set-vendor-rule", |head| {
+            SetVendorRuleRequest {
+                expected_head_seq: head,
+                rule_id: rule_id.clone(),
+                pattern: pattern.clone(),
+                account_id: account_id.clone(),
+            }
+        })
+        .await
+    }
+
+    pub async fn delete_vendor_rule(
+        &mut self,
+        rule_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let rule_id = rule_id.into();
+        self.submit_retrying("/sync/commands/delete-vendor-rule", |head| RuleIdRequest {
+            expected_head_seq: head,
+            rule_id: rule_id.clone(),
+        })
+        .await
+    }
+
+    /// Create a monthly transfer rule on the group's books. `rule_id` is the
+    /// existing id when publishing a rule made before rules were events.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_recurring_transfer_rule(
+        &mut self,
+        rule_id: Option<String>,
+        source_account_id: impl Into<String>,
+        dest_account_id: impl Into<String>,
+        day_of_month: u32,
+        amount_mode: impl Into<String>,
+        fixed_amount_cents: Option<i64>,
+        memo: impl Into<String>,
+        start_month: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let (source, dest, mode, memo, start) = (
+            source_account_id.into(),
+            dest_account_id.into(),
+            amount_mode.into(),
+            memo.into(),
+            start_month.into(),
+        );
+        self.submit_retrying("/sync/commands/create-recurring-transfer-rule", |head| {
+            CreateRecurringRuleRequest {
+                expected_head_seq: head,
+                rule_id: rule_id.clone(),
+                source_account_id: source.clone(),
+                dest_account_id: dest.clone(),
+                day_of_month,
+                amount_mode: mode.clone(),
+                fixed_amount_cents,
+                memo: memo.clone(),
+                start_month: start.clone(),
+            }
+        })
+        .await
+    }
+
+    pub async fn set_recurring_transfer_rule_active(
+        &mut self,
+        rule_id: impl Into<String>,
+        active: bool,
+    ) -> Result<i64, SyncClientError> {
+        let rule_id = rule_id.into();
+        self.submit_retrying("/sync/commands/set-recurring-transfer-rule-active", |head| {
+            SetRecurringRuleActiveRequest {
+                expected_head_seq: head,
+                rule_id: rule_id.clone(),
+                active,
+            }
+        })
+        .await
+    }
+
+    pub async fn delete_recurring_transfer_rule(
+        &mut self,
+        rule_id: impl Into<String>,
+    ) -> Result<i64, SyncClientError> {
+        let rule_id = rule_id.into();
+        self.submit_retrying("/sync/commands/delete-recurring-transfer-rule", |head| {
+            RuleIdRequest {
+                expected_head_seq: head,
+                rule_id: rule_id.clone(),
+            }
+        })
+        .await
     }
 
     /// Point an event-service mapping key at an account in the group's books, so

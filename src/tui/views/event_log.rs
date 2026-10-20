@@ -903,6 +903,31 @@ fn format_event_summary(event: &crate::events::types::Event) -> String {
         Event::IngestMappingSet { key, account_id } => {
             format!("Mapped {} → {}", key, widgets::truncate(account_id, 8))
         }
+        Event::VendorRuleSet {
+            pattern, account_id, ..
+        } => format!("Vendor rule “{}” → {}", pattern, widgets::truncate(account_id, 8)),
+        Event::VendorRuleDeleted { rule_id } => {
+            format!("Removed vendor rule {}", widgets::truncate(rule_id, 8))
+        }
+        Event::RecurringTransferRuleCreated {
+            source_account_id,
+            dest_account_id,
+            day_of_month,
+            ..
+        } => format!(
+            "Recurring transfer {} → {} on day {}",
+            widgets::truncate(source_account_id, 8),
+            widgets::truncate(dest_account_id, 8),
+            day_of_month
+        ),
+        Event::RecurringTransferRuleActiveSet { rule_id, active } => format!(
+            "{} recurring transfer {}",
+            if *active { "Resumed" } else { "Paused" },
+            widgets::truncate(rule_id, 8)
+        ),
+        Event::RecurringTransferRuleDeleted { rule_id } => {
+            format!("Removed recurring transfer {}", widgets::truncate(rule_id, 8))
+        }
         Event::PlaidItemConnected {
             institution_name,
             plaid_accounts,

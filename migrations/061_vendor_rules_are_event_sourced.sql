@@ -1,0 +1,14 @@
+-- Make vendor → payable rules part of the event log.
+--
+-- Like the ingest mappings before migration 060, `vendor_account_rules` was
+-- written by direct SQL on each machine. On group-hosted books that meant a
+-- supplier's bill went to its own payable account when one member synced the
+-- shop feed and to the generic one when another did.
+--
+-- From here on `VendorRuleSet` / `VendorRuleDeleted` write this table, and
+-- `updated_at_event` records which event did. A row with none was made on this
+-- machine before the change; the Services page offers to publish it.
+--
+-- Not truncated by `Projector::rebuild`, for the reason migration 060 gives:
+-- standalone books hold rules no event backs.
+ALTER TABLE vendor_account_rules ADD COLUMN updated_at_event INTEGER REFERENCES events(id);
