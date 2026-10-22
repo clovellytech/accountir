@@ -352,9 +352,21 @@ pub fn plan_remote_event(
         "goods_received" => {
             let mut data: IngestGoodsReceivedData = parsed!(IngestGoodsReceivedData);
             data.reference = Some(reference);
-            Ok(PlannedIngest::Bill(Box::new(
-                ingest_commands::plan_goods_received(conn, data)?,
-            )))
+            let cmd = ingest_commands::plan_goods_received(conn, data)?;
+            // A zero- or negative-cost receipt (e.g. a warranty item received at
+            // no charge) carries no money to book, and an A/P bill for a
+            // non-positive amount is rejected downstream by event validation
+            // ("amount must be positive"). Skip it rather than plan a doomed bill:
+            // a skip lets the sync cursor advance past it, whereas an error leaves
+            // the cursor stuck and re-fails the same event on every pass, wedging
+            // the entire feed behind it.
+            if cmd.amount <= 0 {
+                Ok(PlannedIngest::Nothing {
+                    reason: "Zero-cost receipt (no bill to post)".to_string(),
+                })
+            } else {
+                Ok(PlannedIngest::Bill(Box::new(cmd)))
+            }
         }
         "inventory_adjustment" => {
             let mut data: IngestInventoryAdjustmentData = parsed!(IngestInventoryAdjustmentData);
@@ -585,24 +597,43 @@ pub enum StagedEventReadiness {
     NeedsMapping(Vec<String>),
 }
 
+/// The payment-account mapping keys a sale's tenders book to: one per method in
+/// its split-tender `payments`, else its legacy single `payment_method`
+/// (defaulting to cash, as ingest does when neither names one).
+fn tender_mapping_keys(data: &serde_json::Value) -> Vec<&'static str> {
+    let key = |method: &str| match method {
+        "square" => "pos_square",
+        "stripe" => "pos_stripe",
+        "zelle" => "pos_zelle",
+        "financing" => "pos_financing",
+        _ => "pos_cash",
+    };
+    let mut keys: Vec<&'static str> = Vec::new();
+    let methods: Vec<&str> = match data.get("payments").and_then(|v| v.as_array()) {
+        Some(payments) if !payments.is_empty() => payments
+            .iter()
+            .filter_map(|p| p.get("method").and_then(|m| m.as_str()))
+            .collect(),
+        _ => vec![data
+            .get("payment_method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("cash")],
+    };
+    for m in methods {
+        let k = key(m);
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
 /// Determine which ingest mapping keys are required for an event type
 pub fn required_mapping_keys(event_type: &str, data: &serde_json::Value) -> Vec<&'static str> {
     match event_type {
         "sale" => {
-            let method = data
-                .get("payment_method")
-                .and_then(|v| v.as_str())
-                .unwrap_or("cash");
-            let mut keys = vec![
-                if method == "square" {
-                    "pos_square"
-                } else {
-                    "pos_cash"
-                },
-                "pos_revenue",
-                "cogs",
-                "inventory",
-            ];
+            let mut keys = tender_mapping_keys(data);
+            keys.extend(["pos_revenue", "cogs", "inventory"]);
             if data
                 .get("tax_collected_cents")
                 .and_then(|v| v.as_i64())
@@ -1218,6 +1249,36 @@ pub(crate) mod planning_tests {
         match plan_remote_event(store.connection(), "Bugbear", &po) {
             Ok(PlannedIngest::Nothing { reason }) => assert!(!reason.is_empty()),
             _ => panic!("a PO with no payment must not post"),
+        }
+    }
+
+    /// A receipt whose lines all cost nothing (a free/warranty item) would raise a
+    /// $0 bill, which event validation rejects as "amount must be positive". Left
+    /// as an error it freezes the feed's cursor and re-fails on every sync, so it
+    /// must plan as `Nothing` — skipped, with a reason, and out of the way.
+    #[test]
+    fn a_zero_cost_goods_receipt_plans_to_nothing() {
+        let store = books();
+        let gr = remote(
+            "e-9",
+            "goods_received",
+            serde_json::json!({
+                "date": "2026-09-14",
+                "supplier": "QBP",
+                "items": [{"name": "Schwalbe Marathon Tire", "qty": 1, "unit_cost_cents": 0}],
+            }),
+        );
+        match plan_remote_event(store.connection(), "Bugbear", &gr) {
+            Ok(PlannedIngest::Nothing { reason }) => assert!(!reason.is_empty()),
+            other => panic!(
+                "a zero-cost receipt must skip, not {}",
+                match other {
+                    Ok(PlannedIngest::Bill(_)) => "post a bill".to_string(),
+                    Ok(PlannedIngest::Entry(_)) => "post an entry".to_string(),
+                    Err(e) => e.to_string(),
+                    _ => unreachable!(),
+                }
+            ),
         }
     }
 
@@ -2614,5 +2675,23 @@ mod history_rollup_tests {
             1,
             "another service's sale was swept in"
         );
+    }
+
+    #[test]
+    fn sale_readiness_asks_for_each_split_tender() {
+        let data = serde_json::json!({
+            "payments": [
+                { "method": "financing", "amount_cents": 150000 },
+                { "method": "zelle", "amount_cents": 40000 },
+                { "method": "zelle", "amount_cents": 100 }
+            ],
+            "tax_collected_cents": 0
+        });
+        let keys = required_mapping_keys("sale", &data);
+        assert_eq!(keys, vec!["pos_financing", "pos_zelle", "pos_revenue", "cogs", "inventory"]);
+
+        let legacy = serde_json::json!({ "payment_method": "square" });
+        assert_eq!(required_mapping_keys("sale", &legacy)[0], "pos_square");
+        assert_eq!(required_mapping_keys("sale", &serde_json::json!({}))[0], "pos_cash");
     }
 }

@@ -69,6 +69,8 @@ pub const SETTLED_BY_ANOTHER_FEED: &[&str] = &[
     "amazon_clearing",
     "pos_square",
     "pos_stripe",
+    "pos_zelle",
+    "pos_financing",
 ];
 
 /// Whether an account is filled by a Plaid bank feed.
@@ -205,6 +207,18 @@ pub const MAPPING_DEFS: &[MappingDef] = &[
         note: "",
     },
     MappingDef {
+        key: "pos_zelle",
+        label: "Zelle received (clearing asset)",
+        group: "Point of sale",
+        note: "Zelle lands in the bank, which its feed records too; point this at a clearing account, not the bank account itself.",
+    },
+    MappingDef {
+        key: "pos_financing",
+        label: "Due from financing lender (receivable)",
+        group: "Point of sale",
+        note: "Sales the customer financed through the lender, until the lender pays the shop.",
+    },
+    MappingDef {
         key: "cogs",
         label: "Cost of goods sold (expense)",
         group: "Inventory",
@@ -305,6 +319,10 @@ pub enum IngestPaymentMethod {
     Cash,
     Square,
     Stripe,
+    /// A Zelle transfer straight to the shop's bank.
+    Zelle,
+    /// Paid by the customer's financing lender, who settles with the shop later.
+    Financing,
 }
 
 impl IngestPaymentMethod {
@@ -314,6 +332,8 @@ impl IngestPaymentMethod {
             IngestPaymentMethod::Cash => "pos_cash",
             IngestPaymentMethod::Square => "pos_square",
             IngestPaymentMethod::Stripe => "pos_stripe",
+            IngestPaymentMethod::Zelle => "pos_zelle",
+            IngestPaymentMethod::Financing => "pos_financing",
         }
     }
 }
@@ -1073,6 +1093,18 @@ pub fn ingest_goods_received(
     }
     let cmd = plan_goods_received(store.connection(), data)?;
 
+    // A zero- or negative-cost receipt carries no money to book, and an A/P bill
+    // for a non-positive amount fails validation ("amount must be positive").
+    // Treat it as a no-op skip (empty entry id) rather than erroring — mirroring
+    // the sync path's `PlannedIngest::Nothing`, so neither entry point can wedge
+    // on a free/warranty receipt.
+    if cmd.amount <= 0 {
+        return Ok(IngestResult {
+            entry_id: String::new(),
+            was_duplicate: false,
+        });
+    }
+
     // Create the bill via BillCommands (this creates the journal entry
     // internally). A concurrent goods-received for the same source event that
     // won the race after our pre-check is rejected in-txn as a duplicate; map
@@ -1386,5 +1418,70 @@ mod tests {
         // Genuinely invalid still errors
         assert!(parse_ingest_date("not-a-date").is_err());
         assert!(parse_ingest_date("").is_err());
+    }
+
+    #[test]
+    fn sale_splits_across_zelle_financing_and_cash() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+
+        mk_account(&mut store, "cash", EventAccountType::Asset, "1000", "Cash");
+        mk_account(&mut store, "zelle", EventAccountType::Asset, "1070", "Zelle clearing");
+        mk_account(&mut store, "lender", EventAccountType::Asset, "1210", "Due from lender");
+        mk_account(&mut store, "rev", EventAccountType::Revenue, "4000", "Sales");
+        mk_account(&mut store, "inv", EventAccountType::Asset, "1200", "Inventory");
+        mk_account(&mut store, "cogs", EventAccountType::Expense, "5000", "COGS");
+        {
+            let conn = store.connection();
+            set_account_mapping(conn, "pos_cash", "cash").unwrap();
+            set_account_mapping(conn, "pos_zelle", "zelle").unwrap();
+            set_account_mapping(conn, "pos_financing", "lender").unwrap();
+            set_account_mapping(conn, "pos_revenue", "rev").unwrap();
+            set_account_mapping(conn, "inventory", "inv").unwrap();
+            set_account_mapping(conn, "cogs", "cogs").unwrap();
+        }
+
+        // A $2,000 bike: $1,500 financed, $400 by Zelle, $100 cash.
+        let data: IngestSaleData = serde_json::from_value(serde_json::json!({
+            "date": "2026-10-10",
+            "reference": "pos:sale-fin",
+            "items": [{ "name": "Bike", "qty": 1, "unit_price_cents": 200000, "unit_cost_cents": 120000 }],
+            "payments": [
+                { "method": "financing", "amount_cents": 150000 },
+                { "method": "zelle", "amount_cents": 40000 },
+                { "method": "cash", "amount_cents": 10000 }
+            ]
+        }))
+        .unwrap();
+        let res = ingest_sale(&mut store, "test", data, JournalEntrySource::EventService).unwrap();
+        let amt = entry_amounts(&store, &res.entry_id);
+
+        assert_eq!(amt["lender"], 150000, "financed amount owed by the lender");
+        assert_eq!(amt["zelle"], 40000, "zelle received");
+        assert_eq!(amt["cash"], 10000, "cash received");
+        assert_eq!(amt["rev"], -200000, "revenue credited in full");
+        assert_eq!(amt.values().sum::<i64>(), 0, "entry balances");
+    }
+
+    #[test]
+    fn zelle_and_financing_need_their_own_mappings() {
+        let mut store = EventStore::in_memory().unwrap();
+        init_schema(store.connection()).unwrap();
+        mk_account(&mut store, "rev", EventAccountType::Revenue, "4000", "Sales");
+        mk_account(&mut store, "inv", EventAccountType::Asset, "1200", "Inventory");
+        mk_account(&mut store, "cogs", EventAccountType::Expense, "5000", "COGS");
+        {
+            let conn = store.connection();
+            set_account_mapping(conn, "pos_revenue", "rev").unwrap();
+            set_account_mapping(conn, "inventory", "inv").unwrap();
+            set_account_mapping(conn, "cogs", "cogs").unwrap();
+        }
+        let data: IngestSaleData = serde_json::from_value(serde_json::json!({
+            "date": "2026-10-10",
+            "items": [{ "name": "Tube", "qty": 1, "unit_price_cents": 1000, "unit_cost_cents": 400 }],
+            "payments": [{ "method": "zelle", "amount_cents": 1000 }]
+        }))
+        .unwrap();
+        assert!(ingest_sale(&mut store, "test", data, JournalEntrySource::EventService).is_err());
     }
 }
