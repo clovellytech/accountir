@@ -358,7 +358,8 @@ async fn submit_record_sync(
 #[derive(Serialize, Deserialize)]
 pub struct SetIngestMappingRequest {
     pub expected_head_seq: i64,
-    /// A key from `ingest_commands::MAPPING_DEFS` — `pos_revenue`, `cogs`.
+    /// A key from `ingest_commands::MAPPING_DEFS` — `pos_revenue`, `cogs`. Only
+    /// its shape is checked here, so keys newer than this server are accepted.
     pub key: String,
     pub account_id: String,
 }
@@ -367,7 +368,7 @@ pub struct SetIngestMappingRequest {
 ///
 /// Until this existed the mappings lived on each member's machine, and a second
 /// machine pulling the same shop feed found every one of them unset. The check
-/// is the one the local command runs — see
+/// is the one the local command runs, less the catalogue lookup — see
 /// [`crate::commands::ingest_mapping_commands`].
 async fn submit_set_mapping(
     AuthedUser(actor): AuthedUser,
@@ -455,7 +456,8 @@ mod tests {
 
     /// The reported problem: mappings set on one member's machine never reached
     /// another's. Set through the group, the mapping is an event in the log every
-    /// member replicates; an unknown key is refused before it gets there.
+    /// member replicates. A key newer than the server's catalogue is accepted (the
+    /// reported pos_zelle refusal); a malformed one never reaches the log.
     #[tokio::test]
     async fn a_mapping_set_through_the_group_lands_in_the_log() {
         let base = serve().await;
@@ -479,8 +481,12 @@ mod tests {
         let dump = events.to_string();
         assert!(dump.contains("ingest_mapping_set") && dump.contains("pos_revenue"), "{dump}");
 
-        let refused = client.set_ingest_mapping("not_a_key", &account_id).await;
-        assert!(refused.is_err(), "an unknown key must not reach the log");
+        client
+            .set_ingest_mapping("pos_added_later", &account_id)
+            .await
+            .expect("a key the server's catalogue lacks must still be accepted");
+        let refused = client.set_ingest_mapping("Not A Key", &account_id).await;
+        assert!(refused.is_err(), "a malformed key must not reach the log");
     }
 
     /// The thing that was blocked: a member on hosted books connects a service and

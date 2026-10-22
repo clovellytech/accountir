@@ -5,8 +5,10 @@
 //! table, so on group-hosted books every member's machine kept its own and a
 //! second machine pulling the same feed found nothing mapped. See migration 060.
 //!
-//! The check lives here so a local command and the group server's
-//! `set-ingest-mapping` refuse the same things.
+//! The account check lives here so a local command and the group server's
+//! `set-ingest-mapping` refuse the same things. The key catalogue is checked
+//! only by the local command: the server accepts any well-formed key, so a new
+//! importer key ships with the app and desktop without a server deploy.
 
 use crate::commands::ingest_commands::mapping_keys;
 use crate::events::types::{Event, EventEnvelope, StoredEvent};
@@ -19,6 +21,8 @@ use thiserror::Error;
 pub enum IngestMappingError {
     #[error("Unknown mapping key '{0}'")]
     UnknownKey(String),
+    #[error("Malformed mapping key '{0}'")]
+    MalformedKey(String),
     #[error("No account with id {0}")]
     NoSuchAccount(String),
     #[error("Account {0} is inactive")]
@@ -27,15 +31,27 @@ pub enum IngestMappingError {
     Store(#[from] EventStoreError),
 }
 
-/// Refuse a key the catalogue does not know, or an account that is missing or
-/// inactive. Run inside the append transaction, against the write-locked state.
+/// Whether a key has the shape of a catalogue key: 1–64 of `[a-z0-9_]`.
+fn is_well_formed_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Refuse a malformed key, or an account that is missing or inactive. Run
+/// inside the append transaction, against the write-locked state.
+///
+/// Whether the catalogue knows the key is deliberately not checked here: the
+/// group server runs this with whatever catalogue its pinned app rev had, and a
+/// key added since (`pos_zelle`) would be refused until the server was bumped.
+/// Storing a key no importer reads is harmless; the local command still checks.
 pub fn check_set_ingest_mapping(
     conn: &Connection,
     key: &str,
     account_id: &str,
 ) -> Result<Result<(), IngestMappingError>, EventStoreError> {
-    if !mapping_keys().contains(&key) {
-        return Ok(Err(IngestMappingError::UnknownKey(key.to_string())));
+    if !is_well_formed_key(key) {
+        return Ok(Err(IngestMappingError::MalformedKey(key.to_string())));
     }
     let active: Option<bool> = conn
         .query_row(
@@ -58,6 +74,9 @@ pub fn set_ingest_mapping(
     key: &str,
     account_id: &str,
 ) -> Result<StoredEvent, IngestMappingError> {
+    if !mapping_keys().contains(&key) {
+        return Err(IngestMappingError::UnknownKey(key.to_string()));
+    }
     loop {
         let head = store.latest_id()?.unwrap_or(0);
         let outcome = store.append_checked(
@@ -186,6 +205,29 @@ mod tests {
             Err(IngestMappingError::NoSuchAccount(_))
         ));
         assert!(s.get_all().unwrap().is_empty(), "nothing appended");
+    }
+
+    /// The group server runs the shared check with its own, possibly older,
+    /// catalogue. A key it has never heard of still passes; a malformed one
+    /// or a bad account does not.
+    #[test]
+    fn the_shared_check_takes_keys_the_catalogue_lacks() {
+        let s = store_with_accounts();
+        let conn = s.connection();
+        assert!(check_set_ingest_mapping(conn, "pos_added_later", "rev").unwrap().is_ok());
+        for bad in ["", "Pos_Zelle", "pos zelle", "pos-zelle", &"k".repeat(65)] {
+            assert!(
+                matches!(
+                    check_set_ingest_mapping(conn, bad, "rev").unwrap(),
+                    Err(IngestMappingError::MalformedKey(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            check_set_ingest_mapping(conn, "pos_added_later", "old").unwrap(),
+            Err(IngestMappingError::InactiveAccount(_))
+        ));
     }
 
     /// A mapping written the old way is offered for publishing until an event
